@@ -1,0 +1,266 @@
+name: PaperDesk immutable candidate verifier
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      source_event_name:
+        required: true
+        type: string
+      source_workflow_ref:
+        required: true
+        type: string
+      source_run_id:
+        required: true
+        type: string
+      source_run_attempt:
+        required: true
+        type: string
+      source_artifact_name:
+        required: true
+        type: string
+      verified_artifact_name:
+        required: true
+        type: string
+      verifier_workflow_ref:
+        required: true
+        type: string
+    outputs:
+      verified_artifact_name:
+        description: Exact create-only verified runtime artifact name
+        value: ${{ jobs.verify_candidate.outputs.verified_artifact_name }}
+      receipt_artifact_name:
+        description: Exact create-only verification receipt artifact name
+        value: ${{ jobs.verify_candidate.outputs.receipt_artifact_name }}
+      receipt_sha256:
+        description: SHA-256 of the independent verification receipt
+        value: ${{ jobs.verify_candidate.outputs.receipt_sha256 }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify_candidate:
+    name: Verify hostile candidate from an exact caller commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verified_artifact_name: ${{ steps.receipt.outputs.verified_artifact_name }}
+      receipt_artifact_name: ${{ steps.receipt.outputs.receipt_artifact_name }}
+      receipt_sha256: ${{ steps.receipt.outputs.receipt_sha256 }}
+    steps:
+      - name: Require exact immutable caller coordinates
+        env:
+          SOURCE_ARTIFACT_NAME: ${{ inputs.source_artifact_name }}
+          SOURCE_EVENT_NAME: ${{ inputs.source_event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_WORKFLOW_REF: ${{ inputs.source_workflow_ref }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+          VERIFIER_WORKFLOW_REF: ${{ inputs.verifier_workflow_ref }}
+        run: |
+          set -euo pipefail
+          test "${SOURCE_REPOSITORY}" = "${GITHUB_REPOSITORY}"
+          test "${SOURCE_SHA}" = "${GITHUB_SHA}"
+          test "${SOURCE_REF}" = "${GITHUB_REF}"
+          test "${SOURCE_EVENT_NAME}" = "${GITHUB_EVENT_NAME}"
+          test "${SOURCE_WORKFLOW_REF}" = "${GITHUB_WORKFLOW_REF}"
+          test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"
+          test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${SOURCE_ARTIFACT_NAME}" = "paperdesk-azure-runtime-unverified-${SOURCE_SHA}"
+          test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
+          [[ "${VERIFIER_WORKFLOW_REF}" =~ ^Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate\.yml@[0-9a-f]{40}$ ]]
+
+      - name: Check out immutable independent verifier controls
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: Sethvirak/paperdesk-release-verifier
+          ref: aa9ac0d7f3de54fe159763f52d40730abccbaa8d
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+          path: paperdesk-verifier-control
+
+      - name: Verify independently pinned control bytes
+        working-directory: paperdesk-verifier-control
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "aa9ac0d7f3de54fe159763f52d40730abccbaa8d"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf '%s  %s\n' \
+            '4e54f5bee030feb30ed3fae6a1d7a9363573c558fbb8b901d176789816f90acf' 'scripts/verify_candidate.py' \
+            '893b721221c92778bee928cb20423ad1397a8f91cdd9cda2d7718f5b265d8b55' 'scripts/check_deadline.py' | sha256sum --check --strict
+
+      - name: Check out exact PaperDesk source without persisted credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+          path: paperdesk-source
+
+      - name: Require clean exact-SHA source checkout
+        working-directory: paperdesk-source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up dependency-free verifier toolchain without a cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.19.0'
+
+      - name: Pin verifier npm without project lifecycle scripts
+        run: |
+          set -euo pipefail
+          npm install --global npm@11.13.0 --ignore-scripts --registry=https://registry.npmjs.org
+          test "$(node --version)" = "v24.19.0"
+          test "$(npm --version)" = "11.13.0"
+
+      - name: Reconstruct isolated expected runtime before hostile download
+        working-directory: paperdesk-source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          dependency_stage="${RUNNER_TEMP}/paperdesk-external-verifier-production-dependencies"
+          expected_materials="${RUNNER_TEMP}/paperdesk-external-verifier-release-materials"
+          expected_input="${RUNNER_TEMP}/paperdesk-external-verifier-package-input.json"
+          expected_runtime_manifest="${RUNNER_TEMP}/paperdesk-external-verifier-runtime-files.json"
+          mkdir "${dependency_stage}"
+          cp package.json package-lock.json "${dependency_stage}/"
+          npm --prefix "${dependency_stage}" ci --omit=dev --ignore-scripts
+          test -d "${dependency_stage}/node_modules"
+          node scripts/create-azure-deploy-package.js \
+            --capture-input-manifest "${expected_input}" \
+            --dependency-root "${dependency_stage}/node_modules" \
+            --release-materials-dir "${expected_materials}"
+          node scripts/create-azure-deploy-package.js \
+            --output .azure-deploy-package \
+            --expect-production-node-modules \
+            --no-execute-dependencies \
+            --dependency-root "${dependency_stage}/node_modules" \
+            --input-manifest "${expected_input}" \
+            --release-sha "${SOURCE_SHA}" \
+            --package-manifest-output "${expected_runtime_manifest}"
+          node scripts/create-azure-deploy-package.js --verify-package-dir .azure-deploy-package --no-execute-dependencies
+          node scripts/check-supply-chain.js sbom \
+            --output "${RUNNER_TEMP}/paperdesk-external-verifier-root.cdx.json"
+          node scripts/check-supply-chain.js sbom \
+            --workspace widget-showcase \
+            --output "${RUNNER_TEMP}/paperdesk-external-verifier-widget.cdx.json"
+
+      - name: Require one exact unverified producer artifact and no verified output
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARTIFACT_NAME: ${{ inputs.source_artifact_name }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+        run: |
+          set -euo pipefail
+          artifacts_json="$(gh api "/repos/${SOURCE_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100")"
+          test "$(jq --arg name "${SOURCE_ARTIFACT_NAME}" '[.artifacts[] | select(.name == $name and .expired == false)] | length' <<< "${artifacts_json}")" -eq 1
+          test "$(jq --arg name "${VERIFIED_ARTIFACT_NAME}" '[.artifacts[] | select(.name == $name and .expired == false)] | length' <<< "${artifacts_json}")" -eq 0
+
+      - name: Download unverified producer artifact as hostile input
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: ${{ inputs.source_artifact_name }}
+          path: ${{ runner.temp }}/paperdesk-hostile-candidate
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Independently verify archive, manifests, SBOMs, and provenance
+        env:
+          SOURCE_ARTIFACT_NAME: ${{ inputs.source_artifact_name }}
+          SOURCE_EVENT_NAME: ${{ inputs.source_event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_WORKFLOW_REF: ${{ inputs.source_workflow_ref }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+          VERIFIER_WORKFLOW_REF: ${{ inputs.verifier_workflow_ref }}
+        run: |
+          set -euo pipefail
+          receipt_dir="${RUNNER_TEMP}/paperdesk-candidate-verification-receipt"
+          mkdir "${receipt_dir}"
+          python3 paperdesk-verifier-control/scripts/verify_candidate.py \
+            --artifact-dir "${RUNNER_TEMP}/paperdesk-hostile-candidate" \
+            --expected-runtime-dir paperdesk-source/.azure-deploy-package \
+            --expected-input-manifest "${RUNNER_TEMP}/paperdesk-external-verifier-package-input.json" \
+            --expected-runtime-manifest "${RUNNER_TEMP}/paperdesk-external-verifier-runtime-files.json" \
+            --expected-release-materials "${RUNNER_TEMP}/paperdesk-external-verifier-release-materials" \
+            --expected-root-sbom "${RUNNER_TEMP}/paperdesk-external-verifier-root.cdx.json" \
+            --expected-widget-sbom "${RUNNER_TEMP}/paperdesk-external-verifier-widget.cdx.json" \
+            --policy paperdesk-source/architecture/supply_chain_policy.json \
+            --source-repository "${SOURCE_REPOSITORY}" \
+            --source-sha "${SOURCE_SHA}" \
+            --source-ref "${SOURCE_REF}" \
+            --source-event-name "${SOURCE_EVENT_NAME}" \
+            --source-workflow-ref "${SOURCE_WORKFLOW_REF}" \
+            --source-run-id "${SOURCE_RUN_ID}" \
+            --source-run-attempt "${SOURCE_RUN_ATTEMPT}" \
+            --source-artifact-name "${SOURCE_ARTIFACT_NAME}" \
+            --verified-artifact-name "${VERIFIED_ARTIFACT_NAME}" \
+            --verifier-run-id "${GITHUB_RUN_ID}" \
+            --verifier-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --verifier-workflow-ref "${VERIFIER_WORKFLOW_REF}" \
+            --verifier-job verify_candidate \
+            --receipt-output "${receipt_dir}/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json"
+
+      - name: Export digest-bound receipt coordinates
+        id: receipt
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/paperdesk-candidate-verification-receipt/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json"
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 8192
+          echo "verified_artifact_name=${VERIFIED_ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "receipt_artifact_name=paperdesk-candidate-verification-receipt-${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "receipt_sha256=$(sha256sum "${receipt}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish create-only externally verified candidate artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ inputs.verified_artifact_name }}
+          path: ${{ runner.temp }}/paperdesk-hostile-candidate
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Publish create-only external verification receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paperdesk-candidate-verification-receipt-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/paperdesk-candidate-verification-receipt/paperdesk-candidate-verification-receipt-${{ inputs.source_sha }}.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
