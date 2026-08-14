@@ -1,0 +1,19 @@
+{
+  "acceptanceWorkflowHeadSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "acceptedAt": "2026-08-13T01:30:00.000Z",
+  "acceptedByRunId": "42001",
+  "candidateCompletedAt": "2026-08-13T01:00:00.000Z",
+  "candidateFinalizeDeadline": "2026-08-14T01:00:00.000Z",
+  "candidateRunAttempt": "2",
+  "candidateRunId": "41001",
+  "candidateRuntimeSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "candidateSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "environmentId": "paperdesk-production",
+  "evidenceArtifactId": "93001",
+  "evidenceBundleSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+  "evidenceContractSha256": "REPLACED_WITH_FIXTURE_CONTRACT_SHA256",
+  "evidenceRunId": "42000",
+  "releaseScope": "controlled-non-ha-pilot",
+  "schemaVersion": 1,
+  "status": "fully-accepted"
+}

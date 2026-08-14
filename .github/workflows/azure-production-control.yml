@@ -1,0 +1,733 @@
+name: PaperDesk immutable Azure production control
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        description: Read-only OIDC canary, candidate deployment, live finalization, rollback, or accepted-release persistence
+        required: true
+        type: string
+      source_repository:
+        required: true
+        type: string
+      source_sha:
+        description: Exact release/artifact SHA; may differ from caller_sha for rollback or post-acceptance persistence
+        required: true
+        type: string
+      caller_sha:
+        description: Exact commit executing the calling workflow and binding the OIDC caller claim
+        required: true
+        type: string
+      source_run_id:
+        required: true
+        type: string
+      source_run_attempt:
+        required: true
+        type: string
+      verified_artifact_name:
+        required: false
+        type: string
+        default: ''
+      verification_receipt_name:
+        required: false
+        type: string
+        default: ''
+      verification_receipt_sha256:
+        required: false
+        type: string
+        default: ''
+      acceptance_run_id:
+        required: false
+        type: string
+        default: ''
+      acceptance_run_attempt:
+        required: false
+        type: string
+        default: ''
+      acceptance_workflow_ref:
+        required: false
+        type: string
+        default: ''
+      production_acceptance_receipt_name:
+        required: false
+        type: string
+        default: ''
+      production_acceptance_receipt_sha256:
+        required: false
+        type: string
+        default: ''
+      evidence_run_id:
+        required: false
+        type: string
+        default: ''
+      evidence_run_attempt:
+        required: false
+        type: string
+        default: ''
+      evidence_artifact_name:
+        required: false
+        type: string
+        default: ''
+      evidence_bundle_sha256:
+        required: false
+        type: string
+        default: ''
+      expected_live_url:
+        required: false
+        type: string
+        default: ''
+      expected_app_name:
+        required: false
+        type: string
+        default: ''
+      expected_resource_group:
+        required: false
+        type: string
+        default: ''
+      control_workflow_ref:
+        required: true
+        type: string
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+    outputs:
+      operation_receipt_sha256:
+        description: SHA-256 of the public-control decision/operation receipt
+        value: ${{ jobs.azure_production_control.outputs.operation_receipt_sha256 }}
+      operation_receipt_name:
+        description: Retained public-control receipt artifact name
+        value: ${{ jobs.azure_production_control.outputs.operation_receipt_name }}
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  azure_production_control:
+    name: Authorize exact PaperDesk Azure production operation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: paperdesk-production-control
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    outputs:
+      operation_receipt_sha256: ${{ steps.receipt.outputs.operation_receipt_sha256 }}
+      operation_receipt_name: ${{ steps.receipt.outputs.operation_receipt_name }}
+    steps:
+      - name: Validate immutable caller and operation coordinates before OIDC
+        id: immutable_coordinates
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          CALLER_SHA: ${{ inputs.caller_sha }}
+          CONTROL_WORKFLOW_REF: ${{ inputs.control_workflow_ref }}
+          EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
+          EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
+          EVIDENCE_RUN_ATTEMPT: ${{ inputs.evidence_run_attempt }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          EXPECTED_APP_NAME: ${{ inputs.expected_app_name }}
+          EXPECTED_LIVE_URL: ${{ inputs.expected_live_url }}
+          EXPECTED_RESOURCE_GROUP: ${{ inputs.expected_resource_group }}
+          OPERATION: ${{ inputs.operation }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_NAME: ${{ inputs.production_acceptance_receipt_name }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@23fc16fca795e0c6786f35aae863167fe80aa3cd
+          VERIFICATION_RECEIPT_NAME: ${{ inputs.verification_receipt_name }}
+          VERIFICATION_RECEIPT_SHA256: ${{ inputs.verification_receipt_sha256 }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+        run: |
+          set -euo pipefail
+          test "${SOURCE_REPOSITORY}" = "Sethvirak/MasterDataStructure"
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${CALLER_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${SOURCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${SOURCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${CONTROL_WORKFLOW_REF}" =~ ^Sethvirak/paperdesk-release-verifier/.github/workflows/azure-production-control\.yml@[0-9a-f]{40}$ ]]
+          test "${CALLER_SHA}" = "${GITHUB_SHA}"
+          case "${OPERATION}" in
+            oidc-canary-read-resource)
+              test -z "${VERIFIED_ARTIFACT_NAME}${VERIFICATION_RECEIPT_NAME}${VERIFICATION_RECEIPT_SHA256}${ACCEPTANCE_RUN_ID}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${EVIDENCE_RUN_ID}"
+              test "${SOURCE_SHA}" = "${CALLER_SHA}"
+              test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"
+              test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"
+              ;;
+            deploy-candidate|rollback-accepted-release)
+              test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
+              test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
+              [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              ;;
+            finalize-live-release)
+              test -z "${VERIFIED_ARTIFACT_NAME}"
+              test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
+              [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              ;;
+            persist-accepted-release)
+              test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
+              test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
+              [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              [[ "${ACCEPTANCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+              [[ "${ACCEPTANCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+              test "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" = "paperdesk-production-acceptance-receipt-${SOURCE_SHA}"
+              [[ "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              [[ "${ACCEPTANCE_WORKFLOW_REF}" =~ ^Sethvirak/MasterDataStructure/.github/workflows/main_master-data-structure-sea-9c4e0d0d\.yml@${SOURCE_SHA}$ ]]
+              [[ "${EVIDENCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+              [[ "${EVIDENCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+              test "${ACCEPTANCE_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${EVIDENCE_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${EVIDENCE_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
+              test "${EVIDENCE_ARTIFACT_NAME}" = "paperdesk-production-acceptance-evidence-post-deploy-${SOURCE_SHA}"
+              [[ "${EVIDENCE_BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              test "${GITHUB_REPOSITORY}" = "${SOURCE_REPOSITORY}"
+              test "${GITHUB_SHA}" = "${CALLER_SHA}"
+              test "${GITHUB_REF}" = "refs/heads/main"
+              test "${GITHUB_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
+              test "${GITHUB_WORKFLOW_REF}" = "Sethvirak/MasterDataStructure/.github/workflows/persist-accepted-release.yml@refs/heads/main"
+              test -z "${EXPECTED_APP_NAME}${EXPECTED_RESOURCE_GROUP}${EXPECTED_LIVE_URL}"
+              ;;
+            *)
+              echo "Unsupported Azure production operation."
+              exit 1
+              ;;
+          esac
+          if [ "${OPERATION}" != "persist-accepted-release" ]; then
+            test "${EXPECTED_APP_NAME}" = "master-data-structure-sea-9c4e0d0d"
+            test "${EXPECTED_RESOURCE_GROUP}" = "rg-master-data-structure-sea"
+            test "${EXPECTED_LIVE_URL}" = "https://master-data-structure-sea-9c4e0d0d.azurewebsites.net"
+          fi
+          echo "control_workflow_sha=${CONTROL_WORKFLOW_REF##*@}" >> "${GITHUB_OUTPUT}"
+          if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then
+            echo "All mutating modes remain fail-closed until independently verified artifact provenance, a completed post-acceptance caller, exact WORM-policy read authorization, and an ARM-triggerable in-VNet transport are implemented and canaried."
+            exit 1
+          fi
+
+      - name: Prove exact reusable-workflow and caller claims before Azure login
+        env:
+          CONTROL_WORKFLOW_REF: ${{ inputs.control_workflow_ref }}
+          CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
+          CALLER_SHA: ${{ inputs.caller_sha }}
+          EXPECTED_ENVIRONMENT: paperdesk-production-control
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+        run: |
+          set -euo pipefail
+          [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" == https://* ]]
+          [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" != *$'\n'* ]]
+          [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" != *$'\r'* ]]
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+          response="${RUNNER_TEMP}/paperdesk-external-control-oidc-response.json"
+          trap 'rm -f "${response}"' EXIT INT TERM
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --proto '=https' \
+            --tlsv1.2 \
+            --max-redirs 0 \
+            --max-time 30 \
+            --max-filesize 65536 \
+            --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            --output "${response}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange"
+          OIDC_RESPONSE="${response}" node <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const assert = require('assert/strict');
+          const response = JSON.parse(fs.readFileSync(process.env.OIDC_RESPONSE, 'utf8'));
+          assert.deepEqual(Object.keys(response), ['value']);
+          assert.equal(typeof response.value, 'string');
+          assert.ok(response.value.length < 32768);
+          const parts = response.value.split('.');
+          assert.equal(parts.length, 3);
+          const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+          assert.equal(claims.aud, 'api://AzureADTokenExchange');
+          assert.equal(claims.iss, 'https://token.actions.githubusercontent.com');
+          assert.equal(claims.repository, process.env.SOURCE_REPOSITORY);
+          assert.equal(claims.sha, process.env.CALLER_SHA);
+          assert.equal(claims.ref, process.env.GITHUB_REF);
+          assert.equal(String(claims.run_id), process.env.GITHUB_RUN_ID);
+          assert.equal(String(claims.run_attempt), process.env.GITHUB_RUN_ATTEMPT);
+          assert.equal(claims.workflow_ref, process.env.GITHUB_WORKFLOW_REF);
+          assert.equal(claims.job_workflow_ref, process.env.CONTROL_WORKFLOW_REF);
+          assert.equal(claims.job_workflow_sha, process.env.CONTROL_WORKFLOW_SHA);
+          assert.equal(claims.environment, process.env.EXPECTED_ENVIRONMENT);
+          assert.ok(Number.isInteger(claims.iat) && Number.isInteger(claims.nbf) && Number.isInteger(claims.exp));
+          const now = Math.floor(Date.now() / 1000);
+          assert.ok(claims.nbf <= now + 30 && claims.exp >= now && claims.exp - claims.iat <= 900);
+          NODE
+
+      - name: Azure login from the immutable reusable-workflow identity
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prove exact Azure subscription after claim-bound login
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          test "$(az account show --query id --output tsv)" = "${AZURE_SUBSCRIPTION_ID}"
+
+      - name: OIDC canary reads only the exact App Service resource
+        if: inputs.operation == 'oidc-canary-read-resource'
+        env:
+          EXPECTED_APP_NAME: ${{ inputs.expected_app_name }}
+          EXPECTED_RESOURCE_GROUP: ${{ inputs.expected_resource_group }}
+        run: |
+          set -euo pipefail
+          app_json="$(az webapp show --name "${EXPECTED_APP_NAME}" --resource-group "${EXPECTED_RESOURCE_GROUP}" --output json)"
+          test "$(jq -r '.name' <<< "${app_json}")" = "${EXPECTED_APP_NAME}"
+          test "$(jq -r '.resourceGroup | ascii_downcase' <<< "${app_json}")" = "$(printf '%s' "${EXPECTED_RESOURCE_GROUP}" | tr '[:upper:]' '[:lower:]')"
+
+      - name: Download exact externally verified release material
+        if: inputs.operation == 'deploy-candidate' || inputs.operation == 'rollback-accepted-release' || inputs.operation == 'persist-accepted-release'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: ${{ inputs.verified_artifact_name }}
+          path: ${{ runner.temp }}/paperdesk-verified-release
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact external verification receipt
+        if: inputs.operation != 'oidc-canary-read-resource'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: ${{ inputs.verification_receipt_name }}
+          path: ${{ runner.temp }}/paperdesk-verification-receipt
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify exact receipt digest before any Azure mutation
+        if: inputs.operation != 'oidc-canary-read-resource'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@23fc16fca795e0c6786f35aae863167fe80aa3cd
+          VERIFICATION_RECEIPT_SHA256: ${{ inputs.verification_receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/paperdesk-verification-receipt/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json"
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 8192
+          test "$(sha256sum "${receipt}" | cut -d ' ' -f 1)" = "${VERIFICATION_RECEIPT_SHA256}"
+          jq --exit-status --arg sha "${SOURCE_SHA}" '
+            .schemaVersion == 1
+            and .status == "candidate-verified"
+            and .candidateSha == $sha
+            and .verifierWorkflow == env.VERIFIER_WORKFLOW_REF
+          ' "${receipt}" >/dev/null
+
+      - name: Resolve exact accepted-release artifact identities and digests
+        id: registry_artifacts
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          EVIDENCE_RUN_ATTEMPT: ${{ inputs.evidence_run_attempt }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_NAME: ${{ inputs.production_acceptance_receipt_name }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFICATION_RECEIPT_NAME: ${{ inputs.verification_receipt_name }}
+          VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
+        run: |
+          set -euo pipefail
+          provenance="${RUNNER_TEMP}/paperdesk-verified-release/paperdesk-azure-runtime-${SOURCE_SHA}.provenance.json"
+          test -f "${provenance}" && test ! -L "${provenance}" && test "$(stat --format=%s "${provenance}")" -le 65536
+          source_workflow_path=".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml"
+          source_workflow_ref="Sethvirak/MasterDataStructure/.github/workflows/main_master-data-structure-sea-9c4e0d0d.yml@refs/heads/main"
+          test "$(jq -r '.workflow' "${provenance}")" = "${source_workflow_ref}"
+          test "$(jq -r '.repository' "${provenance}")" = "${SOURCE_REPOSITORY}"
+          test "$(jq -r '.commit' "${provenance}")" = "${SOURCE_SHA}"
+          test "$(jq -r '.runId | tostring' "${provenance}")" = "${SOURCE_RUN_ID}"
+          test "$(jq -r '.runAttempt | tostring' "${provenance}")" = "${SOURCE_RUN_ATTEMPT}"
+          source_event="$(jq -r '.invocation.eventName' "${provenance}")"
+          test "${source_event}" = "push" || test "${source_event}" = "workflow_dispatch"
+          resolve_artifact() {
+            local run_id="$1" expected_attempt="$2" name="$3" prefix="$4" expected_path="$5" expected_event="$6"
+            local run_json artifacts_json artifact_json
+            run_json="$(gh api "/repos/${SOURCE_REPOSITORY}/actions/runs/${run_id}")"
+            test "$(jq -r '.id | tostring' <<< "${run_json}")" = "${run_id}"
+            test "$(jq -r '.run_attempt | tostring' <<< "${run_json}")" = "${expected_attempt}"
+            test "$(jq -r '.status' <<< "${run_json}")" = "completed"
+            test "$(jq -r '.conclusion' <<< "${run_json}")" = "success"
+            test "$(jq -r '.repository.full_name' <<< "${run_json}")" = "${SOURCE_REPOSITORY}"
+            test "$(jq -r '.head_repository.full_name' <<< "${run_json}")" = "${SOURCE_REPOSITORY}"
+            test "$(jq -r '.head_sha' <<< "${run_json}")" = "${SOURCE_SHA}"
+            test "$(jq -r '.head_branch' <<< "${run_json}")" = "main"
+            test "$(jq -r '.path' <<< "${run_json}")" = "${expected_path}"
+            test "$(jq -r '.event' <<< "${run_json}")" = "${expected_event}"
+            artifacts_json="$(gh api "/repos/${SOURCE_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100")"
+            test "$(jq --arg name "${name}" '[.artifacts[] | select(.name == $name and .expired == false)] | length' <<< "${artifacts_json}")" -eq 1
+            artifact_json="$(jq --arg name "${name}" '.artifacts[] | select(.name == $name and .expired == false)' <<< "${artifacts_json}")"
+            test "$(jq -r '.workflow_run.id | tostring' <<< "${artifact_json}")" = "${run_id}"
+            test "$(jq -r '.workflow_run.head_sha' <<< "${artifact_json}")" = "$(jq -r '.head_sha' <<< "${run_json}")"
+            test "$(jq -r '.workflow_run.head_branch' <<< "${artifact_json}")" = "$(jq -r '.head_branch' <<< "${run_json}")"
+            test "$(jq -r '.workflow_run.repository_id | tostring' <<< "${artifact_json}")" = "$(jq -r '.repository.id | tostring' <<< "${run_json}")"
+            test "$(jq -r '.workflow_run.head_repository_id | tostring' <<< "${artifact_json}")" = "$(jq -r '.head_repository.id | tostring' <<< "${run_json}")"
+            local id digest
+            id="$(jq -r '.id | tostring' <<< "${artifact_json}")"
+            digest="$(jq -r '.digest' <<< "${artifact_json}")"
+            [[ "${id}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "${prefix}_id=${id}" >> "${GITHUB_OUTPUT}"
+            echo "${prefix}_digest=${digest#sha256:}" >> "${GITHUB_OUTPUT}"
+          }
+          resolve_artifact "${SOURCE_RUN_ID}" "${SOURCE_RUN_ATTEMPT}" "${VERIFIED_ARTIFACT_NAME}" verified "${source_workflow_path}" "${source_event}"
+          resolve_artifact "${SOURCE_RUN_ID}" "${SOURCE_RUN_ATTEMPT}" "${VERIFICATION_RECEIPT_NAME}" verification "${source_workflow_path}" "${source_event}"
+          resolve_artifact "${ACCEPTANCE_RUN_ID}" "${ACCEPTANCE_RUN_ATTEMPT}" "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" acceptance ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml" workflow_dispatch
+          resolve_artifact "${EVIDENCE_RUN_ID}" "${EVIDENCE_RUN_ATTEMPT}" "${EVIDENCE_ARTIFACT_NAME}" evidence ".github/workflows/production-evidence-intake.yml" workflow_dispatch
+
+      - name: Download exact production-acceptance receipt
+        if: inputs.operation == 'persist-accepted-release'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: ${{ inputs.production_acceptance_receipt_name }}
+          path: ${{ runner.temp }}/paperdesk-production-acceptance-receipt
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.acceptance_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate production-acceptance receipt before registry bridge activation
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.evidence_id }}
+          EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/paperdesk-production-acceptance-receipt/paperdesk-production-acceptance-receipt-${SOURCE_SHA}.json"
+          verification_receipt="${RUNNER_TEMP}/paperdesk-verification-receipt/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json"
+          contract="${RUNNER_TEMP}/paperdesk-verified-release/paperdesk-azure-runtime-${SOURCE_SHA}.acceptance-contract.json"
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 65536
+          test -f "${verification_receipt}" && test ! -L "${verification_receipt}"
+          test -f "${contract}" && test ! -L "${contract}"
+          test "$(sha256sum "${receipt}" | cut -d ' ' -f 1)" = "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}"
+          candidate_runtime_sha256="$(jq -r '.archiveSha256' "${verification_receipt}")"
+          evidence_contract_sha256="$(sha256sum "${contract}" | cut -d ' ' -f 1)"
+          [[ "${candidate_runtime_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${evidence_contract_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          jq --exit-status \
+            --arg sha "${SOURCE_SHA}" \
+            --arg sourceRunId "${SOURCE_RUN_ID}" \
+            --arg sourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg acceptanceRunId "${ACCEPTANCE_RUN_ID}" \
+            --arg evidenceRunId "${EVIDENCE_RUN_ID}" \
+            --arg evidenceArtifactId "${EVIDENCE_ARTIFACT_ID}" \
+            --arg evidenceBundleSha256 "${EVIDENCE_BUNDLE_SHA256}" \
+            --arg evidenceContractSha256 "${evidence_contract_sha256}" \
+            --arg candidateRuntimeSha256 "${candidate_runtime_sha256}" '
+            keys == ["acceptanceWorkflowHeadSha", "acceptedAt", "acceptedByRunId", "candidateCompletedAt", "candidateFinalizeDeadline", "candidateRunAttempt", "candidateRunId", "candidateRuntimeSha256", "candidateSha", "environmentId", "evidenceArtifactId", "evidenceBundleSha256", "evidenceContractSha256", "evidenceRunId", "releaseScope", "schemaVersion", "status"]
+            and .schemaVersion == 1
+            and .status == "fully-accepted"
+            and .candidateSha == $sha
+            and .candidateRunId == $sourceRunId
+            and .candidateRunAttempt == $sourceRunAttempt
+            and .candidateRuntimeSha256 == $candidateRuntimeSha256
+            and .acceptanceWorkflowHeadSha == $sha
+            and .acceptedByRunId == $acceptanceRunId
+            and .evidenceRunId == $evidenceRunId
+            and .evidenceArtifactId == $evidenceArtifactId
+            and .evidenceBundleSha256 == $evidenceBundleSha256
+            and .evidenceContractSha256 == $evidenceContractSha256
+            and (.releaseScope == "controlled-non-ha-pilot" or .releaseScope == "full-production")
+            and (.environmentId | test("^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$"))
+            and (.candidateCompletedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"))
+            and (.candidateFinalizeDeadline | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"))
+            and (.acceptedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"))
+          ' "${receipt}" >/dev/null
+
+      - name: Capture exact live locked WORM policy through Azure control identity
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          policy_id="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases/immutabilityPolicies/default"
+          policy="$(az rest --method get --url "https://management.azure.com${policy_id}?api-version=2025-06-01")"
+          jq --exit-status --arg id "${policy_id}" '
+            .id == $id
+            and .name == "default"
+            and .type == "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
+            and (.etag | type == "string" and length > 0)
+            and .properties.state == "Locked"
+            and .properties.immutabilityPeriodSinceCreationInDays == 30
+            and (.properties.allowProtectedAppendWrites // false) == false
+            and (.properties.allowProtectedAppendWritesAll // false) == false
+          ' <<< "${policy}" >/dev/null
+          snapshot="${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json"
+          jq --arg observedAt "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" --arg storageAccount mdspdbak2608089c4e --arg container paperdesk-accepted-releases '
+            {resourceId: .id, storageAccount: $storageAccount, container: $container, state: .properties.state, immutabilityPeriodSinceCreationInDays: .properties.immutabilityPeriodSinceCreationInDays, allowProtectedAppendWrites: (.properties.allowProtectedAppendWrites // false), allowProtectedAppendWritesAll: (.properties.allowProtectedAppendWritesAll // false), etag: .etag, observedAt: $observedAt}
+          ' <<< "${policy}" > "${snapshot}"
+          test -f "${snapshot}" && test ! -L "${snapshot}" && test "$(stat --format=%s "${snapshot}")" -le 8192
+
+      - name: Check out immutable accepted-release registry helper
+        if: inputs.operation == 'persist-accepted-release'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: Sethvirak/paperdesk-release-verifier
+          ref: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+          path: paperdesk-registry-control
+
+      - name: Build deterministic bounded registry transfer request
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          ACCEPTANCE_ARTIFACT_DIGEST: ${{ steps.registry_artifacts.outputs.acceptance_digest }}
+          ACCEPTANCE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.acceptance_id }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.evidence_id }}
+          EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
+          EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
+          EVIDENCE_RUN_ATTEMPT: ${{ inputs.evidence_run_attempt }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFICATION_ARTIFACT_DIGEST: ${{ steps.registry_artifacts.outputs.verification_digest }}
+          VERIFICATION_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.verification_id }}
+          VERIFIED_ARTIFACT_DIGEST: ${{ steps.registry_artifacts.outputs.verified_digest }}
+          VERIFIED_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.verified_id }}
+        run: |
+          set -euo pipefail
+          test "$(git -C paperdesk-registry-control rev-parse HEAD)" = "${{ steps.immutable_coordinates.outputs.control_workflow_sha }}"
+          test -z "$(git -C paperdesk-registry-control status --porcelain=v1 --untracked-files=all)"
+          python3 paperdesk-registry-control/scripts/accepted_release_registry.py build \
+            --source-sha "${SOURCE_SHA}" \
+            --source-run-id "${SOURCE_RUN_ID}" \
+            --source-run-attempt "${SOURCE_RUN_ATTEMPT}" \
+            --acceptance-run-id "${ACCEPTANCE_RUN_ID}" \
+            --acceptance-run-attempt "${ACCEPTANCE_RUN_ATTEMPT}" \
+            --acceptance-workflow-ref "${ACCEPTANCE_WORKFLOW_REF}" \
+            --evidence-run-id "${EVIDENCE_RUN_ID}" \
+            --evidence-run-attempt "${EVIDENCE_RUN_ATTEMPT}" \
+            --evidence-artifact-id "${EVIDENCE_ARTIFACT_ID}" \
+            --evidence-artifact-name "${EVIDENCE_ARTIFACT_NAME}" \
+            --evidence-bundle-sha256 "${EVIDENCE_BUNDLE_SHA256}" \
+            --verified-artifact-id "${VERIFIED_ARTIFACT_ID}" \
+            --verified-artifact-digest "${VERIFIED_ARTIFACT_DIGEST}" \
+            --verification-artifact-id "${VERIFICATION_ARTIFACT_ID}" \
+            --verification-artifact-digest "${VERIFICATION_ARTIFACT_DIGEST}" \
+            --acceptance-artifact-id "${ACCEPTANCE_ARTIFACT_ID}" \
+            --acceptance-artifact-digest "${ACCEPTANCE_ARTIFACT_DIGEST}" \
+            --verified-artifact-dir "${RUNNER_TEMP}/paperdesk-verified-release" \
+            --verification-receipt "${RUNNER_TEMP}/paperdesk-verification-receipt/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json" \
+            --acceptance-receipt "${RUNNER_TEMP}/paperdesk-production-acceptance-receipt/paperdesk-production-acceptance-receipt-${SOURCE_SHA}.json" \
+            --worm-snapshot "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" \
+            --output "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
+
+      - name: Extract and deploy exact verified candidate
+        if: inputs.operation == 'deploy-candidate' || inputs.operation == 'rollback-accepted-release'
+        env:
+          EXPECTED_APP_NAME: ${{ inputs.expected_app_name }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/paperdesk-verified-release"
+          archive="${artifact_dir}/paperdesk-azure-runtime-${SOURCE_SHA}.tar.gz"
+          checksum="${archive}.sha256"
+          test -f "${archive}" && test ! -L "${archive}" && test "$(stat --format=%s "${archive}")" -le 1073741824
+          test -f "${checksum}" && test ! -L "${checksum}" && test "$(wc -l < "${checksum}")" -eq 1
+          (cd "${artifact_dir}" && sha256sum --check --strict "$(basename "${checksum}")")
+          runtime_dir="${RUNNER_TEMP}/paperdesk-external-control-runtime"
+          mkdir "${runtime_dir}"
+          tar --extract --gzip --file "${archive}" --directory "${runtime_dir}"
+          test "$(cat "${runtime_dir}/server/paperdesk-release-sha.txt")" = "${SOURCE_SHA}"
+          tar --create --gzip --file "${RUNNER_TEMP}/paperdesk-external-control-deploy.tar.gz" --directory "${runtime_dir}" .
+          echo "External workflow owns the Azure login and exact release authorization boundary."
+          echo "The application-specific deployment action remains fail-closed until this workflow is activated after OIDC canary and registry review."
+          exit 1
+
+      - name: Verify exact live release without redeployment
+        if: inputs.operation == 'finalize-live-release'
+        env:
+          EXPECTED_LIVE_URL: ${{ inputs.expected_live_url }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          live_sha="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 30 "${EXPECTED_LIVE_URL}/api/runtime-release-sha")"
+          test "${live_sha}" = "${SOURCE_SHA}"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 30 "${EXPECTED_LIVE_URL}/api/health/live" >/dev/null
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 30 "${EXPECTED_LIVE_URL}/api/health/ready" >/dev/null
+
+      - name: Persist accepted-release material through immutable Blob semantics
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
+          BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          assert_bridge_stopped_and_sealed() {
+            local site_json config_json policies_json
+            site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            test "$(jq -r '.name' <<< "${site_json}")" = "${BRIDGE_APP_NAME}"
+            test "$(jq -r '.resourceGroup | ascii_downcase' <<< "${site_json}")" = "$(printf '%s' "${BRIDGE_RESOURCE_GROUP}" | tr '[:upper:]' '[:lower:]')"
+            test "$(jq -r '.state' <<< "${site_json}")" = "Stopped"
+            test "$(jq -r '.publicNetworkAccess' <<< "${site_json}")" = "Disabled"
+            config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            test "$(jq -r '.ftpsState' <<< "${config_json}")" = "Disabled"
+            test "$(jq -r '.ipSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
+            test "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
+            test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
+            policies_json="$(az rest --method get --url "https://management.azure.com$(jq -r '.id' <<< "${site_json}")/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
+            test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
+            test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256'].name | length(@)" --output tsv)" = "0"
+          }
+
+          cleanup_bridge() {
+            set +e
+            az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null
+            az webapp config access-restriction set \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --default-action Deny \
+              --scm-default-action Deny \
+              --use-same-restrictions-for-scm-site true \
+              --only-show-errors >/dev/null
+            az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
+            az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
+            az webapp config appsettings delete --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --setting-names PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 --only-show-errors >/dev/null
+            rm -f "${RUNNER_TEMP}/paperdesk-bridge-session-token"
+            unset PAPERDESK_BRIDGE_SESSION_TOKEN
+            set -e
+            assert_bridge_stopped_and_sealed
+          }
+          trap cleanup_bridge EXIT INT TERM
+          assert_bridge_stopped_and_sealed
+
+          # Activation is intentionally fail-closed in this review branch. A later
+          # independently approved commit must deploy this exact workflow-SHA helper,
+          # inject a one-run opaque session token, start the fixed bridge, and POST
+          # the digest-bound request from the production VNet before cleanup seals it.
+          test -f "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
+          request_digest="$(sha256sum "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz" | cut -d ' ' -f 1)"
+          [[ "${request_digest}" =~ ^[0-9a-f]{64}$ ]]
+          echo "Registry request is bound for v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/."
+          echo "Bridge activation remains blocked on independent PR approval, exact-workflow OIDC/FIC canary, and deployment of this immutable helper."
+          exit 1
+
+      - name: Seal fixed registry bridge after every persistence attempt
+        if: always() && inputs.operation == 'persist-accepted-release'
+        env:
+          BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
+          BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
+        run: |
+          set -euo pipefail
+          site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)"
+          [[ "${site_id}" =~ /resourceGroups/${BRIDGE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${BRIDGE_APP_NAME}$ ]]
+          az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors
+          az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null
+          az webapp config access-restriction set \
+            --name "${BRIDGE_APP_NAME}" \
+            --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+            --default-action Deny \
+            --scm-default-action Deny \
+            --use-same-restrictions-for-scm-site true \
+            --only-show-errors >/dev/null
+          az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
+          az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
+          az webapp config appsettings delete --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --setting-names PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 --only-show-errors >/dev/null
+          site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+          config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+          policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
+          test "$(jq -r '.state' <<< "${site_json}")" = "Stopped"
+          test "$(jq -r '.publicNetworkAccess' <<< "${site_json}")" = "Disabled"
+          test "$(jq -r '.ftpsState' <<< "${config_json}")" = "Disabled"
+          test "$(jq -r '.ipSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
+          test "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
+          test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
+          test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
+          test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256'].name | length(@)" --output tsv)" = "0"
+
+      - name: Create bounded control receipt
+        id: receipt
+        if: always()
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          CONTROL_WORKFLOW_REF: ${{ inputs.control_workflow_ref }}
+          EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
+          EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
+          EVIDENCE_RUN_ATTEMPT: ${{ inputs.evidence_run_attempt }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          OPERATION: ${{ inputs.operation }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_NAME: ${{ inputs.production_acceptance_receipt_name }}
+          PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERIFICATION_RECEIPT_NAME: ${{ inputs.verification_receipt_name }}
+          VERIFICATION_RECEIPT_SHA256: ${{ inputs.verification_receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          receipt_dir="${RUNNER_TEMP}/paperdesk-external-control-receipt"
+          receipt_name="paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          mkdir "${receipt_dir}"
+          jq --null-input \
+            --arg schemaVersion '1' \
+            --arg status "${{ job.status }}" \
+            --arg operation "${OPERATION}" \
+            --arg sourceRepository "${SOURCE_REPOSITORY}" \
+            --arg sourceSha "${SOURCE_SHA}" \
+            --arg sourceRunId "${SOURCE_RUN_ID}" \
+            --arg sourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg controlWorkflowRef "${CONTROL_WORKFLOW_REF}" \
+            --arg controlRunId "${GITHUB_RUN_ID}" \
+            --arg controlRunAttempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg acceptanceRunId "${ACCEPTANCE_RUN_ID}" \
+            --arg acceptanceRunAttempt "${ACCEPTANCE_RUN_ATTEMPT}" \
+            --arg acceptanceWorkflowRef "${ACCEPTANCE_WORKFLOW_REF}" \
+            --arg evidenceRunId "${EVIDENCE_RUN_ID}" \
+            --arg evidenceRunAttempt "${EVIDENCE_RUN_ATTEMPT}" \
+            --arg evidenceArtifactName "${EVIDENCE_ARTIFACT_NAME}" \
+            --arg evidenceBundleSha256 "${EVIDENCE_BUNDLE_SHA256}" \
+            --arg verificationReceiptName "${VERIFICATION_RECEIPT_NAME}" \
+            --arg verificationReceiptSha256 "${VERIFICATION_RECEIPT_SHA256}" \
+            --arg productionAcceptanceReceiptName "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" \
+            --arg productionAcceptanceReceiptSha256 "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" \
+            --arg registryPrefix "$(if [ "${OPERATION}" = "persist-accepted-release" ]; then printf 'v1/releases/%s/%s/%s/' "${SOURCE_SHA}" "${SOURCE_RUN_ID}" "${ACCEPTANCE_RUN_ID}"; fi)" \
+            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPrefix: $registryPrefix}' \
+            > "${receipt_dir}/${receipt_name}"
+          echo "operation_receipt_name=paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
+          echo "operation_receipt_sha256=$(sha256sum "${receipt_dir}/${receipt_name}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Retain immutable-control receipt
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paperdesk-external-control-${{ inputs.operation }}-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-external-control-receipt
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

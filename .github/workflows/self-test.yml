@@ -33,5 +33,5 @@ jobs:
       - name: Compile and run dependency-free tests
         run: |
           set -euo pipefail
-          python3 -m py_compile scripts/verify_candidate.py scripts/check_deadline.py
+          python3 -m py_compile scripts/verify_candidate.py scripts/check_deadline.py scripts/accepted_release_registry.py
           python3 -m unittest discover -s tests -v
