@@ -2,39 +2,115 @@ from pathlib import Path
 import re
 import unittest
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL = ROOT / ".github" / "workflows" / "azure-production-control.yml"
 VERIFY = ROOT / ".github" / "workflows" / "verify-candidate.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "accepted-release-deadline-watchdog.yml"
 
+MAPPING_ENTRY = re.compile(
+    r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+):(?:[ ]*(?P<value>.*))?$"
+)
+
+
+def mapping_block(source, path):
+    """Return the line bounds and indentation for a strict YAML mapping path."""
+    lines = source.splitlines()
+    start = 0
+    end = len(lines)
+    parent_indent = -2
+
+    for key in path:
+        expected_indent = parent_indent + 2
+        matches = []
+        for index in range(start, end):
+            line = lines[index]
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if line.startswith("\t") or line[: len(line) - len(line.lstrip(" \t"))].find("\t") >= 0:
+                raise AssertionError("workflow mappings must use spaces, not tabs")
+            match = MAPPING_ENTRY.match(line)
+            if (
+                match
+                and len(match.group("indent")) == expected_indent
+                and match.group("key") == key
+            ):
+                matches.append((index, match))
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected exactly one mapping key {'/'.join(path)!r}; found {len(matches)} for {key!r}"
+            )
+
+        index, match = matches[0]
+        if (match.group("value") or "").strip():
+            raise AssertionError(f"workflow key {'/'.join(path)!r} must contain a nested mapping")
+        block_end = end
+        for candidate in range(index + 1, end):
+            line = lines[candidate]
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= expected_indent:
+                block_end = candidate
+                break
+        start = index + 1
+        end = block_end
+        parent_indent = expected_indent
+
+    return lines, start, end, parent_indent
+
+
+def direct_mapping(source, path, *, require_scalar_values=False):
+    """Read direct children of a mapping without implementing general YAML."""
+    lines, start, end, parent_indent = mapping_block(source, path)
+    child_indent = parent_indent + 2
+    result = {}
+    for index in range(start, end):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = MAPPING_ENTRY.match(line)
+        if not match or len(match.group("indent")) != child_indent:
+            continue
+        key = match.group("key")
+        if key in result:
+            raise AssertionError(f"duplicate workflow mapping key {'/'.join((*path, key))!r}")
+        value = (match.group("value") or "").strip()
+        if require_scalar_values and not value:
+            raise AssertionError(f"workflow mapping key {'/'.join((*path, key))!r} must be scalar")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        result[key] = value or None
+    if not result:
+        raise AssertionError(f"workflow mapping {'/'.join(path)!r} must not be empty")
+    return result
+
 
 class WorkflowContractTests(unittest.TestCase):
     def workflow(self, path):
         source = path.read_text(encoding="utf-8")
-        document = yaml.safe_load(source)
-        self.assertIsInstance(document, dict)
-        self.assertIsInstance(document.get("jobs"), dict)
-        return source, document
+        self.assertTrue(direct_mapping(source, ("jobs",)), path)
+        return source
 
     def test_all_actions_are_full_sha_pinned(self):
         for path in (CONTROL, VERIFY, WATCHDOG):
-            source, _ = self.workflow(path)
+            source = self.workflow(path)
             actions = re.findall(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", source, flags=re.M)
             self.assertTrue(actions, path)
             for action in actions:
                 self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$", action)
 
     def test_artifact_verifier_has_no_oidc_or_azure(self):
-        source, document = self.workflow(VERIFY)
+        source = self.workflow(VERIFY)
         self.assertNotIn("id-token", source)
         self.assertNotIn("azure/login", source)
         self.assertNotIn("environment:", source)
-        self.assertEqual(document["permissions"], {"actions": "read", "contents": "read"})
+        self.assertEqual(
+            direct_mapping(source, ("permissions",), require_scalar_values=True),
+            {"actions": "read", "contents": "read"},
+        )
 
     def test_azure_login_lives_only_in_pinned_external_control(self):
-        source, document = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         self.assertIn("id-token: write", source)
         self.assertIn("azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43", source)
         self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", source)
@@ -45,13 +121,17 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("oidc-canary-read-resource", source)
         self.assertIn("az webapp show", source)
         self.assertIn("environment: paperdesk-production-control", source)
-        job = document["jobs"]["azure_production_control"]
-        self.assertEqual(job["permissions"]["id-token"], "write")
-        self.assertEqual(job["permissions"]["contents"], "read")
-        self.assertEqual(job["permissions"]["actions"], "read")
+        self.assertEqual(
+            direct_mapping(
+                source,
+                ("jobs", "azure_production_control", "permissions"),
+                require_scalar_values=True,
+            ),
+            {"actions": "read", "contents": "read", "id-token": "write"},
+        )
 
     def test_mutating_modes_remain_hard_stopped(self):
-        source, _ = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         self.assertIn("application-specific deployment action remains fail-closed", source)
         self.assertIn("Bridge activation remains blocked", source)
         self.assertIn("independently verified artifact provenance", source)
@@ -59,7 +139,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertGreaterEqual(source.count("exit 1"), 3)
 
     def test_registry_contract_is_fixed_bounded_and_manifest_last(self):
-        source, document = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         self.assertNotIn("registry_container_url", source)
         self.assertNotIn("accepted_release_coordinate", source)
         for required in (
@@ -77,8 +157,16 @@ class WorkflowContractTests(unittest.TestCase):
             "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
         ):
             self.assertIn(required, source)
+        for transient_setting in (
+            "PAPERDESK_REGISTRY_ARTIFACT_URL",
+            "PAPERDESK_REGISTRY_ARTIFACT_HOST",
+            "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
+            "PAPERDESK_REGISTRY_REQUEST_SHA256",
+            "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+        ):
+            self.assertGreaterEqual(source.count(transient_setting), 3)
         self.assertIn("actions: read", source)
-        inputs = document.get("on", document.get(True))["workflow_call"]["inputs"]
+        inputs = direct_mapping(source, ("on", "workflow_call", "inputs"))
         for required_input in (
             "caller_sha",
             "acceptance_run_id",
@@ -94,7 +182,7 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(required_input, inputs)
 
     def test_registry_storage_and_bridge_resource_groups_are_not_cross_wired(self):
-        source, _ = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         worm_step = re.search(
             r"(?s)      - name: Capture exact live locked WORM policy through Azure control identity.*?"
             r"(?=\n      - name:)",
@@ -120,7 +208,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("BRIDGE_RESOURCE_GROUP: rg-paperdesk-rollback-sea-20260808", source)
 
     def test_caller_release_and_fixed_production_coordinates_are_separate(self):
-        source, _ = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         self.assertIn('test "${CALLER_SHA}" = "${GITHUB_SHA}"', source)
         self.assertNotIn('test "${SOURCE_SHA}" = "${GITHUB_SHA}"', source)
         self.assertIn(
@@ -137,7 +225,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn('[[ "${EXPECTED_APP_NAME}" =~', source)
 
     def test_receipts_and_registry_artifacts_bind_exact_workflow_runs(self):
-        source, _ = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         receipt_step = re.search(
             r"(?s)      - name: Verify exact receipt digest before any Azure mutation.*?"
             r"(?=\n      - name:)",
@@ -176,7 +264,7 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(exact_check, source)
 
     def test_only_read_only_canary_reaches_oidc(self):
-        source, _ = self.workflow(CONTROL)
+        source = self.workflow(CONTROL)
         hard_stop = source.index('if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then')
         azure_login = source.index("      - name: Azure login from the immutable reusable-workflow identity")
         self.assertLess(hard_stop, azure_login)

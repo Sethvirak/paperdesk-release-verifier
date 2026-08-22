@@ -599,7 +599,17 @@ jobs:
             test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
             policies_json="$(az rest --method get --url "https://management.azure.com$(jq -r '.id' <<< "${site_json}")/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
             test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
-            test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256'].name | length(@)" --output tsv)" = "0"
+            local transient_setting
+            for transient_setting in \
+              PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
+              PAPERDESK_REGISTRY_ARTIFACT_URL \
+              PAPERDESK_REGISTRY_ARTIFACT_HOST \
+              PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
+              PAPERDESK_REGISTRY_REQUEST_SHA256 \
+              PAPERDESK_REGISTRY_EXPECTED_PREFIX
+            do
+              test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='${transient_setting}'].name | length(@)" --output tsv)" = "0"
+            done
           }
 
           cleanup_bridge() {
@@ -615,7 +625,17 @@ jobs:
               --only-show-errors >/dev/null
             az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
             az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
-            az webapp config appsettings delete --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --setting-names PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 --only-show-errors >/dev/null
+            az webapp config appsettings delete \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --setting-names \
+                PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
+                PAPERDESK_REGISTRY_ARTIFACT_URL \
+                PAPERDESK_REGISTRY_ARTIFACT_HOST \
+                PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
+                PAPERDESK_REGISTRY_REQUEST_SHA256 \
+                PAPERDESK_REGISTRY_EXPECTED_PREFIX \
+              --only-show-errors >/dev/null
             rm -f "${RUNNER_TEMP}/paperdesk-bridge-session-token"
             unset PAPERDESK_BRIDGE_SESSION_TOKEN
             set -e
@@ -625,14 +645,15 @@ jobs:
           assert_bridge_stopped_and_sealed
 
           # Activation is intentionally fail-closed in this review branch. A later
-          # independently approved commit must deploy this exact workflow-SHA helper,
-          # inject a one-run opaque session token, start the fixed bridge, and POST
-          # the digest-bound request from the production VNet before cleanup seals it.
+          # independently approved commit must deploy the deterministic WebJob package,
+          # select and canary a compatible runtime, implement an approved one-shot
+          # coordinate handoff, trigger the fixed job through ARM, and prove its
+          # durable manifest before cleanup removes every transient coordinate.
           test -f "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
           request_digest="$(sha256sum "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz" | cut -d ' ' -f 1)"
           [[ "${request_digest}" =~ ^[0-9a-f]{64}$ ]]
           echo "Registry request is bound for v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/."
-          echo "Bridge activation remains blocked on independent PR approval, exact-workflow OIDC/FIC canary, and deployment of this immutable helper."
+          echo "Bridge activation remains blocked on caller-handoff approval, compatible-runtime canary, exact-workflow OIDC/FIC canary, and deployment of the immutable helper package."
           exit 1
 
       - name: Seal fixed registry bridge after every persistence attempt
@@ -655,7 +676,17 @@ jobs:
             --only-show-errors >/dev/null
           az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
           az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
-          az webapp config appsettings delete --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --setting-names PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 --only-show-errors >/dev/null
+          az webapp config appsettings delete \
+            --name "${BRIDGE_APP_NAME}" \
+            --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+            --setting-names \
+              PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
+              PAPERDESK_REGISTRY_ARTIFACT_URL \
+              PAPERDESK_REGISTRY_ARTIFACT_HOST \
+              PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
+              PAPERDESK_REGISTRY_REQUEST_SHA256 \
+              PAPERDESK_REGISTRY_EXPECTED_PREFIX \
+            --only-show-errors >/dev/null
           site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
           config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
           policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
@@ -666,7 +697,16 @@ jobs:
           test "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
           test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
           test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
-          test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256'].name | length(@)" --output tsv)" = "0"
+          for transient_setting in \
+            PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
+            PAPERDESK_REGISTRY_ARTIFACT_URL \
+            PAPERDESK_REGISTRY_ARTIFACT_HOST \
+            PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
+            PAPERDESK_REGISTRY_REQUEST_SHA256 \
+            PAPERDESK_REGISTRY_EXPECTED_PREFIX
+          do
+            test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='${transient_setting}'].name | length(@)" --output tsv)" = "0"
+          done
 
       - name: Create bounded control receipt
         id: receipt

@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import http.client
 import http.server
+import ipaddress
 import io
 import json
 import os
@@ -29,7 +30,7 @@ import sys
 import tarfile
 import tempfile
 import threading
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Mapping
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,7 +51,22 @@ MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_OTHER_FILE_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_BYTES = 1200 * 1024 * 1024
 MAX_MEMBERS = 21
+MAX_ACTIONS_ARTIFACT_BYTES = MAX_REQUEST_BYTES
+MAX_ACTIONS_ARTIFACT_URL_CHARS = 8192
+MAX_ACTIONS_ARTIFACT_QUERY_CHARS = 4096
+MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS = 10
+MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS = 300
+MAX_ONE_SHOT_RESULT_BYTES = 4096
 STORAGE_API_VERSION = "2023-11-03"
+
+ACTIONS_REQUEST_NAME = "paperdesk-accepted-release-request.tar.gz"
+ACTIONS_ARTIFACT_URL_ENV = "PAPERDESK_REGISTRY_ARTIFACT_URL"
+ACTIONS_ARTIFACT_HOST_ENV = "PAPERDESK_REGISTRY_ARTIFACT_HOST"
+ACTIONS_ARTIFACT_ZIP_SHA256_ENV = "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256"
+ACTIONS_REQUEST_SHA256_ENV = "PAPERDESK_REGISTRY_REQUEST_SHA256"
+EXPECTED_PREFIX_ENV = "PAPERDESK_REGISTRY_EXPECTED_PREFIX"
+REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
+REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -65,6 +81,10 @@ PAPERDESK_SOURCE_WORKFLOW_REF = (
 )
 CONTENT_MD5 = re.compile(r"[A-Za-z0-9+/]{22}==")
 ETAG = re.compile(r"[^\r\n]{1,256}")
+AZURE_BLOB_HOST = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.blob\.core\.windows\.net"
+)
+REGISTRY_PREFIX = re.compile(r"v1/releases/[0-9a-f]{40}/[1-9][0-9]*/[1-9][0-9]*/")
 
 RELEASE_MATERIAL_PATHS = (
     "architecture/production_acceptance_evidence_contract.json",
@@ -548,7 +568,7 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def safe_extract_actions_zip(archive_path: Path, output: Path) -> None:
+def safe_extract_actions_zip(archive_path: Path, output: Path) -> tuple[str, ...]:
     regular_file(archive_path, "Actions artifact archive", MAX_REQUEST_BYTES)
     if output.exists():
         fail("Actions artifact extraction target already exists")
@@ -582,12 +602,239 @@ def safe_extract_actions_zip(archive_path: Path, output: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with archive.open(info) as source, os.fdopen(descriptor, "wb") as sink:
-                    shutil.copyfileobj(source, sink, 1024 * 1024)
-                if target.stat().st_size != info.file_size:
+                    written = 0
+                    while True:
+                        chunk = source.read(min(1024 * 1024, info.file_size - written + 1))
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > info.file_size:
+                            fail("Actions artifact member exceeds its declared size")
+                        sink.write(chunk)
+                if written != info.file_size or target.stat().st_size != info.file_size:
                     fail("Actions artifact member size changed during extraction")
-    except Exception:
+        return tuple(sorted(seen))
+    except RegistryError:
         shutil.rmtree(output, ignore_errors=True)
         raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        shutil.rmtree(output, ignore_errors=True)
+        fail("Actions artifact ZIP is invalid")
+
+
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Make an artifact URL single-hop so its exact host binding cannot drift."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: BinaryIO,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
+
+
+def build_direct_artifact_opener() -> Any:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirectHandler(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+
+
+def build_direct_identity_opener() -> Any:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirectHandler(),
+    )
+
+
+def required_environment_value(environment: Mapping[str, str], name: str, maximum: int) -> str:
+    value = environment.get(name, "")
+    if not isinstance(value, str) or not value or value != value.strip() or len(value) > maximum:
+        fail(f"required one-shot coordinate {name} is invalid")
+    if any(ord(character) < 0x20 or ord(character) > 0x7e for character in value):
+        fail(f"required one-shot coordinate {name} is invalid")
+    return value
+
+
+def validate_actions_artifact_url(
+    url: str,
+    allowed_host: str,
+    observed_at: dt.datetime | None = None,
+) -> str:
+    if (
+        len(url) > MAX_ACTIONS_ARTIFACT_URL_CHARS
+        or len(allowed_host) > 253
+        or not AZURE_BLOB_HOST.fullmatch(allowed_host)
+    ):
+        fail("Actions artifact URL boundary is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        fail("Actions artifact URL boundary is invalid")
+    if any((
+        parsed.scheme != "https",
+        hostname != allowed_host,
+        parsed.netloc != allowed_host,
+        username is not None,
+        password is not None,
+        port is not None,
+        bool(parsed.fragment),
+        not parsed.path.startswith("/"),
+        len(parsed.path) > 2048,
+        not parsed.query,
+        len(parsed.query) > MAX_ACTIONS_ARTIFACT_QUERY_CHARS,
+        "%0d" in url.lower(),
+        "%0a" in url.lower(),
+    )):
+        fail("Actions artifact URL boundary is invalid")
+    try:
+        query = urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=32,
+        )
+    except ValueError:
+        fail("Actions artifact URL query is invalid")
+    names = [name for name, _ in query]
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or any(not name or not value for name, value in query)
+        or "sig" not in names
+    ):
+        fail("Actions artifact URL query is invalid")
+    parameters = dict(query)
+    if (
+        parameters.get("sp") != "r"
+        or parameters.get("sr") != "b"
+        or parameters.get("spr") != "https"
+    ):
+        fail("Actions artifact URL permissions are not read-only HTTPS Blob access")
+    expires = parameters.get("se", "")
+    if not expires.endswith("Z"):
+        fail("Actions artifact URL expiry is invalid")
+    try:
+        expiry = dt.datetime.fromisoformat(expires[:-1] + "+00:00")
+    except ValueError:
+        fail("Actions artifact URL expiry is invalid")
+    now = observed_at or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None or now.utcoffset() != dt.timedelta(0):
+        fail("Actions artifact URL observation time is invalid")
+    remaining = (expiry - now).total_seconds()
+    if not MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS <= remaining <= MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS:
+        fail("Actions artifact URL expiry is outside the one-shot boundary")
+    return url
+
+
+def download_actions_artifact(
+    url: str,
+    allowed_host: str,
+    expected_sha256: str,
+    output: Path,
+    opener: Any | None = None,
+) -> str:
+    validate_actions_artifact_url(url, allowed_host)
+    expected = digest(expected_sha256, "Actions artifact ZIP digest")
+    if output.exists():
+        fail("Actions artifact download target already exists")
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/zip", "User-Agent": "PaperDeskRegistryBridge/1"},
+        method="GET",
+    )
+    client = opener if opener is not None else build_direct_artifact_opener()
+    descriptor: int | None = None
+    try:
+        with client.open(request, timeout=900) as response:
+            if getattr(response, "status", 0) != 200 or response.geturl() != url:
+                fail("Actions artifact download was not one exact successful hop")
+            content_length_value = response.headers.get("Content-Length", "")
+            if not POSITIVE_INTEGER.fullmatch(content_length_value):
+                fail("Actions artifact Content-Length is invalid")
+            content_length = int(content_length_value)
+            if content_length > MAX_ACTIONS_ARTIFACT_BYTES:
+                fail("Actions artifact download exceeds the fixed bound")
+            if response.headers.get("Content-Encoding", "") not in ("", "identity"):
+                fail("Actions artifact response encoding is invalid")
+            if response.headers.get("Transfer-Encoding", ""):
+                fail("Actions artifact transfer encoding is invalid")
+            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            actual = hashlib.sha256()
+            total = 0
+            with os.fdopen(descriptor, "wb") as sink:
+                descriptor = None
+                while True:
+                    chunk = response.read(min(1024 * 1024, content_length - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > content_length or total > MAX_ACTIONS_ARTIFACT_BYTES:
+                        fail("Actions artifact response exceeds its declared bound")
+                    actual.update(chunk)
+                    sink.write(chunk)
+            if total != content_length:
+                fail("Actions artifact response ended before its declared bound")
+            actual_sha256 = actual.hexdigest()
+            if not hmac.compare_digest(actual_sha256, expected):
+                fail("Actions artifact ZIP digest is invalid")
+            return actual_sha256
+    except RegistryError:
+        output.unlink(missing_ok=True)
+        raise
+    except urllib.error.HTTPError as exc:
+        output.unlink(missing_ok=True)
+        code = exc.code if isinstance(exc.code, int) and 100 <= exc.code <= 599 else 0
+        fail(f"Actions artifact download failed with HTTP {code}")
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        output.unlink(missing_ok=True)
+        fail("Actions artifact download failed")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def validate_exact_actions_request_inventory(archive_path: Path) -> None:
+    regular_file(archive_path, "Actions artifact archive", MAX_REQUEST_BYTES)
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            if len(members) != 1:
+                fail("Actions artifact inventory is not the exact registry request")
+            info = members[0]
+            relative = safe_relative(info.filename.rstrip("/"))
+            mode = (info.external_attr >> 16) & 0o170000
+            if (
+                relative != ACTIONS_REQUEST_NAME
+                or info.is_dir()
+                or mode not in (0, 0o100000)
+                or info.file_size <= 0
+                or info.file_size > MAX_REQUEST_BYTES
+            ):
+                fail("Actions artifact inventory is not the exact registry request")
+    except RegistryError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        fail("Actions artifact ZIP is invalid")
+
+
+def extract_actions_request(archive_path: Path, output: Path) -> Path:
+    # Reject extra inventory before any member bytes are extracted.
+    validate_exact_actions_request_inventory(archive_path)
+    inventory = safe_extract_actions_zip(archive_path, output)
+    if inventory != (ACTIONS_REQUEST_NAME,):
+        shutil.rmtree(output, ignore_errors=True)
+        fail("Actions artifact inventory is not the exact registry request")
+    return regular_file(output / ACTIONS_REQUEST_NAME, "Actions registry request", MAX_REQUEST_BYTES)
 
 
 def extract_request(archive_path: Path, output: Path) -> tuple[dict[str, Any], dict[str, Path]]:
@@ -807,24 +1054,111 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     return files
 
 
+def validate_registry_prefix(value: str, label: str = "expected registry prefix") -> str:
+    if not isinstance(value, str) or len(value) > 160 or not REGISTRY_PREFIX.fullmatch(value):
+        fail(f"{label} is invalid")
+    return value
+
+
+def validate_expected_request_prefix(archive_path: Path, expected_prefix: str) -> str:
+    expected = validate_registry_prefix(expected_prefix)
+    try:
+        with tempfile.TemporaryDirectory(prefix="paperdesk-registry-prefix-") as temporary:
+            request, _ = extract_request(archive_path, Path(temporary) / "extracted")
+            actual = request["registry"]["prefix"]
+    except RegistryError:
+        raise
+    except (OSError, tarfile.TarError, EOFError):
+        fail("registry request cannot be validated before storage access")
+    if not hmac.compare_digest(actual, expected):
+        fail("registry request prefix does not match the expected one-shot prefix")
+    return actual
+
+
+def one_shot_coordinates(environment: Mapping[str, str]) -> dict[str, str]:
+    coordinates = {
+        "url": required_environment_value(
+            environment, ACTIONS_ARTIFACT_URL_ENV, MAX_ACTIONS_ARTIFACT_URL_CHARS
+        ),
+        "host": required_environment_value(environment, ACTIONS_ARTIFACT_HOST_ENV, 253),
+        "artifactSha256": required_environment_value(
+            environment, ACTIONS_ARTIFACT_ZIP_SHA256_ENV, 64
+        ),
+        "requestSha256": required_environment_value(environment, ACTIONS_REQUEST_SHA256_ENV, 64),
+        "expectedPrefix": required_environment_value(environment, EXPECTED_PREFIX_ENV, 160),
+    }
+    validate_actions_artifact_url(coordinates["url"], coordinates["host"])
+    digest(coordinates["artifactSha256"], "Actions artifact ZIP digest")
+    digest(coordinates["requestSha256"], "Actions registry request digest")
+    validate_registry_prefix(coordinates["expectedPrefix"])
+    return coordinates
+
+
+def validate_identity_endpoint(endpoint: str) -> str:
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or endpoint != endpoint.strip()
+        or len(endpoint) > 2048
+        or any(ord(character) < 0x20 or ord(character) > 0x7e for character in endpoint)
+    ):
+        fail("App Service managed-identity endpoint is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        fail("App Service managed-identity endpoint is invalid")
+    if any((
+        parsed.scheme != "http",
+        username is not None,
+        password is not None,
+        port is None,
+        bool(parsed.query),
+        bool(parsed.fragment),
+        parsed.path not in {"/MSI/token", "/MSI/token/"},
+        not hostname,
+        "%" in (hostname or ""),
+    )):
+        fail("App Service managed-identity endpoint is invalid")
+    if hostname != "localhost":
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            fail("App Service managed-identity endpoint host is not local")
+        if not (address.is_loopback or address.is_link_local):
+            fail("App Service managed-identity endpoint host is not local")
+    return endpoint
+
+
 def identity_token(client_id: str) -> str:
     if not UUID.fullmatch(client_id):
         fail("bridge managed-identity client ID is invalid")
-    endpoint = os.environ.get("IDENTITY_ENDPOINT", "")
+    endpoint = validate_identity_endpoint(os.environ.get("IDENTITY_ENDPOINT", ""))
     header = os.environ.get("IDENTITY_HEADER", "")
-    if not endpoint.startswith("http://") or not header or "\r" in header or "\n" in header:
+    if not header or len(header) > 8192 or "\r" in header or "\n" in header:
         fail("App Service managed-identity endpoint is unavailable")
     query = urllib.parse.urlencode({
         "api-version": "2019-08-01",
         "resource": "https://storage.azure.com/",
         "client_id": client_id,
     })
-    request = urllib.request.Request(f"{endpoint}?{query}", headers={"X-IDENTITY-HEADER": header})
+    token_url = f"{endpoint}?{query}"
+    request = urllib.request.Request(token_url, headers={"X-IDENTITY-HEADER": header})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            document = json.load(response)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        fail(f"managed-identity token acquisition failed: {exc}")
+        with build_direct_identity_opener().open(request, timeout=30) as response:
+            if getattr(response, "status", 0) != 200 or response.geturl() != token_url:
+                fail("managed-identity token response boundary is invalid")
+            body = response.read(65537)
+            if len(body) > 65536:
+                fail("managed-identity token response is excessive")
+            document = json.loads(body)
+    except RegistryError:
+        raise
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        fail("managed-identity token acquisition failed")
     token = document.get("access_token") if isinstance(document, dict) else None
     if not isinstance(token, str) or len(token) < 100 or "\r" in token or "\n" in token:
         fail("managed-identity token response is invalid")
@@ -929,11 +1263,19 @@ def verify_readback(body: bytes, headers: dict[str, str], record: dict[str, Any]
         fail("registry blob Content-MD5 property differs from the accepted source")
 
 
-def persist_request(archive_path: Path, client: StorageClient) -> dict[str, Any]:
+def persist_request(
+    archive_path: Path,
+    client: StorageClient,
+    expected_prefix: str | None = None,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="paperdesk-registry-request-") as temporary:
         root = Path(temporary) / "extracted"
         request, files = extract_request(archive_path, root)
         prefix = request["registry"]["prefix"]
+        if expected_prefix is not None:
+            expected = validate_registry_prefix(expected_prefix)
+            if not hmac.compare_digest(prefix, expected):
+                fail("registry request prefix does not match the expected one-shot prefix")
         records = {record["path"]: record for record in request["files"]}
         manifest_name = prefix + "registry-manifest.json"
         existing_status, existing_body, _ = client.get(manifest_name, prefix, 1024 * 1024)
@@ -1028,6 +1370,87 @@ def persist_request(archive_path: Path, client: StorageClient) -> dict[str, Any]
             "overwriteNegative": "not-run-completed" if completed else ("passed" if overwrite_proved else "not-run"),
             "outOfPrefixNegative": "passed",
         }
+
+
+def bounded_one_shot_result(
+    persisted: dict[str, Any],
+    expected_prefix: str,
+    artifact_sha256: str,
+    request_sha256: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(persisted, dict)
+        or persisted.get("status") != "complete"
+        or persisted.get("prefix") != expected_prefix
+        or persisted.get("fileCount") != 19
+        or not isinstance(persisted.get("createdBlobCount"), int)
+        or not 0 <= persisted["createdBlobCount"] <= 20
+        or persisted.get("overwriteNegative") not in {"passed", "not-run-completed"}
+        or persisted.get("outOfPrefixNegative") != "passed"
+    ):
+        fail("one-shot registry persistence result is invalid")
+    manifest_sha256 = digest(
+        str(persisted.get("manifestSha256", "")), "one-shot registry manifest digest"
+    )
+    document = {
+        "status": "complete",
+        "prefix": expected_prefix,
+        "artifactZipSha256": digest(artifact_sha256, "Actions artifact ZIP digest"),
+        "requestSha256": digest(request_sha256, "Actions registry request digest"),
+        "manifestSha256": manifest_sha256,
+        "fileCount": 19,
+        "createdBlobCount": persisted["createdBlobCount"],
+        "overwriteNegative": persisted["overwriteNegative"],
+        "outOfPrefixNegative": "passed",
+    }
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("one-shot registry persistence result exceeds its bound")
+    return document
+
+
+def persist_actions_artifact(
+    environment: Mapping[str, str] | None = None,
+    opener: Any | None = None,
+) -> dict[str, Any]:
+    coordinates = one_shot_coordinates(os.environ if environment is None else environment)
+    try:
+        with tempfile.TemporaryDirectory(prefix="paperdesk-actions-artifact-") as temporary:
+            root = Path(temporary)
+            artifact_path = root / "actions-artifact.zip"
+            artifact_sha256 = download_actions_artifact(
+                coordinates["url"],
+                coordinates["host"],
+                coordinates["artifactSha256"],
+                artifact_path,
+                opener,
+            )
+            request_path = extract_actions_request(artifact_path, root / "artifact")
+            request_sha256 = sha256_file(request_path)
+            if not hmac.compare_digest(request_sha256, coordinates["requestSha256"]):
+                fail("Actions registry request digest is invalid")
+
+            # Validate the full request and its exact prefix before identity-token
+            # acquisition, StorageClient construction, or any storage data-plane call.
+            expected_prefix = validate_expected_request_prefix(
+                request_path, coordinates["expectedPrefix"]
+            )
+            if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+                fail("fixed writer and reader managed identities must be distinct")
+            client = StorageClient(
+                identity_token(REGISTRY_WRITER_CLIENT_ID),
+                identity_token(REGISTRY_READER_CLIENT_ID),
+            )
+            persisted = persist_request(request_path, client, expected_prefix=expected_prefix)
+            return bounded_one_shot_result(
+                persisted,
+                expected_prefix,
+                artifact_sha256,
+                request_sha256,
+            )
+    except RegistryError:
+        raise
+    except Exception:
+        fail("one-shot registry persistence failed at a closed boundary")
 
 
 def validate_existing_manifest(manifest: Any, request: dict[str, Any]) -> None:
@@ -1145,6 +1568,7 @@ def serve(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("persist-actions-artifact")
     extract = commands.add_parser("extract-actions-artifact")
     extract.add_argument("--archive", required=True)
     extract.add_argument("--output", required=True)
@@ -1167,7 +1591,9 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.command == "extract-actions-artifact":
+        if args.command == "persist-actions-artifact":
+            print(json.dumps(persist_actions_artifact(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "extract-actions-artifact":
             safe_extract_actions_zip(Path(args.archive).resolve(), Path(args.output).resolve())
             print("Actions artifact extracted through bounded safe extraction.")
         elif args.command == "build":

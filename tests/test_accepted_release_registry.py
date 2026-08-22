@@ -2,6 +2,7 @@ import argparse
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -38,6 +40,21 @@ EVIDENCE_NAME = f"paperdesk-production-acceptance-evidence-post-deploy-{SHA}"
 
 def hex_digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def signed_artifact_url(host, *, remaining_seconds=60, permissions="r", resource="b"):
+    expires = (
+        registry.dt.datetime.now(registry.dt.timezone.utc)
+        + registry.dt.timedelta(seconds=remaining_seconds)
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+    query = registry.urllib.parse.urlencode({
+        "sig": "secret",
+        "sp": permissions,
+        "spr": "https",
+        "sr": resource,
+        "se": expires,
+    })
+    return f"https://{host}/actions-results/request.zip?{query}"
 
 
 class RegistryFixture:
@@ -176,6 +193,39 @@ class FakeStorage:
         return 201, ""
 
 
+class FakeDownloadResponse:
+    def __init__(self, body, url, status=200, headers=None):
+        self.body = io.BytesIO(body)
+        self.url = url
+        self.status = status
+        self.headers = {
+            "Content-Length": str(len(body)),
+            **({} if headers is None else headers),
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def geturl(self):
+        return self.url
+
+    def read(self, size=-1):
+        return self.body.read(size)
+
+
+class FakeDownloadOpener:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        return self.response
+
+
 class AcceptedReleaseRegistryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -189,6 +239,28 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         output = self.root / name
         result = registry.build_request(self.fixture.args(output))
         return output, result
+
+    def actions_zip(self, request_path, *extra_members):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr(registry.ACTIONS_REQUEST_NAME, request_path.read_bytes())
+            for name, body in extra_members:
+                archive.writestr(name, body)
+        return buffer.getvalue()
+
+    def one_shot_environment(self, artifact_body, request_path, expected_prefix=None):
+        host = "productionresultssa0.blob.core.windows.net"
+        return {
+            registry.ACTIONS_ARTIFACT_URL_ENV: signed_artifact_url(host),
+            registry.ACTIONS_ARTIFACT_HOST_ENV: host,
+            registry.ACTIONS_ARTIFACT_ZIP_SHA256_ENV: hex_digest(artifact_body),
+            registry.ACTIONS_REQUEST_SHA256_ENV: registry.sha256_file(request_path),
+            registry.EXPECTED_PREFIX_ENV: (
+                expected_prefix
+                if expected_prefix is not None
+                else f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/"
+            ),
+        }
 
     def test_request_is_deterministic_and_preserves_exact_nineteen_files(self):
         first, first_result = self.build("first.tar.gz")
@@ -283,6 +355,264 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         with self.assertRaises(registry.RegistryError):
             registry.safe_extract_actions_zip(hostile, self.root / "zip-output")
         self.assertFalse((self.root / "escape").exists())
+
+    def test_one_shot_url_is_exact_https_blob_host_with_bounded_signed_query(self):
+        host = "productionresultssa0.blob.core.windows.net"
+        valid = signed_artifact_url(host)
+        self.assertEqual(registry.validate_actions_artifact_url(valid, host), valid)
+        valid_query = registry.urllib.parse.urlsplit(valid).query
+        invalid = (
+            f"http://{host}/actions-results/request.zip?{valid_query}",
+            f"https://user@{host}/actions-results/request.zip?{valid_query}",
+            f"https://{host}:443/actions-results/request.zip?{valid_query}",
+            f"https://{host}:invalid/actions-results/request.zip?{valid_query}",
+            f"https://other.blob.core.windows.net/actions-results/request.zip?{valid_query}",
+            f"https://{host}/actions-results/request.zip?{valid_query}#fragment",
+            f"https://{host}/actions-results/request.zip",
+            f"{valid}&sig=second",
+            valid.replace("&spr=https", ""),
+            signed_artifact_url(host, permissions="rw"),
+            signed_artifact_url(host, resource="c"),
+            signed_artifact_url(host, remaining_seconds=5),
+            signed_artifact_url(host, remaining_seconds=301),
+        )
+        for url in invalid:
+            with self.subTest(url=url):
+                with self.assertRaises(registry.RegistryError):
+                    registry.validate_actions_artifact_url(url, host)
+        with self.assertRaises(registry.RegistryError):
+            registry.validate_actions_artifact_url(
+                "https://artifact.example.test/request.zip?sig=secret&sp=r&sr=b&se=2099-01-01T00%3A00%3A00Z",
+                "artifact.example.test",
+            )
+
+    def test_one_shot_download_is_single_hop_bounded_and_digest_bound(self):
+        body = b"bounded Actions artifact"
+        host = "productionresultssa0.blob.core.windows.net"
+        url = signed_artifact_url(host)
+        output = self.root / "download.zip"
+        opener = FakeDownloadOpener(FakeDownloadResponse(body, url))
+        actual = registry.download_actions_artifact(url, host, hex_digest(body), output, opener)
+        self.assertEqual(actual, hex_digest(body))
+        self.assertEqual(output.read_bytes(), body)
+        self.assertEqual(opener.requests[0][1], 900)
+
+        redirected = self.root / "redirected.zip"
+        with self.assertRaises(registry.RegistryError):
+            registry.download_actions_artifact(
+                url,
+                host,
+                hex_digest(body),
+                redirected,
+                FakeDownloadOpener(FakeDownloadResponse(body, url, status=302)),
+            )
+        self.assertFalse(redirected.exists())
+        self.assertIsNone(
+            registry.RejectRedirectHandler().redirect_request(None, None, 302, "", {}, url)
+        )
+
+        mismatched = self.root / "mismatched.zip"
+        with self.assertRaises(registry.RegistryError):
+            registry.download_actions_artifact(
+                url,
+                host,
+                "0" * 64,
+                mismatched,
+                FakeDownloadOpener(FakeDownloadResponse(body, url)),
+            )
+        self.assertFalse(mismatched.exists())
+
+        excessive = self.root / "excessive.zip"
+        with mock.patch.object(registry, "MAX_ACTIONS_ARTIFACT_BYTES", len(body) - 1):
+            with self.assertRaises(registry.RegistryError):
+                registry.download_actions_artifact(
+                    url,
+                    host,
+                    hex_digest(body),
+                    excessive,
+                    FakeDownloadOpener(FakeDownloadResponse(body, url)),
+                )
+        self.assertFalse(excessive.exists())
+
+    def test_signed_artifact_and_managed_identity_openers_disable_environment_proxies(self):
+        sentinel = object()
+        with mock.patch.object(
+            registry.urllib.request, "build_opener", return_value=sentinel
+        ) as factory:
+            self.assertIs(registry.build_direct_artifact_opener(), sentinel)
+        artifact_handlers = factory.call_args.args
+        self.assertTrue(any(
+            isinstance(handler, registry.urllib.request.ProxyHandler) and handler.proxies == {}
+            for handler in artifact_handlers
+        ))
+        self.assertTrue(any(
+            isinstance(handler, registry.RejectRedirectHandler)
+            for handler in artifact_handlers
+        ))
+        self.assertTrue(any(
+            isinstance(handler, registry.urllib.request.HTTPSHandler)
+            for handler in artifact_handlers
+        ))
+
+        with mock.patch.object(
+            registry.urllib.request, "build_opener", return_value=sentinel
+        ) as factory:
+            self.assertIs(registry.build_direct_identity_opener(), sentinel)
+        identity_handlers = factory.call_args.args
+        self.assertTrue(any(
+            isinstance(handler, registry.urllib.request.ProxyHandler) and handler.proxies == {}
+            for handler in identity_handlers
+        ))
+        self.assertTrue(any(
+            isinstance(handler, registry.RejectRedirectHandler)
+            for handler in identity_handlers
+        ))
+
+    def test_managed_identity_endpoint_is_local_and_errors_are_redacted(self):
+        valid = (
+            "http://127.0.0.1:41741/MSI/token/",
+            "http://169.254.129.1:41741/MSI/token/",
+            "http://localhost:41741/MSI/token/",
+            "http://[::1]:41741/MSI/token/",
+            "http://[fe80::1]:41741/MSI/token/",
+        )
+        for endpoint in valid:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(registry.validate_identity_endpoint(endpoint), endpoint)
+        invalid = (
+            "https://127.0.0.1:41741/MSI/token/",
+            "http://example.com:41741/MSI/token/",
+            "http://10.0.0.4:41741/MSI/token/",
+            "http://user@127.0.0.1:41741/MSI/token/",
+            "http://127.0.0.1/MSI/token/",
+            "http://127.0.0.1:41741/internal/admin",
+            "http://127.0.0.1:99999/MSI/token/",
+            "http://127.0.0.1:41741/MSI/token/?secret=value",
+            "http://127.0.0.1:41741/MSI/token/#fragment",
+        )
+        for endpoint in invalid:
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(registry.RegistryError):
+                    registry.validate_identity_endpoint(endpoint)
+
+        class RaisingIdentityOpener:
+            def open(self, request, timeout):
+                raise registry.urllib.error.URLError("secret-endpoint-context")
+
+        with mock.patch.dict(registry.os.environ, {
+            "IDENTITY_ENDPOINT": valid[0],
+            "IDENTITY_HEADER": "secret-platform-header",
+        }, clear=True), mock.patch.object(
+            registry, "build_direct_identity_opener", return_value=RaisingIdentityOpener()
+        ):
+            with self.assertRaises(registry.RegistryError) as caught:
+                registry.identity_token(registry.REGISTRY_WRITER_CLIENT_ID)
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(str(caught.exception), "managed-identity token acquisition failed")
+
+    def test_actions_artifact_inventory_is_exactly_one_registry_request(self):
+        request, _ = self.build("artifact-request.tar.gz")
+        exact = self.root / "exact.zip"
+        exact.write_bytes(self.actions_zip(request))
+        extracted = registry.extract_actions_request(exact, self.root / "exact-output")
+        self.assertEqual(extracted.name, registry.ACTIONS_REQUEST_NAME)
+        self.assertEqual(extracted.read_bytes(), request.read_bytes())
+
+        extra = self.root / "extra.zip"
+        extra.write_bytes(self.actions_zip(request, ("unexpected.txt", b"not allowed")))
+        rejected_output = self.root / "extra-output"
+        with mock.patch.object(registry, "safe_extract_actions_zip") as extractor:
+            with self.assertRaises(registry.RegistryError):
+                registry.extract_actions_request(extra, rejected_output)
+            extractor.assert_not_called()
+        self.assertFalse(rejected_output.exists())
+
+    def test_expected_prefix_is_checked_before_any_storage_get_or_write(self):
+        request, _ = self.build("prefix-bound.tar.gz")
+        storage = FakeStorage()
+        wrong_prefix = f"v1/releases/{SHA}/{SOURCE_RUN}/99999/"
+        with self.assertRaises(registry.RegistryError):
+            registry.persist_request(request, storage, expected_prefix=wrong_prefix)
+        self.assertEqual(storage.events, [])
+
+    def test_one_shot_uses_fixed_identities_and_emits_only_bounded_safe_json(self):
+        request, _ = self.build("one-shot-request.tar.gz")
+        artifact_body = self.actions_zip(request)
+        environment = self.one_shot_environment(artifact_body, request)
+        url = environment[registry.ACTIONS_ARTIFACT_URL_ENV]
+        storage = FakeStorage()
+        tokens = {
+            registry.REGISTRY_WRITER_CLIENT_ID: "fixed-writer-token",
+            registry.REGISTRY_READER_CLIENT_ID: "fixed-reader-token",
+        }
+        with mock.patch.object(
+            registry, "identity_token", side_effect=lambda client_id: tokens[client_id]
+        ) as token_provider, mock.patch.object(
+            registry, "StorageClient", return_value=storage
+        ) as client_factory:
+            result = registry.persist_actions_artifact(
+                environment,
+                FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in token_provider.call_args_list],
+            [registry.REGISTRY_WRITER_CLIENT_ID, registry.REGISTRY_READER_CLIENT_ID],
+        )
+        client_factory.assert_called_once_with("fixed-writer-token", "fixed-reader-token")
+        self.assertNotEqual(registry.REGISTRY_WRITER_CLIENT_ID, registry.REGISTRY_READER_CLIENT_ID)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["fileCount"], 19)
+        serialized = registry.canonical_json(result)
+        self.assertLessEqual(len(serialized), registry.MAX_ONE_SHOT_RESULT_BYTES)
+        self.assertNotIn(b"secret", serialized)
+        self.assertNotIn(b"token", serialized)
+        self.assertNotIn(b"https://", serialized)
+
+    def test_bad_inner_digest_or_prefix_never_acquires_identity_or_storage_client(self):
+        request, _ = self.build("pre-storage-request.tar.gz")
+        artifact_body = self.actions_zip(request)
+        base_environment = self.one_shot_environment(artifact_body, request)
+        url = base_environment[registry.ACTIONS_ARTIFACT_URL_ENV]
+
+        bad_artifact_digest = dict(base_environment)
+        bad_artifact_digest[registry.ACTIONS_ARTIFACT_ZIP_SHA256_ENV] = "0" * 64
+        with mock.patch.object(registry, "identity_token") as token_provider, mock.patch.object(
+            registry, "StorageClient"
+        ) as client_factory:
+            with self.assertRaises(registry.RegistryError):
+                registry.persist_actions_artifact(
+                    bad_artifact_digest,
+                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                )
+            token_provider.assert_not_called()
+            client_factory.assert_not_called()
+
+        bad_digest = dict(base_environment)
+        bad_digest[registry.ACTIONS_REQUEST_SHA256_ENV] = "0" * 64
+        with mock.patch.object(registry, "identity_token") as token_provider, mock.patch.object(
+            registry, "StorageClient"
+        ) as client_factory:
+            with self.assertRaises(registry.RegistryError):
+                registry.persist_actions_artifact(
+                    bad_digest,
+                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                )
+            token_provider.assert_not_called()
+            client_factory.assert_not_called()
+
+        bad_prefix = dict(base_environment)
+        bad_prefix[registry.EXPECTED_PREFIX_ENV] = f"v1/releases/{SHA}/{SOURCE_RUN}/99999/"
+        with mock.patch.object(registry, "identity_token") as token_provider, mock.patch.object(
+            registry, "StorageClient"
+        ) as client_factory:
+            with self.assertRaises(registry.RegistryError):
+                registry.persist_actions_artifact(
+                    bad_prefix,
+                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                )
+            token_provider.assert_not_called()
+            client_factory.assert_not_called()
 
     def test_worm_policy_must_be_locked_and_exact(self):
         snapshot = self.root / "worm-snapshot.json"
