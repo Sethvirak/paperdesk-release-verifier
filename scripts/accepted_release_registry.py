@@ -68,13 +68,14 @@ ACTIONS_GITHUB_ARTIFACT_ID_ENV = "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID"
 ACTIONS_ARTIFACT_ZIP_SHA256_ENV = "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256"
 ACTIONS_REQUEST_SHA256_ENV = "PAPERDESK_REGISTRY_REQUEST_SHA256"
 EXPECTED_PREFIX_ENV = "PAPERDESK_REGISTRY_EXPECTED_PREFIX"
+RBAC_CANARY_BLOB_ENV = "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB"
 PAPERDESK_REPOSITORY = "Sethvirak/MasterDataStructure"
 GITHUB_API_HOST = "api.github.com"
 REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
 REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
 WEBJOB_RUNNER_NAME = "run.sh"
 WEBJOB_SETTINGS_NAME = "settings.job"
-WEBJOB_RUNNER_SHA256 = "fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc"
+WEBJOB_RUNNER_SHA256 = "61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50"
 WEBJOB_SETTINGS_SHA256 = "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e"
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -103,6 +104,10 @@ GITHUB_ACTIONS_SAS_QUERY_NAMES = frozenset({
     "sp", "spr", "sr", "st", "sv",
 })
 REGISTRY_PREFIX = re.compile(r"v1/releases/[0-9a-f]{40}/[1-9][0-9]*/[1-9][0-9]*/")
+RBAC_CANARY_BLOB = re.compile(
+    r"v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/"
+    r"[0-9a-f]{32}(?:-reader-write-denied)?\.json"
+)
 
 RELEASE_MATERIAL_PATHS = (
     "architecture/production_acceptance_evidence_contract.json",
@@ -1297,6 +1302,14 @@ def blob_url(blob_name: str, prefix: str) -> str:
     return f"/{CONTAINER}/{encoded}"
 
 
+def rbac_canary_blob_url(blob_name: str) -> str:
+    if not isinstance(blob_name, str) or not RBAC_CANARY_BLOB.fullmatch(blob_name):
+        fail("storage RBAC canary blob is outside the fixed canary prefix")
+    safe_relative(blob_name)
+    encoded = "/".join(urllib.parse.quote(part, safe="") for part in PurePosixPath(blob_name).parts)
+    return f"/{CONTAINER}/{encoded}"
+
+
 class StorageClient:
     def __init__(self, writer_token: str, reader_token: str):
         self.writer_token = writer_token
@@ -1306,31 +1319,64 @@ class StorageClient:
     def _connection(self) -> http.client.HTTPSConnection:
         return http.client.HTTPSConnection(self.host, timeout=900, context=ssl.create_default_context())
 
-    def get(self, blob_name: str, prefix: str, maximum: int) -> tuple[int, bytes, dict[str, str]]:
+    @staticmethod
+    def _error_code(status: int, body: bytes, headers: dict[str, str]) -> str:
+        error_code = headers.get("x-ms-error-code", "")
+        if status >= 300 and not error_code and body:
+            match = re.search(rb"<Code>([A-Za-z0-9]+)</Code>", body)
+            error_code = match.group(1).decode("ascii") if match else ""
+        return error_code
+
+    def _get(
+        self, target: str, token: str, maximum: int
+    ) -> tuple[int, bytes, dict[str, str], str]:
         connection = self._connection()
-        path = blob_url(blob_name, prefix)
         headers = {
-            "Authorization": f"Bearer {self.reader_token}",
+            "Authorization": f"Bearer {token}",
             "x-ms-version": STORAGE_API_VERSION,
             "x-ms-date": email_date(),
         }
         try:
-            connection.request("GET", path, headers=headers)
+            connection.request("GET", target, headers=headers)
             response = connection.getresponse()
             body = response.read(maximum + 1)
             if len(body) > maximum:
                 fail("registry blob read exceeds the expected bound")
-            return response.status, body, {key.lower(): value for key, value in response.getheaders()}
+            response_headers = {key.lower(): value for key, value in response.getheaders()}
+            return (
+                response.status,
+                body,
+                response_headers,
+                self._error_code(response.status, body, response_headers),
+            )
         finally:
             connection.close()
 
-    def put_create_only(self, blob_name: str, prefix: str, path: Path, content_md5: str) -> tuple[int, str]:
+    def get(self, blob_name: str, prefix: str, maximum: int) -> tuple[int, bytes, dict[str, str]]:
+        status, body, headers, _ = self._get(
+            blob_url(blob_name, prefix), self.reader_token, maximum
+        )
+        return status, body, headers
+
+    def reader_get_canary(self, blob_name: str, maximum: int) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(rbac_canary_blob_url(blob_name), self.reader_token, maximum)
+
+    def writer_get_canary(self, blob_name: str, maximum: int) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(rbac_canary_blob_url(blob_name), self.writer_token, maximum)
+
+    def _put(
+        self,
+        target: str,
+        token: str,
+        path: Path,
+        content_md5: str,
+        create_only: bool,
+    ) -> tuple[int, str]:
         connection = self._connection()
-        target = blob_url(blob_name, prefix)
         size = path.stat().st_size
         connection.putrequest("PUT", target)
         headers = {
-            "Authorization": f"Bearer {self.writer_token}",
+            "Authorization": f"Bearer {token}",
             "x-ms-version": STORAGE_API_VERSION,
             "x-ms-date": email_date(),
             "x-ms-blob-type": "BlockBlob",
@@ -1338,8 +1384,9 @@ class StorageClient:
             "Content-MD5": content_md5,
             "Content-Length": str(size),
             "Content-Type": "application/octet-stream",
-            "If-None-Match": "*",
         }
+        if create_only:
+            headers["If-None-Match"] = "*"
         for key, value in headers.items():
             connection.putheader(key, value)
         connection.endheaders()
@@ -1353,13 +1400,14 @@ class StorageClient:
             response = connection.getresponse()
             body = response.read(65536)
             headers = {key.lower(): value for key, value in response.getheaders()}
-            error_code = headers.get("x-ms-error-code", "")
-            if response.status >= 300 and not error_code and body:
-                match = re.search(rb"<Code>([A-Za-z0-9]+)</Code>", body)
-                error_code = match.group(1).decode("ascii") if match else ""
-            return response.status, error_code
+            return response.status, self._error_code(response.status, body, headers)
         finally:
             connection.close()
+
+    def put_create_only(self, blob_name: str, prefix: str, path: Path, content_md5: str) -> tuple[int, str]:
+        return self._put(
+            blob_url(blob_name, prefix), self.writer_token, path, content_md5, True
+        )
 
     def put_bytes_create_only(self, blob_name: str, prefix: str, body: bytes) -> tuple[int, str]:
         with tempfile.NamedTemporaryFile(prefix="paperdesk-manifest-", delete=False) as handle:
@@ -1371,6 +1419,45 @@ class StorageClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def _put_canary_bytes_create_only(
+        self, blob_name: str, token: str, body: bytes
+    ) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(prefix="paperdesk-rbac-canary-", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(
+                rbac_canary_blob_url(blob_name), token, path, encoded_md5, True
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def writer_put_canary_create_only(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        return self._put_canary_bytes_create_only(blob_name, self.writer_token, body)
+
+    def reader_put_canary_create_only(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        return self._put_canary_bytes_create_only(blob_name, self.reader_token, body)
+
+    def writer_put_canary_unconditional(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(prefix="paperdesk-rbac-overwrite-", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(
+                rbac_canary_blob_url(blob_name),
+                self.writer_token,
+                path,
+                encoded_md5,
+                False,
+            )
+        finally:
+            path.unlink(missing_ok=True)
 
 def email_date() -> str:
     from email.utils import format_datetime
@@ -1580,6 +1667,91 @@ def persist_actions_artifact(
         fail("one-shot registry persistence failed at a closed boundary")
 
 
+def storage_rbac_canary(
+    environment: MutableMapping[str, str] | None = None,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    environment = os.environ if environment is None else environment
+    if ACTIONS_GITHUB_TOKEN_ENV in environment:
+        fail("storage RBAC canary must not receive a GitHub credential")
+    canary_blob = environment.pop(RBAC_CANARY_BLOB_ENV, "")
+    rbac_canary_blob_url(canary_blob)
+    reader_write_probe = canary_blob[:-5] + "-reader-write-denied.json"
+    rbac_canary_blob_url(reader_write_probe)
+    try:
+        rbac_canary_blob_url("v1/releases/outside-storage-rbac-canary.json")
+    except RegistryError:
+        pass
+    else:
+        fail("storage RBAC canary out-of-prefix negative did not fail closed")
+
+    body = canonical_json({
+        "blob": canary_blob,
+        "schemaVersion": 1,
+        "status": "storage-rbac-canary",
+    })
+    if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+        fail("fixed writer and reader managed identities must be distinct")
+    if client is None:
+        client = StorageClient(
+            identity_token(REGISTRY_WRITER_CLIENT_ID),
+            identity_token(REGISTRY_READER_CLIENT_ID),
+        )
+
+    create_status, create_code = client.writer_put_canary_create_only(canary_blob, body)
+    if create_status not in (201, 202) or create_code:
+        fail("storage RBAC writer create canary failed")
+
+    read_status, read_body, _, read_code = client.reader_get_canary(
+        canary_blob, len(body)
+    )
+    if read_status != 200 or read_code or read_body != body:
+        fail("storage RBAC reader read canary failed")
+
+    overwrite_status, overwrite_code = client.writer_put_canary_unconditional(
+        canary_blob, body
+    )
+    if (overwrite_status, overwrite_code) not in {
+        (403, "UnauthorizedBlobOverwrite"),
+        (403, "AuthorizationPermissionMismatch"),
+        (409, "BlobImmutableDueToPolicy"),
+    }:
+        fail("storage RBAC writer unconditional overwrite canary did not fail closed")
+
+    writer_read_status, _, _, writer_read_code = client.writer_get_canary(
+        canary_blob, 64 * 1024
+    )
+    if (writer_read_status, writer_read_code) != (
+        403,
+        "AuthorizationPermissionMismatch",
+    ):
+        fail("storage RBAC writer read canary did not fail closed")
+
+    reader_write_status, reader_write_code = client.reader_put_canary_create_only(
+        reader_write_probe, body
+    )
+    if (reader_write_status, reader_write_code) != (
+        403,
+        "AuthorizationPermissionMismatch",
+    ):
+        fail("storage RBAC reader create canary did not fail closed")
+
+    document = {
+        "schemaVersion": 1,
+        "status": "storage-rbac-ready",
+        "canaryBlob": canary_blob,
+        "writerCreate": "passed",
+        "readerRead": "passed",
+        "writerUnconditionalOverwriteDenied": "passed",
+        "writerReadDenied": "passed",
+        "readerWriteDenied": "passed",
+        "localPrefixGuard": "passed-before-network",
+    }
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("storage RBAC canary result exceeds its bound")
+    return document
+
+
 def runtime_canary(job_directory: Path | None = None) -> dict[str, Any]:
     helper = Path(__file__).resolve()
     regular_file(helper, "registry WebJob helper", 2 * 1024 * 1024)
@@ -1739,6 +1911,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("persist-actions-artifact")
     commands.add_parser("runtime-canary")
+    commands.add_parser("storage-rbac-canary")
     extract = commands.add_parser("extract-actions-artifact")
     extract.add_argument("--archive", required=True)
     extract.add_argument("--output", required=True)
@@ -1765,6 +1938,8 @@ def main() -> int:
             print(json.dumps(persist_actions_artifact(), sort_keys=True, separators=(",", ":")))
         elif args.command == "runtime-canary":
             print(json.dumps(runtime_canary(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "storage-rbac-canary":
+            print(json.dumps(storage_rbac_canary(), sort_keys=True, separators=(",", ":")))
         elif args.command == "extract-actions-artifact":
             safe_extract_actions_zip(Path(args.archive).resolve(), Path(args.output).resolve())
             print("Actions artifact extracted through bounded safe extraction.")

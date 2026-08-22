@@ -252,6 +252,17 @@ jobs:
               ;;
           esac
           echo "control_workflow_sha=${CONTROL_WORKFLOW_REF##*@}" >> "${GITHUB_OUTPUT}"
+          case "${OPERATION}" in
+            registry-bridge-preflight|persist-accepted-release)
+              # Intentionally unconditional in this dormant source. A later independently
+              # reviewed commit may replace this only after an external cleanup watcher can
+              # stop/reseal the bridge after runner loss and a separately authorized read-only
+              # security-audit identity refreshes the RBAC/Entra receipt. The current control
+              # principal has no Storage-IAM, UAMI, Graph, or PIM enumeration authority.
+              echo "Registry bridge activation is impossible until an independent cleanup watcher/reconciliation receipt and separately authorized read-only RBAC/Entra audit refresh exist; PIM enumeration is unavailable without the required tenant license."
+              exit 1
+              ;;
+          esac
           if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then
             echo "All mutating modes remain fail-closed until this source receives independent review, exact WORM-policy and WebJob authorization is granted, the package and exact-workflow FIC are bootstrapped, the old workflow SHA is denied, and live runtime/registry canaries pass."
             exit 1
@@ -319,11 +330,24 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prove exact Azure subscription after claim-bound login
+        id: azure_session
         env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
-          test "$(az account show --query id --output tsv)" = "${AZURE_SUBSCRIPTION_ID}"
+          account_json="$(az account show --output json)"
+          jq --exit-status \
+            --arg clientId "${AZURE_CLIENT_ID}" \
+            --arg subscriptionId "${AZURE_SUBSCRIPTION_ID}" \
+            --arg tenantId "${AZURE_TENANT_ID}" '
+            .id == $subscriptionId
+            and .tenantId == $tenantId
+            and .state == "Enabled"
+            and .user == {name: $clientId, type: "servicePrincipal"}
+          ' <<< "${account_json}" >/dev/null
+          echo "confirmed=true" >> "${GITHUB_OUTPUT}"
 
       - name: OIDC canary reads only the exact App Service resource
         if: inputs.operation == 'oidc-canary-read-resource'
@@ -543,9 +567,9 @@ jobs:
         if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         env:
           CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
-          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
-          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
-          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
+          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
+          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
         run: |
           set -euo pipefail
@@ -568,7 +592,7 @@ jobs:
             --arg runnerSha256 "${EXPECTED_RUNNER_SHA256}" \
             --arg settingsSha256 "${EXPECTED_SETTINGS_SHA256}" '
             . as $root
-            | keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "webJob"]
+            | keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "storageRbac", "webJob"]
             and .schemaVersion == 1
             and .status == "bootstrap-complete"
             and (.reviewedSourceSha | test("^[0-9a-f]{40}$") and . != ("0" * 40))
@@ -603,6 +627,49 @@ jobs:
                 PAPERDESK_REGISTRY_SETTINGS_SHA256: $settingsSha256
               }
             }
+            and (.storageRbac | keys) == ["containerResourceId", "identityAudit", "reader", "writer"]
+            and .storageRbac.containerResourceId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases"
+            and (.storageRbac.identityAudit | keys) == ["capturedAt", "pimScheduleAudit", "readerMemberOf", "writerMemberOf"]
+            and (.storageRbac.identityAudit.capturedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and .storageRbac.identityAudit.writerMemberOf == []
+            and .storageRbac.identityAudit.readerMemberOf == []
+            and .storageRbac.identityAudit.pimScheduleAudit == {status: "unavailable", reason: "AadPremiumLicenseRequired", boundary: "tenant-has-no-P2-or-Identity-Governance-license; no-PIM-success-is-claimed"}
+            and (.storageRbac.writer | keys) == ["actions", "assignableScopes", "clientId", "condition", "conditionVersion", "dataActions", "identityResourceId", "identityType", "notActions", "notDataActions", "principalId", "principalType", "roleAssignmentId", "roleAssignmentSha256", "roleDefinitionId", "roleDefinitionSha256", "tenantId"]
+            and .storageRbac.writer.identityType == "ManagedIdentity"
+            and .storageRbac.writer.identityResourceId == .bridge.writerIdentityResourceId
+            and .storageRbac.writer.clientId == .bridge.writerClientId
+            and .storageRbac.writer.principalId == .bridge.writerPrincipalId
+            and .storageRbac.writer.tenantId == "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"
+            and .storageRbac.writer.principalType == "ServicePrincipal"
+            and .storageRbac.writer.roleAssignmentId == (.storageRbac.containerResourceId + "/providers/Microsoft.Authorization/roleAssignments/0151259f-6f5b-408e-a633-e927fa6773bc")
+            and (.storageRbac.writer.roleAssignmentSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and .storageRbac.writer.roleDefinitionId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d"
+            and .storageRbac.writer.condition == null
+            and .storageRbac.writer.conditionVersion == null
+            and .storageRbac.writer.actions == []
+            and .storageRbac.writer.notActions == []
+            and .storageRbac.writer.dataActions == ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]
+            and .storageRbac.writer.notDataActions == []
+            and .storageRbac.writer.assignableScopes == ["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"]
+            and (.storageRbac.writer.roleDefinitionSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and (.storageRbac.reader | keys) == ["actions", "assignableScopes", "clientId", "condition", "conditionVersion", "dataActions", "identityResourceId", "identityType", "notActions", "notDataActions", "principalId", "principalType", "roleAssignmentId", "roleAssignmentSha256", "roleDefinitionId", "roleDefinitionSha256", "tenantId"]
+            and .storageRbac.reader.identityType == "ManagedIdentity"
+            and .storageRbac.reader.identityResourceId == .bridge.readerIdentityResourceId
+            and .storageRbac.reader.clientId == .bridge.readerClientId
+            and .storageRbac.reader.principalId == .bridge.readerPrincipalId
+            and .storageRbac.reader.tenantId == "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"
+            and .storageRbac.reader.principalType == "ServicePrincipal"
+            and .storageRbac.reader.roleAssignmentId == (.storageRbac.containerResourceId + "/providers/Microsoft.Authorization/roleAssignments/44d5161c-3104-4de2-8e9b-3d640f013cfb")
+            and (.storageRbac.reader.roleAssignmentSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and .storageRbac.reader.roleDefinitionId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/e005b62b-037b-4989-b492-932669ec0842"
+            and .storageRbac.reader.condition == null
+            and .storageRbac.reader.conditionVersion == null
+            and .storageRbac.reader.actions == []
+            and .storageRbac.reader.notActions == []
+            and .storageRbac.reader.dataActions == ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
+            and .storageRbac.reader.notDataActions == []
+            and .storageRbac.reader.assignableScopes == ["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"]
+            and (.storageRbac.reader.roleDefinitionSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
             and (.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]
             and .deployment.apiVersion == "2025-05-01"
             and .deployment.resourceId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy"
@@ -619,9 +686,9 @@ jobs:
             and .package == {
               sha256: $packageSha256,
               inventory: [
-                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh", mode: "0755", size: 746, sha256: $runnerSha256},
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh", mode: "0755", size: 766, sha256: $runnerSha256},
                 {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/settings.job", mode: "0644", size: 88, sha256: $settingsSha256},
-                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/accepted_release_registry.py", mode: "0644", size: 82202, sha256: $helperSha256}
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/accepted_release_registry.py", mode: "0644", size: 88983, sha256: $helperSha256}
               ]
             }
             and .webJob == {name: "paperdesk-accepted-release-registry", apiVersion: "2025-05-01", runCommand: "run.sh"}
@@ -787,6 +854,26 @@ jobs:
             and .registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}
             and .registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment
             and .registryBridgePreflight.bridge == $currentBootstrap[0].bridge
+            and .registryBridgePreflight.storageRbac == $currentBootstrap[0].storageRbac
+            and (.registryBridgePreflight.storageRbacCanary | keys) == ["blob", "endedAt", "helperContract", "historyId", "historyStatus", "result", "resultSha256", "startedAt", "webJobId"]
+            and (.registryBridgePreflight.storageRbacCanary.blob | test("^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\\.json$"))
+            and .registryBridgePreflight.storageRbacCanary.helperContract == "fixed-reviewed-helper-storage-rbac-v1"
+            and .registryBridgePreflight.storageRbacCanary.historyStatus == "Success"
+            and (.registryBridgePreflight.storageRbacCanary.historyId | type == "string" and length > 0)
+            and (.registryBridgePreflight.storageRbacCanary.webJobId | type == "string" and length > 0)
+            and (.registryBridgePreflight.storageRbacCanary.startedAt | type == "string" and length > 0)
+            and (.registryBridgePreflight.storageRbacCanary.endedAt | type == "string" and length > 0)
+            and (.registryBridgePreflight.storageRbacCanary.resultSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and (.registryBridgePreflight.storageRbacCanary.result | keys) == ["canaryBlob", "localPrefixGuard", "readerRead", "readerWriteDenied", "schemaVersion", "status", "writerCreate", "writerReadDenied", "writerUnconditionalOverwriteDenied"]
+            and .registryBridgePreflight.storageRbacCanary.result.schemaVersion == 1
+            and .registryBridgePreflight.storageRbacCanary.result.status == "storage-rbac-ready"
+            and .registryBridgePreflight.storageRbacCanary.result.canaryBlob == .registryBridgePreflight.storageRbacCanary.blob
+            and .registryBridgePreflight.storageRbacCanary.result.writerCreate == "passed"
+            and .registryBridgePreflight.storageRbacCanary.result.readerRead == "passed"
+            and .registryBridgePreflight.storageRbacCanary.result.writerUnconditionalOverwriteDenied == "passed"
+            and .registryBridgePreflight.storageRbacCanary.result.writerReadDenied == "passed"
+            and .registryBridgePreflight.storageRbacCanary.result.readerWriteDenied == "passed"
+            and .registryBridgePreflight.storageRbacCanary.result.localPrefixGuard == "passed-before-network"
             and .registryBridgePreflight.webJob.name == "paperdesk-accepted-release-registry"
             and .registryBridgePreflight.webJob.apiVersion == "2025-05-01"
             and .registryBridgePreflight.webJob.runCommand == "run.sh"
@@ -803,6 +890,9 @@ jobs:
             and .registryBridgePreflight.wormPolicy.allowProtectedAppendWritesAll == $currentWorm[0].allowProtectedAppendWritesAll
             and .registryBridgePreflight.wormPolicy.etag == $currentWorm[0].etag
           ' "${receipt}" >/dev/null
+          embedded_storage_rbac_result="$(jq --sort-keys --compact-output '.registryBridgePreflight.storageRbacCanary.result' "${receipt}")"
+          embedded_storage_rbac_result_sha256="$(printf '%s' "${embedded_storage_rbac_result}" | sha256sum | cut -d ' ' -f 1)"
+          test "${embedded_storage_rbac_result_sha256}" = "$(jq -r '.registryBridgePreflight.storageRbacCanary.resultSha256' "${receipt}")"
           preflight_observed_at="$(jq -r '.registryBridgePreflight.observedAt' "${receipt}")"
           preflight_observed_epoch="$(date --date="${preflight_observed_at}" '+%s')"
           now_epoch="$(date --utc '+%s')"
@@ -936,15 +1026,15 @@ jobs:
 
       - name: Preflight and persist accepted-release material through fixed bridge
         id: registry_bridge
-        if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
+        if: steps.azure_session.outputs.confirmed == 'true' && (inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release')
         env:
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           BOOTSTRAP_RECEIPT_SHA256: ${{ steps.registry_bootstrap.outputs.receipt_sha256 }}
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
-          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
-          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
+          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
+          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
           OPERATION: ${{ inputs.operation }}
           REGISTRY_TRANSFER_ARTIFACT_ID: ${{ steps.registry_transfer.outputs.artifact-id }}
@@ -960,9 +1050,17 @@ jobs:
           webjob_ended_at=""
           webjob_history_id=""
           live_onedeploy_deployment=""
+          live_storage_rbac=""
           webjob_run_id=""
           webjob_run_command=""
           webjob_started_at=""
+          storage_rbac_canary_blob=""
+          storage_rbac_canary_ended_at=""
+          storage_rbac_canary_history_id=""
+          storage_rbac_canary_result=""
+          storage_rbac_canary_result_sha256=""
+          storage_rbac_canary_run_id=""
+          storage_rbac_canary_started_at=""
           readonly transient_settings=(
             PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256
             PAPERDESK_REGISTRY_ARTIFACT_URL
@@ -972,6 +1070,7 @@ jobs:
             PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256
             PAPERDESK_REGISTRY_REQUEST_SHA256
             PAPERDESK_REGISTRY_EXPECTED_PREFIX
+            PAPERDESK_REGISTRY_RBAC_CANARY_BLOB
             PAPERDESK_REGISTRY_OPERATION
           )
 
@@ -1069,6 +1168,92 @@ jobs:
             ' <<< "${live_response}")"
             expected_live_deployment="$(jq --compact-output '.deployment.liveDeployment' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
             test "${live_onedeploy_deployment}" = "${expected_live_deployment}"
+          }
+
+          verify_live_storage_subject() {
+            local subject expected principal_id container_scope assignments role_assignment_sha256 role_definition_id role_definition role_definition_sha256
+            subject="$1"
+            expected="$(jq --compact-output --arg subject "${subject}" '.storageRbac[$subject]' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            test -n "${expected}"
+            principal_id="$(jq -r '.principalId' <<< "${expected}")"
+            container_scope="$(jq -r '.storageRbac.containerResourceId' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            assignments="$(az role assignment list \
+              --all \
+              --include-inherited \
+              --assignee-object-id "${principal_id}" \
+              --scope "${container_scope}" \
+              --fill-principal-name false \
+              --fill-role-definition-name false \
+              --only-show-errors \
+              --output json)"
+            jq --exit-status --argjson expected "${expected}" '
+              type == "array"
+              and length == 1
+              and ((.[0].id | ascii_downcase) == ($expected.roleAssignmentId | ascii_downcase))
+              and ((.[0].scope | ascii_downcase) == ($expected.roleAssignmentId | sub("/providers/Microsoft.Authorization/roleAssignments/[0-9a-f-]{36}$"; "") | ascii_downcase))
+              and ((.[0].roleDefinitionId | ascii_downcase) == ($expected.roleDefinitionId | ascii_downcase))
+              and ((.[0].principalId | ascii_downcase) == ($expected.principalId | ascii_downcase))
+              and .[0].principalType == $expected.principalType
+              and ((.[0].condition // null) == $expected.condition)
+              and ((.[0].conditionVersion // null) == $expected.conditionVersion)
+            ' <<< "${assignments}" >/dev/null
+            role_assignment_sha256="$(jq --sort-keys --compact-output '
+              .[0] | {
+                id: .id,
+                scope: .scope,
+                roleDefinitionId: .roleDefinitionId,
+                principalId: .principalId,
+                principalType: .principalType,
+                condition: (.condition // null),
+                conditionVersion: (.conditionVersion // null)
+              }
+            ' <<< "${assignments}" | sha256sum | cut -d ' ' -f 1)"
+            test "${role_assignment_sha256}" = "$(jq -r '.roleAssignmentSha256' <<< "${expected}")"
+            role_definition_id="$(jq -r '.roleDefinitionId' <<< "${expected}")"
+            role_definition="$(az rest \
+              --method get \
+              --url "https://management.azure.com${role_definition_id}?api-version=2022-04-01" \
+              --only-show-errors \
+              --output json)"
+            role_definition_sha256="$(jq --sort-keys --compact-output '.' <<< "${role_definition}" | sha256sum | cut -d ' ' -f 1)"
+            jq --exit-status \
+              --argjson expected "${expected}" \
+              --arg roleDefinitionSha256 "${role_definition_sha256}" '
+              ((.id | ascii_downcase) == ($expected.roleDefinitionId | ascii_downcase))
+              and .type == "Microsoft.Authorization/roleDefinitions"
+              and .properties.type == "CustomRole"
+              and .properties.assignableScopes == $expected.assignableScopes
+              and (.properties.permissions | type == "array" and length == 1)
+              and .properties.permissions[0].actions == $expected.actions
+              and .properties.permissions[0].notActions == $expected.notActions
+              and .properties.permissions[0].dataActions == $expected.dataActions
+              and .properties.permissions[0].notDataActions == $expected.notDataActions
+              and $roleDefinitionSha256 == $expected.roleDefinitionSha256
+            ' <<< "${role_definition}" >/dev/null
+          }
+
+          verify_live_storage_rbac() {
+            local site_json identity_keys
+            site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            identity_keys="$(jq --compact-output '.identity.userAssignedIdentities | keys | sort' <<< "${site_json}")"
+            jq --exit-status '
+              . == [
+                "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+                "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer"
+              ]
+            ' <<< "${identity_keys}" >/dev/null
+            jq --exit-status \
+              --slurpfile bootstrap paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json '
+              .identity.type == "UserAssigned"
+              and .identity.userAssignedIdentities[$bootstrap[0].storageRbac.writer.identityResourceId]
+                == {clientId: $bootstrap[0].storageRbac.writer.clientId, principalId: $bootstrap[0].storageRbac.writer.principalId}
+              and .identity.userAssignedIdentities[$bootstrap[0].storageRbac.reader.identityResourceId]
+                == {clientId: $bootstrap[0].storageRbac.reader.clientId, principalId: $bootstrap[0].storageRbac.reader.principalId}
+            ' <<< "${site_json}" >/dev/null
+            verify_live_storage_subject writer
+            verify_live_storage_subject reader
+            live_storage_rbac="$(jq --compact-output '.storageRbac' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            test -n "${live_storage_rbac}"
           }
 
           cleanup_bridge() {
@@ -1221,8 +1406,53 @@ jobs:
             verify_live_onedeploy_anchor
           }
 
+          run_storage_rbac_canary() {
+            local canary_nonce
+            verify_live_onedeploy_anchor
+            canary_nonce="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+            [[ "${canary_nonce}" =~ ^[0-9a-f]{32}$ ]]
+            storage_rbac_canary_blob="v1/canaries/storage-rbac/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${canary_nonce}.json"
+            capture_bound_storage_rbac_canary_result
+            az webapp config appsettings set \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --settings \
+                PAPERDESK_REGISTRY_OPERATION=storage-rbac-canary \
+                PAPERDESK_REGISTRY_RBAC_CANARY_BLOB="${storage_rbac_canary_blob}" \
+              --only-show-errors \
+              --output none
+            az webapp start --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            wait_for_fixed_webjob
+            trigger_fixed_webjob_and_wait
+            storage_rbac_canary_history_id="${webjob_history_id}"
+            storage_rbac_canary_run_id="${webjob_run_id}"
+            storage_rbac_canary_started_at="${webjob_started_at}"
+            storage_rbac_canary_ended_at="${webjob_ended_at}"
+            az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            delete_transient_settings
+            assert_bridge_stopped_and_sealed
+            verify_live_onedeploy_anchor
+          }
+
+          capture_bound_storage_rbac_canary_result() {
+            # ARM WebJob history Success does not bind helper stdout to this exact
+            # operation/history/nonce. Its output_url/error_url cannot be retrieved
+            # through the sealed SCM boundary without new access or authority.
+            # Activation also lacks exact receipt-bound outputs for all four reviewed
+            # executions: storage-rbac-ready, runtime-ready, persistence #1 complete,
+            # and persistence #2 complete with an exact idempotence comparison.
+            # Each persistence result must bind its exact prefix, request/artifact digests,
+            # manifestSha256, fileCount, createdBlobCount, and both negative checks.
+            # Retry attestation accepts only two cases while immutable outcome fields match:
+            # A) run #1 creates/recovers 1..20 blobs with overwriteNegative=passed and
+            # replay is 0/not-run-completed; B) an entry was already complete before this
+            # workflow and both calls are 0/not-run-completed. Any mismatch fails closed.
+            echo "Registry bridge activation is impossible until a separately reviewed immutable result-attestation channel binds all four exact helper outputs to their WebJob histories and operations, including the storage canary nonce, without weakening sealed SCM or public access." >&2
+            return 1
+          }
+
           write_preflight_proof() {
-            local site_json config_json settings_json policies_json proof identity_keys
+            local site_json config_json settings_json policies_json proof identity_keys storage_rbac_canary_result_canonical
             verify_live_onedeploy_anchor
             test -n "${live_onedeploy_deployment}"
             test -n "${webjob_history_id}"
@@ -1230,6 +1460,29 @@ jobs:
             test "${webjob_run_command}" = "run.sh"
             test -n "${webjob_started_at}"
             test -n "${webjob_ended_at}"
+            test -n "${live_storage_rbac}"
+            [[ "${storage_rbac_canary_blob}" =~ ^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\.json$ ]]
+            test -n "${storage_rbac_canary_history_id}"
+            test -n "${storage_rbac_canary_run_id}"
+            test -n "${storage_rbac_canary_started_at}"
+            test -n "${storage_rbac_canary_ended_at}"
+            test -n "${storage_rbac_canary_result}"
+            test "${#storage_rbac_canary_result}" -le 4096
+            jq --exit-status --arg blob "${storage_rbac_canary_blob}" '
+              keys == ["canaryBlob", "localPrefixGuard", "readerRead", "readerWriteDenied", "schemaVersion", "status", "writerCreate", "writerReadDenied", "writerUnconditionalOverwriteDenied"]
+              and .schemaVersion == 1
+              and .status == "storage-rbac-ready"
+              and .canaryBlob == $blob
+              and .writerCreate == "passed"
+              and .readerRead == "passed"
+              and .writerUnconditionalOverwriteDenied == "passed"
+              and .writerReadDenied == "passed"
+              and .readerWriteDenied == "passed"
+              and .localPrefixGuard == "passed-before-network"
+            ' <<< "${storage_rbac_canary_result}" >/dev/null
+            storage_rbac_canary_result_canonical="$(jq --sort-keys --compact-output '.' <<< "${storage_rbac_canary_result}")"
+            storage_rbac_canary_result_sha256="$(printf '%s' "${storage_rbac_canary_result_canonical}" | sha256sum | cut -d ' ' -f 1)"
+            [[ "${storage_rbac_canary_result_sha256}" =~ ^[0-9a-f]{64}$ ]]
             site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
             config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
             settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
@@ -1277,7 +1530,15 @@ jobs:
               --arg webJobId "${webjob_run_id}" \
               --arg startedAt "${webjob_started_at}" \
               --arg endedAt "${webjob_ended_at}" \
+              --arg storageRbacCanaryBlob "${storage_rbac_canary_blob}" \
+              --arg storageRbacCanaryHistoryId "${storage_rbac_canary_history_id}" \
+              --arg storageRbacCanaryRunId "${storage_rbac_canary_run_id}" \
+              --arg storageRbacCanaryStartedAt "${storage_rbac_canary_started_at}" \
+              --arg storageRbacCanaryEndedAt "${storage_rbac_canary_ended_at}" \
+              --arg storageRbacCanaryResultSha256 "${storage_rbac_canary_result_sha256}" \
+              --argjson storageRbacCanaryResult "${storage_rbac_canary_result_canonical}" \
               --argjson liveOneDeploy "${live_onedeploy_deployment}" \
+              --argjson liveStorageRbac "${live_storage_rbac}" \
               --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
               --slurpfile worm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" '
               {
@@ -1330,6 +1591,18 @@ jobs:
                   startedAt: $startedAt,
                   endedAt: $endedAt
                 },
+                storageRbac: $liveStorageRbac,
+                storageRbacCanary: {
+                  blob: $storageRbacCanaryBlob,
+                  helperContract: "fixed-reviewed-helper-storage-rbac-v1",
+                  historyId: $storageRbacCanaryHistoryId,
+                  webJobId: $storageRbacCanaryRunId,
+                  historyStatus: "Success",
+                  startedAt: $storageRbacCanaryStartedAt,
+                  endedAt: $storageRbacCanaryEndedAt,
+                  resultSha256: $storageRbacCanaryResultSha256,
+                  result: $storageRbacCanaryResult
+                },
                 wormPolicy: $worm[0]
               }
             ' > "${proof}"
@@ -1340,6 +1613,21 @@ jobs:
               .packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}
               and .oneDeploy == $bootstrap[0].deployment
               and .bridge == $bootstrap[0].bridge
+              and .storageRbac == $bootstrap[0].storageRbac
+              and (.storageRbacCanary | keys) == ["blob", "endedAt", "helperContract", "historyId", "historyStatus", "result", "resultSha256", "startedAt", "webJobId"]
+              and (.storageRbacCanary.blob | test("^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\\.json$"))
+              and .storageRbacCanary.historyStatus == "Success"
+              and (.storageRbacCanary.resultSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+              and (.storageRbacCanary.result | keys) == ["canaryBlob", "localPrefixGuard", "readerRead", "readerWriteDenied", "schemaVersion", "status", "writerCreate", "writerReadDenied", "writerUnconditionalOverwriteDenied"]
+              and .storageRbacCanary.result.schemaVersion == 1
+              and .storageRbacCanary.result.status == "storage-rbac-ready"
+              and .storageRbacCanary.result.canaryBlob == .storageRbacCanary.blob
+              and .storageRbacCanary.result.writerCreate == "passed"
+              and .storageRbacCanary.result.readerRead == "passed"
+              and .storageRbacCanary.result.writerUnconditionalOverwriteDenied == "passed"
+              and .storageRbacCanary.result.writerReadDenied == "passed"
+              and .storageRbacCanary.result.readerWriteDenied == "passed"
+              and .storageRbacCanary.result.localPrefixGuard == "passed-before-network"
               and .webJob.runCommand == $bootstrap[0].webJob.runCommand
               and .webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"
             ' "${proof}" >/dev/null
@@ -1389,7 +1677,9 @@ jobs:
           trap cleanup_bridge EXIT INT TERM
           assert_bridge_stopped_and_sealed
           verify_live_onedeploy_anchor
+          verify_live_storage_rbac
           if [ "${OPERATION}" = "registry-bridge-preflight" ]; then
+            run_storage_rbac_canary
             run_runtime_canary
             write_preflight_proof
             cleanup_bridge
@@ -1404,8 +1694,9 @@ jobs:
           [[ "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
           expected_prefix="v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/"
 
-          # This source-complete path remains unreachable behind the independent-review
-          # hard stop above. Activation requires a later reviewed commit that binds an
+          # This incomplete dormant path remains unreachable behind the independent-review
+          # hard stop above. Activation requires a later reviewed commit that binds all
+          # four exact helper results (storage RBAC, runtime, and both persistence runs), an
           # independently reviewed canonical package-bootstrap receipt and checksum from
           # this immutable checkout, exact-workflow FIC rotation, narrow WebJob RBAC,
           # removed bootstrap publish authority, and old-workflow denial proof.
@@ -1417,13 +1708,13 @@ jobs:
           trap - EXIT INT TERM
 
       - name: Seal fixed registry bridge after every bridge attempt
-        if: always() && (inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release')
+        if: always() && steps.azure_session.outputs.confirmed == 'true' && (inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release')
         env:
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
-          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
-          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
+          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
+          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
         run: |
           set -uo pipefail
@@ -1462,6 +1753,7 @@ jobs:
               PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
               PAPERDESK_REGISTRY_REQUEST_SHA256 \
               PAPERDESK_REGISTRY_EXPECTED_PREFIX \
+              PAPERDESK_REGISTRY_RBAC_CANARY_BLOB \
               PAPERDESK_REGISTRY_OPERATION \
             --only-show-errors >/dev/null || cleanup_failed=1
           set -e
@@ -1502,6 +1794,7 @@ jobs:
             PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
             PAPERDESK_REGISTRY_REQUEST_SHA256 \
             PAPERDESK_REGISTRY_EXPECTED_PREFIX \
+            PAPERDESK_REGISTRY_RBAC_CANARY_BLOB \
             PAPERDESK_REGISTRY_OPERATION
           do
             jq --exit-status --arg name "${transient_setting}" '[.[] | select(.name == $name)] | length == 0' <<< "${settings_json}" >/dev/null

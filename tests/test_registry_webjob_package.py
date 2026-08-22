@@ -61,6 +61,7 @@ class RegistryWebJobPackageTests(unittest.TestCase):
             self.assertIn("python3 -I", runner)
             self.assertIn("persist-actions-artifact", runner)
             self.assertIn("runtime-canary", runner)
+            self.assertIn("storage-rbac-canary", runner)
             self.assertNotIn("PAPERDESK_REGISTRY_WRITER_CLIENT_ID", runner)
             self.assertIn("PAPERDESK_REGISTRY_HELPER_SHA256", runner)
             self.assertNotIn(hashlib.sha256(helper).hexdigest(), runner)

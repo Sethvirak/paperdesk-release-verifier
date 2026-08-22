@@ -11,7 +11,7 @@ test -f "${helper}"
 test ! -L "${helper}"
 test "$(sha256sum "${helper}" | cut -d ' ' -f 1)" = "${expected_helper_sha256}"
 case "${operation}" in
-  runtime-canary|persist-actions-artifact) ;;
+  runtime-canary|storage-rbac-canary|persist-actions-artifact) ;;
   *)
     echo "Registry WebJob operation is invalid." >&2
     exit 1

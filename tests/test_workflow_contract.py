@@ -3,6 +3,7 @@ import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
 CONTROL = ROOT / ".github" / "workflows" / "azure-production-control.yml"
 VERIFY = ROOT / ".github" / "workflows" / "verify-candidate.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "accepted-release-deadline-watchdog.yml"
@@ -141,6 +142,61 @@ class WorkflowContractTests(unittest.TestCase):
             {"actions": "read", "contents": "read", "id-token": "write"},
         )
 
+    def test_every_mutating_azure_step_requires_confirmed_post_login_session(self):
+        source = self.workflow(CONTROL)
+        session_step = workflow_step(source, "Prove exact Azure subscription after claim-bound login")
+        for required in (
+            "id: azure_session",
+            'account_json="$(az account show --output json)"',
+            '.id == $subscriptionId',
+            '.tenantId == $tenantId',
+            '.state == "Enabled"',
+            '.user == {name: $clientId, type: "servicePrincipal"}',
+            'echo "confirmed=true" >> "${GITHUB_OUTPUT}"',
+        ):
+            self.assertIn(required, session_step)
+
+        login_offset = source.index(
+            "      - name: Azure login from the immutable reusable-workflow identity"
+        )
+        session_offset = source.index(
+            "      - name: Prove exact Azure subscription after claim-bound login"
+        )
+        self.assertLess(login_offset, session_offset)
+
+        mutating_azure_fragments = (
+            "az webapp config appsettings set",
+            "az webapp config appsettings delete",
+            "az webapp config access-restriction set",
+            "az webapp start",
+            "az webapp stop",
+            "az resource update",
+            "az rest --method post",
+            "az rest --method put",
+            "az rest --method patch",
+            "az rest --method delete",
+        )
+        named_steps = re.findall(
+            r"(?ms)^      - name: .*?(?=^      - name:|\Z)", source
+        )
+        mutation_steps = [
+            step for step in named_steps if any(fragment in step for fragment in mutating_azure_fragments)
+        ]
+        self.assertEqual(
+            [re.search(r"^      - name: (.+)$", step, flags=re.M).group(1) for step in mutation_steps],
+            [
+                "Preflight and persist accepted-release material through fixed bridge",
+                "Seal fixed registry bridge after every bridge attempt",
+            ],
+        )
+        for step in mutation_steps:
+            self.assertIn("steps.azure_session.outputs.confirmed == 'true'", step)
+        seal_step = workflow_step(source, "Seal fixed registry bridge after every bridge attempt")
+        self.assertIn(
+            "if: always() && steps.azure_session.outputs.confirmed == 'true'",
+            seal_step,
+        )
+
     def test_mutating_modes_remain_hard_stopped(self):
         source = self.workflow(CONTROL)
         coordinate_step = workflow_step(
@@ -181,6 +237,7 @@ class WorkflowContractTests(unittest.TestCase):
             "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
             "PAPERDESK_REGISTRY_REQUEST_SHA256",
             "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+            "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB",
             "PAPERDESK_REGISTRY_OPERATION",
         ):
             self.assertGreaterEqual(source.count(transient_setting), 3)
@@ -272,7 +329,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("env.TRANSIENT_GITHUB_TOKEN", persistence_step)
 
         activation = persistence_step.split(
-            "# This source-complete path remains unreachable behind the independent-review",
+            "# This incomplete dormant path remains unreachable behind the independent-review",
             1,
         )[1]
         self.assertIn(
@@ -293,6 +350,7 @@ class WorkflowContractTests(unittest.TestCase):
             "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
             "PAPERDESK_REGISTRY_REQUEST_SHA256",
             "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+            "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB",
             "PAPERDESK_REGISTRY_OPERATION",
         )
         for transient_setting in canonical_transient:
@@ -353,6 +411,10 @@ class WorkflowContractTests(unittest.TestCase):
             'if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then',
             coordinate_step,
         )
+        self.assertIn(
+            "Registry bridge activation is impossible until an independent cleanup watcher/reconciliation receipt",
+            coordinate_step,
+        )
         self.assertFalse(
             (ROOT / "evidence" / "registry-bridge-bootstrap-receipt.json").exists(),
             "the canonical bootstrap receipt must be added only by the later reviewed activation commit",
@@ -369,15 +431,15 @@ class WorkflowContractTests(unittest.TestCase):
         for required in (
             'readonly receipt_name="registry-bridge-bootstrap-receipt.json"',
             'sha256sum --check --strict "${receipt_name}.sha256"',
-            'keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "webJob"]',
+            'keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "storageRbac", "webJob"]',
             '(.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]',
             '.deployment.liveDeployment.statusCode == 4',
             '.deployment.liveDeployment.responseObjectSha256',
             'extensions/onedeploy"',
             'runCommand: "run.sh"',
-            'mode: "0755", size: 746',
+            'mode: "0755", size: 766',
             'mode: "0644", size: 88',
-            'mode: "0644", size: 82202',
+            'mode: "0644", size: 88983',
             '"Microsoft.Web/sites/extensions/Write"',
             '"Microsoft.Web/sites/extensions/Read"',
             '"Microsoft.Web/sites/publish/Action"',
@@ -388,6 +450,15 @@ class WorkflowContractTests(unittest.TestCase):
             'inventory_sha256=',
             '.grantsRedeploy == false',
             'every-preflight-detects-onedeploy-drift',
+            'roleAssignments/0151259f-6f5b-408e-a633-e927fa6773bc',
+            'roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d',
+            'roleAssignments/44d5161c-3104-4de2-8e9b-3d640f013cfb',
+            'roleDefinitions/e005b62b-037b-4989-b492-932669ec0842',
+            '"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"',
+            '"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"',
+            'reason: "AadPremiumLicenseRequired"',
+            '.storageRbac.writer.roleAssignmentSha256',
+            '.storageRbac.writer.roleDefinitionSha256',
             'deployment_completed_epoch <= authority_removed_epoch',
             'authority_removed_epoch <= authority_audit_epoch',
         ):
@@ -418,6 +489,11 @@ class WorkflowContractTests(unittest.TestCase):
             ".registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}",
             ".registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment",
             ".registryBridgePreflight.bridge == $currentBootstrap[0].bridge",
+            ".registryBridgePreflight.storageRbac == $currentBootstrap[0].storageRbac",
+            '.registryBridgePreflight.storageRbacCanary.result.writerUnconditionalOverwriteDenied == "passed"',
+            ".registryBridgePreflight.storageRbacCanary.result.canaryBlob == .registryBridgePreflight.storageRbacCanary.blob",
+            ".registryBridgePreflight.storageRbacCanary.resultSha256",
+            "embedded_storage_rbac_result_sha256=",
             '.registryBridgePreflight.webJob.runCommand == "run.sh"',
             '.registryBridgePreflight.webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"',
             ".registryBridgePreflight.webJob.status == \"Success\"",
@@ -431,6 +507,7 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertIn('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then', bridge_step)
         self.assertIn("write_preflight_proof", bridge_step)
+        self.assertIn("run_storage_rbac_canary", bridge_step)
         self.assertIn('test "${OPERATION}" = "persist-accepted-release"', bridge_step)
         self.assertLess(
             bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
@@ -449,10 +526,41 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('test "${webjob_run_command}" = "run.sh"', proof_function)
         self.assertIn('--argjson liveOneDeploy "${live_onedeploy_deployment}"', proof_function)
         self.assertIn('and .oneDeploy == $bootstrap[0].deployment', proof_function)
+        self.assertIn('and .storageRbac == $bootstrap[0].storageRbac', proof_function)
+        self.assertIn('resultSha256: $storageRbacCanaryResultSha256', proof_function)
+        self.assertIn('result: $storageRbacCanaryResult', proof_function)
+        self.assertIn('.result.writerUnconditionalOverwriteDenied == "passed"', proof_function)
+        self.assertIn('.result.canaryBlob == .storageRbacCanary.blob', proof_function)
+        for synthetic_pass in (
+            'writerCreate: "passed"',
+            'readerRead: "passed"',
+            'writerUnconditionalOverwriteDenied: "passed"',
+            'writerReadDenied: "passed"',
+            'readerWriteDenied: "passed"',
+            'localPrefixGuard: "passed-before-network"',
+        ):
+            self.assertNotIn(synthetic_pass, proof_function)
         self.assertNotIn('--arg packageSha256 "${EXPECTED_PACKAGE_SHA256}"', proof_function)
         self.assertIn('select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256")', proof_function)
 
         self.assertIn("verify_live_onedeploy_anchor() {", bridge_step)
+        self.assertIn("verify_live_storage_rbac() {", bridge_step)
+        rbac_function = bridge_step.split("verify_live_storage_subject() {", 1)[1].split(
+            "cleanup_bridge() {", 1
+        )[0]
+        for required in (
+            "--include-inherited",
+            "--assignee-object-id",
+            'type == "array"',
+            "and length == 1",
+            ".condition // null",
+            ".conditionVersion // null",
+            "role_assignment_sha256=",
+            "role_definition_sha256=",
+            '.properties.permissions[0].dataActions == $expected.dataActions',
+            '.identity.type == "UserAssigned"',
+        ):
+            self.assertIn(required, rbac_function)
         onedeploy_function = bridge_step.split("verify_live_onedeploy_anchor() {", 1)[1].split(
             "cleanup_bridge() {", 1
         )[0]
@@ -468,18 +576,46 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(required, onedeploy_function)
         self.assertLess(
-            bridge_step.index("verify_live_onedeploy_anchor\n          if"),
+            bridge_step.index("verify_live_storage_rbac\n          if"),
             bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
         )
 
         runtime_canary_function = bridge_step.split("run_runtime_canary() {", 1)[1].split(
+            "run_storage_rbac_canary() {", 1
+        )[0]
+        storage_canary_function = bridge_step.split("run_storage_rbac_canary() {", 1)[1].split(
             "write_preflight_proof() {", 1
         )[0]
+        bound_result_stop = bridge_step.split(
+            "capture_bound_storage_rbac_canary_result() {", 1
+        )[1].split("write_preflight_proof() {", 1)[0]
+        for required in (
+            "ARM WebJob history Success does not bind helper stdout",
+            "output_url/error_url cannot be retrieved",
+            "all four reviewed",
+            "storage-rbac-ready, runtime-ready, persistence #1 complete",
+            "exact prefix, request/artifact digests",
+            "manifestSha256, fileCount, createdBlobCount, and both negative checks",
+            "Retry attestation accepts only two cases",
+            "run #1 creates/recovers 1..20 blobs with overwriteNegative=passed",
+            "replay is 0/not-run-completed",
+            "both calls are 0/not-run-completed",
+            "Any mismatch fails closed",
+            "Registry bridge activation is impossible",
+            "return 1",
+        ):
+            self.assertIn(required, bound_result_stop)
+        self.assertNotIn("curl", bound_result_stop)
+        self.assertLess(
+            storage_canary_function.index("capture_bound_storage_rbac_canary_result"),
+            storage_canary_function.index("az webapp config appsettings set"),
+        )
         persistence_function = bridge_step.split("run_persistence_once() {", 1)[1].split(
             "trap cleanup_bridge", 1
         )[0]
         for label, function in (
             ("runtime canary", runtime_canary_function),
+            ("storage RBAC canary", storage_canary_function),
             ("persistence", persistence_function),
         ):
             with self.subTest(webjob_wait=label):
@@ -492,6 +628,34 @@ class WorkflowContractTests(unittest.TestCase):
                     function.index("wait_for_fixed_webjob"),
                     function.index("trigger_fixed_webjob_and_wait"),
                 )
+
+        readme = README.read_text(encoding="utf-8")
+        self.assertNotIn("source-complete", readme)
+        for required in (
+            "Exact result attestation remains unimplemented for all four WebJob executions",
+            "strict `storage-rbac-ready` result",
+            "strict `runtime-ready` result",
+            "persistence run 1",
+            "persistence run 2",
+            "`artifactZipSha256`",
+            "`requestSha256`",
+            "`manifestSha256`",
+            "`fileCount`",
+            "`createdBlobCount`",
+            "`overwriteNegative`",
+            "`outOfPrefixNegative`",
+            "Both receipts must match on `prefix`",
+            "both must prove `outOfPrefixNegative: passed`",
+            "Retry attestation permits exactly two cases",
+            "run 1 creates or recovers `createdBlobCount` 1..20",
+            "replay proves `createdBlobCount: 0`",
+            "entry was already complete before this workflow",
+            "both calls prove `createdBlobCount: 0`",
+            "Any other value or immutable-field mismatch must fail closed",
+            "Generic History `Success` is insufficient",
+        ):
+            self.assertIn(required, readme)
+        self.assertNotIn("byte-identical", readme)
 
         receipt_step = workflow_step(source, "Create bounded control receipt")
         self.assertIn("--arg schemaVersion '2'", receipt_step)

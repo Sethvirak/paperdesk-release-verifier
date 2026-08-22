@@ -197,6 +197,36 @@ class FakeStorage:
         return 201, ""
 
 
+class FakeRbacCanaryStorage:
+    def __init__(self):
+        self.blobs = {}
+        self.events = []
+
+    def writer_put_canary_create_only(self, blob_name, body):
+        self.events.append(("writer-put", blob_name))
+        if blob_name in self.blobs:
+            return 403, "UnauthorizedBlobOverwrite"
+        self.blobs[blob_name] = body
+        return 201, ""
+
+    def reader_get_canary(self, blob_name, maximum):
+        self.events.append(("reader-get", blob_name))
+        body = self.blobs[blob_name]
+        return 200, body[:maximum], {}, ""
+
+    def writer_get_canary(self, blob_name, maximum):
+        self.events.append(("writer-get", blob_name))
+        return 403, b"", {}, "AuthorizationPermissionMismatch"
+
+    def reader_put_canary_create_only(self, blob_name, body):
+        self.events.append(("reader-put", blob_name))
+        return 403, "AuthorizationPermissionMismatch"
+
+    def writer_put_canary_unconditional(self, blob_name, body):
+        self.events.append(("writer-overwrite", blob_name))
+        return 403, "UnauthorizedBlobOverwrite"
+
+
 class FakeDownloadResponse:
     def __init__(self, body, url, status=200, headers=None):
         self.body = io.BytesIO(body)
@@ -750,6 +780,91 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
                 with self.assertRaises(registry.RegistryError):
                     registry.runtime_canary(job_directory)
 
+    def test_storage_rbac_canary_proves_fixed_identity_boundaries_and_unique_prefix(self):
+        blob_name = (
+            "v1/canaries/storage-rbac/51001/2/"
+            "0123456789abcdef0123456789abcdef.json"
+        )
+        environment = {registry.RBAC_CANARY_BLOB_ENV: blob_name}
+        storage = FakeRbacCanaryStorage()
+
+        result = registry.storage_rbac_canary(environment, storage)
+
+        self.assertEqual(result["status"], "storage-rbac-ready")
+        self.assertEqual(result["canaryBlob"], blob_name)
+        self.assertEqual(result["writerCreate"], "passed")
+        self.assertEqual(result["readerRead"], "passed")
+        self.assertEqual(result["writerUnconditionalOverwriteDenied"], "passed")
+        self.assertEqual(result["writerReadDenied"], "passed")
+        self.assertEqual(result["readerWriteDenied"], "passed")
+        self.assertEqual(result["localPrefixGuard"], "passed-before-network")
+        self.assertNotIn(registry.RBAC_CANARY_BLOB_ENV, environment)
+        self.assertEqual(
+            [event[0] for event in storage.events],
+            ["writer-put", "reader-get", "writer-overwrite", "writer-get", "reader-put"],
+        )
+        self.assertTrue(all(name.startswith("v1/canaries/storage-rbac/") for _, name in storage.events))
+
+    def test_storage_rbac_canary_rejects_invalid_or_overprivileged_boundaries(self):
+        storage = FakeRbacCanaryStorage()
+        with self.assertRaises(registry.RegistryError):
+            registry.storage_rbac_canary(
+                {registry.RBAC_CANARY_BLOB_ENV: "v1/releases/outside.json"}, storage
+            )
+        self.assertEqual(storage.events, [])
+
+        class OverprivilegedReaderStorage(FakeRbacCanaryStorage):
+            def reader_put_canary_create_only(self, blob_name, body):
+                return 201, ""
+
+        with self.assertRaises(registry.RegistryError):
+            registry.storage_rbac_canary(
+                {
+                    registry.RBAC_CANARY_BLOB_ENV: (
+                        "v1/canaries/storage-rbac/51001/3/"
+                        "fedcba9876543210fedcba9876543210.json"
+                    )
+                },
+                OverprivilegedReaderStorage(),
+            )
+
+        with self.assertRaises(registry.RegistryError):
+            registry.storage_rbac_canary({
+                registry.RBAC_CANARY_BLOB_ENV: (
+                    "v1/canaries/storage-rbac/51001/4/"
+                    "00112233445566778899aabbccddeeff.json"
+                ),
+                registry.ACTIONS_GITHUB_TOKEN_ENV: "must-not-be-present",
+            }, FakeRbacCanaryStorage())
+
+        class OversizedErrorResponse:
+            status = 403
+
+            def read(self, size):
+                return b"x" * size
+
+            def getheaders(self):
+                return [("x-ms-error-code", "AuthorizationPermissionMismatch")]
+
+        class OversizedErrorConnection:
+            def request(self, *args, **kwargs):
+                return None
+
+            def getresponse(self):
+                return OversizedErrorResponse()
+
+            def close(self):
+                return None
+
+        client = registry.StorageClient("writer-token", "reader-token")
+        with mock.patch.object(client, "_connection", return_value=OversizedErrorConnection()):
+            with self.assertRaises(registry.RegistryError):
+                client.writer_get_canary(
+                    "v1/canaries/storage-rbac/51001/5/"
+                    "ffeeddccbbaa99887766554433221100.json",
+                    64 * 1024,
+                )
+
     def test_runtime_canary_rejects_tampered_runner_or_settings(self):
         source = ROOT / "webjobs" / "paperdesk-accepted-release-registry"
         for filename in (registry.WEBJOB_RUNNER_NAME, registry.WEBJOB_SETTINGS_NAME):
@@ -833,7 +948,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         source = (ROOT / "scripts" / "accepted_release_registry.py").read_text(encoding="utf-8")
         for required in (
             'BRIDGE_PATH = "/internal/v1/persist-accepted-release"',
-            '"If-None-Match": "*"',
+            'headers["If-None-Match"] = "*"',
             'PAPERDESK_REGISTRY_WRITER_CLIENT_ID',
             'PAPERDESK_REGISTRY_READER_CLIENT_ID',
             'writer_id == reader_id',
@@ -841,6 +956,11 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
             'manifest_name = prefix + "registry-manifest.json"',
         ):
             self.assertIn(required, source)
+        unconditional = source.split("def writer_put_canary_unconditional", 1)[1].split(
+            "def email_date", 1
+        )[0]
+        self.assertIn("False,", unconditional)
+        self.assertNotIn("If-None-Match", unconditional)
 
 
 if __name__ == "__main__":
