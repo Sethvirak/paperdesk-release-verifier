@@ -549,8 +549,20 @@ class WorkflowContractTests(unittest.TestCase):
             "cleanup_bridge() {", 1
         )[0]
         for required in (
-            "--include-inherited",
-            "--assignee-object-id",
+            "expected_container_scope=",
+            "expected_assignments_path=",
+            "expected_assignments_url=",
+            "https://management.azure.com${assignments_path}",
+            "api-version=2022-04-01&%24filter=principalId%20eq%20%27${principal_id}%27",
+            '[[ "${principal_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]',
+            'test "${assignments_path}" = "${expected_assignments_path}"',
+            'test "${assignments_url}" = "${expected_assignments_url}"',
+            'assignments_response="$(az rest',
+            '(.value | type) == "array"',
+            '((.nextLink // "") == "")',
+            '.type == "Microsoft.Authorization/roleAssignments"',
+            "scope: .properties.scope",
+            "roleDefinitionId: .properties.roleDefinitionId",
             'type == "array"',
             "and length == 1",
             ".condition // null",
@@ -561,6 +573,21 @@ class WorkflowContractTests(unittest.TestCase):
             '.identity.type == "UserAssigned"',
         ):
             self.assertIn(required, rbac_function)
+        for forbidden in (
+            "az role assignment list",
+            "--all",
+            "--include-inherited",
+            "--assignee-object-id",
+        ):
+            self.assertNotIn(forbidden, rbac_function)
+        self.assertLess(
+            rbac_function.index('test "${assignments_url}" = "${expected_assignments_url}"'),
+            rbac_function.index('assignments_response="$(az rest'),
+        )
+        self.assertLess(
+            rbac_function.index('((.nextLink // "") == "")'),
+            rbac_function.index('assignments="$(jq --compact-output'),
+        )
         onedeploy_function = bridge_step.split("verify_live_onedeploy_anchor() {", 1)[1].split(
             "cleanup_bridge() {", 1
         )[0]
@@ -653,6 +680,9 @@ class WorkflowContractTests(unittest.TestCase):
             "both calls prove `createdBlobCount: 0`",
             "Any other value or immutable-field mismatch must fail closed",
             "Generic History `Success` is insufficient",
+            "does not expand Entra group membership or transitive membership",
+            "does not prove PIM eligibility or activation schedules",
+            "separately approved read-only Graph/PIM audit identity",
         ):
             self.assertIn(required, readme)
         self.assertNotIn("byte-identical", readme)

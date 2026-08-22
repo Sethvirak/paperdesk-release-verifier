@@ -1171,21 +1171,55 @@ jobs:
           }
 
           verify_live_storage_subject() {
-            local subject expected principal_id container_scope assignments role_assignment_sha256 role_definition_id role_definition role_definition_sha256
+            local subject expected principal_id container_scope expected_container_scope assignments_path expected_assignments_path assignments_url expected_assignments_url assignments_response assignments role_assignment_sha256 role_definition_id role_definition role_definition_sha256
             subject="$1"
             expected="$(jq --compact-output --arg subject "${subject}" '.storageRbac[$subject]' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
             test -n "${expected}"
             principal_id="$(jq -r '.principalId' <<< "${expected}")"
             container_scope="$(jq -r '.storageRbac.containerResourceId' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
-            assignments="$(az role assignment list \
-              --all \
-              --include-inherited \
-              --assignee-object-id "${principal_id}" \
-              --scope "${container_scope}" \
-              --fill-principal-name false \
-              --fill-role-definition-name false \
+            expected_container_scope="/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases"
+            test "${container_scope}" = "${expected_container_scope}"
+            [[ "${principal_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+            expected_assignments_path="${expected_container_scope}/providers/Microsoft.Authorization/roleAssignments"
+            assignments_path="${container_scope}/providers/Microsoft.Authorization/roleAssignments"
+            test "${assignments_path}" = "${expected_assignments_path}"
+            expected_assignments_url="https://management.azure.com${expected_assignments_path}?api-version=2022-04-01&%24filter=principalId%20eq%20%27${principal_id}%27"
+            assignments_url="https://management.azure.com${assignments_path}?api-version=2022-04-01&%24filter=principalId%20eq%20%27${principal_id}%27"
+            test "${assignments_url}" = "${expected_assignments_url}"
+            assignments_response="$(az rest \
+              --method get \
+              --url "${assignments_url}" \
               --only-show-errors \
               --output json)"
+            jq --exit-status '
+              type == "object"
+              and (.value | type) == "array"
+              and ((.nextLink // "") == "")
+              and all(
+                .value[];
+                type == "object"
+                and .type == "Microsoft.Authorization/roleAssignments"
+                and (.id | type) == "string"
+                and (.properties | type) == "object"
+                and (.properties.scope | type) == "string"
+                and (.properties.roleDefinitionId | type) == "string"
+                and (.properties.principalId | type) == "string"
+                and (.properties.principalType | type) == "string"
+              )
+            ' <<< "${assignments_response}" >/dev/null
+            assignments="$(jq --compact-output '
+              [
+                .value[] | {
+                  id: .id,
+                  scope: .properties.scope,
+                  roleDefinitionId: .properties.roleDefinitionId,
+                  principalId: .properties.principalId,
+                  principalType: .properties.principalType,
+                  condition: (.properties.condition // null),
+                  conditionVersion: (.properties.conditionVersion // null)
+                }
+              ]
+            ' <<< "${assignments_response}")"
             jq --exit-status --argjson expected "${expected}" '
               type == "array"
               and length == 1
