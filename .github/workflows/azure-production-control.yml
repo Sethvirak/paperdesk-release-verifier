@@ -113,6 +113,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: paperdesk-production-control
+    concurrency:
+      group: paperdesk-immutable-azure-production-control
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read
@@ -208,7 +211,7 @@ jobs:
           fi
           echo "control_workflow_sha=${CONTROL_WORKFLOW_REF##*@}" >> "${GITHUB_OUTPUT}"
           if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then
-            echo "All mutating modes remain fail-closed until independently verified artifact provenance, a completed post-acceptance caller, exact WORM-policy read authorization, and an ARM-triggerable in-VNet transport are implemented and canaried."
+            echo "All mutating modes remain fail-closed until this source receives independent review, exact WORM-policy and WebJob authorization is granted, the package and exact-workflow FIC are bootstrapped, the old workflow SHA is denied, and live runtime/registry canaries pass."
             exit 1
           fi
 
@@ -541,6 +544,49 @@ jobs:
             --worm-snapshot "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" \
             --output "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
 
+      - name: Upload exact one-shot registry transfer artifact
+        id: registry_transfer
+        if: inputs.operation == 'persist-accepted-release'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paperdesk-accepted-release-request-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-accepted-release-request.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Bind exact uploaded registry transfer metadata
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          EXPECTED_ARTIFACT_DIGEST: ${{ steps.registry_transfer.outputs.artifact-digest }}
+          EXPECTED_ARTIFACT_ID: ${{ steps.registry_transfer.outputs.artifact-id }}
+          EXPECTED_ARTIFACT_NAME: paperdesk-accepted-release-request-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${EXPECTED_ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ ]]
+          artifact_json="$(gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${EXPECTED_ARTIFACT_ID}")"
+          jq --exit-status \
+            --arg artifactId "${EXPECTED_ARTIFACT_ID}" \
+            --arg artifactName "${EXPECTED_ARTIFACT_NAME}" \
+            --arg artifactDigest "sha256:${EXPECTED_ARTIFACT_DIGEST}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg runId "${GITHUB_RUN_ID}" \
+            --arg headSha "${GITHUB_SHA}" '
+            (.id | tostring) == $artifactId
+            and .name == $artifactName
+            and .expired == false
+            and .digest == $artifactDigest
+            and (.size_in_bytes | type == "number" and . > 0 and . <= 1342177280)
+            and .url == ("https://api.github.com/repos/" + $repository + "/actions/artifacts/" + $artifactId)
+            and .archive_download_url == ("https://api.github.com/repos/" + $repository + "/actions/artifacts/" + $artifactId + "/zip")
+            and (.workflow_run.id | tostring) == $runId
+            and .workflow_run.head_sha == $headSha
+          ' <<< "${artifact_json}" >/dev/null
+
       - name: Extract and deploy exact verified candidate
         if: inputs.operation == 'deploy-candidate' || inputs.operation == 'rollback-accepted-release'
         env:
@@ -581,35 +627,73 @@ jobs:
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
+          EXPECTED_HELPER_SHA256: 2100b0ce4265ce71503d87bd661579078dead5fd3a17335f108af4b5bbb97050
+          EXPECTED_PACKAGE_SHA256: 3537f2515657731ea2ac3d1829778beb95df35a5c159c85aca0525cccc8186ad
+          EXPECTED_RUNNER_SHA256: 27db14a7b963e183955196adb10ff8b9a84a14f5f1fffdefb1cfcba3efd871f0
+          REGISTRY_TRANSFER_ARTIFACT_ID: ${{ steps.registry_transfer.outputs.artifact-id }}
+          REGISTRY_TRANSFER_ARTIFACT_SHA256: ${{ steps.registry_transfer.outputs.artifact-digest }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          TRANSIENT_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          readonly webjob_name="paperdesk-accepted-release-registry"
+          readonly web_api_version="2025-05-01"
+          transient_settings_file=""
+          readonly transient_settings=(
+            PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256
+            PAPERDESK_REGISTRY_ARTIFACT_URL
+            PAPERDESK_REGISTRY_ARTIFACT_HOST
+            PAPERDESK_REGISTRY_GITHUB_TOKEN
+            PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID
+            PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256
+            PAPERDESK_REGISTRY_REQUEST_SHA256
+            PAPERDESK_REGISTRY_EXPECTED_PREFIX
+            PAPERDESK_REGISTRY_OPERATION
+          )
+
+          delete_transient_settings() {
+            az webapp config appsettings delete \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --setting-names "${transient_settings[@]}" \
+              --only-show-errors \
+              --output none
+          }
+
+          assert_transient_settings_absent() {
+            local settings_json transient_setting
+            settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            for transient_setting in "${transient_settings[@]}"; do
+              jq --exit-status --arg name "${transient_setting}" '[.[] | select(.name == $name)] | length == 0' <<< "${settings_json}" >/dev/null
+            done
+          }
+
           assert_bridge_stopped_and_sealed() {
-            local site_json config_json policies_json
+            local site_json config_json policies_json settings_json site_id
             site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
             test "$(jq -r '.name' <<< "${site_json}")" = "${BRIDGE_APP_NAME}"
             test "$(jq -r '.resourceGroup | ascii_downcase' <<< "${site_json}")" = "$(printf '%s' "${BRIDGE_RESOURCE_GROUP}" | tr '[:upper:]' '[:lower:]')"
             test "$(jq -r '.state' <<< "${site_json}")" = "Stopped"
             test "$(jq -r '.publicNetworkAccess' <<< "${site_json}")" = "Disabled"
+            site_id="$(jq -r '.id' <<< "${site_json}")"
+            [[ "${site_id}" =~ /resourceGroups/${BRIDGE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${BRIDGE_APP_NAME}$ ]]
             config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
             test "$(jq -r '.ftpsState' <<< "${config_json}")" = "Disabled"
             test "$(jq -r '.ipSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
             test "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
             test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
-            policies_json="$(az rest --method get --url "https://management.azure.com$(jq -r '.id' <<< "${site_json}")/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
+            test "$(jq -r '.linuxFxVersion' <<< "${config_json}")" = "PYTHON|3.12"
+            test "$(jq -r '.alwaysOn' <<< "${config_json}")" = "true"
+            test "$(jq -r '.webJobsEnabled' <<< "${config_json}")" = "true"
+            policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=${web_api_version}")"
             test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
-            local transient_setting
-            for transient_setting in \
-              PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
-              PAPERDESK_REGISTRY_ARTIFACT_URL \
-              PAPERDESK_REGISTRY_ARTIFACT_HOST \
-              PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
-              PAPERDESK_REGISTRY_REQUEST_SHA256 \
-              PAPERDESK_REGISTRY_EXPECTED_PREFIX
-            do
-              test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='${transient_setting}'].name | length(@)" --output tsv)" = "0"
-            done
+            settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            jq --exit-status --arg value "false" '[.[] | select(.name == "WEBSITE_SKIP_RUNNING_KUDUAGENT" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+            jq --exit-status --arg value "${EXPECTED_PACKAGE_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+            jq --exit-status --arg value "${EXPECTED_HELPER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_HELPER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+            jq --exit-status --arg value "${EXPECTED_RUNNER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_RUNNER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+            assert_transient_settings_absent
           }
 
           cleanup_bridge() {
@@ -625,57 +709,230 @@ jobs:
               --only-show-errors >/dev/null
             az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
             az resource update --ids "$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
-            az webapp config appsettings delete \
-              --name "${BRIDGE_APP_NAME}" \
-              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
-              --setting-names \
-                PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
-                PAPERDESK_REGISTRY_ARTIFACT_URL \
-                PAPERDESK_REGISTRY_ARTIFACT_HOST \
-                PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
-                PAPERDESK_REGISTRY_REQUEST_SHA256 \
-                PAPERDESK_REGISTRY_EXPECTED_PREFIX \
-              --only-show-errors >/dev/null
+            delete_transient_settings
+            if [ -n "${transient_settings_file}" ]; then
+              rm -f "${transient_settings_file}"
+              transient_settings_file=""
+            fi
             rm -f "${RUNNER_TEMP}/paperdesk-bridge-session-token"
-            unset PAPERDESK_BRIDGE_SESSION_TOKEN
+            unset PAPERDESK_BRIDGE_SESSION_TOKEN TRANSIENT_GITHUB_TOKEN
             set -e
             assert_bridge_stopped_and_sealed
           }
+
+          wait_for_fixed_webjob() {
+            local site_id deadline webjob_json
+            site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)"
+            deadline=$((SECONDS + 180))
+            while (( SECONDS < deadline )); do
+              if webjob_json="$(az rest --method get --url "https://management.azure.com${site_id}/triggeredwebjobs/${webjob_name}?api-version=${web_api_version}" 2>/dev/null)"; then
+                if jq --exit-status --arg name "${webjob_name}" '
+                  .name == $name
+                  and .type == "Microsoft.Web/sites/triggeredwebjobs"
+                  and .properties.web_job_type == "Triggered"
+                  and (.properties.run_command | type == "string" and length > 0)
+                ' <<< "${webjob_json}" >/dev/null; then
+                  return 0
+                fi
+              fi
+              sleep 5
+            done
+            echo "Fixed registry WebJob did not become ARM-visible." >&2
+            return 1
+          }
+
+          trigger_fixed_webjob_and_wait() {
+            local site_id history_url run_url before_json before_ids deadline history_json new_histories new_count run_json status success_history_id stable_deadline stable_json stable_histories
+            site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)"
+            history_url="https://management.azure.com${site_id}/triggeredwebjobs/${webjob_name}/history?api-version=${web_api_version}"
+            run_url="https://management.azure.com${site_id}/triggeredwebjobs/${webjob_name}/run?api-version=${web_api_version}"
+            before_json="$(az rest --method get --url "${history_url}")"
+            jq --exit-status '.value | type == "array"' <<< "${before_json}" >/dev/null
+            test "$(jq -r '.nextLink // ""' <<< "${before_json}")" = ""
+            before_ids="$(jq -c '[.value[]?.id | select(type == "string" and length > 0)] | unique' <<< "${before_json}")"
+            az rest --method post --url "${run_url}" --output none
+            deadline=$((SECONDS + 900))
+            while (( SECONDS < deadline )); do
+              history_json="$(az rest --method get --url "${history_url}")"
+              jq --exit-status '.value | type == "array"' <<< "${history_json}" >/dev/null
+              test "$(jq -r '.nextLink // ""' <<< "${history_json}")" = ""
+              new_histories="$(jq -c --argjson before "${before_ids}" '
+                [.value[]?
+                  | select(.id | type == "string" and length > 0)
+                  | select(.id as $id | ($before | index($id)) == null)]
+                | sort_by(.id)
+              ' <<< "${history_json}")"
+              new_count="$(jq 'length' <<< "${new_histories}")"
+              if (( new_count > 1 )); then
+                echo "More than one new registry WebJob run appeared inside the single-flight boundary." >&2
+                return 1
+              fi
+              if (( new_count == 1 )); then
+                run_json="$(jq -c --arg job "${webjob_name}" '
+                  .[0] as $history
+                  | select($history.properties.runs | type == "array" and length == 1)
+                  | $history.properties.runs[0]
+                  | select(.web_job_name == $job)
+                  | . + {history_id: $history.id}
+                ' <<< "${new_histories}")"
+                test -n "${run_json}"
+                status="$(jq -r '.status' <<< "${run_json}")"
+                case "${status}" in
+                  Success)
+                    jq --exit-status --arg job "${webjob_name}" '
+                      (.history_id | type == "string" and length > 0)
+                      and .web_job_name == $job
+                      and (.web_job_id | type == "string" and length > 0)
+                      and (.start_time | type == "string" and length > 0)
+                      and (.end_time | type == "string" and length > 0)
+                    ' <<< "${run_json}" >/dev/null
+                    success_history_id="$(jq -r '.history_id' <<< "${run_json}")"
+                    stable_deadline=$((SECONDS + 15))
+                    while (( SECONDS < stable_deadline )); do
+                      sleep 5
+                      stable_json="$(az rest --method get --url "${history_url}")"
+                      jq --exit-status '.value | type == "array"' <<< "${stable_json}" >/dev/null
+                      test "$(jq -r '.nextLink // ""' <<< "${stable_json}")" = ""
+                      stable_histories="$(jq -c --argjson before "${before_ids}" '
+                        [.value[]?
+                          | select(.id | type == "string" and length > 0)
+                          | select(.id as $id | ($before | index($id)) == null)]
+                        | sort_by(.id)
+                      ' <<< "${stable_json}")"
+                      jq --exit-status --arg id "${success_history_id}" --arg job "${webjob_name}" '
+                        length == 1
+                        and .[0].id == $id
+                        and (.[0].properties.runs | type == "array" and length == 1)
+                        and .[0].properties.runs[0].web_job_name == $job
+                        and .[0].properties.runs[0].status == "Success"
+                      ' <<< "${stable_histories}" >/dev/null
+                    done
+                    return 0
+                    ;;
+                  Failed|Error|Aborted)
+                    echo "Registry WebJob failed at the ARM history boundary." >&2
+                    return 1
+                    ;;
+                  *)
+                    echo "Registry WebJob returned an unknown ARM history status." >&2
+                    return 1
+                    ;;
+                esac
+              fi
+              sleep 5
+            done
+            echo "Registry WebJob did not finish inside the bounded evidence window." >&2
+            return 1
+          }
+
+          run_runtime_canary() {
+            az webapp config appsettings set \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --settings PAPERDESK_REGISTRY_OPERATION=runtime-canary \
+              --only-show-errors \
+              --output none
+            az webapp start --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            wait_for_fixed_webjob
+            trigger_fixed_webjob_and_wait
+            az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            delete_transient_settings
+            assert_bridge_stopped_and_sealed
+          }
+
+          run_persistence_once() {
+            assert_bridge_stopped_and_sealed
+            transient_settings_file="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-settings.XXXXXX.json")"
+            chmod 600 "${transient_settings_file}"
+            jq --null-input \
+              --arg operation persist-actions-artifact \
+              --arg artifactId "${REGISTRY_TRANSFER_ARTIFACT_ID}" \
+              --arg artifactSha256 "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" \
+              --arg requestSha256 "${request_digest}" \
+              --arg expectedPrefix "${expected_prefix}" '
+              (env.TRANSIENT_GITHUB_TOKEN // "") as $githubToken
+              | if (($githubToken | type) == "string" and ($githubToken | length) > 0 and ($githubToken | length) <= 4096)
+                then [
+                  {name:"PAPERDESK_REGISTRY_OPERATION", value:$operation, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_GITHUB_TOKEN", value:$githubToken, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID", value:$artifactId, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256", value:$artifactSha256, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_REQUEST_SHA256", value:$requestSha256, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_EXPECTED_PREFIX", value:$expectedPrefix, slotSetting:false}
+                ]
+                else error("transient GitHub credential is unavailable")
+                end
+            ' > "${transient_settings_file}"
+            az webapp config appsettings set \
+              --name "${BRIDGE_APP_NAME}" \
+              --resource-group "${BRIDGE_RESOURCE_GROUP}" \
+              --settings "@${transient_settings_file}" \
+              --only-show-errors \
+              --output none
+            rm -f "${transient_settings_file}"
+            transient_settings_file=""
+            az webapp start --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            wait_for_fixed_webjob
+            trigger_fixed_webjob_and_wait
+            az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
+            delete_transient_settings
+            assert_bridge_stopped_and_sealed
+          }
+
           trap cleanup_bridge EXIT INT TERM
           assert_bridge_stopped_and_sealed
-
-          # Activation is intentionally fail-closed in this review branch. A later
-          # independently approved commit must deploy the deterministic WebJob package,
-          # select and canary a compatible runtime, implement an approved one-shot
-          # coordinate handoff, trigger the fixed job through ARM, and prove its
-          # durable manifest before cleanup removes every transient coordinate.
           test -f "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
           request_digest="$(sha256sum "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz" | cut -d ' ' -f 1)"
           [[ "${request_digest}" =~ ^[0-9a-f]{64}$ ]]
-          echo "Registry request is bound for v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/."
-          echo "Bridge activation remains blocked on caller-handoff approval, compatible-runtime canary, exact-workflow OIDC/FIC canary, and deployment of the immutable helper package."
-          exit 1
+          [[ "${REGISTRY_TRANSFER_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          expected_prefix="v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/"
+
+          # This source-complete path remains unreachable behind the independent-review
+          # hard stop above. Activation requires a later reviewed commit that binds an
+          # independently captured package-bootstrap receipt, exact-workflow FIC rotation,
+          # narrow WebJob RBAC, and old-workflow denial proof.
+          run_runtime_canary
+          run_persistence_once
+          run_persistence_once
+          unset TRANSIENT_GITHUB_TOKEN
+          cleanup_bridge
+          trap - EXIT INT TERM
 
       - name: Seal fixed registry bridge after every persistence attempt
         if: always() && inputs.operation == 'persist-accepted-release'
         env:
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
+          EXPECTED_HELPER_SHA256: 2100b0ce4265ce71503d87bd661579078dead5fd3a17335f108af4b5bbb97050
+          EXPECTED_PACKAGE_SHA256: 3537f2515657731ea2ac3d1829778beb95df35a5c159c85aca0525cccc8186ad
+          EXPECTED_RUNNER_SHA256: 27db14a7b963e183955196adb10ff8b9a84a14f5f1fffdefb1cfcba3efd871f0
         run: |
-          set -euo pipefail
-          site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)"
-          [[ "${site_id}" =~ /resourceGroups/${BRIDGE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${BRIDGE_APP_NAME}$ ]]
-          az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors
-          az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null
+          set -uo pipefail
+          readonly web_api_version="2025-05-01"
+          cleanup_failed=0
+          site_id_valid=0
+          site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)" || cleanup_failed=1
+          if [[ "${site_id}" =~ /resourceGroups/${BRIDGE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${BRIDGE_APP_NAME}$ ]]; then
+            site_id_valid=1
+          else
+            cleanup_failed=1
+          fi
+          az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors || cleanup_failed=1
+          az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null || cleanup_failed=1
           az webapp config access-restriction set \
             --name "${BRIDGE_APP_NAME}" \
             --resource-group "${BRIDGE_RESOURCE_GROUP}" \
             --default-action Deny \
             --scm-default-action Deny \
             --use-same-restrictions-for-scm-site true \
-            --only-show-errors >/dev/null
-          az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
-          az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null
+            --only-show-errors >/dev/null || cleanup_failed=1
+          if [ "${site_id_valid}" -eq 1 ]; then
+            az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/ftp" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null || cleanup_failed=1
+            az resource update --ids "${site_id}/basicPublishingCredentialsPolicies/scm" --set properties.allow=false --api-version 2024-11-01 --only-show-errors >/dev/null || cleanup_failed=1
+          else
+            cleanup_failed=1
+          fi
           az webapp config appsettings delete \
             --name "${BRIDGE_APP_NAME}" \
             --resource-group "${BRIDGE_RESOURCE_GROUP}" \
@@ -683,30 +940,46 @@ jobs:
               PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
               PAPERDESK_REGISTRY_ARTIFACT_URL \
               PAPERDESK_REGISTRY_ARTIFACT_HOST \
+              PAPERDESK_REGISTRY_GITHUB_TOKEN \
+              PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID \
               PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
               PAPERDESK_REGISTRY_REQUEST_SHA256 \
               PAPERDESK_REGISTRY_EXPECTED_PREFIX \
-            --only-show-errors >/dev/null
+              PAPERDESK_REGISTRY_OPERATION \
+            --only-show-errors >/dev/null || cleanup_failed=1
+          set -e
           site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
           config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
-          policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=2024-11-01")"
+          policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=${web_api_version}")"
+          settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
           test "$(jq -r '.state' <<< "${site_json}")" = "Stopped"
           test "$(jq -r '.publicNetworkAccess' <<< "${site_json}")" = "Disabled"
           test "$(jq -r '.ftpsState' <<< "${config_json}")" = "Disabled"
           test "$(jq -r '.ipSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
           test "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" = "Deny"
           test "$(jq -r '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" = "true"
+          test "$(jq -r '.linuxFxVersion' <<< "${config_json}")" = "PYTHON|3.12"
+          test "$(jq -r '.alwaysOn' <<< "${config_json}")" = "true"
+          test "$(jq -r '.webJobsEnabled' <<< "${config_json}")" = "true"
           test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
+          jq --exit-status --arg value false '[.[] | select(.name == "WEBSITE_SKIP_RUNNING_KUDUAGENT" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+          jq --exit-status --arg value "${EXPECTED_PACKAGE_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+          jq --exit-status --arg value "${EXPECTED_HELPER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_HELPER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+          jq --exit-status --arg value "${EXPECTED_RUNNER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_RUNNER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
           for transient_setting in \
             PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
             PAPERDESK_REGISTRY_ARTIFACT_URL \
             PAPERDESK_REGISTRY_ARTIFACT_HOST \
+            PAPERDESK_REGISTRY_GITHUB_TOKEN \
+            PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID \
             PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256 \
             PAPERDESK_REGISTRY_REQUEST_SHA256 \
-            PAPERDESK_REGISTRY_EXPECTED_PREFIX
+            PAPERDESK_REGISTRY_EXPECTED_PREFIX \
+            PAPERDESK_REGISTRY_OPERATION
           do
-            test "$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query "[?name=='${transient_setting}'].name | length(@)" --output tsv)" = "0"
+            jq --exit-status --arg name "${transient_setting}" '[.[] | select(.name == $name)] | length == 0' <<< "${settings_json}" >/dev/null
           done
+          test "${cleanup_failed}" -eq 0
 
       - name: Create bounded control receipt
         id: receipt

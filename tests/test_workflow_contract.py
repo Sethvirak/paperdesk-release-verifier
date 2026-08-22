@@ -85,6 +85,17 @@ def direct_mapping(source, path, *, require_scalar_values=False):
     return result
 
 
+def workflow_step(source, name):
+    match = re.search(
+        rf"(?s)^      - name: {re.escape(name)}\n.*?(?=^      - name:|\Z)",
+        source,
+        flags=re.M,
+    )
+    if match is None:
+        raise AssertionError(f"workflow step {name!r} was not found exactly once")
+    return match.group(0)
+
+
 class WorkflowContractTests(unittest.TestCase):
     def workflow(self, path):
         source = path.read_text(encoding="utf-8")
@@ -132,10 +143,17 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_mutating_modes_remain_hard_stopped(self):
         source = self.workflow(CONTROL)
+        coordinate_step = workflow_step(
+            source, "Validate immutable caller and operation coordinates before OIDC"
+        )
         self.assertIn("application-specific deployment action remains fail-closed", source)
-        self.assertIn("Bridge activation remains blocked", source)
-        self.assertIn("independently verified artifact provenance", source)
-        self.assertIn("ARM-triggerable in-VNet transport", source)
+        self.assertIn("this source receives independent review", coordinate_step)
+        self.assertIn("the old workflow SHA is denied", coordinate_step)
+        self.assertRegex(
+            coordinate_step,
+            r'if \[ "\$\{OPERATION\}" != "oidc-canary-read-resource" \]; then\n'
+            r'.*?\n\s+exit 1\n\s+fi',
+        )
         self.assertGreaterEqual(source.count("exit 1"), 3)
 
     def test_registry_contract_is_fixed_bounded_and_manifest_last(self):
@@ -158,11 +176,12 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
         for transient_setting in (
-            "PAPERDESK_REGISTRY_ARTIFACT_URL",
-            "PAPERDESK_REGISTRY_ARTIFACT_HOST",
+            "PAPERDESK_REGISTRY_GITHUB_TOKEN",
+            "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID",
             "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
             "PAPERDESK_REGISTRY_REQUEST_SHA256",
             "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+            "PAPERDESK_REGISTRY_OPERATION",
         ):
             self.assertGreaterEqual(source.count(transient_setting), 3)
         self.assertIn("actions: read", source)
@@ -180,6 +199,109 @@ class WorkflowContractTests(unittest.TestCase):
             "evidence_bundle_sha256",
         ):
             self.assertIn(required_input, inputs)
+
+    def test_registry_transport_is_single_flight_digest_bound_and_secret_safe(self):
+        source = self.workflow(CONTROL)
+        self.assertEqual(
+            direct_mapping(
+                source,
+                ("jobs", "azure_production_control", "concurrency"),
+                require_scalar_values=True,
+            ),
+            {
+                "group": "paperdesk-immutable-azure-production-control",
+                "cancel-in-progress": "false",
+            },
+        )
+
+        upload_step = workflow_step(source, "Upload exact one-shot registry transfer artifact")
+        for required in (
+            "id: registry_transfer",
+            "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+            "retention-days: 1",
+            "compression-level: 0",
+            "overwrite: false",
+            "if-no-files-found: error",
+        ):
+            self.assertIn(required, upload_step)
+
+        metadata_step = workflow_step(source, "Bind exact uploaded registry transfer metadata")
+        for required in (
+            "/actions/artifacts/${EXPECTED_ARTIFACT_ID}",
+            ".id | tostring",
+            ".name == $artifactName",
+            ".expired == false",
+            ".digest == $artifactDigest",
+            ".workflow_run.id | tostring",
+            ".workflow_run.head_sha == $headSha",
+            '"sha256:${EXPECTED_ARTIFACT_DIGEST}"',
+        ):
+            self.assertIn(required, metadata_step)
+
+        persistence_step = workflow_step(
+            source, "Persist accepted-release material through immutable Blob semantics"
+        )
+        for required in (
+            'readonly web_api_version="2025-05-01"',
+            'mktemp "${RUNNER_TEMP}/paperdesk-registry-settings.XXXXXX.json"',
+            'chmod 600 "${transient_settings_file}"',
+            '--settings "@${transient_settings_file}"',
+            'rm -f "${transient_settings_file}"',
+            "/triggeredwebjobs/${webjob_name}/run?api-version=${web_api_version}",
+            "/triggeredwebjobs/${webjob_name}/history?api-version=${web_api_version}",
+            "new_count > 1",
+            "properties.runs | type == \"array\" and length == 1",
+            "Success)",
+            "stable_deadline=$((SECONDS + 15))",
+            '.[0].properties.runs[0].status == "Success"',
+            'test "$(jq -r \'.linuxFxVersion\' <<< "${config_json}")" = "PYTHON|3.12"',
+            'test "$(jq -r \'.alwaysOn\' <<< "${config_json}")" = "true"',
+            'test "$(jq -r \'.webJobsEnabled\' <<< "${config_json}")" = "true"',
+        ):
+            self.assertIn(required, persistence_step)
+        self.assertNotIn(
+            'PAPERDESK_REGISTRY_GITHUB_TOKEN="${TRANSIENT_GITHUB_TOKEN}"',
+            persistence_step,
+        )
+        self.assertNotIn('--arg githubToken "${TRANSIENT_GITHUB_TOKEN}"', persistence_step)
+        self.assertIn("env.TRANSIENT_GITHUB_TOKEN", persistence_step)
+
+        activation = persistence_step.split(
+            "# This source-complete path remains unreachable behind the independent-review",
+            1,
+        )[1]
+        self.assertIn("independently captured package-bootstrap receipt", activation)
+        self.assertEqual(activation.count("run_runtime_canary"), 1)
+        self.assertEqual(activation.count("run_persistence_once"), 2)
+        self.assertLess(activation.index("run_runtime_canary"), activation.index("run_persistence_once"))
+
+        seal_step = workflow_step(source, "Seal fixed registry bridge after every persistence attempt")
+        canonical_transient = (
+            "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
+            "PAPERDESK_REGISTRY_ARTIFACT_URL",
+            "PAPERDESK_REGISTRY_ARTIFACT_HOST",
+            "PAPERDESK_REGISTRY_GITHUB_TOKEN",
+            "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID",
+            "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
+            "PAPERDESK_REGISTRY_REQUEST_SHA256",
+            "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+            "PAPERDESK_REGISTRY_OPERATION",
+        )
+        for transient_setting in canonical_transient:
+            self.assertIn(transient_setting, persistence_step)
+            self.assertGreaterEqual(seal_step.count(transient_setting), 2)
+        persistence_function = persistence_step.split("run_persistence_once() {", 1)[1].split(
+            "trap cleanup_bridge", 1
+        )[0]
+        self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_URL", persistence_function)
+        self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_HOST", persistence_function)
+        self.assertIn("cleanup_failed=0", seal_step)
+        self.assertIn("site_id_valid=0", seal_step)
+        self.assertIn('if [ "${site_id_valid}" -eq 1 ]; then', seal_step)
+        delete_offset = seal_step.index("az webapp config appsettings delete")
+        final_assert_offset = seal_step.index("site_json=", delete_offset)
+        self.assertLess(delete_offset, final_assert_offset)
+        self.assertIn('test "${cleanup_failed}" -eq 0', seal_step)
 
     def test_registry_storage_and_bridge_resource_groups_are_not_cross_wired(self):
         source = self.workflow(CONTROL)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import MutableMapping
 import datetime as dt
 import gzip
 import hashlib
@@ -54,17 +55,20 @@ MAX_MEMBERS = 21
 MAX_ACTIONS_ARTIFACT_BYTES = MAX_REQUEST_BYTES
 MAX_ACTIONS_ARTIFACT_URL_CHARS = 8192
 MAX_ACTIONS_ARTIFACT_QUERY_CHARS = 4096
+MAX_GITHUB_TOKEN_CHARS = 4096
 MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS = 10
 MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS = 300
 MAX_ONE_SHOT_RESULT_BYTES = 4096
 STORAGE_API_VERSION = "2023-11-03"
 
 ACTIONS_REQUEST_NAME = "paperdesk-accepted-release-request.tar.gz"
-ACTIONS_ARTIFACT_URL_ENV = "PAPERDESK_REGISTRY_ARTIFACT_URL"
-ACTIONS_ARTIFACT_HOST_ENV = "PAPERDESK_REGISTRY_ARTIFACT_HOST"
+ACTIONS_GITHUB_TOKEN_ENV = "PAPERDESK_REGISTRY_GITHUB_TOKEN"
+ACTIONS_GITHUB_ARTIFACT_ID_ENV = "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID"
 ACTIONS_ARTIFACT_ZIP_SHA256_ENV = "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256"
 ACTIONS_REQUEST_SHA256_ENV = "PAPERDESK_REGISTRY_REQUEST_SHA256"
 EXPECTED_PREFIX_ENV = "PAPERDESK_REGISTRY_EXPECTED_PREFIX"
+PAPERDESK_REPOSITORY = "Sethvirak/MasterDataStructure"
+GITHUB_API_HOST = "api.github.com"
 REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
 REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
 
@@ -81,9 +85,18 @@ PAPERDESK_SOURCE_WORKFLOW_REF = (
 )
 CONTENT_MD5 = re.compile(r"[A-Za-z0-9+/]{22}==")
 ETAG = re.compile(r"[^\r\n]{1,256}")
-AZURE_BLOB_HOST = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.blob\.core\.windows\.net"
+GITHUB_ACTIONS_BLOB_HOST = re.compile(
+    r"productionresultssa[0-9]+\.blob\.core\.windows\.net"
 )
+GITHUB_ACTIONS_BLOB_PATH = re.compile(
+    r"/actions-results/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+    r"workflow-job-run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+    r"artifacts/[0-9a-f]{64}\.zip"
+)
+GITHUB_ACTIONS_SAS_QUERY_NAMES = frozenset({
+    "rscd", "rsct", "se", "sig", "ske", "skoid", "sks", "skt", "sktid", "skv",
+    "sp", "spr", "sr", "st", "sv",
+})
 REGISTRY_PREFIX = re.compile(r"v1/releases/[0-9a-f]{40}/[1-9][0-9]*/[1-9][0-9]*/")
 
 RELEASE_MATERIAL_PATHS = (
@@ -645,6 +658,89 @@ def build_direct_artifact_opener() -> Any:
     )
 
 
+def github_actions_artifact_api_url(artifact_id: str) -> str:
+    validated_id = positive(artifact_id, "GitHub Actions artifact ID")
+    if len(validated_id) > 20:
+        fail("GitHub Actions artifact ID is invalid")
+    return (
+        f"https://{GITHUB_API_HOST}/repos/{PAPERDESK_REPOSITORY}/"
+        f"actions/artifacts/{validated_id}/zip"
+    )
+
+
+def resolve_github_actions_artifact_url(
+    artifact_id: str,
+    token: str,
+    opener: Any | None = None,
+) -> tuple[str, str]:
+    api_url = github_actions_artifact_api_url(artifact_id)
+    if (
+        not isinstance(token, str)
+        or not token
+        or token != token.strip()
+        or len(token) > MAX_GITHUB_TOKEN_CHARS
+        or any(ord(character) < 0x21 or ord(character) > 0x7e for character in token)
+    ):
+        fail("GitHub Actions artifact credential is invalid")
+    request = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "PaperDeskRegistryBridge/1",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+        method="GET",
+    )
+    client = opener if opener is not None else build_direct_artifact_opener()
+    response: Any | None = None
+    try:
+        try:
+            response = client.open(request, timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 302 or exc.geturl() != api_url:
+                code = exc.code if isinstance(exc.code, int) and 100 <= exc.code <= 599 else 0
+                fail(f"GitHub Actions artifact resolution failed with HTTP {code}")
+            response = exc
+        if getattr(response, "status", getattr(response, "code", 0)) != 302:
+            fail("GitHub Actions artifact resolution did not return one exact redirect")
+        if response.geturl() != api_url:
+            fail("GitHub Actions artifact resolution escaped the fixed API request")
+        get_all = getattr(response.headers, "get_all", None)
+        locations = get_all("Location") if callable(get_all) else None
+        if locations is None:
+            single_location = response.headers.get("Location", "")
+            locations = [single_location] if single_location else []
+        if len(locations) != 1:
+            fail("GitHub Actions artifact redirect is invalid")
+        location = locations[0]
+        if (
+            not isinstance(location, str)
+            or not location
+            or location != location.strip()
+            or len(location) > MAX_ACTIONS_ARTIFACT_URL_CHARS
+        ):
+            fail("GitHub Actions artifact redirect is invalid")
+        try:
+            redirect_host = urllib.parse.urlsplit(location).hostname or ""
+        except ValueError:
+            fail("GitHub Actions artifact redirect is invalid")
+        validate_actions_artifact_url(location, redirect_host)
+        return location, redirect_host
+    except RegistryError:
+        raise
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        fail("GitHub Actions artifact resolution failed")
+    finally:
+        request.remove_header("Authorization")
+        token = ""
+        if response is not None:
+            try:
+                response.close()
+            except (AttributeError, OSError):
+                pass
+
+
 def build_direct_identity_opener() -> Any:
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
@@ -669,7 +765,7 @@ def validate_actions_artifact_url(
     if (
         len(url) > MAX_ACTIONS_ARTIFACT_URL_CHARS
         or len(allowed_host) > 253
-        or not AZURE_BLOB_HOST.fullmatch(allowed_host)
+        or not GITHUB_ACTIONS_BLOB_HOST.fullmatch(allowed_host)
     ):
         fail("Actions artifact URL boundary is invalid")
     try:
@@ -689,6 +785,7 @@ def validate_actions_artifact_url(
         port is not None,
         bool(parsed.fragment),
         not parsed.path.startswith("/"),
+        not GITHUB_ACTIONS_BLOB_PATH.fullmatch(parsed.path),
         len(parsed.path) > 2048,
         not parsed.query,
         len(parsed.query) > MAX_ACTIONS_ARTIFACT_QUERY_CHARS,
@@ -709,6 +806,7 @@ def validate_actions_artifact_url(
     if (
         not names
         or len(set(names)) != len(names)
+        or not set(names).issubset(GITHUB_ACTIONS_SAS_QUERY_NAMES)
         or any(not name or not value for name, value in query)
         or "sig" not in names
     ):
@@ -1075,22 +1173,43 @@ def validate_expected_request_prefix(archive_path: Path, expected_prefix: str) -
     return actual
 
 
-def one_shot_coordinates(environment: Mapping[str, str]) -> dict[str, str]:
+def one_shot_coordinates(
+    environment: MutableMapping[str, str],
+    opener: Any | None = None,
+) -> dict[str, str]:
+    artifact_id = required_environment_value(
+        environment, ACTIONS_GITHUB_ARTIFACT_ID_ENV, 20
+    )
+    artifact_sha256 = digest(required_environment_value(
+        environment, ACTIONS_ARTIFACT_ZIP_SHA256_ENV, 64
+    ), "Actions artifact ZIP digest")
+    request_sha256 = digest(required_environment_value(
+        environment, ACTIONS_REQUEST_SHA256_ENV, 64
+    ), "Actions registry request digest")
+    expected_prefix = validate_registry_prefix(required_environment_value(
+        environment, EXPECTED_PREFIX_ENV, 160
+    ))
+    token = required_environment_value(
+        environment, ACTIONS_GITHUB_TOKEN_ENV, MAX_GITHUB_TOKEN_CHARS
+    )
+    removed_token = environment.pop(ACTIONS_GITHUB_TOKEN_ENV, None)
+    if not isinstance(removed_token, str) or not hmac.compare_digest(removed_token, token):
+        fail("one-shot environment could not discard the GitHub credential")
+    try:
+        artifact_url, artifact_host = resolve_github_actions_artifact_url(
+            artifact_id, token, opener
+        )
+    finally:
+        token = ""
+        removed_token = ""
     coordinates = {
-        "url": required_environment_value(
-            environment, ACTIONS_ARTIFACT_URL_ENV, MAX_ACTIONS_ARTIFACT_URL_CHARS
-        ),
-        "host": required_environment_value(environment, ACTIONS_ARTIFACT_HOST_ENV, 253),
-        "artifactSha256": required_environment_value(
-            environment, ACTIONS_ARTIFACT_ZIP_SHA256_ENV, 64
-        ),
-        "requestSha256": required_environment_value(environment, ACTIONS_REQUEST_SHA256_ENV, 64),
-        "expectedPrefix": required_environment_value(environment, EXPECTED_PREFIX_ENV, 160),
+        "artifactId": positive(artifact_id, "GitHub Actions artifact ID"),
+        "url": artifact_url,
+        "host": artifact_host,
+        "artifactSha256": artifact_sha256,
+        "requestSha256": request_sha256,
+        "expectedPrefix": expected_prefix,
     }
-    validate_actions_artifact_url(coordinates["url"], coordinates["host"])
-    digest(coordinates["artifactSha256"], "Actions artifact ZIP digest")
-    digest(coordinates["requestSha256"], "Actions registry request digest")
-    validate_registry_prefix(coordinates["expectedPrefix"])
     return coordinates
 
 
@@ -1409,10 +1528,13 @@ def bounded_one_shot_result(
 
 
 def persist_actions_artifact(
-    environment: Mapping[str, str] | None = None,
+    environment: MutableMapping[str, str] | None = None,
     opener: Any | None = None,
 ) -> dict[str, Any]:
-    coordinates = one_shot_coordinates(os.environ if environment is None else environment)
+    coordinates = one_shot_coordinates(
+        os.environ if environment is None else environment,
+        opener,
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="paperdesk-actions-artifact-") as temporary:
             root = Path(temporary)
@@ -1451,6 +1573,31 @@ def persist_actions_artifact(
         raise
     except Exception:
         fail("one-shot registry persistence failed at a closed boundary")
+
+
+def runtime_canary() -> dict[str, Any]:
+    helper = Path(__file__).resolve()
+    regular_file(helper, "registry WebJob helper", 2 * 1024 * 1024)
+    if sys.version_info[:2] != (3, 12):
+        fail("registry WebJob requires the reviewed Python 3.12 runtime")
+    if sys.flags.isolated != 1:
+        fail("registry WebJob helper must run in isolated Python mode")
+    if ACTIONS_GITHUB_TOKEN_ENV in os.environ:
+        fail("runtime canary must not receive a GitHub credential")
+    document = {
+        "schemaVersion": 1,
+        "status": "runtime-ready",
+        "python": "3.12",
+        "isolated": True,
+        "helperSha256": sha256_file(helper),
+        "writerClientId": REGISTRY_WRITER_CLIENT_ID,
+        "readerClientId": REGISTRY_READER_CLIENT_ID,
+    }
+    if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+        fail("fixed writer and reader managed identities must be distinct")
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("registry WebJob runtime canary result exceeds its bound")
+    return document
 
 
 def validate_existing_manifest(manifest: Any, request: dict[str, Any]) -> None:
@@ -1569,6 +1716,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("persist-actions-artifact")
+    commands.add_parser("runtime-canary")
     extract = commands.add_parser("extract-actions-artifact")
     extract.add_argument("--archive", required=True)
     extract.add_argument("--output", required=True)
@@ -1593,6 +1741,8 @@ def main() -> int:
     try:
         if args.command == "persist-actions-artifact":
             print(json.dumps(persist_actions_artifact(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "runtime-canary":
+            print(json.dumps(runtime_canary(), sort_keys=True, separators=(",", ":")))
         elif args.command == "extract-actions-artifact":
             safe_extract_actions_zip(Path(args.archive).resolve(), Path(args.output).resolve())
             print("Actions artifact extracted through bounded safe extraction.")

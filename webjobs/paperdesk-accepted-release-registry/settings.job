@@ -1,0 +1,5 @@
+{
+  "is_singleton": true,
+  "stopping_wait_time": 60,
+  "shutdownGraceTimeLimit": 120
+}

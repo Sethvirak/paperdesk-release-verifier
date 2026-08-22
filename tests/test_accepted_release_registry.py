@@ -54,7 +54,11 @@ def signed_artifact_url(host, *, remaining_seconds=60, permissions="r", resource
         "sr": resource,
         "se": expires,
     })
-    return f"https://{host}/actions-results/request.zip?{query}"
+    return (
+        f"https://{host}/actions-results/11111111-1111-4111-8111-111111111111/"
+        "workflow-job-run-22222222-2222-4222-8222-222222222222/artifacts/"
+        f"{'3' * 64}.zip?{query}"
+    )
 
 
 class RegistryFixture:
@@ -202,6 +206,7 @@ class FakeDownloadResponse:
             "Content-Length": str(len(body)),
             **({} if headers is None else headers),
         }
+        self.closed = False
 
     def __enter__(self):
         return self
@@ -215,15 +220,20 @@ class FakeDownloadResponse:
     def read(self, size=-1):
         return self.body.read(size)
 
+    def close(self):
+        self.closed = True
+
 
 class FakeDownloadOpener:
     def __init__(self, response):
-        self.response = response
+        self.responses = list(response) if isinstance(response, (list, tuple)) else [response]
         self.requests = []
 
     def open(self, request, timeout):
-        self.requests.append((request, timeout))
-        return self.response
+        self.requests.append((request, timeout, dict(request.header_items())))
+        if not self.responses:
+            raise AssertionError("fake opener received an unexpected request")
+        return self.responses.pop(0)
 
 
 class AcceptedReleaseRegistryTests(unittest.TestCase):
@@ -249,10 +259,9 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         return buffer.getvalue()
 
     def one_shot_environment(self, artifact_body, request_path, expected_prefix=None):
-        host = "productionresultssa0.blob.core.windows.net"
         return {
-            registry.ACTIONS_ARTIFACT_URL_ENV: signed_artifact_url(host),
-            registry.ACTIONS_ARTIFACT_HOST_ENV: host,
+            registry.ACTIONS_GITHUB_TOKEN_ENV: "github-read-token-for-tests",
+            registry.ACTIONS_GITHUB_ARTIFACT_ID_ENV: "95001",
             registry.ACTIONS_ARTIFACT_ZIP_SHA256_ENV: hex_digest(artifact_body),
             registry.ACTIONS_REQUEST_SHA256_ENV: registry.sha256_file(request_path),
             registry.EXPECTED_PREFIX_ENV: (
@@ -261,6 +270,15 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
                 else f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/"
             ),
         }
+
+    def one_shot_opener(self, artifact_body, artifact_id="95001"):
+        host = "productionresultssa0.blob.core.windows.net"
+        signed_url = signed_artifact_url(host)
+        api_url = registry.github_actions_artifact_api_url(artifact_id)
+        return FakeDownloadOpener([
+            FakeDownloadResponse(b"", api_url, status=302, headers={"Location": signed_url}),
+            FakeDownloadResponse(artifact_body, signed_url),
+        ])
 
     def test_request_is_deterministic_and_preserves_exact_nineteen_files(self):
         first, first_result = self.build("first.tar.gz")
@@ -363,13 +381,19 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         valid_query = registry.urllib.parse.urlsplit(valid).query
         invalid = (
             f"http://{host}/actions-results/request.zip?{valid_query}",
+            f"https://{host}/actions-results/request.zip?{valid_query}",
             f"https://user@{host}/actions-results/request.zip?{valid_query}",
             f"https://{host}:443/actions-results/request.zip?{valid_query}",
             f"https://{host}:invalid/actions-results/request.zip?{valid_query}",
             f"https://other.blob.core.windows.net/actions-results/request.zip?{valid_query}",
             f"https://{host}/actions-results/request.zip?{valid_query}#fragment",
             f"https://{host}/actions-results/request.zip",
+            valid.replace(
+                "11111111-1111-4111-8111-111111111111",
+                "111111111111111111111111111111111111",
+            ),
             f"{valid}&sig=second",
+            f"{valid}&unexpected=value",
             valid.replace("&spr=https", ""),
             signed_artifact_url(host, permissions="rw"),
             signed_artifact_url(host, resource="c"),
@@ -433,6 +457,70 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
                     FakeDownloadOpener(FakeDownloadResponse(body, url)),
                 )
         self.assertFalse(excessive.exists())
+
+    def test_github_artifact_resolution_is_one_redirect_and_never_forwards_authorization(self):
+        artifact_id = "95001"
+        token = "github-read-token-for-tests"
+        host = "productionresultssa0.blob.core.windows.net"
+        signed_url = signed_artifact_url(host)
+        api_url = registry.github_actions_artifact_api_url(artifact_id)
+        opener = FakeDownloadOpener(
+            FakeDownloadResponse(b"", api_url, status=302, headers={"Location": signed_url})
+        )
+        resolved_url, resolved_host = registry.resolve_github_actions_artifact_url(
+            artifact_id, token, opener
+        )
+        self.assertEqual((resolved_url, resolved_host), (signed_url, host))
+        request, timeout, sent_headers = opener.requests[0]
+        self.assertEqual(timeout, 30)
+        self.assertEqual(request.full_url, api_url)
+        self.assertEqual(sent_headers["X-github-api-version"], "2026-03-10")
+        self.assertEqual(sent_headers.get("Authorization"), f"Bearer {token}")
+        self.assertIsNone(request.get_header("Authorization"))
+
+        body = b"bounded Actions artifact"
+        download_opener = FakeDownloadOpener(FakeDownloadResponse(body, signed_url))
+        output = self.root / "authorization-boundary.zip"
+        registry.download_actions_artifact(
+            signed_url, host, hex_digest(body), output, download_opener
+        )
+        blob_request = download_opener.requests[0][0]
+        self.assertIsNone(blob_request.get_header("Authorization"))
+        self.assertNotIn(token, repr(blob_request.header_items()))
+
+        invalid_redirects = (
+            "https://attacker.example.test/request.zip?sig=x&sp=r&spr=https&sr=b&se=2099-01-01T00%3A00%3A00Z",
+            signed_url + "#fragment",
+            signed_url.replace("https://", "https://user@"),
+        )
+        for location in invalid_redirects:
+            with self.subTest(location=location):
+                with self.assertRaises(registry.RegistryError):
+                    registry.resolve_github_actions_artifact_url(
+                        artifact_id,
+                        token,
+                        FakeDownloadOpener(FakeDownloadResponse(
+                            b"", api_url, status=302, headers={"Location": location}
+                        )),
+                    )
+
+        with self.assertRaises(registry.RegistryError):
+            registry.resolve_github_actions_artifact_url(
+                artifact_id,
+                token,
+                FakeDownloadOpener(FakeDownloadResponse(b"", api_url, status=200)),
+            )
+
+        class DuplicateLocationHeaders(dict):
+            def get_all(self, name):
+                return [signed_url, signed_url] if name.lower() == "location" else None
+
+        duplicate_response = FakeDownloadResponse(b"", api_url, status=302)
+        duplicate_response.headers = DuplicateLocationHeaders(Location=signed_url)
+        with self.assertRaises(registry.RegistryError):
+            registry.resolve_github_actions_artifact_url(
+                artifact_id, token, FakeDownloadOpener(duplicate_response)
+            )
 
     def test_signed_artifact_and_managed_identity_openers_disable_environment_proxies(self):
         sentinel = object()
@@ -539,7 +627,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         request, _ = self.build("one-shot-request.tar.gz")
         artifact_body = self.actions_zip(request)
         environment = self.one_shot_environment(artifact_body, request)
-        url = environment[registry.ACTIONS_ARTIFACT_URL_ENV]
+        opener = self.one_shot_opener(artifact_body)
         storage = FakeStorage()
         tokens = {
             registry.REGISTRY_WRITER_CLIENT_ID: "fixed-writer-token",
@@ -552,7 +640,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         ) as client_factory:
             result = registry.persist_actions_artifact(
                 environment,
-                FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                opener,
             )
 
         self.assertEqual(
@@ -568,12 +656,15 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         self.assertNotIn(b"secret", serialized)
         self.assertNotIn(b"token", serialized)
         self.assertNotIn(b"https://", serialized)
+        self.assertNotIn(registry.ACTIONS_GITHUB_TOKEN_ENV, environment)
+        self.assertEqual(opener.requests[0][2].get("Authorization"), "Bearer github-read-token-for-tests")
+        self.assertIsNone(opener.requests[0][0].get_header("Authorization"))
+        self.assertNotIn("Authorization", opener.requests[1][2])
 
     def test_bad_inner_digest_or_prefix_never_acquires_identity_or_storage_client(self):
         request, _ = self.build("pre-storage-request.tar.gz")
         artifact_body = self.actions_zip(request)
         base_environment = self.one_shot_environment(artifact_body, request)
-        url = base_environment[registry.ACTIONS_ARTIFACT_URL_ENV]
 
         bad_artifact_digest = dict(base_environment)
         bad_artifact_digest[registry.ACTIONS_ARTIFACT_ZIP_SHA256_ENV] = "0" * 64
@@ -583,7 +674,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
             with self.assertRaises(registry.RegistryError):
                 registry.persist_actions_artifact(
                     bad_artifact_digest,
-                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                    self.one_shot_opener(artifact_body),
                 )
             token_provider.assert_not_called()
             client_factory.assert_not_called()
@@ -596,7 +687,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
             with self.assertRaises(registry.RegistryError):
                 registry.persist_actions_artifact(
                     bad_digest,
-                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                    self.one_shot_opener(artifact_body),
                 )
             token_provider.assert_not_called()
             client_factory.assert_not_called()
@@ -609,10 +700,52 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
             with self.assertRaises(registry.RegistryError):
                 registry.persist_actions_artifact(
                     bad_prefix,
-                    FakeDownloadOpener(FakeDownloadResponse(artifact_body, url)),
+                    self.one_shot_opener(artifact_body),
                 )
             token_provider.assert_not_called()
             client_factory.assert_not_called()
+
+    def test_github_credential_is_discarded_even_when_resolution_fails(self):
+        request, _ = self.build("credential-discard-request.tar.gz")
+        artifact_body = self.actions_zip(request)
+        environment = self.one_shot_environment(artifact_body, request)
+        api_url = registry.github_actions_artifact_api_url(
+            environment[registry.ACTIONS_GITHUB_ARTIFACT_ID_ENV]
+        )
+        opener = FakeDownloadOpener(FakeDownloadResponse(b"", api_url, status=500))
+        with self.assertRaises(registry.RegistryError) as caught:
+            registry.persist_actions_artifact(environment, opener)
+        self.assertEqual(
+            str(caught.exception),
+            "GitHub Actions artifact resolution did not return one exact redirect",
+        )
+        self.assertNotIn(registry.ACTIONS_GITHUB_TOKEN_ENV, environment)
+        self.assertNotIn("github-read-token-for-tests", str(caught.exception))
+
+    def test_runtime_canary_requires_python_312_isolation_and_no_github_credential(self):
+        with mock.patch.object(registry.sys, "version_info", (3, 12, 13)), mock.patch.object(
+            registry.sys, "flags", mock.Mock(isolated=1)
+        ), mock.patch.dict(registry.os.environ, {}, clear=True):
+            result = registry.runtime_canary()
+        self.assertEqual(result["status"], "runtime-ready")
+        self.assertEqual(result["python"], "3.12")
+        self.assertTrue(result["isolated"])
+        self.assertEqual(result["helperSha256"], registry.sha256_file(
+            ROOT / "scripts" / "accepted_release_registry.py"
+        ))
+
+        for version, isolated, environment in (
+            ((3, 11, 9), 1, {}),
+            ((3, 12, 13), 0, {}),
+            ((3, 12, 13), 1, {registry.ACTIONS_GITHUB_TOKEN_ENV: "must-not-be-present"}),
+        ):
+            with self.subTest(version=version, isolated=isolated, environment=environment), mock.patch.object(
+                registry.sys, "version_info", version
+            ), mock.patch.object(registry.sys, "flags", mock.Mock(isolated=isolated)), mock.patch.dict(
+                registry.os.environ, environment, clear=True
+            ):
+                with self.assertRaises(registry.RegistryError):
+                    registry.runtime_canary()
 
     def test_worm_policy_must_be_locked_and_exact(self):
         snapshot = self.root / "worm-snapshot.json"

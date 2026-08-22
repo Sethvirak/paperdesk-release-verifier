@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the dormant PaperDesk registry triggered-WebJob package deterministically."""
+"""Build the PaperDesk registry triggered-WebJob package deterministically."""
 
 from __future__ import annotations
 
@@ -22,6 +22,12 @@ SOURCES = (
         ROOT / "webjobs" / JOB_NAME / "run.sh",
         f"{PACKAGE_ROOT}/run.sh",
         0o755,
+        4096,
+    ),
+    (
+        ROOT / "webjobs" / JOB_NAME / "settings.job",
+        f"{PACKAGE_ROOT}/settings.job",
+        0o644,
         4096,
     ),
     (
@@ -84,7 +90,7 @@ def build(output: Path) -> dict[str, object]:
     package_digest = hashlib.sha256(output.read_bytes()).hexdigest()
     return {
         "schemaVersion": 1,
-        "status": "built-dormant",
+        "status": "built-source-ready",
         "jobName": JOB_NAME,
         "packageSha256": package_digest,
         "files": records,
