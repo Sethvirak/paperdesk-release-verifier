@@ -197,6 +197,10 @@ class WorkflowContractTests(unittest.TestCase):
             "evidence_run_attempt",
             "evidence_artifact_name",
             "evidence_bundle_sha256",
+            "registry_preflight_source_sha",
+            "registry_preflight_run_id",
+            "registry_preflight_run_attempt",
+            "registry_preflight_receipt_sha256",
         ):
             self.assertIn(required_input, inputs)
 
@@ -239,7 +243,7 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(required, metadata_step)
 
         persistence_step = workflow_step(
-            source, "Persist accepted-release material through immutable Blob semantics"
+            source, "Preflight and persist accepted-release material through fixed bridge"
         )
         for required in (
             'readonly web_api_version="2025-05-01"',
@@ -257,6 +261,7 @@ class WorkflowContractTests(unittest.TestCase):
             'test "$(jq -r \'.linuxFxVersion\' <<< "${config_json}")" = "PYTHON|3.12"',
             'test "$(jq -r \'.alwaysOn\' <<< "${config_json}")" = "true"',
             'test "$(jq -r \'.webJobsEnabled\' <<< "${config_json}")" = "true"',
+            'and .properties.run_command == "run.sh"',
         ):
             self.assertIn(required, persistence_step)
         self.assertNotIn(
@@ -270,12 +275,15 @@ class WorkflowContractTests(unittest.TestCase):
             "# This source-complete path remains unreachable behind the independent-review",
             1,
         )[1]
-        self.assertIn("independently captured package-bootstrap receipt", activation)
+        self.assertIn(
+            "independently reviewed canonical package-bootstrap receipt and checksum",
+            activation,
+        )
         self.assertEqual(activation.count("run_runtime_canary"), 1)
         self.assertEqual(activation.count("run_persistence_once"), 2)
         self.assertLess(activation.index("run_runtime_canary"), activation.index("run_persistence_once"))
 
-        seal_step = workflow_step(source, "Seal fixed registry bridge after every persistence attempt")
+        seal_step = workflow_step(source, "Seal fixed registry bridge after every bridge attempt")
         canonical_transient = (
             "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
             "PAPERDESK_REGISTRY_ARTIFACT_URL",
@@ -319,8 +327,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Storage/", worm_step)
 
         for step_name in (
-            "Persist accepted-release material through immutable Blob semantics",
-            "Seal fixed registry bridge after every persistence attempt",
+            "Preflight and persist accepted-release material through fixed bridge",
+            "Seal fixed registry bridge after every bridge attempt",
         ):
             step = re.search(
                 rf"(?s)      - name: {re.escape(step_name)}.*?(?=\n      - name:)",
@@ -330,6 +338,167 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertNotIn("BRIDGE_RESOURCE_GROUP: rg-paperdesk-rollback-sea-20260808", step)
 
         self.assertNotIn("BRIDGE_RESOURCE_GROUP: rg-paperdesk-rollback-sea-20260808", source)
+
+    def test_registry_preflight_is_dormant_retained_and_required_before_persistence(self):
+        source = self.workflow(CONTROL)
+        coordinate_step = workflow_step(
+            source, "Validate immutable caller and operation coordinates before OIDC"
+        )
+        self.assertIn("registry-bridge-preflight)", coordinate_step)
+        self.assertIn(
+            ".github/workflows/production-registry-bridge-preflight.yml@refs/heads/main",
+            coordinate_step,
+        )
+        self.assertIn(
+            'if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then',
+            coordinate_step,
+        )
+        self.assertFalse(
+            (ROOT / "evidence" / "registry-bridge-bootstrap-receipt.json").exists(),
+            "the canonical bootstrap receipt must be added only by the later reviewed activation commit",
+        )
+
+        checkout_step = workflow_step(
+            source, "Check out immutable registry control and bootstrap trust anchor"
+        )
+        self.assertIn("steps.immutable_coordinates.outputs.control_workflow_sha", checkout_step)
+        self.assertIn("persist-credentials: false", checkout_step)
+        anchor_step = workflow_step(
+            source, "Verify canonical independently reviewed package bootstrap receipt"
+        )
+        for required in (
+            'readonly receipt_name="registry-bridge-bootstrap-receipt.json"',
+            'sha256sum --check --strict "${receipt_name}.sha256"',
+            'keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "webJob"]',
+            '(.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]',
+            '.deployment.liveDeployment.statusCode == 4',
+            '.deployment.liveDeployment.responseObjectSha256',
+            'extensions/onedeploy"',
+            'runCommand: "run.sh"',
+            'mode: "0755", size: 746',
+            'mode: "0644", size: 88',
+            'mode: "0644", size: 82202',
+            '"Microsoft.Web/sites/extensions/Write"',
+            '"Microsoft.Web/sites/extensions/Read"',
+            '"Microsoft.Web/sites/publish/Action"',
+            '.bootstrapAuthority.verifiedAbsent == true',
+            '.bootstrapAuthority.automationRedeployAudit.remainingDedicatedRedeployAssignments == []',
+            '.bootstrapAuthority.automationRedeployAudit.temporaryBootstrapAssignmentDeleted == true',
+            '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory',
+            'inventory_sha256=',
+            '.grantsRedeploy == false',
+            'every-preflight-detects-onedeploy-drift',
+            'deployment_completed_epoch <= authority_removed_epoch',
+            'authority_removed_epoch <= authority_audit_epoch',
+        ):
+            self.assertIn(required, anchor_step)
+        self.assertNotIn("actions/download-artifact", anchor_step)
+
+        worm_step = workflow_step(
+            source, "Capture exact live locked WORM policy through Azure control identity"
+        )
+        self.assertIn("inputs.operation == 'registry-bridge-preflight'", worm_step)
+        download_step = workflow_step(
+            source, "Download exact successful registry bridge preflight receipt"
+        )
+        self.assertIn(
+            "actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53",
+            download_step,
+        )
+        self.assertIn("registry_preflight_run_id", download_step)
+        verify_step = workflow_step(
+            source, "Verify successful registry bridge preflight before persistence"
+        )
+        for required in (
+            "/actions/runs/${PREFLIGHT_RUN_ID}",
+            '.path == ".github/workflows/production-registry-bridge-preflight.yml"',
+            '.conclusion == "success"',
+            'test "$(sha256sum "${receipt}" | cut -d \' \' -f 1)" = "${PREFLIGHT_RECEIPT_SHA256}"',
+            ".controlWorkflowRef == $controlWorkflowRef",
+            ".registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}",
+            ".registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment",
+            ".registryBridgePreflight.bridge == $currentBootstrap[0].bridge",
+            '.registryBridgePreflight.webJob.runCommand == "run.sh"',
+            '.registryBridgePreflight.webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"',
+            ".registryBridgePreflight.webJob.status == \"Success\"",
+            ".registryBridgePreflight.wormPolicy.etag == $currentWorm[0].etag",
+            "now_epoch - preflight_observed_epoch <= 86400",
+        ):
+            self.assertIn(required, verify_step)
+
+        bridge_step = workflow_step(
+            source, "Preflight and persist accepted-release material through fixed bridge"
+        )
+        self.assertIn('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then', bridge_step)
+        self.assertIn("write_preflight_proof", bridge_step)
+        self.assertIn('test "${OPERATION}" = "persist-accepted-release"', bridge_step)
+        self.assertLess(
+            bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
+            bridge_step.index('test "${OPERATION}" = "persist-accepted-release"'),
+        )
+        self.assertIn(
+            "TRANSIENT_GITHUB_TOKEN: ${{ inputs.operation == 'persist-accepted-release' && github.token || '' }}",
+            bridge_step,
+        )
+        proof_function = bridge_step.split("write_preflight_proof() {", 1)[1].split(
+            "run_persistence_once() {", 1
+        )[0]
+        self.assertIn('--slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json"', proof_function)
+        self.assertIn('packageBootstrap: {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}', proof_function)
+        self.assertIn('runtimeCanaryAnchor: "independently-reviewed-package-bootstrap-receipt"', proof_function)
+        self.assertIn('test "${webjob_run_command}" = "run.sh"', proof_function)
+        self.assertIn('--argjson liveOneDeploy "${live_onedeploy_deployment}"', proof_function)
+        self.assertIn('and .oneDeploy == $bootstrap[0].deployment', proof_function)
+        self.assertNotIn('--arg packageSha256 "${EXPECTED_PACKAGE_SHA256}"', proof_function)
+        self.assertIn('select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256")', proof_function)
+
+        self.assertIn("verify_live_onedeploy_anchor() {", bridge_step)
+        onedeploy_function = bridge_step.split("verify_live_onedeploy_anchor() {", 1)[1].split(
+            "cleanup_bridge() {", 1
+        )[0]
+        for required in (
+            '/extensions/onedeploy?api-version=${web_api_version}',
+            '(.value | length) == 1',
+            '(.nextLink // "") == ""',
+            '.value[0].properties.status == 4',
+            '.value[0].properties.active == true',
+            "jq --sort-keys --compact-output '.value[0]'",
+            "expected_live_deployment=",
+            'test "${live_onedeploy_deployment}" = "${expected_live_deployment}"',
+        ):
+            self.assertIn(required, onedeploy_function)
+        self.assertLess(
+            bridge_step.index("verify_live_onedeploy_anchor\n          if"),
+            bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
+        )
+
+        runtime_canary_function = bridge_step.split("run_runtime_canary() {", 1)[1].split(
+            "write_preflight_proof() {", 1
+        )[0]
+        persistence_function = bridge_step.split("run_persistence_once() {", 1)[1].split(
+            "trap cleanup_bridge", 1
+        )[0]
+        for label, function in (
+            ("runtime canary", runtime_canary_function),
+            ("persistence", persistence_function),
+        ):
+            with self.subTest(webjob_wait=label):
+                self.assertEqual(function.count("wait_for_fixed_webjob"), 1)
+                self.assertLess(
+                    function.index("az webapp start"),
+                    function.index("wait_for_fixed_webjob"),
+                )
+                self.assertLess(
+                    function.index("wait_for_fixed_webjob"),
+                    function.index("trigger_fixed_webjob_and_wait"),
+                )
+
+        receipt_step = workflow_step(source, "Create bounded control receipt")
+        self.assertIn("--arg schemaVersion '2'", receipt_step)
+        self.assertIn("registryBridgePreflight: $registryBridgePreflight", receipt_step)
+        self.assertIn("registryPreflightReceiptSha256", receipt_step)
+        retained_step = workflow_step(source, "Retain immutable-control receipt")
+        self.assertIn("retention-days: 90", retained_step)
 
     def test_caller_release_and_fixed_production_coordinates_are_separate(self):
         source = self.workflow(CONTROL)

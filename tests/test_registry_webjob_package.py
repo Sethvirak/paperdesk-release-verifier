@@ -53,7 +53,8 @@ class RegistryWebJobPackageTests(unittest.TestCase):
                     [oct((info.external_attr >> 16) & 0o777) for info in archive.infolist()],
                     ["0o755", "0o644", "0o644"],
                 )
-                runner = archive.read(f"{expected_root}/run.sh").decode("utf-8")
+                runner_bytes = archive.read(f"{expected_root}/run.sh")
+                runner = runner_bytes.decode("utf-8")
                 settings = archive.read(f"{expected_root}/settings.job")
                 helper = archive.read(f"{expected_root}/accepted_release_registry.py")
 
@@ -61,7 +62,10 @@ class RegistryWebJobPackageTests(unittest.TestCase):
             self.assertIn("persist-actions-artifact", runner)
             self.assertIn("runtime-canary", runner)
             self.assertNotIn("PAPERDESK_REGISTRY_WRITER_CLIENT_ID", runner)
-            self.assertIn(hashlib.sha256(helper).hexdigest(), runner)
+            self.assertIn("PAPERDESK_REGISTRY_HELPER_SHA256", runner)
+            self.assertNotIn(hashlib.sha256(helper).hexdigest(), runner)
+            self.assertIn(hashlib.sha256(runner_bytes).hexdigest(), helper.decode("utf-8"))
+            self.assertIn(hashlib.sha256(settings).hexdigest(), helper.decode("utf-8"))
             self.assertEqual(
                 settings,
                 b'{\n  "is_singleton": true,\n  "stopping_wait_time": 60,\n  "shutdownGraceTimeLimit": 120\n}\n',
@@ -80,6 +84,7 @@ class RegistryWebJobPackageTests(unittest.TestCase):
             expected_hashes = {
                 "EXPECTED_PACKAGE_SHA256": first_result["packageSha256"],
                 "EXPECTED_RUNNER_SHA256": file_digests[f"{expected_root}/run.sh"],
+                "EXPECTED_SETTINGS_SHA256": file_digests[f"{expected_root}/settings.job"],
                 "EXPECTED_HELPER_SHA256": file_digests[
                     f"{expected_root}/accepted_release_registry.py"
                 ],
@@ -87,8 +92,8 @@ class RegistryWebJobPackageTests(unittest.TestCase):
             for setting, expected_digest in expected_hashes.items():
                 self.assertEqual(
                     workflow.count(f"{setting}: {expected_digest}"),
-                    2,
-                    f"{setting} must bind both persistence and always-seal steps",
+                    3,
+                    f"{setting} must bind preflight verification, bridge execution, and always-seal",
                 )
 
     def test_source_inventory_is_fixed_and_rejects_existing_output(self):

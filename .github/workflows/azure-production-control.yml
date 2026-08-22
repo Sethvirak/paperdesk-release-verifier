@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       operation:
-        description: Read-only OIDC canary, candidate deployment, live finalization, rollback, or accepted-release persistence
+        description: Read-only OIDC canary, registry bridge preflight, candidate deployment, live finalization, rollback, or accepted-release persistence
         required: true
         type: string
       source_repository:
@@ -69,6 +69,22 @@ on:
         type: string
         default: ''
       evidence_bundle_sha256:
+        required: false
+        type: string
+        default: ''
+      registry_preflight_source_sha:
+        required: false
+        type: string
+        default: ''
+      registry_preflight_run_id:
+        required: false
+        type: string
+        default: ''
+      registry_preflight_run_attempt:
+        required: false
+        type: string
+        default: ''
+      registry_preflight_receipt_sha256:
         required: false
         type: string
         default: ''
@@ -142,6 +158,10 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           PRODUCTION_ACCEPTANCE_RECEIPT_NAME: ${{ inputs.production_acceptance_receipt_name }}
           PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
+          REGISTRY_PREFLIGHT_RECEIPT_SHA256: ${{ inputs.registry_preflight_receipt_sha256 }}
+          REGISTRY_PREFLIGHT_RUN_ATTEMPT: ${{ inputs.registry_preflight_run_attempt }}
+          REGISTRY_PREFLIGHT_RUN_ID: ${{ inputs.registry_preflight_run_id }}
+          REGISTRY_PREFLIGHT_SOURCE_SHA: ${{ inputs.registry_preflight_source_sha }}
           SOURCE_REPOSITORY: ${{ inputs.source_repository }}
           SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
@@ -165,6 +185,15 @@ jobs:
               test "${SOURCE_SHA}" = "${CALLER_SHA}"
               test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"
               test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"
+              ;;
+            registry-bridge-preflight)
+              test -z "${VERIFIED_ARTIFACT_NAME}${VERIFICATION_RECEIPT_NAME}${VERIFICATION_RECEIPT_SHA256}${ACCEPTANCE_RUN_ID}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${EVIDENCE_RUN_ID}"
+              test "${SOURCE_SHA}" = "${CALLER_SHA}"
+              test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"
+              test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"
+              test "${GITHUB_REPOSITORY}" = "${SOURCE_REPOSITORY}"
+              test "${GITHUB_REF}" = "refs/heads/main"
+              test "${GITHUB_WORKFLOW_REF}" = "Sethvirak/MasterDataStructure/.github/workflows/production-registry-bridge-preflight.yml@refs/heads/main"
               ;;
             deploy-candidate|rollback-accepted-release)
               test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
@@ -198,6 +227,11 @@ jobs:
               test "${GITHUB_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
               test "${GITHUB_WORKFLOW_REF}" = "Sethvirak/MasterDataStructure/.github/workflows/persist-accepted-release.yml@refs/heads/main"
               test -z "${EXPECTED_APP_NAME}${EXPECTED_RESOURCE_GROUP}${EXPECTED_LIVE_URL}"
+              [[ "${REGISTRY_PREFLIGHT_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+              [[ "${REGISTRY_PREFLIGHT_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+              [[ "${REGISTRY_PREFLIGHT_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+              [[ "${REGISTRY_PREFLIGHT_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              test "${REGISTRY_PREFLIGHT_RUN_ID}" != "${GITHUB_RUN_ID}"
               ;;
             *)
               echo "Unsupported Azure production operation."
@@ -205,10 +239,18 @@ jobs:
               ;;
           esac
           if [ "${OPERATION}" != "persist-accepted-release" ]; then
-            test "${EXPECTED_APP_NAME}" = "master-data-structure-sea-9c4e0d0d"
-            test "${EXPECTED_RESOURCE_GROUP}" = "rg-master-data-structure-sea"
-            test "${EXPECTED_LIVE_URL}" = "https://master-data-structure-sea-9c4e0d0d.azurewebsites.net"
+            test -z "${REGISTRY_PREFLIGHT_SOURCE_SHA}${REGISTRY_PREFLIGHT_RUN_ID}${REGISTRY_PREFLIGHT_RUN_ATTEMPT}${REGISTRY_PREFLIGHT_RECEIPT_SHA256}"
           fi
+          case "${OPERATION}" in
+            persist-accepted-release|registry-bridge-preflight)
+              test -z "${EXPECTED_APP_NAME}${EXPECTED_RESOURCE_GROUP}${EXPECTED_LIVE_URL}"
+              ;;
+            *)
+              test "${EXPECTED_APP_NAME}" = "master-data-structure-sea-9c4e0d0d"
+              test "${EXPECTED_RESOURCE_GROUP}" = "rg-master-data-structure-sea"
+              test "${EXPECTED_LIVE_URL}" = "https://master-data-structure-sea-9c4e0d0d.azurewebsites.net"
+              ;;
+          esac
           echo "control_workflow_sha=${CONTROL_WORKFLOW_REF##*@}" >> "${GITHUB_OUTPUT}"
           if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then
             echo "All mutating modes remain fail-closed until this source receives independent review, exact WORM-policy and WebJob authorization is granted, the package and exact-workflow FIC are bootstrapped, the old workflow SHA is denied, and live runtime/registry canaries pass."
@@ -462,7 +504,7 @@ jobs:
           ' "${receipt}" >/dev/null
 
       - name: Capture exact live locked WORM policy through Azure control identity
-        if: inputs.operation == 'persist-accepted-release'
+        if: inputs.operation == 'persist-accepted-release' || inputs.operation == 'registry-bridge-preflight'
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
@@ -485,8 +527,8 @@ jobs:
           ' <<< "${policy}" > "${snapshot}"
           test -f "${snapshot}" && test ! -L "${snapshot}" && test "$(stat --format=%s "${snapshot}")" -le 8192
 
-      - name: Check out immutable accepted-release registry helper
-        if: inputs.operation == 'persist-accepted-release'
+      - name: Check out immutable registry control and bootstrap trust anchor
+        if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: Sethvirak/paperdesk-release-verifier
@@ -495,6 +537,277 @@ jobs:
           clean: true
           persist-credentials: false
           path: paperdesk-registry-control
+
+      - name: Verify canonical independently reviewed package bootstrap receipt
+        id: registry_bootstrap
+        if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
+        env:
+          CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
+          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
+          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
+          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
+        run: |
+          set -euo pipefail
+          readonly control_root="paperdesk-registry-control"
+          readonly anchor_dir="${control_root}/evidence"
+          readonly receipt_name="registry-bridge-bootstrap-receipt.json"
+          readonly receipt="${anchor_dir}/${receipt_name}"
+          readonly checksum="${receipt}.sha256"
+          test "$(git -C "${control_root}" rev-parse HEAD)" = "${CONTROL_WORKFLOW_SHA}"
+          test -z "$(git -C "${control_root}" status --porcelain=v1 --untracked-files=all)"
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 32768
+          test -f "${checksum}" && test ! -L "${checksum}" && test "$(wc -l < "${checksum}")" -eq 1
+          checksum_line="$(cat "${checksum}")"
+          [[ "${checksum_line}" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]registry-bridge-bootstrap-receipt\.json$ ]]
+          (cd "${anchor_dir}" && sha256sum --check --strict "${receipt_name}.sha256")
+          receipt_sha256="$(sha256sum "${receipt}" | cut -d ' ' -f 1)"
+          jq --exit-status \
+            --arg packageSha256 "${EXPECTED_PACKAGE_SHA256}" \
+            --arg helperSha256 "${EXPECTED_HELPER_SHA256}" \
+            --arg runnerSha256 "${EXPECTED_RUNNER_SHA256}" \
+            --arg settingsSha256 "${EXPECTED_SETTINGS_SHA256}" '
+            . as $root
+            | keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "webJob"]
+            and .schemaVersion == 1
+            and .status == "bootstrap-complete"
+            and (.reviewedSourceSha | test("^[0-9a-f]{40}$") and . != ("0" * 40))
+            and (.reviewedMergeSha | test("^[0-9a-f]{40}$") and . != ("0" * 40))
+            and .reviewedSourceSha != .reviewedMergeSha
+            and .bridge == {
+              resourceId: "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+              name: "paperdesk-release-registry-bridge-9c4e0d0d",
+              resourceGroup: "rg-master-data-structure-sea",
+              state: "Stopped",
+              publicNetworkAccess: "Disabled",
+              linuxFxVersion: "PYTHON|3.12",
+              alwaysOn: true,
+              webJobsEnabled: true,
+              scmIpSecurityRestrictionsUseMain: true,
+              ftpsState: "Disabled",
+              ipSecurityRestrictionsDefaultAction: "Deny",
+              scmIpSecurityRestrictionsDefaultAction: "Deny",
+              ftpBasicPublishingAllowed: false,
+              scmBasicPublishingAllowed: false,
+              writerIdentityResourceId: "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
+              writerClientId: "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
+              writerPrincipalId: "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
+              readerIdentityResourceId: "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+              readerClientId: "a52c21e2-b465-4f01-88b8-44bb5fb8b306",
+              readerPrincipalId: "c78102ff-17cd-459e-8da4-c7a900db0f86",
+              persistentSettings: {
+                WEBSITE_SKIP_RUNNING_KUDUAGENT: "false",
+                PAPERDESK_REGISTRY_PACKAGE_SHA256: $packageSha256,
+                PAPERDESK_REGISTRY_HELPER_SHA256: $helperSha256,
+                PAPERDESK_REGISTRY_RUNNER_SHA256: $runnerSha256,
+                PAPERDESK_REGISTRY_SETTINGS_SHA256: $settingsSha256
+              }
+            }
+            and (.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]
+            and .deployment.apiVersion == "2025-05-01"
+            and .deployment.resourceId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy"
+            and (.deployment.liveDeployment | keys) == ["active", "completedAt", "deployer", "deploymentId", "resourceId", "resourceType", "responseObjectSha256", "startedAt", "statusCode"]
+            and (.deployment.liveDeployment.deploymentId | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+            and .deployment.liveDeployment.resourceId == ("/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/deployments/" + .deployment.liveDeployment.deploymentId)
+            and .deployment.liveDeployment.resourceType == "Microsoft.Web/sites/deployments"
+            and .deployment.liveDeployment.statusCode == 4
+            and .deployment.liveDeployment.active == true
+            and (.deployment.liveDeployment.deployer | type == "string" and length > 0 and length <= 128 and test("^[^\\r\\n]+$"))
+            and (.deployment.liveDeployment.responseObjectSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and (.deployment.liveDeployment.startedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+            and (.deployment.liveDeployment.completedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+            and .package == {
+              sha256: $packageSha256,
+              inventory: [
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh", mode: "0755", size: 746, sha256: $runnerSha256},
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/settings.job", mode: "0644", size: 88, sha256: $settingsSha256},
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/accepted_release_registry.py", mode: "0644", size: 82202, sha256: $helperSha256}
+              ]
+            }
+            and .webJob == {name: "paperdesk-accepted-release-registry", apiVersion: "2025-05-01", runCommand: "run.sh"}
+            and (.bootstrapAuthority | keys) == ["automationRedeployAudit", "controlPrincipalId", "permanentActions", "permanentRoleAssignmentId", "permanentRoleDefinitionId", "removedActions", "roleDefinitionEtag", "verifiedAbsent", "verifiedRemovedAt"]
+            and .bootstrapAuthority.controlPrincipalId == "915f5478-68d3-4382-bc37-faadabdc78d6"
+            and .bootstrapAuthority.permanentRoleDefinitionId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/ad33ece7-baeb-47d1-b096-6ee55ff2efcc"
+            and .bootstrapAuthority.permanentRoleAssignmentId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/58620e18-38d4-4978-8d5b-7150c8002015"
+            and (.bootstrapAuthority.roleDefinitionEtag | type == "string" and length > 0 and length <= 256 and test("^[^\\r\\n]+$"))
+            and (.bootstrapAuthority.permanentActions | length) == 12
+            and (.bootstrapAuthority.permanentActions | unique | length) == 12
+            and (.bootstrapAuthority.permanentActions | sort) == ([
+              "Microsoft.Web/sites/Read",
+              "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Read",
+              "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Write",
+              "Microsoft.Web/sites/config/Read",
+              "Microsoft.Web/sites/config/Write",
+              "Microsoft.Web/sites/config/list/Action",
+              "Microsoft.Web/sites/extensions/Read",
+              "Microsoft.Web/sites/start/Action",
+              "Microsoft.Web/sites/stop/Action",
+              "Microsoft.Web/sites/triggeredwebjobs/history/read",
+              "Microsoft.Web/sites/triggeredwebjobs/read",
+              "Microsoft.Web/sites/triggeredwebjobs/run/action"
+            ] | sort)
+            and (.bootstrapAuthority.removedActions | sort) == (["Microsoft.Web/sites/extensions/Write", "Microsoft.Web/sites/publish/Action"] | sort)
+            and .bootstrapAuthority.verifiedAbsent == true
+            and (.bootstrapAuthority.verifiedRemovedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (.bootstrapAuthority.automationRedeployAudit | keys) == ["administrativeBoundary", "capturedAt", "effectiveRoleAssignmentInventory", "effectiveRoleAssignmentInventorySha256", "redeployActions", "remainingDedicatedRedeployAssignments", "scopeResourceId", "temporaryBootstrapAssignmentDeleted", "temporaryBootstrapRoleAssignmentId"]
+            and .bootstrapAuthority.automationRedeployAudit.scopeResourceId == .bridge.resourceId
+            and (.bootstrapAuthority.automationRedeployAudit.capturedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventorySha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and (.bootstrapAuthority.automationRedeployAudit.redeployActions | sort) == (["Microsoft.Web/sites/extensions/Write", "Microsoft.Web/sites/publish/Action"] | sort)
+            and (.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory | type == "array" and length > 0 and length <= 64)
+            and (.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory | map(.assignmentId) | unique | length) == (.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory | length)
+            and all(.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory[];
+              (keys == ["assignmentId", "category", "grantsRedeploy", "principalId", "principalType", "roleDefinitionId", "scope"])
+              and (.assignmentId | type == "string" and length > 0 and length <= 1024 and test("^/[A-Za-z0-9._/-]+$"))
+              and (.principalId | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and (.principalType | type == "string" and length > 0 and length <= 64 and test("^[A-Za-z]+$"))
+              and (.roleDefinitionId | type == "string" and length > 0 and length <= 1024 and test("^/[A-Za-z0-9._/-]+$"))
+              and (.scope | type == "string" and length > 0 and length <= 1024 and test("^/[A-Za-z0-9._/-]+$"))
+              and (.category == "dedicated-automation" or .category == "administrative-governance")
+              and (.grantsRedeploy | type == "boolean")
+            )
+            and (.bootstrapAuthority.automationRedeployAudit.temporaryBootstrapRoleAssignmentId | type == "string" and test("^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft\\.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft\\.Authorization/roleAssignments/[0-9a-f-]{36}$"))
+            and .bootstrapAuthority.automationRedeployAudit.temporaryBootstrapAssignmentDeleted == true
+            and ([.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory[]
+              | select(.category == "dedicated-automation" and .grantsRedeploy)
+              | .assignmentId] | sort) == (.bootstrapAuthority.automationRedeployAudit.remainingDedicatedRedeployAssignments | sort)
+            and .bootstrapAuthority.automationRedeployAudit.remainingDedicatedRedeployAssignments == []
+            and ([.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory[]
+              | select(
+                  .assignmentId == $root.bootstrapAuthority.permanentRoleAssignmentId
+                  and .principalId == $root.bootstrapAuthority.controlPrincipalId
+                  and .roleDefinitionId == $root.bootstrapAuthority.permanentRoleDefinitionId
+                  and .category == "dedicated-automation"
+                  and .grantsRedeploy == false
+                )] | length) == 1
+            and all(.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory[];
+              .assignmentId != $root.bootstrapAuthority.automationRedeployAudit.temporaryBootstrapRoleAssignmentId)
+            and .bootstrapAuthority.automationRedeployAudit.administrativeBoundary == "subscription-and-resource-group-administrators-remain-an-out-of-band-governance-boundary; every-preflight-detects-onedeploy-drift"
+          ' "${receipt}" >/dev/null
+          inventory_sha256="$(jq --sort-keys --compact-output '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory' "${receipt}" | sha256sum | cut -d ' ' -f 1)"
+          test "${inventory_sha256}" = "$(jq -r '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventorySha256' "${receipt}")"
+          deployment_started_epoch="$(date --date="$(jq -r '.deployment.liveDeployment.startedAt' "${receipt}")" '+%s')"
+          deployment_completed_epoch="$(date --date="$(jq -r '.deployment.liveDeployment.completedAt' "${receipt}")" '+%s')"
+          authority_removed_epoch="$(date --date="$(jq -r '.bootstrapAuthority.verifiedRemovedAt' "${receipt}")" '+%s')"
+          authority_audit_epoch="$(date --date="$(jq -r '.bootstrapAuthority.automationRedeployAudit.capturedAt' "${receipt}")" '+%s')"
+          now_epoch="$(date --utc '+%s')"
+          (( deployment_started_epoch <= deployment_completed_epoch ))
+          (( deployment_completed_epoch <= authority_removed_epoch ))
+          (( authority_removed_epoch <= authority_audit_epoch ))
+          (( authority_audit_epoch <= now_epoch + 300 ))
+          echo "receipt_sha256=${receipt_sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download exact successful registry bridge preflight receipt
+        if: inputs.operation == 'persist-accepted-release'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: paperdesk-external-control-registry-bridge-preflight-${{ inputs.registry_preflight_source_sha }}-${{ inputs.registry_preflight_run_id }}-${{ inputs.registry_preflight_run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-registry-bridge-preflight-receipt
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.registry_preflight_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify successful registry bridge preflight before persistence
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          BOOTSTRAP_RECEIPT_SHA256: ${{ steps.registry_bootstrap.outputs.receipt_sha256 }}
+          CONTROL_WORKFLOW_REF: ${{ inputs.control_workflow_ref }}
+          GH_TOKEN: ${{ github.token }}
+          PREFLIGHT_RECEIPT_SHA256: ${{ inputs.registry_preflight_receipt_sha256 }}
+          PREFLIGHT_RUN_ATTEMPT: ${{ inputs.registry_preflight_run_attempt }}
+          PREFLIGHT_RUN_ID: ${{ inputs.registry_preflight_run_id }}
+          PREFLIGHT_SOURCE_SHA: ${{ inputs.registry_preflight_source_sha }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+        run: |
+          set -euo pipefail
+          receipt_dir="${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-receipt"
+          receipt_name="paperdesk-external-control-registry-bridge-preflight-${PREFLIGHT_SOURCE_SHA}-${PREFLIGHT_RUN_ID}-${PREFLIGHT_RUN_ATTEMPT}.json"
+          receipt="${receipt_dir}/${receipt_name}"
+          test "$(find "${receipt_dir}" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+          test -f "${receipt}" && test ! -L "${receipt}"
+          test "$(stat --format=%s "${receipt}")" -le 32768
+          test "$(sha256sum "${receipt}" | cut -d ' ' -f 1)" = "${PREFLIGHT_RECEIPT_SHA256}"
+          run_json="$(gh api --method GET "/repos/${SOURCE_REPOSITORY}/actions/runs/${PREFLIGHT_RUN_ID}")"
+          jq --exit-status \
+            --arg repository "${SOURCE_REPOSITORY}" \
+            --arg runId "${PREFLIGHT_RUN_ID}" \
+            --arg runAttempt "${PREFLIGHT_RUN_ATTEMPT}" \
+            --arg headSha "${PREFLIGHT_SOURCE_SHA}" '
+            (.id | tostring) == $runId
+            and (.run_attempt | tostring) == $runAttempt
+            and .repository.full_name == $repository
+            and .head_repository.full_name == $repository
+            and .head_sha == $headSha
+            and .head_branch == "main"
+            and .event == "workflow_dispatch"
+            and .path == ".github/workflows/production-registry-bridge-preflight.yml"
+            and .status == "completed"
+            and .conclusion == "success"
+          ' <<< "${run_json}" >/dev/null
+          jq --exit-status \
+            --arg repository "${SOURCE_REPOSITORY}" \
+            --arg sourceSha "${PREFLIGHT_SOURCE_SHA}" \
+            --arg runId "${PREFLIGHT_RUN_ID}" \
+            --arg runAttempt "${PREFLIGHT_RUN_ATTEMPT}" \
+            --arg controlWorkflowRef "${CONTROL_WORKFLOW_REF}" \
+            --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
+            --slurpfile currentBootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
+            --slurpfile currentWorm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" '
+            .schemaVersion == 2
+            and .status == "success"
+            and .operation == "registry-bridge-preflight"
+            and .sourceRepository == $repository
+            and .sourceSha == $sourceSha
+            and .sourceRunId == $runId
+            and .sourceRunAttempt == $runAttempt
+            and .controlRunId == $runId
+            and .controlRunAttempt == $runAttempt
+            and .controlWorkflowRef == $controlWorkflowRef
+            and .callerWorkflowRef == "Sethvirak/MasterDataStructure/.github/workflows/production-registry-bridge-preflight.yml@refs/heads/main"
+            and .acceptanceRunId == ""
+            and .acceptanceRunAttempt == ""
+            and .acceptanceWorkflowRef == ""
+            and .evidenceRunId == ""
+            and .evidenceRunAttempt == ""
+            and .evidenceArtifactName == ""
+            and .evidenceBundleSha256 == ""
+            and .verificationReceiptName == ""
+            and .verificationReceiptSha256 == ""
+            and .productionAcceptanceReceiptName == ""
+            and .productionAcceptanceReceiptSha256 == ""
+            and .registryPrefix == ""
+            and .registryPreflightSourceSha == ""
+            and .registryPreflightRunId == ""
+            and .registryPreflightRunAttempt == ""
+            and .registryPreflightReceiptSha256 == ""
+            and (.registryBridgePreflight | type == "object")
+            and .registryBridgePreflight.schemaVersion == 1
+            and .registryBridgePreflight.status == "success"
+            and (.registryBridgePreflight.observedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and .registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}
+            and .registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment
+            and .registryBridgePreflight.bridge == $currentBootstrap[0].bridge
+            and .registryBridgePreflight.webJob.name == "paperdesk-accepted-release-registry"
+            and .registryBridgePreflight.webJob.apiVersion == "2025-05-01"
+            and .registryBridgePreflight.webJob.runCommand == "run.sh"
+            and .registryBridgePreflight.webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"
+            and .registryBridgePreflight.webJob.status == "Success"
+            and (.registryBridgePreflight.webJob.historyId | type == "string" and length > 0)
+            and (.registryBridgePreflight.webJob.webJobId | type == "string" and length > 0)
+            and (.registryBridgePreflight.webJob.startedAt | type == "string" and length > 0)
+            and (.registryBridgePreflight.webJob.endedAt | type == "string" and length > 0)
+            and .registryBridgePreflight.wormPolicy.resourceId == $currentWorm[0].resourceId
+            and .registryBridgePreflight.wormPolicy.state == $currentWorm[0].state
+            and .registryBridgePreflight.wormPolicy.immutabilityPeriodSinceCreationInDays == $currentWorm[0].immutabilityPeriodSinceCreationInDays
+            and .registryBridgePreflight.wormPolicy.allowProtectedAppendWrites == $currentWorm[0].allowProtectedAppendWrites
+            and .registryBridgePreflight.wormPolicy.allowProtectedAppendWritesAll == $currentWorm[0].allowProtectedAppendWritesAll
+            and .registryBridgePreflight.wormPolicy.etag == $currentWorm[0].etag
+          ' "${receipt}" >/dev/null
+          preflight_observed_at="$(jq -r '.registryBridgePreflight.observedAt' "${receipt}")"
+          preflight_observed_epoch="$(date --date="${preflight_observed_at}" '+%s')"
+          now_epoch="$(date --utc '+%s')"
+          (( preflight_observed_epoch <= now_epoch + 300 ))
+          (( now_epoch - preflight_observed_epoch <= 86400 ))
 
       - name: Build deterministic bounded registry transfer request
         if: inputs.operation == 'persist-accepted-release'
@@ -621,25 +934,35 @@ jobs:
           curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 30 "${EXPECTED_LIVE_URL}/api/health/live" >/dev/null
           curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 30 "${EXPECTED_LIVE_URL}/api/health/ready" >/dev/null
 
-      - name: Persist accepted-release material through immutable Blob semantics
-        if: inputs.operation == 'persist-accepted-release'
+      - name: Preflight and persist accepted-release material through fixed bridge
+        id: registry_bridge
+        if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         env:
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          BOOTSTRAP_RECEIPT_SHA256: ${{ steps.registry_bootstrap.outputs.receipt_sha256 }}
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 2100b0ce4265ce71503d87bd661579078dead5fd3a17335f108af4b5bbb97050
-          EXPECTED_PACKAGE_SHA256: 3537f2515657731ea2ac3d1829778beb95df35a5c159c85aca0525cccc8186ad
-          EXPECTED_RUNNER_SHA256: 27db14a7b963e183955196adb10ff8b9a84a14f5f1fffdefb1cfcba3efd871f0
+          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
+          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
+          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
+          OPERATION: ${{ inputs.operation }}
           REGISTRY_TRANSFER_ARTIFACT_ID: ${{ steps.registry_transfer.outputs.artifact-id }}
           REGISTRY_TRANSFER_ARTIFACT_SHA256: ${{ steps.registry_transfer.outputs.artifact-digest }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-          TRANSIENT_GITHUB_TOKEN: ${{ github.token }}
+          TRANSIENT_GITHUB_TOKEN: ${{ inputs.operation == 'persist-accepted-release' && github.token || '' }}
         run: |
           set -euo pipefail
           readonly webjob_name="paperdesk-accepted-release-registry"
           readonly web_api_version="2025-05-01"
           transient_settings_file=""
+          webjob_ended_at=""
+          webjob_history_id=""
+          live_onedeploy_deployment=""
+          webjob_run_id=""
+          webjob_run_command=""
+          webjob_started_at=""
           readonly transient_settings=(
             PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256
             PAPERDESK_REGISTRY_ARTIFACT_URL
@@ -689,11 +1012,63 @@ jobs:
             policies_json="$(az rest --method get --url "https://management.azure.com${site_id}/basicPublishingCredentialsPolicies?api-version=${web_api_version}")"
             test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
             settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            jq --exit-status '
+              ([.[].name] | sort) == [
+                "PAPERDESK_REGISTRY_HELPER_SHA256",
+                "PAPERDESK_REGISTRY_PACKAGE_SHA256",
+                "PAPERDESK_REGISTRY_RUNNER_SHA256",
+                "PAPERDESK_REGISTRY_SETTINGS_SHA256",
+                "WEBSITE_SKIP_RUNNING_KUDUAGENT"
+              ]
+            ' <<< "${settings_json}" >/dev/null
             jq --exit-status --arg value "false" '[.[] | select(.name == "WEBSITE_SKIP_RUNNING_KUDUAGENT" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
             jq --exit-status --arg value "${EXPECTED_PACKAGE_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
             jq --exit-status --arg value "${EXPECTED_HELPER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_HELPER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
             jq --exit-status --arg value "${EXPECTED_RUNNER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_RUNNER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+            jq --exit-status --arg value "${EXPECTED_SETTINGS_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_SETTINGS_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
             assert_transient_settings_absent
+          }
+
+          verify_live_onedeploy_anchor() {
+            local site_id live_response live_object_sha256 expected_live_deployment
+            site_id="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --query id --output tsv)"
+            live_response="$(az rest \
+              --method get \
+              --url "https://management.azure.com${site_id}/extensions/onedeploy?api-version=${web_api_version}" \
+              --only-show-errors \
+              --output json)"
+            jq --exit-status --arg siteId "${site_id}" '
+              (.value | type) == "array"
+              and (.value | length) == 1
+              and ((.nextLink // "") == "")
+              and (.value[0].id | type == "string" and startswith($siteId + "/deployments/"))
+              and (.value[0].name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+              and .value[0].id == ($siteId + "/deployments/" + .value[0].name)
+              and .value[0].type == "Microsoft.Web/sites/deployments"
+              and .value[0].properties.status == 4
+              and .value[0].properties.active == true
+              and (.value[0].properties.deployer | type == "string" and length > 0 and length <= 128 and test("^[^\\r\\n]+$"))
+              and (.value[0].properties.start_time | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+              and (.value[0].properties.end_time | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+            ' <<< "${live_response}" >/dev/null
+            live_object_sha256="$(jq --sort-keys --compact-output '.value[0]' <<< "${live_response}" | sha256sum | cut -d ' ' -f 1)"
+            [[ "${live_object_sha256}" =~ ^[0-9a-f]{64}$ ]]
+            live_onedeploy_deployment="$(jq --compact-output \
+              --arg responseObjectSha256 "${live_object_sha256}" '
+              .value[0] | {
+                active: .properties.active,
+                completedAt: .properties.end_time,
+                deployer: .properties.deployer,
+                deploymentId: .name,
+                resourceId: .id,
+                resourceType: .type,
+                responseObjectSha256: $responseObjectSha256,
+                startedAt: .properties.start_time,
+                statusCode: .properties.status
+              }
+            ' <<< "${live_response}")"
+            expected_live_deployment="$(jq --compact-output '.deployment.liveDeployment' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            test "${live_onedeploy_deployment}" = "${expected_live_deployment}"
           }
 
           cleanup_bridge() {
@@ -729,8 +1104,9 @@ jobs:
                   .name == $name
                   and .type == "Microsoft.Web/sites/triggeredwebjobs"
                   and .properties.web_job_type == "Triggered"
-                  and (.properties.run_command | type == "string" and length > 0)
+                  and .properties.run_command == "run.sh"
                 ' <<< "${webjob_json}" >/dev/null; then
+                  webjob_run_command="$(jq -r '.properties.run_command' <<< "${webjob_json}")"
                   return 0
                 fi
               fi
@@ -786,6 +1162,10 @@ jobs:
                       and (.end_time | type == "string" and length > 0)
                     ' <<< "${run_json}" >/dev/null
                     success_history_id="$(jq -r '.history_id' <<< "${run_json}")"
+                    webjob_history_id="${success_history_id}"
+                    webjob_run_id="$(jq -r '.web_job_id' <<< "${run_json}")"
+                    webjob_started_at="$(jq -r '.start_time' <<< "${run_json}")"
+                    webjob_ended_at="$(jq -r '.end_time' <<< "${run_json}")"
                     stable_deadline=$((SECONDS + 15))
                     while (( SECONDS < stable_deadline )); do
                       sleep 5
@@ -825,6 +1205,7 @@ jobs:
           }
 
           run_runtime_canary() {
+            verify_live_onedeploy_anchor
             az webapp config appsettings set \
               --name "${BRIDGE_APP_NAME}" \
               --resource-group "${BRIDGE_RESOURCE_GROUP}" \
@@ -837,10 +1218,136 @@ jobs:
             az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
             delete_transient_settings
             assert_bridge_stopped_and_sealed
+            verify_live_onedeploy_anchor
+          }
+
+          write_preflight_proof() {
+            local site_json config_json settings_json policies_json proof identity_keys
+            verify_live_onedeploy_anchor
+            test -n "${live_onedeploy_deployment}"
+            test -n "${webjob_history_id}"
+            test -n "${webjob_run_id}"
+            test "${webjob_run_command}" = "run.sh"
+            test -n "${webjob_started_at}"
+            test -n "${webjob_ended_at}"
+            site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            settings_json="$(az webapp config appsettings list --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
+            policies_json="$(az rest --method get --url "https://management.azure.com$(jq -r '.id' <<< "${site_json}")/basicPublishingCredentialsPolicies?api-version=${web_api_version}")"
+            identity_keys="$(jq -c '.identity.userAssignedIdentities | keys | sort' <<< "${site_json}")"
+            jq --exit-status '
+              . == [
+                "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+                "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer"
+              ]
+            ' <<< "${identity_keys}" >/dev/null
+            jq --exit-status '
+              .identity.userAssignedIdentities["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer"]
+                == {clientId: "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16", principalId: "2fda0f07-5dc6-4a46-b63a-9cf2616d9011"}
+              and .identity.userAssignedIdentities["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader"]
+                == {clientId: "a52c21e2-b465-4f01-88b8-44bb5fb8b306", principalId: "c78102ff-17cd-459e-8da4-c7a900db0f86"}
+            ' <<< "${site_json}" >/dev/null
+            proof="${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-proof.json"
+            jq --null-input \
+              --arg observedAt "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" \
+              --arg resourceId "$(jq -r '.id' <<< "${site_json}")" \
+              --arg name "${BRIDGE_APP_NAME}" \
+              --arg resourceGroup "${BRIDGE_RESOURCE_GROUP}" \
+              --arg state "$(jq -r '.state' <<< "${site_json}")" \
+              --arg publicNetworkAccess "$(jq -r '.publicNetworkAccess' <<< "${site_json}")" \
+              --arg linuxFxVersion "$(jq -r '.linuxFxVersion' <<< "${config_json}")" \
+              --argjson alwaysOn "$(jq '.alwaysOn' <<< "${config_json}")" \
+              --argjson webJobsEnabled "$(jq '.webJobsEnabled' <<< "${config_json}")" \
+              --argjson scmUsesMain "$(jq '.scmIpSecurityRestrictionsUseMain' <<< "${config_json}")" \
+              --arg ftpsState "$(jq -r '.ftpsState' <<< "${config_json}")" \
+              --arg ipDefault "$(jq -r '.ipSecurityRestrictionsDefaultAction' <<< "${config_json}")" \
+              --arg scmIpDefault "$(jq -r '.scmIpSecurityRestrictionsDefaultAction' <<< "${config_json}")" \
+              --argjson ftpBasicAllowed "$(jq '[.value[] | select(.name == "ftp")][0].properties.allow' <<< "${policies_json}")" \
+              --argjson scmBasicAllowed "$(jq '[.value[] | select(.name == "scm")][0].properties.allow' <<< "${policies_json}")" \
+              --arg skipKuduAgent "$(jq -r '[.[] | select(.name == "WEBSITE_SKIP_RUNNING_KUDUAGENT")][0].value' <<< "${settings_json}")" \
+              --arg packageSha256 "$(jq -r '[.[] | select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256")][0].value' <<< "${settings_json}")" \
+              --arg helperSha256 "$(jq -r '[.[] | select(.name == "PAPERDESK_REGISTRY_HELPER_SHA256")][0].value' <<< "${settings_json}")" \
+              --arg runnerSha256 "$(jq -r '[.[] | select(.name == "PAPERDESK_REGISTRY_RUNNER_SHA256")][0].value' <<< "${settings_json}")" \
+              --arg settingsSha256 "$(jq -r '[.[] | select(.name == "PAPERDESK_REGISTRY_SETTINGS_SHA256")][0].value' <<< "${settings_json}")" \
+              --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
+              --arg webJobName "${webjob_name}" \
+              --arg apiVersion "${web_api_version}" \
+              --arg runCommand "${webjob_run_command}" \
+              --arg historyId "${webjob_history_id}" \
+              --arg webJobId "${webjob_run_id}" \
+              --arg startedAt "${webjob_started_at}" \
+              --arg endedAt "${webjob_ended_at}" \
+              --argjson liveOneDeploy "${live_onedeploy_deployment}" \
+              --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
+              --slurpfile worm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" '
+              {
+                schemaVersion: 1,
+                status: "success",
+                observedAt: $observedAt,
+                packageBootstrap: {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]},
+                oneDeploy: {
+                  apiVersion: $bootstrap[0].deployment.apiVersion,
+                  resourceId: $bootstrap[0].deployment.resourceId,
+                  liveDeployment: $liveOneDeploy
+                },
+                bridge: {
+                  resourceId: $resourceId,
+                  name: $name,
+                  resourceGroup: $resourceGroup,
+                  state: $state,
+                  publicNetworkAccess: $publicNetworkAccess,
+                  linuxFxVersion: $linuxFxVersion,
+                  alwaysOn: $alwaysOn,
+                  webJobsEnabled: $webJobsEnabled,
+                  scmIpSecurityRestrictionsUseMain: $scmUsesMain,
+                  ftpsState: $ftpsState,
+                  ipSecurityRestrictionsDefaultAction: $ipDefault,
+                  scmIpSecurityRestrictionsDefaultAction: $scmIpDefault,
+                  ftpBasicPublishingAllowed: $ftpBasicAllowed,
+                  scmBasicPublishingAllowed: $scmBasicAllowed,
+                  writerIdentityResourceId: "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
+                  writerClientId: "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
+                  writerPrincipalId: "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
+                  readerIdentityResourceId: "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+                  readerClientId: "a52c21e2-b465-4f01-88b8-44bb5fb8b306",
+                  readerPrincipalId: "c78102ff-17cd-459e-8da4-c7a900db0f86",
+                  persistentSettings: {
+                    WEBSITE_SKIP_RUNNING_KUDUAGENT: $skipKuduAgent,
+                    PAPERDESK_REGISTRY_PACKAGE_SHA256: $packageSha256,
+                    PAPERDESK_REGISTRY_HELPER_SHA256: $helperSha256,
+                    PAPERDESK_REGISTRY_RUNNER_SHA256: $runnerSha256,
+                    PAPERDESK_REGISTRY_SETTINGS_SHA256: $settingsSha256
+                  }
+                },
+                webJob: {
+                  name: $webJobName,
+                  apiVersion: $apiVersion,
+                  runCommand: $runCommand,
+                  runtimeCanaryAnchor: "independently-reviewed-package-bootstrap-receipt",
+                  historyId: $historyId,
+                  webJobId: $webJobId,
+                  status: "Success",
+                  startedAt: $startedAt,
+                  endedAt: $endedAt
+                },
+                wormPolicy: $worm[0]
+              }
+            ' > "${proof}"
+            test -f "${proof}" && test ! -L "${proof}" && test "$(stat --format=%s "${proof}")" -le 32768
+            jq --exit-status \
+              --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
+              --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" '
+              .packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}
+              and .oneDeploy == $bootstrap[0].deployment
+              and .bridge == $bootstrap[0].bridge
+              and .webJob.runCommand == $bootstrap[0].webJob.runCommand
+              and .webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"
+            ' "${proof}" >/dev/null
           }
 
           run_persistence_once() {
             assert_bridge_stopped_and_sealed
+            verify_live_onedeploy_anchor
             transient_settings_file="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-settings.XXXXXX.json")"
             chmod 600 "${transient_settings_file}"
             jq --null-input \
@@ -876,10 +1383,20 @@ jobs:
             az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
             delete_transient_settings
             assert_bridge_stopped_and_sealed
+            verify_live_onedeploy_anchor
           }
 
           trap cleanup_bridge EXIT INT TERM
           assert_bridge_stopped_and_sealed
+          verify_live_onedeploy_anchor
+          if [ "${OPERATION}" = "registry-bridge-preflight" ]; then
+            run_runtime_canary
+            write_preflight_proof
+            cleanup_bridge
+            trap - EXIT INT TERM
+            exit 0
+          fi
+          test "${OPERATION}" = "persist-accepted-release"
           test -f "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz"
           request_digest="$(sha256sum "${RUNNER_TEMP}/paperdesk-accepted-release-request.tar.gz" | cut -d ' ' -f 1)"
           [[ "${request_digest}" =~ ^[0-9a-f]{64}$ ]]
@@ -889,8 +1406,9 @@ jobs:
 
           # This source-complete path remains unreachable behind the independent-review
           # hard stop above. Activation requires a later reviewed commit that binds an
-          # independently captured package-bootstrap receipt, exact-workflow FIC rotation,
-          # narrow WebJob RBAC, and old-workflow denial proof.
+          # independently reviewed canonical package-bootstrap receipt and checksum from
+          # this immutable checkout, exact-workflow FIC rotation, narrow WebJob RBAC,
+          # removed bootstrap publish authority, and old-workflow denial proof.
           run_runtime_canary
           run_persistence_once
           run_persistence_once
@@ -898,14 +1416,15 @@ jobs:
           cleanup_bridge
           trap - EXIT INT TERM
 
-      - name: Seal fixed registry bridge after every persistence attempt
-        if: always() && inputs.operation == 'persist-accepted-release'
+      - name: Seal fixed registry bridge after every bridge attempt
+        if: always() && (inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release')
         env:
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 2100b0ce4265ce71503d87bd661579078dead5fd3a17335f108af4b5bbb97050
-          EXPECTED_PACKAGE_SHA256: 3537f2515657731ea2ac3d1829778beb95df35a5c159c85aca0525cccc8186ad
-          EXPECTED_RUNNER_SHA256: 27db14a7b963e183955196adb10ff8b9a84a14f5f1fffdefb1cfcba3efd871f0
+          EXPECTED_HELPER_SHA256: 306805cefa888f0418e70d1fa3be64ec97f9fcdbe7fb1afedb5f2276a92c980b
+          EXPECTED_PACKAGE_SHA256: 479bd0cc0a9d6b084cac1357716935ff7acba96186c036c0a973ebf5e34095eb
+          EXPECTED_RUNNER_SHA256: fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc
+          EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
         run: |
           set -uo pipefail
           readonly web_api_version="2025-05-01"
@@ -960,10 +1479,20 @@ jobs:
           test "$(jq -r '.alwaysOn' <<< "${config_json}")" = "true"
           test "$(jq -r '.webJobsEnabled' <<< "${config_json}")" = "true"
           test "$(jq '[.value[] | select((.name == "ftp" or .name == "scm") and .properties.allow == false)] | length' <<< "${policies_json}")" -eq 2
+          jq --exit-status '
+            ([.[].name] | sort) == [
+              "PAPERDESK_REGISTRY_HELPER_SHA256",
+              "PAPERDESK_REGISTRY_PACKAGE_SHA256",
+              "PAPERDESK_REGISTRY_RUNNER_SHA256",
+              "PAPERDESK_REGISTRY_SETTINGS_SHA256",
+              "WEBSITE_SKIP_RUNNING_KUDUAGENT"
+            ]
+          ' <<< "${settings_json}" >/dev/null
           jq --exit-status --arg value false '[.[] | select(.name == "WEBSITE_SKIP_RUNNING_KUDUAGENT" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
           jq --exit-status --arg value "${EXPECTED_PACKAGE_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
           jq --exit-status --arg value "${EXPECTED_HELPER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_HELPER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
           jq --exit-status --arg value "${EXPECTED_RUNNER_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_RUNNER_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
+          jq --exit-status --arg value "${EXPECTED_SETTINGS_SHA256}" '[.[] | select(.name == "PAPERDESK_REGISTRY_SETTINGS_SHA256" and .value == $value)] | length == 1' <<< "${settings_json}" >/dev/null
           for transient_setting in \
             PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256 \
             PAPERDESK_REGISTRY_ARTIFACT_URL \
@@ -994,6 +1523,10 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           PRODUCTION_ACCEPTANCE_RECEIPT_NAME: ${{ inputs.production_acceptance_receipt_name }}
           PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
+          REGISTRY_PREFLIGHT_RECEIPT_SHA256: ${{ inputs.registry_preflight_receipt_sha256 }}
+          REGISTRY_PREFLIGHT_RUN_ATTEMPT: ${{ inputs.registry_preflight_run_attempt }}
+          REGISTRY_PREFLIGHT_RUN_ID: ${{ inputs.registry_preflight_run_id }}
+          REGISTRY_PREFLIGHT_SOURCE_SHA: ${{ inputs.registry_preflight_source_sha }}
           SOURCE_REPOSITORY: ${{ inputs.source_repository }}
           SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
@@ -1005,11 +1538,21 @@ jobs:
           receipt_dir="${RUNNER_TEMP}/paperdesk-external-control-receipt"
           receipt_name="paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           mkdir "${receipt_dir}"
+          registry_bridge_preflight=null
+          preflight_proof="${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-proof.json"
+          if [ -f "${preflight_proof}" ] && [ ! -L "${preflight_proof}" ]; then
+            test "$(stat --format=%s "${preflight_proof}")" -le 32768
+            registry_bridge_preflight="$(jq --compact-output '.' "${preflight_proof}")"
+          elif [ "${OPERATION}" = "registry-bridge-preflight" ] && [ "${{ job.status }}" = "success" ]; then
+            echo "A successful registry bridge preflight must retain its exact proof." >&2
+            exit 1
+          fi
           jq --null-input \
-            --arg schemaVersion '1' \
+            --arg schemaVersion '2' \
             --arg status "${{ job.status }}" \
             --arg operation "${OPERATION}" \
             --arg sourceRepository "${SOURCE_REPOSITORY}" \
+            --arg callerWorkflowRef "${GITHUB_WORKFLOW_REF}" \
             --arg sourceSha "${SOURCE_SHA}" \
             --arg sourceRunId "${SOURCE_RUN_ID}" \
             --arg sourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
@@ -1027,8 +1570,13 @@ jobs:
             --arg verificationReceiptSha256 "${VERIFICATION_RECEIPT_SHA256}" \
             --arg productionAcceptanceReceiptName "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" \
             --arg productionAcceptanceReceiptSha256 "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" \
+            --arg registryPreflightSourceSha "${REGISTRY_PREFLIGHT_SOURCE_SHA}" \
+            --arg registryPreflightRunId "${REGISTRY_PREFLIGHT_RUN_ID}" \
+            --arg registryPreflightRunAttempt "${REGISTRY_PREFLIGHT_RUN_ATTEMPT}" \
+            --arg registryPreflightReceiptSha256 "${REGISTRY_PREFLIGHT_RECEIPT_SHA256}" \
+            --argjson registryBridgePreflight "${registry_bridge_preflight}" \
             --arg registryPrefix "$(if [ "${OPERATION}" = "persist-accepted-release" ]; then printf 'v1/releases/%s/%s/%s/' "${SOURCE_SHA}" "${SOURCE_RUN_ID}" "${ACCEPTANCE_RUN_ID}"; fi)" \
-            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPrefix: $registryPrefix}' \
+            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, callerWorkflowRef: $callerWorkflowRef, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPreflightSourceSha: $registryPreflightSourceSha, registryPreflightRunId: $registryPreflightRunId, registryPreflightRunAttempt: $registryPreflightRunAttempt, registryPreflightReceiptSha256: $registryPreflightReceiptSha256, registryBridgePreflight: $registryBridgePreflight, registryPrefix: $registryPrefix}' \
             > "${receipt_dir}/${receipt_name}"
           echo "operation_receipt_name=paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
           echo "operation_receipt_sha256=$(sha256sum "${receipt_dir}/${receipt_name}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"

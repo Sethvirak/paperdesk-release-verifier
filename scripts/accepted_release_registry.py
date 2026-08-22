@@ -27,6 +27,7 @@ import re
 import shutil
 import socketserver
 import ssl
+import stat
 import sys
 import tarfile
 import tempfile
@@ -71,6 +72,10 @@ PAPERDESK_REPOSITORY = "Sethvirak/MasterDataStructure"
 GITHUB_API_HOST = "api.github.com"
 REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
 REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
+WEBJOB_RUNNER_NAME = "run.sh"
+WEBJOB_SETTINGS_NAME = "settings.job"
+WEBJOB_RUNNER_SHA256 = "fa7b97be611afd6ff36b5698793f5869e8af48a4cdf570325c2baf0fbf23f9dc"
+WEBJOB_SETTINGS_SHA256 = "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e"
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -1575,9 +1580,24 @@ def persist_actions_artifact(
         fail("one-shot registry persistence failed at a closed boundary")
 
 
-def runtime_canary() -> dict[str, Any]:
+def runtime_canary(job_directory: Path | None = None) -> dict[str, Any]:
     helper = Path(__file__).resolve()
     regular_file(helper, "registry WebJob helper", 2 * 1024 * 1024)
+    job_directory = helper.parent if job_directory is None else job_directory.resolve()
+    if not job_directory.is_dir() or job_directory.is_symlink():
+        fail("registry WebJob directory must be one real directory")
+    runner = regular_file(job_directory / WEBJOB_RUNNER_NAME, "registry WebJob runner", 4096)
+    settings = regular_file(
+        job_directory / WEBJOB_SETTINGS_NAME, "registry WebJob settings", 4096
+    )
+    if os.name == "posix" and not runner.stat().st_mode & stat.S_IXUSR:
+        fail("registry WebJob runner must remain owner-executable")
+    runner_sha256 = sha256_file(runner)
+    settings_sha256 = sha256_file(settings)
+    if not hmac.compare_digest(runner_sha256, WEBJOB_RUNNER_SHA256):
+        fail("registry WebJob runner digest is invalid")
+    if not hmac.compare_digest(settings_sha256, WEBJOB_SETTINGS_SHA256):
+        fail("registry WebJob settings digest is invalid")
     if sys.version_info[:2] != (3, 12):
         fail("registry WebJob requires the reviewed Python 3.12 runtime")
     if sys.flags.isolated != 1:
@@ -1590,6 +1610,8 @@ def runtime_canary() -> dict[str, Any]:
         "python": "3.12",
         "isolated": True,
         "helperSha256": sha256_file(helper),
+        "runnerSha256": runner_sha256,
+        "settingsJobSha256": settings_sha256,
         "writerClientId": REGISTRY_WRITER_CLIENT_ID,
         "readerClientId": REGISTRY_READER_CLIENT_ID,
     }

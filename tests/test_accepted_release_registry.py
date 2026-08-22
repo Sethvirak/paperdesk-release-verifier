@@ -723,16 +723,19 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         self.assertNotIn("github-read-token-for-tests", str(caught.exception))
 
     def test_runtime_canary_requires_python_312_isolation_and_no_github_credential(self):
+        job_directory = ROOT / "webjobs" / "paperdesk-accepted-release-registry"
         with mock.patch.object(registry.sys, "version_info", (3, 12, 13)), mock.patch.object(
             registry.sys, "flags", mock.Mock(isolated=1)
         ), mock.patch.dict(registry.os.environ, {}, clear=True):
-            result = registry.runtime_canary()
+            result = registry.runtime_canary(job_directory)
         self.assertEqual(result["status"], "runtime-ready")
         self.assertEqual(result["python"], "3.12")
         self.assertTrue(result["isolated"])
         self.assertEqual(result["helperSha256"], registry.sha256_file(
             ROOT / "scripts" / "accepted_release_registry.py"
         ))
+        self.assertEqual(result["runnerSha256"], registry.WEBJOB_RUNNER_SHA256)
+        self.assertEqual(result["settingsJobSha256"], registry.WEBJOB_SETTINGS_SHA256)
 
         for version, isolated, environment in (
             ((3, 11, 9), 1, {}),
@@ -745,7 +748,25 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
                 registry.os.environ, environment, clear=True
             ):
                 with self.assertRaises(registry.RegistryError):
-                    registry.runtime_canary()
+                    registry.runtime_canary(job_directory)
+
+    def test_runtime_canary_rejects_tampered_runner_or_settings(self):
+        source = ROOT / "webjobs" / "paperdesk-accepted-release-registry"
+        for filename in (registry.WEBJOB_RUNNER_NAME, registry.WEBJOB_SETTINGS_NAME):
+            with self.subTest(filename=filename):
+                job_directory = self.root / f"tampered-{filename.replace('.', '-')}"
+                job_directory.mkdir()
+                for member in (registry.WEBJOB_RUNNER_NAME, registry.WEBJOB_SETTINGS_NAME):
+                    shutil.copy2(source / member, job_directory / member)
+                target = job_directory / filename
+                target.write_bytes(target.read_bytes() + b"#tampered\n")
+                with mock.patch.object(
+                    registry.sys, "version_info", (3, 12, 13)
+                ), mock.patch.object(
+                    registry.sys, "flags", mock.Mock(isolated=1)
+                ), mock.patch.dict(registry.os.environ, {}, clear=True):
+                    with self.assertRaises(registry.RegistryError):
+                        registry.runtime_canary(job_directory)
 
     def test_worm_policy_must_be_locked_and_exact(self):
         snapshot = self.root / "worm-snapshot.json"
