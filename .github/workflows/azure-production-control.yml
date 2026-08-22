@@ -699,7 +699,6 @@ jobs:
           cleanup_bridge() {
             set +e
             az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
-            az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null
             az webapp config access-restriction set \
               --name "${BRIDGE_APP_NAME}" \
               --resource-group "${BRIDGE_RESOURCE_GROUP}" \
@@ -919,7 +918,6 @@ jobs:
             cleanup_failed=1
           fi
           az webapp stop --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors || cleanup_failed=1
-          az webapp update --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --set publicNetworkAccess=Disabled --only-show-errors >/dev/null || cleanup_failed=1
           az webapp config access-restriction set \
             --name "${BRIDGE_APP_NAME}" \
             --resource-group "${BRIDGE_RESOURCE_GROUP}" \

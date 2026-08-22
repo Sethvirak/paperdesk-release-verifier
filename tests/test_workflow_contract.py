@@ -170,7 +170,7 @@ class WorkflowContractTests(unittest.TestCase):
             "v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/",
             "assert_bridge_stopped_and_sealed",
             "trap cleanup_bridge EXIT INT TERM",
-            "publicNetworkAccess=Disabled",
+            ".publicNetworkAccess",
             "properties.allow=false",
             "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
         ):
@@ -295,6 +295,8 @@ class WorkflowContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_URL", persistence_function)
         self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_HOST", persistence_function)
+        self.assertNotIn("az webapp update", persistence_step)
+        self.assertNotIn("az webapp update", seal_step)
         self.assertIn("cleanup_failed=0", seal_step)
         self.assertIn("site_id_valid=0", seal_step)
         self.assertIn('if [ "${site_id_valid}" -eq 1 ]; then', seal_step)
