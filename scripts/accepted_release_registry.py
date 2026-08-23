@@ -41,6 +41,7 @@ import zipfile
 
 ACCOUNT = "mdspdbak2608089c4e"
 CONTAINER = "paperdesk-accepted-releases"
+RESULT_CONTAINER = "paperdesk-registry-webjob-results"
 STORAGE_RESOURCE_GROUP = "rg-paperdesk-rollback-sea-20260808"
 BRIDGE_APP = "paperdesk-release-registry-bridge-9c4e0d0d"
 BRIDGE_RESOURCE_GROUP = "rg-master-data-structure-sea"
@@ -48,6 +49,7 @@ ENVIRONMENT = "production"
 BRIDGE_PATH = "/internal/v1/persist-accepted-release"
 SCHEMA = "paperdesk-accepted-release-registry-request-v1"
 MANIFEST_SCHEMA = "paperdesk-accepted-release-registry-manifest-v1"
+RESULT_ATTESTATION_SCHEMA = "paperdesk-registry-webjob-result-attestation-v1"
 MAX_REQUEST_BYTES = 1280 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_OTHER_FILE_BYTES = 64 * 1024 * 1024
@@ -60,6 +62,7 @@ MAX_GITHUB_TOKEN_CHARS = 4096
 MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS = 10
 MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS = 300
 MAX_ONE_SHOT_RESULT_BYTES = 4096
+MAX_RESULT_ATTESTATION_BYTES = 8192
 STORAGE_API_VERSION = "2023-11-03"
 
 ACTIONS_REQUEST_NAME = "paperdesk-accepted-release-request.tar.gz"
@@ -69,13 +72,28 @@ ACTIONS_ARTIFACT_ZIP_SHA256_ENV = "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256"
 ACTIONS_REQUEST_SHA256_ENV = "PAPERDESK_REGISTRY_REQUEST_SHA256"
 EXPECTED_PREFIX_ENV = "PAPERDESK_REGISTRY_EXPECTED_PREFIX"
 RBAC_CANARY_BLOB_ENV = "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB"
+RESULT_PURPOSE_ENV = "PAPERDESK_REGISTRY_RESULT_PURPOSE"
+RESULT_EXECUTION_ENV = "PAPERDESK_REGISTRY_RESULT_EXECUTION"
+RESULT_NONCE_ENV = "PAPERDESK_REGISTRY_RESULT_NONCE"
+RESULT_BLOB_ENV = "PAPERDESK_REGISTRY_RESULT_BLOB"
+RESULT_GITHUB_RUN_ID_ENV = "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID"
+RESULT_GITHUB_RUN_ATTEMPT_ENV = "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT"
+RESULT_CONTROL_WORKFLOW_SHA_ENV = "PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA"
+ATTESTED_HELPER_SHA256_ENV = "PAPERDESK_REGISTRY_ATTESTED_HELPER_SHA256"
+PACKAGE_SHA256_ENV = "PAPERDESK_REGISTRY_PACKAGE_SHA256"
 PAPERDESK_REPOSITORY = "Sethvirak/MasterDataStructure"
 GITHUB_API_HOST = "api.github.com"
 REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
 REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
+# The same two fixed helper identities are intended to receive separate, exact
+# add-only/read-only assignments at RESULT_CONTAINER.  The future immutable
+# bootstrap receipt must prove those assignments do not overlap or widen the
+# accepted-release container grants before this dormant source is activated.
+RESULT_WRITER_CLIENT_ID = REGISTRY_WRITER_CLIENT_ID
+RESULT_READER_CLIENT_ID = REGISTRY_READER_CLIENT_ID
 WEBJOB_RUNNER_NAME = "run.sh"
 WEBJOB_SETTINGS_NAME = "settings.job"
-WEBJOB_RUNNER_SHA256 = "61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50"
+WEBJOB_RUNNER_SHA256 = "47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b"
 WEBJOB_SETTINGS_SHA256 = "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e"
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -107,6 +125,19 @@ REGISTRY_PREFIX = re.compile(r"v1/releases/[0-9a-f]{40}/[1-9][0-9]*/[1-9][0-9]*/
 RBAC_CANARY_BLOB = re.compile(
     r"v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/"
     r"[0-9a-f]{32}(?:-reader-write-denied)?\.json"
+)
+RESULT_NONCE = re.compile(r"[0-9a-f]{32}")
+WEBJOB_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+RESULT_PURPOSES = {
+    "preflight-storage": ("storage-rbac-canary", frozenset({1})),
+    "preflight-runtime": ("runtime-canary", frozenset({1})),
+    "persistence-runtime": ("runtime-canary", frozenset({1})),
+    "persistence-result": ("persist-actions-artifact", frozenset({1, 2})),
+}
+RESULT_BLOB = re.compile(
+    r"v1/results/[1-9][0-9]*/[1-9][0-9]*/"
+    r"(?:preflight-storage|preflight-runtime|persistence-runtime|persistence-result)/"
+    r"[12]/[0-9a-f]{32}(?:-reader-write-denied)?\.json"
 )
 
 RELEASE_MATERIAL_PATHS = (
@@ -1310,6 +1341,16 @@ def rbac_canary_blob_url(blob_name: str) -> str:
     return f"/{CONTAINER}/{encoded}"
 
 
+def result_blob_url(blob_name: str) -> str:
+    if not isinstance(blob_name, str) or not RESULT_BLOB.fullmatch(blob_name):
+        fail("WebJob result blob is outside the fixed attestation prefix")
+    safe_relative(blob_name)
+    encoded = "/".join(
+        urllib.parse.quote(part, safe="") for part in PurePosixPath(blob_name).parts
+    )
+    return f"/{RESULT_CONTAINER}/{encoded}"
+
+
 class StorageClient:
     def __init__(self, writer_token: str, reader_token: str):
         self.writer_token = writer_token
@@ -1459,6 +1500,62 @@ class StorageClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def result_reader_get(
+        self, blob_name: str, maximum: int
+    ) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(result_blob_url(blob_name), self.reader_token, maximum)
+
+    def result_writer_get(
+        self, blob_name: str, maximum: int
+    ) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(result_blob_url(blob_name), self.writer_token, maximum)
+
+    def _put_result_bytes_create_only(
+        self, blob_name: str, token: str, body: bytes
+    ) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(prefix="paperdesk-webjob-result-", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(result_blob_url(blob_name), token, path, encoded_md5, True)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def result_writer_put_create_only(
+        self, blob_name: str, body: bytes
+    ) -> tuple[int, str]:
+        return self._put_result_bytes_create_only(blob_name, self.writer_token, body)
+
+    def result_writer_put_unconditional(
+        self, blob_name: str, body: bytes
+    ) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(
+            prefix="paperdesk-webjob-result-overwrite-", delete=False
+        ) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(
+                result_blob_url(blob_name),
+                self.writer_token,
+                path,
+                encoded_md5,
+                False,
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def result_reader_put_create_only(
+        self, blob_name: str, body: bytes
+    ) -> tuple[int, str]:
+        return self._put_result_bytes_create_only(blob_name, self.reader_token, body)
+
 def email_date() -> str:
     from email.utils import format_datetime
     return format_datetime(dt.datetime.now(dt.timezone.utc), usegmt=True)
@@ -1594,9 +1691,18 @@ def bounded_one_shot_result(
         or persisted.get("status") != "complete"
         or persisted.get("prefix") != expected_prefix
         or persisted.get("fileCount") != 19
-        or not isinstance(persisted.get("createdBlobCount"), int)
+        or type(persisted.get("createdBlobCount")) is not int
         or not 0 <= persisted["createdBlobCount"] <= 20
-        or persisted.get("overwriteNegative") not in {"passed", "not-run-completed"}
+        or not (
+            (
+                persisted["createdBlobCount"] == 0
+                and persisted.get("overwriteNegative") == "not-run-completed"
+            )
+            or (
+                1 <= persisted["createdBlobCount"] <= 20
+                and persisted.get("overwriteNegative") == "passed"
+            )
+        )
         or persisted.get("outOfPrefixNegative") != "passed"
     ):
         fail("one-shot registry persistence result is invalid")
@@ -1617,6 +1723,282 @@ def bounded_one_shot_result(
     if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
         fail("one-shot registry persistence result exceeds its bound")
     return document
+
+
+def validate_attested_helper_result(
+    operation: str, purpose: str, result: Any
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        fail("WebJob helper result is not one JSON object")
+    if operation == "storage-rbac-canary":
+        if (
+            purpose != "preflight-storage"
+            or set(result) != {
+                "schemaVersion", "status", "canaryBlob", "writerCreate",
+                "readerRead", "writerUnconditionalOverwriteDenied",
+                "writerReadDenied", "readerWriteDenied", "localPrefixGuard",
+            }
+            or type(result.get("schemaVersion")) is not int
+            or result.get("schemaVersion") != 1
+            or result.get("status") != "storage-rbac-ready"
+            or not isinstance(result.get("canaryBlob"), str)
+            or not RBAC_CANARY_BLOB.fullmatch(result["canaryBlob"])
+            or result.get("writerCreate") != "passed"
+            or result.get("readerRead") != "passed"
+            or result.get("writerUnconditionalOverwriteDenied") != "passed"
+            or result.get("writerReadDenied") != "passed"
+            or result.get("readerWriteDenied") != "passed"
+            or result.get("localPrefixGuard") != "passed-before-network"
+        ):
+            fail("storage RBAC helper result is not exact")
+    elif operation == "runtime-canary":
+        if (
+            purpose not in {"preflight-runtime", "persistence-runtime"}
+            or set(result) != {
+                "schemaVersion", "status", "python", "isolated", "helperSha256",
+                "runnerSha256", "settingsJobSha256", "writerClientId", "readerClientId",
+            }
+            or type(result.get("schemaVersion")) is not int
+            or result.get("schemaVersion") != 1
+            or result.get("status") != "runtime-ready"
+            or result.get("python") != "3.12"
+            or result.get("isolated") is not True
+            or digest(str(result.get("helperSha256", "")), "runtime helper digest")
+                != result["helperSha256"]
+            or result.get("runnerSha256") != WEBJOB_RUNNER_SHA256
+            or result.get("settingsJobSha256") != WEBJOB_SETTINGS_SHA256
+            or result.get("writerClientId") != REGISTRY_WRITER_CLIENT_ID
+            or result.get("readerClientId") != REGISTRY_READER_CLIENT_ID
+        ):
+            fail("runtime helper result is not exact")
+    elif operation == "persist-actions-artifact":
+        if (
+            purpose != "persistence-result"
+            or set(result) != {
+                "status", "prefix", "artifactZipSha256", "requestSha256",
+                "manifestSha256", "fileCount", "createdBlobCount",
+                "overwriteNegative", "outOfPrefixNegative",
+            }
+            or result.get("status") != "complete"
+            or not isinstance(result.get("prefix"), str)
+            or validate_registry_prefix(result["prefix"]) != result["prefix"]
+            or digest(str(result.get("artifactZipSha256", "")), "artifact ZIP digest")
+                != result["artifactZipSha256"]
+            or digest(str(result.get("requestSha256", "")), "request digest")
+                != result["requestSha256"]
+            or digest(str(result.get("manifestSha256", "")), "manifest digest")
+                != result["manifestSha256"]
+            or result.get("fileCount") != 19
+            or type(result.get("createdBlobCount")) is not int
+            or not 0 <= result["createdBlobCount"] <= 20
+            or not (
+                (
+                    result["createdBlobCount"] == 0
+                    and result.get("overwriteNegative") == "not-run-completed"
+                )
+                or (
+                    1 <= result["createdBlobCount"] <= 20
+                    and result.get("overwriteNegative") == "passed"
+                )
+            )
+            or result.get("outOfPrefixNegative") != "passed"
+        ):
+            fail("persistence helper result is not exact")
+    else:
+        fail("WebJob helper operation is not attestable")
+    return result
+
+
+def result_attestation_coordinates(
+    operation: str, environment: MutableMapping[str, str]
+) -> dict[str, Any]:
+    purpose = required_environment_value(environment, RESULT_PURPOSE_ENV, 32)
+    contract = RESULT_PURPOSES.get(purpose)
+    if contract is None or contract[0] != operation:
+        fail("WebJob result purpose does not match the fixed operation")
+    execution_text = positive(
+        required_environment_value(environment, RESULT_EXECUTION_ENV, 1),
+        "WebJob result execution",
+    )
+    execution = int(execution_text)
+    if execution not in contract[1]:
+        fail("WebJob result execution is outside the fixed purpose contract")
+    nonce = required_environment_value(environment, RESULT_NONCE_ENV, 32)
+    if not RESULT_NONCE.fullmatch(nonce):
+        fail("WebJob result nonce is invalid")
+    github_run_id = positive(
+        required_environment_value(environment, RESULT_GITHUB_RUN_ID_ENV, 20),
+        "result GitHub run ID",
+    )
+    github_run_attempt = positive(
+        required_environment_value(environment, RESULT_GITHUB_RUN_ATTEMPT_ENV, 10),
+        "result GitHub run attempt",
+    )
+    result_blob = required_environment_value(environment, RESULT_BLOB_ENV, 256)
+    expected_blob = (
+        f"v1/results/{github_run_id}/{github_run_attempt}/{purpose}/"
+        f"{execution}/{nonce}.json"
+    )
+    if not hmac.compare_digest(result_blob, expected_blob):
+        fail("WebJob result blob does not match its exact coordinates")
+    result_blob_url(result_blob)
+    webjobs_name = required_environment_value(environment, "WEBJOBS_NAME", 128)
+    webjobs_type = required_environment_value(environment, "WEBJOBS_TYPE", 32)
+    webjobs_run_id = required_environment_value(environment, "WEBJOBS_RUN_ID", 128)
+    if webjobs_name != "paperdesk-accepted-release-registry":
+        fail("WebJob result name is invalid")
+    if webjobs_type != "triggered":
+        fail("WebJob result type is invalid")
+    if not WEBJOB_RUN_ID.fullmatch(webjobs_run_id):
+        fail("WebJob result run ID is invalid")
+    control_workflow_sha = full_sha(
+        required_environment_value(environment, RESULT_CONTROL_WORKFLOW_SHA_ENV, 40),
+        "result control workflow SHA",
+    )
+    package_sha256 = digest(
+        required_environment_value(environment, PACKAGE_SHA256_ENV, 64),
+        "result package digest",
+    )
+    helper_sha256 = digest(
+        required_environment_value(environment, ATTESTED_HELPER_SHA256_ENV, 64),
+        "result helper digest",
+    )
+    if not hmac.compare_digest(helper_sha256, sha256_file(Path(__file__).resolve())):
+        fail("result helper digest does not match the executing helper")
+    for name in (
+        RESULT_PURPOSE_ENV,
+        RESULT_EXECUTION_ENV,
+        RESULT_NONCE_ENV,
+        RESULT_BLOB_ENV,
+        RESULT_GITHUB_RUN_ID_ENV,
+        RESULT_GITHUB_RUN_ATTEMPT_ENV,
+        RESULT_CONTROL_WORKFLOW_SHA_ENV,
+        PACKAGE_SHA256_ENV,
+        ATTESTED_HELPER_SHA256_ENV,
+    ):
+        environment.pop(name, None)
+    return {
+        "operation": operation,
+        "purpose": purpose,
+        "execution": execution,
+        "nonce": nonce,
+        "resultBlob": result_blob,
+        "githubRunId": github_run_id,
+        "githubRunAttempt": github_run_attempt,
+        "controlWorkflowSha": control_workflow_sha,
+        "packageSha256": package_sha256,
+        "helperSha256": helper_sha256,
+        "webJobsName": webjobs_name,
+        "webJobsType": webjobs_type,
+        "webJobsRunId": webjobs_run_id,
+    }
+
+
+def write_attested_webjob_result(
+    operation: str,
+    result: Any,
+    coordinates: dict[str, Any],
+    client: Any | None = None,
+) -> dict[str, Any]:
+    coordinate_fields = {
+        "operation", "purpose", "execution", "nonce", "resultBlob",
+        "githubRunId", "githubRunAttempt", "controlWorkflowSha",
+        "packageSha256", "helperSha256", "webJobsName", "webJobsType",
+        "webJobsRunId",
+    }
+    if (
+        not isinstance(coordinates, dict)
+        or set(coordinates) != coordinate_fields
+        or coordinates.get("operation") != operation
+    ):
+        fail("prevalidated WebJob result coordinates are not exact")
+    exact_result = validate_attested_helper_result(
+        operation, coordinates["purpose"], result
+    )
+    if operation == "storage-rbac-canary":
+        expected_canary_blob = (
+            "v1/canaries/storage-rbac/"
+            f'{coordinates["githubRunId"]}/{coordinates["githubRunAttempt"]}/'
+            f'{coordinates["nonce"]}.json'
+        )
+        if not hmac.compare_digest(exact_result["canaryBlob"], expected_canary_blob):
+            fail("storage RBAC canary is not bound to the result coordinates")
+    elif operation == "runtime-canary" and not hmac.compare_digest(
+        exact_result["helperSha256"], coordinates["helperSha256"]
+    ):
+        fail("runtime helper result digest differs from its result coordinates")
+    result_body = canonical_json(exact_result)
+    if len(result_body) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("WebJob helper result exceeds its attestation bound")
+    envelope = {
+        "schema": RESULT_ATTESTATION_SCHEMA,
+        "status": "attested",
+        **coordinates,
+        "resultSha256": hashlib.sha256(result_body).hexdigest(),
+        "result": exact_result,
+    }
+    envelope_body = canonical_json(envelope)
+    if len(envelope_body) > MAX_RESULT_ATTESTATION_BYTES:
+        fail("WebJob result attestation exceeds its bound")
+    if RESULT_WRITER_CLIENT_ID == RESULT_READER_CLIENT_ID:
+        fail("result writer and reader managed identities must be distinct")
+    if client is None:
+        client = StorageClient(
+            identity_token(RESULT_WRITER_CLIENT_ID),
+            identity_token(RESULT_READER_CLIENT_ID),
+        )
+    result_blob = coordinates["resultBlob"]
+    create_status, create_code = client.result_writer_put_create_only(
+        result_blob, envelope_body
+    )
+    if create_status != 201 or create_code:
+        fail("create-only WebJob result attestation failed")
+    read_status, read_body, read_headers, read_code = client.result_reader_get(
+        result_blob, len(envelope_body)
+    )
+    if read_status != 200 or read_code or read_body != envelope_body:
+        fail("WebJob result reader exact-byte readback failed")
+    expected_md5 = base64.b64encode(
+        hashlib.md5(envelope_body, usedforsecurity=False).digest()
+    ).decode("ascii")
+    if read_headers.get("content-md5") != expected_md5:
+        fail("WebJob result reader Content-MD5 differs")
+    overwrite_status, overwrite_code = client.result_writer_put_unconditional(
+        result_blob, envelope_body
+    )
+    if (overwrite_status, overwrite_code) not in {
+        (403, "AuthorizationPermissionMismatch"),
+        (403, "UnauthorizedBlobOverwrite"),
+        (409, "BlobImmutableDueToPolicy"),
+    }:
+        fail("WebJob result writer unconditional overwrite was not denied")
+    writer_read_status, _, _, writer_read_code = client.result_writer_get(
+        result_blob, MAX_RESULT_ATTESTATION_BYTES
+    )
+    if (writer_read_status, writer_read_code) != (
+        403, "AuthorizationPermissionMismatch"
+    ):
+        fail("WebJob result writer unexpectedly has read access")
+    reader_probe = result_blob[:-5] + "-reader-write-denied.json"
+    reader_write_status, reader_write_code = client.result_reader_put_create_only(
+        reader_probe, envelope_body
+    )
+    if (reader_write_status, reader_write_code) != (
+        403, "AuthorizationPermissionMismatch"
+    ):
+        fail("WebJob result reader unexpectedly has create access")
+    return envelope
+
+
+def attest_webjob_result(
+    operation: str,
+    result: Any,
+    environment: MutableMapping[str, str] | None = None,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    environment = os.environ if environment is None else environment
+    coordinates = result_attestation_coordinates(operation, environment)
+    return write_attested_webjob_result(operation, result, coordinates, client)
 
 
 def persist_actions_artifact(
@@ -1935,11 +2317,29 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "persist-actions-artifact":
-            print(json.dumps(persist_actions_artifact(), sort_keys=True, separators=(",", ":")))
+            coordinates = result_attestation_coordinates(args.command, os.environ)
+            result = persist_actions_artifact()
+            print(json.dumps(
+                write_attested_webjob_result(args.command, result, coordinates),
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
         elif args.command == "runtime-canary":
-            print(json.dumps(runtime_canary(), sort_keys=True, separators=(",", ":")))
+            coordinates = result_attestation_coordinates(args.command, os.environ)
+            result = runtime_canary()
+            print(json.dumps(
+                write_attested_webjob_result(args.command, result, coordinates),
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
         elif args.command == "storage-rbac-canary":
-            print(json.dumps(storage_rbac_canary(), sort_keys=True, separators=(",", ":")))
+            coordinates = result_attestation_coordinates(args.command, os.environ)
+            result = storage_rbac_canary()
+            print(json.dumps(
+                write_attested_webjob_result(args.command, result, coordinates),
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
         elif args.command == "extract-actions-artifact":
             safe_extract_actions_zip(Path(args.archive).resolve(), Path(args.output).resolve())
             print("Actions artifact extracted through bounded safe extraction.")
