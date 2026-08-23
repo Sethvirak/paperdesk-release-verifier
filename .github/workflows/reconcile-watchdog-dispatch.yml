@@ -1,0 +1,83 @@
+name: Reconcile held PaperDesk watchdog dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      claim_id:
+        description: Provider-issued UUID for the held attempted dispatch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paperdesk-watchdog-manual-reconciliation
+  cancel-in-progress: false
+
+jobs:
+  reconcile_dispatch:
+    name: Hold or repair one known attempted dispatch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: paperdesk-watchdog-reconciliation
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact reconciliation workflow source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Verify exact dormant reconciliation client source
+        env:
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_WORKFLOW_SHA}"
+          test "${GITHUB_REPOSITORY}" = "Sethvirak/paperdesk-release-verifier"
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          [[ "${CLAIM_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+          echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
+          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          python3 scripts/watchdog_evidence.py validate-config
+
+      - name: Source-dormant hard stop before protected reconciliation OIDC
+        run: |
+          set -euo pipefail
+          echo 'Manual reconciliation activation is blocked until the provider package, three workflow SHAs, and protected environment reviewers are independently approved and live-canaried.' >&2
+          exit 1
+
+      - name: Reconcile without releasing any attempted state
+        env:
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "${RUNNER_TEMP}/paperdesk-watchdog-reconciliation"
+          python3 scripts/watchdog_evidence.py reconcile \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog-reconciliation' \
+            --event-name 'workflow_dispatch' \
+            --claim-id "${CLAIM_ID}" \
+            --mode manual \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-reconciliation/result.json"
+
+      - name: Retain non-secret reconciliation projection
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paperdesk-watchdog-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-watchdog-reconciliation
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

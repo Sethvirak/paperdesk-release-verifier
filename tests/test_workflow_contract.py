@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import re
 import unittest
 
@@ -7,6 +8,8 @@ README = ROOT / "README.md"
 CONTROL = ROOT / ".github" / "workflows" / "azure-production-control.yml"
 VERIFY = ROOT / ".github" / "workflows" / "verify-candidate.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "accepted-release-deadline-watchdog.yml"
+BASELINE = ROOT / ".github" / "workflows" / "initialize-watchdog-rollback-baseline.yml"
+RECONCILIATION = ROOT / ".github" / "workflows" / "reconcile-watchdog-dispatch.yml"
 
 MAPPING_ENTRY = re.compile(
     r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+):(?:[ ]*(?P<value>.*))?$"
@@ -104,7 +107,7 @@ class WorkflowContractTests(unittest.TestCase):
         return source
 
     def test_all_actions_are_full_sha_pinned(self):
-        for path in (CONTROL, VERIFY, WATCHDOG):
+        for path in (CONTROL, VERIFY, WATCHDOG, BASELINE, RECONCILIATION):
             source = self.workflow(path)
             actions = re.findall(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", source, flags=re.M)
             self.assertTrue(actions, path)
@@ -786,6 +789,132 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('test "${SOURCE_SHA}" = "${CALLER_SHA}"', source)
         self.assertIn('test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"', source)
         self.assertIn('test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"', source)
+
+    def test_watchdog_v2_workflows_are_source_dormant_before_any_oidc_client_call(self):
+        cases = (
+            (
+                WATCHDOG,
+                ("jobs", "enforce_deadline", "permissions"),
+                "environment: paperdesk-watchdog",
+                "Source-dormant hard stop before GitHub OIDC or provider calls",
+                "Fetch exact canonical provider state with transient OIDC",
+            ),
+            (
+                BASELINE,
+                ("jobs", "initialize_baseline", "permissions"),
+                "environment: paperdesk-watchdog-baseline",
+                "Source-dormant hard stop before baseline OIDC or state creation",
+                "Initialize provider state from the preexisting reviewed WORM receipt",
+            ),
+            (
+                RECONCILIATION,
+                ("jobs", "reconcile_dispatch", "permissions"),
+                "environment: paperdesk-watchdog-reconciliation",
+                "Source-dormant hard stop before protected reconciliation OIDC",
+                "Reconcile without releasing any attempted state",
+            ),
+        )
+        for path, permissions_path, environment, hard_stop_name, protected_name in cases:
+            with self.subTest(path=path.name):
+                source = self.workflow(path)
+                self.assertEqual(
+                    direct_mapping(source, permissions_path, require_scalar_values=True),
+                    {"contents": "read", "id-token": "write"},
+                )
+                self.assertIn(environment, source)
+                self.assertIn("ref: ${{ github.workflow_sha }}", source)
+                self.assertIn("persist-credentials: false", source)
+                self.assertIn("clean: true", source)
+                hard_stop = workflow_step(source, hard_stop_name)
+                self.assertIn("exit 1", hard_stop)
+                self.assertLess(source.index(hard_stop_name), source.index(protected_name))
+                for forbidden in (
+                    "secrets.", "github.token", "GH_TOKEN", "PAPERDESK_WATCHDOG_STATE_TOKEN",
+                    "azure/login@", "gh api", "return_run_details",
+                ):
+                    self.assertNotIn(forbidden, source)
+
+    def test_watchdog_v2_workflow_sources_are_exact_hash_bound(self):
+        expected_paths = {
+            WATCHDOG: {
+                "scripts/check_deadline.py",
+                "scripts/watchdog_evidence.py",
+                "scripts/watchdog_contract.py",
+                "provider/watchdog_state_provider.py",
+                "provider/accepted_release_manifest.py",
+                "contracts/production_release_watchdog_contract.json",
+            },
+            BASELINE: {
+                "scripts/watchdog_evidence.py",
+                "provider/watchdog_state_provider.py",
+                "contracts/production_release_watchdog_contract.json",
+            },
+            RECONCILIATION: {
+                "scripts/watchdog_evidence.py",
+                "provider/watchdog_state_provider.py",
+            },
+        }
+        for workflow_path, required in expected_paths.items():
+            with self.subTest(workflow=workflow_path.name):
+                source = self.workflow(workflow_path)
+                bindings = dict(re.findall(
+                    r"echo '([0-9a-f]{64})  ([A-Za-z0-9_./-]+)' \| sha256sum --check --strict",
+                    source,
+                ))
+                self.assertEqual(set(bindings.values()), required)
+                by_path = {path: digest for digest, path in bindings.items()}
+                for relative in required:
+                    actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+                    self.assertEqual(by_path[relative], actual, relative)
+
+    def test_every_byte_digest_bound_source_forces_lf_checkout_bytes(self):
+        attributes = {
+            line
+            for line in (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+            if line
+        }
+        self.assertEqual(attributes, {
+            "webjobs/paperdesk-accepted-release-registry/run.sh text eol=lf",
+            "webjobs/paperdesk-accepted-release-registry/settings.job text eol=lf",
+            "scripts/check_deadline.py text eol=lf",
+            "scripts/watchdog_contract.py text eol=lf",
+            "scripts/watchdog_evidence.py text eol=lf",
+            "provider/accepted_release_manifest.py text eol=lf",
+            "provider/watchdog_state_provider.py text eol=lf",
+            "provider/startup.sh text eol=lf",
+            "contracts/production_release_watchdog_contract.json text eol=lf",
+        })
+
+    def test_watchdog_v2_lifecycle_uses_provider_only_dispatch_and_fail_closed_reconciliation(self):
+        source = self.workflow(WATCHDOG)
+        for required in (
+            "accepted-release-deadline-v2",
+            "scripts/watchdog_evidence.py fetch-state",
+            "scripts/check_deadline.py",
+            "scripts/watchdog_evidence.py claim",
+            "scripts/watchdog_evidence.py provider-dispatch",
+            "rollback-claim-expired-unattempted",
+            "--mode automatic",
+            "HTTP 200 run binding",
+            "mergedMutatingCommitSha is null",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn("actions/workflows/", source)
+        self.assertNotIn("manual-azure-production-rollback.yml", source)
+
+        baseline_source = self.workflow(BASELINE)
+        for required in (
+            "evidence/watchdog-initial-rollback-baseline.json",
+            "90-day WORM receipt",
+            "PAPERDESK_WATCHDOG_BASELINE_PROJECTION_SHA256",
+            "scripts/watchdog_evidence.py initialize-baseline",
+        ):
+            self.assertIn(required, baseline_source)
+
+        reconciliation_source = self.workflow(RECONCILIATION)
+        self.assertIn("--mode manual", reconciliation_source)
+        self.assertIn("Reconcile without releasing any attempted state", reconciliation_source)
+        self.assertNotIn("--mode automatic", reconciliation_source)
 
 
 if __name__ == "__main__":
