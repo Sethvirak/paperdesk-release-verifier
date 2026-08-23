@@ -1,0 +1,105 @@
+name: Initialize reviewed PaperDesk watchdog rollback baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_receipt_sha256:
+        description: Independently reviewed SHA-256 of the exact canonical baseline projection
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paperdesk-watchdog-initial-baseline
+  cancel-in-progress: false
+
+jobs:
+  initialize_baseline:
+    name: Create one initial state only from reviewed WORM evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: paperdesk-watchdog-baseline
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact baseline workflow source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Verify exact dormant baseline client source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_WORKFLOW_SHA}"
+          test "${GITHUB_REPOSITORY}" = "Sethvirak/paperdesk-release-verifier"
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
+          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          echo 'cfe32a359a2dd77e6656c9dcabc1c7260d98f9e20196a1d8dd14268c811d96fd  contracts/production_release_watchdog_contract.json' | sha256sum --check --strict
+          python3 scripts/watchdog_evidence.py validate-config
+
+      - name: Source-dormant hard stop before baseline OIDC or state creation
+        run: |
+          set -euo pipefail
+          echo 'Initial baseline activation is blocked until evidence/watchdog-initial-rollback-baseline.json and its 90-day WORM receipt are independently reviewed and added by a separate commit.' >&2
+          exit 1
+
+      - name: Verify exact independently reviewed baseline projection
+        env:
+          EXPECTED_BASELINE_SHA256: ${{ inputs.baseline_receipt_sha256 }}
+          REVIEWED_BASELINE_SHA256: ${{ vars.PAPERDESK_WATCHDOG_BASELINE_PROJECTION_SHA256 }}
+        run: |
+          set -euo pipefail
+          readonly baseline='evidence/watchdog-initial-rollback-baseline.json'
+          test -f "${baseline}"
+          test ! -L "${baseline}"
+          test "${#EXPECTED_BASELINE_SHA256}" -eq 64
+          test "${EXPECTED_BASELINE_SHA256}" = "${REVIEWED_BASELINE_SHA256}"
+          test "$(sha256sum "${baseline}" | cut -d ' ' -f 1)" = "${EXPECTED_BASELINE_SHA256}"
+          python3 - "${baseline}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from scripts import watchdog_evidence
+          path = Path(sys.argv[1])
+          raw = path.read_bytes()
+          document = json.loads(raw.decode("utf-8"))
+          if raw != watchdog_evidence.canonical_json(document):
+              raise SystemExit("baseline must be canonical JSON")
+          watchdog_evidence.validate_initial_baseline(document)
+          PY
+
+      - name: Initialize provider state from the preexisting reviewed WORM receipt
+        id: initialize
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "${RUNNER_TEMP}/paperdesk-watchdog-baseline"
+          python3 scripts/watchdog_evidence.py initialize-baseline \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog-baseline' \
+            --event-name 'workflow_dispatch' \
+            --baseline 'evidence/watchdog-initial-rollback-baseline.json' \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-baseline/result.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Retain non-secret baseline initialization projection
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paperdesk-watchdog-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-watchdog-baseline
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
