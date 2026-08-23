@@ -227,6 +227,39 @@ class FakeRbacCanaryStorage:
         return 403, "UnauthorizedBlobOverwrite"
 
 
+class FakeResultAttestationStorage:
+    def __init__(self):
+        self.blobs = {}
+        self.events = []
+
+    def result_writer_put_create_only(self, blob_name, body):
+        self.events.append(("writer-put", blob_name))
+        if blob_name in self.blobs:
+            return 409, "BlobAlreadyExists"
+        self.blobs[blob_name] = body
+        return 201, ""
+
+    def result_writer_put_unconditional(self, blob_name, body):
+        self.events.append(("writer-overwrite", blob_name))
+        return 403, "AuthorizationPermissionMismatch"
+
+    def result_reader_get(self, blob_name, maximum):
+        self.events.append(("reader-get", blob_name))
+        body = self.blobs[blob_name]
+        content_md5 = base64.b64encode(
+            hashlib.md5(body, usedforsecurity=False).digest()
+        ).decode("ascii")
+        return 200, body[:maximum], {"content-md5": content_md5}, ""
+
+    def result_writer_get(self, blob_name, maximum):
+        self.events.append(("writer-get", blob_name))
+        return 403, b"", {}, "AuthorizationPermissionMismatch"
+
+    def result_reader_put_create_only(self, blob_name, body):
+        self.events.append(("reader-put", blob_name))
+        return 403, "AuthorizationPermissionMismatch"
+
+
 class FakeDownloadResponse:
     def __init__(self, body, url, status=200, headers=None):
         self.body = io.BytesIO(body)
@@ -309,6 +342,76 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
             FakeDownloadResponse(b"", api_url, status=302, headers={"Location": signed_url}),
             FakeDownloadResponse(artifact_body, signed_url),
         ])
+
+    def result_environment(self, purpose, execution=1, operation=None):
+        del operation
+        nonce = "0123456789abcdef0123456789abcdef"
+        run_id = "61001"
+        run_attempt = "3"
+        return {
+            registry.RESULT_PURPOSE_ENV: purpose,
+            registry.RESULT_EXECUTION_ENV: str(execution),
+            registry.RESULT_NONCE_ENV: nonce,
+            registry.RESULT_BLOB_ENV: (
+                f"v1/results/{run_id}/{run_attempt}/{purpose}/{execution}/{nonce}.json"
+            ),
+            registry.RESULT_GITHUB_RUN_ID_ENV: run_id,
+            registry.RESULT_GITHUB_RUN_ATTEMPT_ENV: run_attempt,
+            registry.RESULT_CONTROL_WORKFLOW_SHA_ENV: "c" * 40,
+            registry.PACKAGE_SHA256_ENV: "d" * 64,
+            registry.ATTESTED_HELPER_SHA256_ENV: registry.sha256_file(
+                ROOT / "scripts" / "accepted_release_registry.py"
+            ),
+            "WEBJOBS_NAME": "paperdesk-accepted-release-registry",
+            "WEBJOBS_TYPE": "triggered",
+            "WEBJOBS_RUN_ID": "202608231234567890",
+        }
+
+    def runtime_result(self):
+        return {
+            "schemaVersion": 1,
+            "status": "runtime-ready",
+            "python": "3.12",
+            "isolated": True,
+            "helperSha256": registry.sha256_file(
+                ROOT / "scripts" / "accepted_release_registry.py"
+            ),
+            "runnerSha256": registry.WEBJOB_RUNNER_SHA256,
+            "settingsJobSha256": registry.WEBJOB_SETTINGS_SHA256,
+            "writerClientId": registry.REGISTRY_WRITER_CLIENT_ID,
+            "readerClientId": registry.REGISTRY_READER_CLIENT_ID,
+        }
+
+    @staticmethod
+    def storage_result():
+        return {
+            "schemaVersion": 1,
+            "status": "storage-rbac-ready",
+            "canaryBlob": (
+                "v1/canaries/storage-rbac/61001/3/"
+                "0123456789abcdef0123456789abcdef.json"
+            ),
+            "writerCreate": "passed",
+            "readerRead": "passed",
+            "writerUnconditionalOverwriteDenied": "passed",
+            "writerReadDenied": "passed",
+            "readerWriteDenied": "passed",
+            "localPrefixGuard": "passed-before-network",
+        }
+
+    @staticmethod
+    def persistence_result(created=20, overwrite="passed"):
+        return {
+            "status": "complete",
+            "prefix": f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/",
+            "artifactZipSha256": "1" * 64,
+            "requestSha256": "2" * 64,
+            "manifestSha256": "3" * 64,
+            "fileCount": 19,
+            "createdBlobCount": created,
+            "overwriteNegative": overwrite,
+            "outOfPrefixNegative": "passed",
+        }
 
     def test_request_is_deterministic_and_preserves_exact_nineteen_files(self):
         first, first_result = self.build("first.tar.gz")
@@ -864,6 +967,289 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
                     "ffeeddccbbaa99887766554433221100.json",
                     64 * 1024,
                 )
+
+    def test_result_attestation_covers_four_classes_and_five_exact_executions(self):
+        contracts = (
+            ("storage-rbac-canary", "preflight-storage", 1, self.storage_result()),
+            ("runtime-canary", "preflight-runtime", 1, self.runtime_result()),
+            ("runtime-canary", "persistence-runtime", 1, self.runtime_result()),
+            (
+                "persist-actions-artifact",
+                "persistence-result",
+                1,
+                self.persistence_result(),
+            ),
+            (
+                "persist-actions-artifact",
+                "persistence-result",
+                2,
+                self.persistence_result(0, "not-run-completed"),
+            ),
+        )
+        self.assertEqual(len(registry.RESULT_PURPOSES), 4)
+        for operation, purpose, execution, helper_result in contracts:
+            with self.subTest(purpose=purpose, execution=execution):
+                environment = self.result_environment(purpose, execution)
+                storage = FakeResultAttestationStorage()
+                envelope = registry.attest_webjob_result(
+                    operation, helper_result, environment, storage
+                )
+                expected_blob = (
+                    f"v1/results/61001/3/{purpose}/{execution}/"
+                    "0123456789abcdef0123456789abcdef.json"
+                )
+                self.assertEqual(envelope["schema"], registry.RESULT_ATTESTATION_SCHEMA)
+                self.assertEqual(envelope["status"], "attested")
+                self.assertEqual(envelope["operation"], operation)
+                self.assertEqual(envelope["purpose"], purpose)
+                self.assertEqual(envelope["execution"], execution)
+                self.assertEqual(envelope["resultBlob"], expected_blob)
+                self.assertEqual(envelope["webJobsRunId"], "202608231234567890")
+                self.assertEqual(envelope["controlWorkflowSha"], "c" * 40)
+                self.assertEqual(envelope["packageSha256"], "d" * 64)
+                self.assertEqual(
+                    envelope["helperSha256"],
+                    registry.sha256_file(ROOT / "scripts" / "accepted_release_registry.py"),
+                )
+                self.assertEqual(
+                    envelope["resultSha256"],
+                    hashlib.sha256(registry.canonical_json(helper_result)).hexdigest(),
+                )
+                self.assertEqual(
+                    storage.blobs[expected_blob], registry.canonical_json(envelope)
+                )
+                self.assertEqual(
+                    [event[0] for event in storage.events],
+                    [
+                        "writer-put",
+                        "reader-get",
+                        "writer-overwrite",
+                        "writer-get",
+                        "reader-put",
+                    ],
+                )
+                for consumed in (
+                    registry.RESULT_PURPOSE_ENV,
+                    registry.RESULT_EXECUTION_ENV,
+                    registry.RESULT_NONCE_ENV,
+                    registry.RESULT_BLOB_ENV,
+                    registry.RESULT_GITHUB_RUN_ID_ENV,
+                    registry.RESULT_GITHUB_RUN_ATTEMPT_ENV,
+                    registry.RESULT_CONTROL_WORKFLOW_SHA_ENV,
+                    registry.PACKAGE_SHA256_ENV,
+                    registry.ATTESTED_HELPER_SHA256_ENV,
+                ):
+                    self.assertNotIn(consumed, environment)
+
+    def test_result_attestation_rejects_coordinate_and_privilege_drift(self):
+        invalid = []
+        wrong_purpose = self.result_environment("preflight-runtime")
+        invalid.append(("storage-rbac-canary", self.storage_result(), wrong_purpose))
+        wrong_execution = self.result_environment("persistence-result", 2)
+        wrong_execution[registry.RESULT_EXECUTION_ENV] = "3"
+        invalid.append((
+            "persist-actions-artifact", self.persistence_result(), wrong_execution
+        ))
+        wrong_blob = self.result_environment("preflight-runtime")
+        wrong_blob[registry.RESULT_BLOB_ENV] = wrong_blob[registry.RESULT_BLOB_ENV].replace(
+            "/1/", "/2/", 1
+        )
+        invalid.append(("runtime-canary", self.runtime_result(), wrong_blob))
+        wrong_run = self.result_environment("preflight-runtime")
+        wrong_run["WEBJOBS_RUN_ID"] = "contains/slash"
+        invalid.append(("runtime-canary", self.runtime_result(), wrong_run))
+        wrong_control_sha = self.result_environment("preflight-runtime")
+        wrong_control_sha[registry.RESULT_CONTROL_WORKFLOW_SHA_ENV] = "C" * 40
+        invalid.append(("runtime-canary", self.runtime_result(), wrong_control_sha))
+        wrong_helper = self.result_environment("preflight-runtime")
+        wrong_helper[registry.ATTESTED_HELPER_SHA256_ENV] = "0" * 64
+        invalid.append(("runtime-canary", self.runtime_result(), wrong_helper))
+        wrong_runtime_result = self.runtime_result()
+        wrong_runtime_result["helperSha256"] = "1" * 64
+        invalid.append((
+            "runtime-canary",
+            wrong_runtime_result,
+            self.result_environment("preflight-runtime"),
+        ))
+        wrong_canary_result = self.storage_result()
+        wrong_canary_result["canaryBlob"] = wrong_canary_result["canaryBlob"].replace(
+            "/61001/3/", "/61002/3/"
+        )
+        invalid.append((
+            "storage-rbac-canary",
+            wrong_canary_result,
+            self.result_environment("preflight-storage"),
+        ))
+        for operation, helper_result, environment in invalid:
+            storage = FakeResultAttestationStorage()
+            with self.subTest(operation=operation, environment=environment), self.assertRaises(
+                registry.RegistryError
+            ):
+                registry.attest_webjob_result(
+                    operation, helper_result, environment, storage
+                )
+            self.assertEqual(storage.events, [])
+
+        class OverprivilegedWriter(FakeResultAttestationStorage):
+            def result_writer_get(self, blob_name, maximum):
+                return 200, self.blobs[blob_name], {}, ""
+
+        with self.assertRaises(registry.RegistryError):
+            registry.attest_webjob_result(
+                "runtime-canary",
+                self.runtime_result(),
+                self.result_environment("preflight-runtime"),
+                OverprivilegedWriter(),
+            )
+
+        class OverprivilegedReader(FakeResultAttestationStorage):
+            def result_reader_put_create_only(self, blob_name, body):
+                return 201, ""
+
+        with self.assertRaises(registry.RegistryError):
+            registry.attest_webjob_result(
+                "runtime-canary",
+                self.runtime_result(),
+                self.result_environment("preflight-runtime"),
+                OverprivilegedReader(),
+            )
+
+        class OverprivilegedOverwrite(FakeResultAttestationStorage):
+            def result_writer_put_unconditional(self, blob_name, body):
+                self.blobs[blob_name] = body
+                return 201, ""
+
+        with self.assertRaises(registry.RegistryError):
+            registry.attest_webjob_result(
+                "runtime-canary",
+                self.runtime_result(),
+                self.result_environment("preflight-runtime"),
+                OverprivilegedOverwrite(),
+            )
+
+    def test_result_attestation_rejects_non_exact_bytes_md5_conflict_and_results(self):
+        class ChangedReadback(FakeResultAttestationStorage):
+            def result_reader_get(self, blob_name, maximum):
+                status, body, headers, code = super().result_reader_get(
+                    blob_name, maximum
+                )
+                return status, body[:-1] + b" ", headers, code
+
+        class MissingMd5(FakeResultAttestationStorage):
+            def result_reader_get(self, blob_name, maximum):
+                status, body, _, code = super().result_reader_get(blob_name, maximum)
+                return status, body, {}, code
+
+        for storage in (ChangedReadback(), MissingMd5()):
+            with self.subTest(storage=type(storage).__name__), self.assertRaises(
+                registry.RegistryError
+            ):
+                registry.attest_webjob_result(
+                    "runtime-canary",
+                    self.runtime_result(),
+                    self.result_environment("preflight-runtime"),
+                    storage,
+                )
+
+        conflict = FakeResultAttestationStorage()
+        environment = self.result_environment("preflight-runtime")
+        conflict.blobs[environment[registry.RESULT_BLOB_ENV]] = b"occupied\n"
+        with self.assertRaises(registry.RegistryError):
+            registry.attest_webjob_result(
+                "runtime-canary", self.runtime_result(), environment, conflict
+            )
+        self.assertEqual([event[0] for event in conflict.events], ["writer-put"])
+
+        invalid_results = []
+        extra = self.runtime_result()
+        extra["unexpected"] = "secret-marker"
+        invalid_results.append((
+            "runtime-canary", "preflight-runtime", extra
+        ))
+        boolean_schema = self.runtime_result()
+        boolean_schema["schemaVersion"] = True
+        invalid_results.append((
+            "runtime-canary", "preflight-runtime", boolean_schema
+        ))
+        boolean_count = self.persistence_result()
+        boolean_count["createdBlobCount"] = True
+        invalid_results.append((
+            "persist-actions-artifact", "persistence-result", boolean_count
+        ))
+        impossible_pair = self.persistence_result(0, "passed")
+        invalid_results.append((
+            "persist-actions-artifact", "persistence-result", impossible_pair
+        ))
+        for operation, purpose, helper_result in invalid_results:
+            storage = FakeResultAttestationStorage()
+            with self.subTest(operation=operation, result=helper_result), self.assertRaises(
+                registry.RegistryError
+            ):
+                registry.attest_webjob_result(
+                    operation,
+                    helper_result,
+                    self.result_environment(purpose),
+                    storage,
+                )
+            self.assertEqual(storage.events, [])
+
+    def test_result_attestation_does_not_serialize_unrelated_environment_values(self):
+        environment = self.result_environment("preflight-runtime")
+        environment["UNRELATED_SECRET"] = "must-not-enter-attestation"
+        storage = FakeResultAttestationStorage()
+        envelope = registry.attest_webjob_result(
+            "runtime-canary", self.runtime_result(), environment, storage
+        )
+        body = storage.blobs[envelope["resultBlob"]]
+        self.assertNotIn(b"must-not-enter-attestation", body)
+        self.assertNotIn("UNRELATED_SECRET", envelope)
+
+    def test_result_attestation_writer_rejects_non_exact_prevalidated_coordinates(self):
+        environment = self.result_environment("preflight-runtime")
+        coordinates = registry.result_attestation_coordinates(
+            "runtime-canary", environment
+        )
+        coordinates["unexpected"] = "must-not-be-serialized"
+        storage = FakeResultAttestationStorage()
+        with self.assertRaises(registry.RegistryError):
+            registry.write_attested_webjob_result(
+                "runtime-canary", self.runtime_result(), coordinates, storage
+            )
+        self.assertEqual(storage.events, [])
+
+    def test_main_validates_result_coordinates_before_any_operation_and_never_attests_failure(self):
+        operations = (
+            "runtime-canary",
+            "storage-rbac-canary",
+            "persist-actions-artifact",
+        )
+        for operation in operations:
+            target = operation.replace("-", "_")
+            with self.subTest(operation=operation), mock.patch(
+                "sys.argv", ["accepted_release_registry.py", operation]
+            ), mock.patch.object(
+                registry,
+                "result_attestation_coordinates",
+                side_effect=registry.RegistryError("invalid result coordinates"),
+            ), mock.patch.object(
+                registry, target
+            ) as operation_call:
+                self.assertEqual(registry.main(), 1)
+                operation_call.assert_not_called()
+
+        with mock.patch(
+            "sys.argv", ["accepted_release_registry.py", "runtime-canary"]
+        ), mock.patch.object(
+            registry, "result_attestation_coordinates", return_value={}
+        ), mock.patch.object(
+            registry,
+            "runtime_canary",
+            side_effect=registry.RegistryError("runtime failed"),
+        ), mock.patch.object(
+            registry, "write_attested_webjob_result"
+        ) as writer:
+            self.assertEqual(registry.main(), 1)
+            writer.assert_not_called()
 
     def test_runtime_canary_rejects_tampered_runner_or_settings(self):
         source = ROOT / "webjobs" / "paperdesk-accepted-release-registry"

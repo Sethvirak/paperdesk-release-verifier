@@ -567,9 +567,9 @@ jobs:
         if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         env:
           CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
-          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
-          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
-          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
+          EXPECTED_HELPER_SHA256: 889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050
+          EXPECTED_PACKAGE_SHA256: 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8
+          EXPECTED_RUNNER_SHA256: 47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
         run: |
           set -euo pipefail
@@ -686,9 +686,9 @@ jobs:
             and .package == {
               sha256: $packageSha256,
               inventory: [
-                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh", mode: "0755", size: 766, sha256: $runnerSha256},
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh", mode: "0755", size: 970, sha256: $runnerSha256},
                 {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/settings.job", mode: "0644", size: 88, sha256: $settingsSha256},
-                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/accepted_release_registry.py", mode: "0644", size: 88983, sha256: $helperSha256}
+                {path: "App_Data/jobs/triggered/paperdesk-accepted-release-registry/accepted_release_registry.py", mode: "0644", size: 106227, sha256: $helperSha256}
               ]
             }
             and .webJob == {name: "paperdesk-accepted-release-registry", apiVersion: "2025-05-01", runCommand: "run.sh"}
@@ -1032,9 +1032,9 @@ jobs:
           BOOTSTRAP_RECEIPT_SHA256: ${{ steps.registry_bootstrap.outputs.receipt_sha256 }}
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
-          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
-          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
+          EXPECTED_HELPER_SHA256: 889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050
+          EXPECTED_PACKAGE_SHA256: 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8
+          EXPECTED_RUNNER_SHA256: 47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
           OPERATION: ${{ inputs.operation }}
           REGISTRY_TRANSFER_ARTIFACT_ID: ${{ steps.registry_transfer.outputs.artifact-id }}
@@ -1071,6 +1071,13 @@ jobs:
             PAPERDESK_REGISTRY_REQUEST_SHA256
             PAPERDESK_REGISTRY_EXPECTED_PREFIX
             PAPERDESK_REGISTRY_RBAC_CANARY_BLOB
+            PAPERDESK_REGISTRY_RESULT_PURPOSE
+            PAPERDESK_REGISTRY_RESULT_EXECUTION
+            PAPERDESK_REGISTRY_RESULT_NONCE
+            PAPERDESK_REGISTRY_RESULT_BLOB
+            PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID
+            PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT
+            PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA
             PAPERDESK_REGISTRY_OPERATION
           )
 
@@ -1469,19 +1476,20 @@ jobs:
           }
 
           capture_bound_storage_rbac_canary_result() {
-            # ARM WebJob history Success does not bind helper stdout to this exact
-            # operation/history/nonce. Its output_url/error_url cannot be retrieved
-            # through the sealed SCM boundary without new access or authority.
-            # Activation also lacks exact receipt-bound outputs for all four reviewed
-            # executions: storage-rbac-ready, runtime-ready, persistence #1 complete,
-            # and persistence #2 complete with an exact idempotence comparison.
+            # The helper-side canonical result channel is implemented, but this workflow
+            # does not yet provision or receipt-bind its dedicated locked-WORM container,
+            # pass five unique coordinate sets, download exact blobs with Entra login, or
+            # bind each ARM web_job_id to the envelope WEBJOBS_RUN_ID. Generic ARM History
+            # Success is not a result attestation. Activation still lacks all five reviewed
+            # executions: preflight storage/runtime, persistence runtime, and persistence
+            # #1/#2 with an exact idempotence comparison.
             # Each persistence result must bind its exact prefix, request/artifact digests,
             # manifestSha256, fileCount, createdBlobCount, and both negative checks.
             # Retry attestation accepts only two cases while immutable outcome fields match:
             # A) run #1 creates/recovers 1..20 blobs with overwriteNegative=passed and
             # replay is 0/not-run-completed; B) an entry was already complete before this
             # workflow and both calls are 0/not-run-completed. Any mismatch fails closed.
-            echo "Registry bridge activation is impossible until a separately reviewed immutable result-attestation channel binds all four exact helper outputs to their WebJob histories and operations, including the storage canary nonce, without weakening sealed SCM or public access." >&2
+            echo "Registry bridge activation is impossible until separately reviewed workflow/RBAC orchestration binds all five exact helper envelopes to their WebJob histories, operations, nonces, immutable control/package/helper digests, and the dedicated locked-WORM result container without weakening sealed SCM or public access." >&2
             return 1
           }
 
@@ -1730,7 +1738,8 @@ jobs:
 
           # This incomplete dormant path remains unreachable behind the independent-review
           # hard stop above. Activation requires a later reviewed commit that binds all
-          # four exact helper results (storage RBAC, runtime, and both persistence runs), an
+          # five exact helper results (preflight storage/runtime, persistence runtime,
+          # and both persistence runs), an
           # independently reviewed canonical package-bootstrap receipt and checksum from
           # this immutable checkout, exact-workflow FIC rotation, narrow WebJob RBAC,
           # removed bootstrap publish authority, and old-workflow denial proof.
@@ -1746,9 +1755,9 @@ jobs:
         env:
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
-          EXPECTED_HELPER_SHA256: 05e4e8f0f596d2d05d54f435f2f05f9b72ce57c15742b28200113a355bd2328a
-          EXPECTED_PACKAGE_SHA256: 4013214c10547b1d801d14a4dddd7fd46258b4aef45810c58bcdf3ed7d8f651e
-          EXPECTED_RUNNER_SHA256: 61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50
+          EXPECTED_HELPER_SHA256: 889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050
+          EXPECTED_PACKAGE_SHA256: 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8
+          EXPECTED_RUNNER_SHA256: 47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b
           EXPECTED_SETTINGS_SHA256: cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e
         run: |
           set -uo pipefail
@@ -1788,6 +1797,13 @@ jobs:
               PAPERDESK_REGISTRY_REQUEST_SHA256 \
               PAPERDESK_REGISTRY_EXPECTED_PREFIX \
               PAPERDESK_REGISTRY_RBAC_CANARY_BLOB \
+              PAPERDESK_REGISTRY_RESULT_PURPOSE \
+              PAPERDESK_REGISTRY_RESULT_EXECUTION \
+              PAPERDESK_REGISTRY_RESULT_NONCE \
+              PAPERDESK_REGISTRY_RESULT_BLOB \
+              PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID \
+              PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT \
+              PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA \
               PAPERDESK_REGISTRY_OPERATION \
             --only-show-errors >/dev/null || cleanup_failed=1
           set -e
@@ -1829,6 +1845,13 @@ jobs:
             PAPERDESK_REGISTRY_REQUEST_SHA256 \
             PAPERDESK_REGISTRY_EXPECTED_PREFIX \
             PAPERDESK_REGISTRY_RBAC_CANARY_BLOB \
+            PAPERDESK_REGISTRY_RESULT_PURPOSE \
+            PAPERDESK_REGISTRY_RESULT_EXECUTION \
+            PAPERDESK_REGISTRY_RESULT_NONCE \
+            PAPERDESK_REGISTRY_RESULT_BLOB \
+            PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID \
+            PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT \
+            PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA \
             PAPERDESK_REGISTRY_OPERATION
           do
             jq --exit-status --arg name "${transient_setting}" '[.[] | select(.name == $name)] | length == 0' <<< "${settings_json}" >/dev/null
