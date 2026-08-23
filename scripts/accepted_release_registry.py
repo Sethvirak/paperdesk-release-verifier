@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import MutableMapping
 import datetime as dt
 import gzip
 import hashlib
 import hmac
 import http.client
 import http.server
+import ipaddress
 import io
 import json
 import os
@@ -25,11 +27,12 @@ import re
 import shutil
 import socketserver
 import ssl
+import stat
 import sys
 import tarfile
 import tempfile
 import threading
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Mapping
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,7 +53,30 @@ MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_OTHER_FILE_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_BYTES = 1200 * 1024 * 1024
 MAX_MEMBERS = 21
+MAX_ACTIONS_ARTIFACT_BYTES = MAX_REQUEST_BYTES
+MAX_ACTIONS_ARTIFACT_URL_CHARS = 8192
+MAX_ACTIONS_ARTIFACT_QUERY_CHARS = 4096
+MAX_GITHUB_TOKEN_CHARS = 4096
+MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS = 10
+MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS = 300
+MAX_ONE_SHOT_RESULT_BYTES = 4096
 STORAGE_API_VERSION = "2023-11-03"
+
+ACTIONS_REQUEST_NAME = "paperdesk-accepted-release-request.tar.gz"
+ACTIONS_GITHUB_TOKEN_ENV = "PAPERDESK_REGISTRY_GITHUB_TOKEN"
+ACTIONS_GITHUB_ARTIFACT_ID_ENV = "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID"
+ACTIONS_ARTIFACT_ZIP_SHA256_ENV = "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256"
+ACTIONS_REQUEST_SHA256_ENV = "PAPERDESK_REGISTRY_REQUEST_SHA256"
+EXPECTED_PREFIX_ENV = "PAPERDESK_REGISTRY_EXPECTED_PREFIX"
+RBAC_CANARY_BLOB_ENV = "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB"
+PAPERDESK_REPOSITORY = "Sethvirak/MasterDataStructure"
+GITHUB_API_HOST = "api.github.com"
+REGISTRY_WRITER_CLIENT_ID = "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16"
+REGISTRY_READER_CLIENT_ID = "a52c21e2-b465-4f01-88b8-44bb5fb8b306"
+WEBJOB_RUNNER_NAME = "run.sh"
+WEBJOB_SETTINGS_NAME = "settings.job"
+WEBJOB_RUNNER_SHA256 = "61d5c2a5e1c042965fdcc11682f02e05c1fe5982844b7b8839adbfc1470f1e50"
+WEBJOB_SETTINGS_SHA256 = "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e"
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -65,6 +91,23 @@ PAPERDESK_SOURCE_WORKFLOW_REF = (
 )
 CONTENT_MD5 = re.compile(r"[A-Za-z0-9+/]{22}==")
 ETAG = re.compile(r"[^\r\n]{1,256}")
+GITHUB_ACTIONS_BLOB_HOST = re.compile(
+    r"productionresultssa[0-9]+\.blob\.core\.windows\.net"
+)
+GITHUB_ACTIONS_BLOB_PATH = re.compile(
+    r"/actions-results/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+    r"workflow-job-run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+    r"artifacts/[0-9a-f]{64}\.zip"
+)
+GITHUB_ACTIONS_SAS_QUERY_NAMES = frozenset({
+    "rscd", "rsct", "se", "sig", "ske", "skoid", "sks", "skt", "sktid", "skv",
+    "sp", "spr", "sr", "st", "sv",
+})
+REGISTRY_PREFIX = re.compile(r"v1/releases/[0-9a-f]{40}/[1-9][0-9]*/[1-9][0-9]*/")
+RBAC_CANARY_BLOB = re.compile(
+    r"v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/"
+    r"[0-9a-f]{32}(?:-reader-write-denied)?\.json"
+)
 
 RELEASE_MATERIAL_PATHS = (
     "architecture/production_acceptance_evidence_contract.json",
@@ -548,7 +591,7 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def safe_extract_actions_zip(archive_path: Path, output: Path) -> None:
+def safe_extract_actions_zip(archive_path: Path, output: Path) -> tuple[str, ...]:
     regular_file(archive_path, "Actions artifact archive", MAX_REQUEST_BYTES)
     if output.exists():
         fail("Actions artifact extraction target already exists")
@@ -582,12 +625,324 @@ def safe_extract_actions_zip(archive_path: Path, output: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with archive.open(info) as source, os.fdopen(descriptor, "wb") as sink:
-                    shutil.copyfileobj(source, sink, 1024 * 1024)
-                if target.stat().st_size != info.file_size:
+                    written = 0
+                    while True:
+                        chunk = source.read(min(1024 * 1024, info.file_size - written + 1))
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > info.file_size:
+                            fail("Actions artifact member exceeds its declared size")
+                        sink.write(chunk)
+                if written != info.file_size or target.stat().st_size != info.file_size:
                     fail("Actions artifact member size changed during extraction")
-    except Exception:
+        return tuple(sorted(seen))
+    except RegistryError:
         shutil.rmtree(output, ignore_errors=True)
         raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        shutil.rmtree(output, ignore_errors=True)
+        fail("Actions artifact ZIP is invalid")
+
+
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Make an artifact URL single-hop so its exact host binding cannot drift."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: BinaryIO,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
+
+
+def build_direct_artifact_opener() -> Any:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirectHandler(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+
+
+def github_actions_artifact_api_url(artifact_id: str) -> str:
+    validated_id = positive(artifact_id, "GitHub Actions artifact ID")
+    if len(validated_id) > 20:
+        fail("GitHub Actions artifact ID is invalid")
+    return (
+        f"https://{GITHUB_API_HOST}/repos/{PAPERDESK_REPOSITORY}/"
+        f"actions/artifacts/{validated_id}/zip"
+    )
+
+
+def resolve_github_actions_artifact_url(
+    artifact_id: str,
+    token: str,
+    opener: Any | None = None,
+) -> tuple[str, str]:
+    api_url = github_actions_artifact_api_url(artifact_id)
+    if (
+        not isinstance(token, str)
+        or not token
+        or token != token.strip()
+        or len(token) > MAX_GITHUB_TOKEN_CHARS
+        or any(ord(character) < 0x21 or ord(character) > 0x7e for character in token)
+    ):
+        fail("GitHub Actions artifact credential is invalid")
+    request = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "PaperDeskRegistryBridge/1",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+        method="GET",
+    )
+    client = opener if opener is not None else build_direct_artifact_opener()
+    response: Any | None = None
+    try:
+        try:
+            response = client.open(request, timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 302 or exc.geturl() != api_url:
+                code = exc.code if isinstance(exc.code, int) and 100 <= exc.code <= 599 else 0
+                fail(f"GitHub Actions artifact resolution failed with HTTP {code}")
+            response = exc
+        if getattr(response, "status", getattr(response, "code", 0)) != 302:
+            fail("GitHub Actions artifact resolution did not return one exact redirect")
+        if response.geturl() != api_url:
+            fail("GitHub Actions artifact resolution escaped the fixed API request")
+        get_all = getattr(response.headers, "get_all", None)
+        locations = get_all("Location") if callable(get_all) else None
+        if locations is None:
+            single_location = response.headers.get("Location", "")
+            locations = [single_location] if single_location else []
+        if len(locations) != 1:
+            fail("GitHub Actions artifact redirect is invalid")
+        location = locations[0]
+        if (
+            not isinstance(location, str)
+            or not location
+            or location != location.strip()
+            or len(location) > MAX_ACTIONS_ARTIFACT_URL_CHARS
+        ):
+            fail("GitHub Actions artifact redirect is invalid")
+        try:
+            redirect_host = urllib.parse.urlsplit(location).hostname or ""
+        except ValueError:
+            fail("GitHub Actions artifact redirect is invalid")
+        validate_actions_artifact_url(location, redirect_host)
+        return location, redirect_host
+    except RegistryError:
+        raise
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        fail("GitHub Actions artifact resolution failed")
+    finally:
+        request.remove_header("Authorization")
+        token = ""
+        if response is not None:
+            try:
+                response.close()
+            except (AttributeError, OSError):
+                pass
+
+
+def build_direct_identity_opener() -> Any:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirectHandler(),
+    )
+
+
+def required_environment_value(environment: Mapping[str, str], name: str, maximum: int) -> str:
+    value = environment.get(name, "")
+    if not isinstance(value, str) or not value or value != value.strip() or len(value) > maximum:
+        fail(f"required one-shot coordinate {name} is invalid")
+    if any(ord(character) < 0x20 or ord(character) > 0x7e for character in value):
+        fail(f"required one-shot coordinate {name} is invalid")
+    return value
+
+
+def validate_actions_artifact_url(
+    url: str,
+    allowed_host: str,
+    observed_at: dt.datetime | None = None,
+) -> str:
+    if (
+        len(url) > MAX_ACTIONS_ARTIFACT_URL_CHARS
+        or len(allowed_host) > 253
+        or not GITHUB_ACTIONS_BLOB_HOST.fullmatch(allowed_host)
+    ):
+        fail("Actions artifact URL boundary is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        fail("Actions artifact URL boundary is invalid")
+    if any((
+        parsed.scheme != "https",
+        hostname != allowed_host,
+        parsed.netloc != allowed_host,
+        username is not None,
+        password is not None,
+        port is not None,
+        bool(parsed.fragment),
+        not parsed.path.startswith("/"),
+        not GITHUB_ACTIONS_BLOB_PATH.fullmatch(parsed.path),
+        len(parsed.path) > 2048,
+        not parsed.query,
+        len(parsed.query) > MAX_ACTIONS_ARTIFACT_QUERY_CHARS,
+        "%0d" in url.lower(),
+        "%0a" in url.lower(),
+    )):
+        fail("Actions artifact URL boundary is invalid")
+    try:
+        query = urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=32,
+        )
+    except ValueError:
+        fail("Actions artifact URL query is invalid")
+    names = [name for name, _ in query]
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or not set(names).issubset(GITHUB_ACTIONS_SAS_QUERY_NAMES)
+        or any(not name or not value for name, value in query)
+        or "sig" not in names
+    ):
+        fail("Actions artifact URL query is invalid")
+    parameters = dict(query)
+    if (
+        parameters.get("sp") != "r"
+        or parameters.get("sr") != "b"
+        or parameters.get("spr") != "https"
+    ):
+        fail("Actions artifact URL permissions are not read-only HTTPS Blob access")
+    expires = parameters.get("se", "")
+    if not expires.endswith("Z"):
+        fail("Actions artifact URL expiry is invalid")
+    try:
+        expiry = dt.datetime.fromisoformat(expires[:-1] + "+00:00")
+    except ValueError:
+        fail("Actions artifact URL expiry is invalid")
+    now = observed_at or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None or now.utcoffset() != dt.timedelta(0):
+        fail("Actions artifact URL observation time is invalid")
+    remaining = (expiry - now).total_seconds()
+    if not MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS <= remaining <= MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS:
+        fail("Actions artifact URL expiry is outside the one-shot boundary")
+    return url
+
+
+def download_actions_artifact(
+    url: str,
+    allowed_host: str,
+    expected_sha256: str,
+    output: Path,
+    opener: Any | None = None,
+) -> str:
+    validate_actions_artifact_url(url, allowed_host)
+    expected = digest(expected_sha256, "Actions artifact ZIP digest")
+    if output.exists():
+        fail("Actions artifact download target already exists")
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/zip", "User-Agent": "PaperDeskRegistryBridge/1"},
+        method="GET",
+    )
+    client = opener if opener is not None else build_direct_artifact_opener()
+    descriptor: int | None = None
+    try:
+        with client.open(request, timeout=900) as response:
+            if getattr(response, "status", 0) != 200 or response.geturl() != url:
+                fail("Actions artifact download was not one exact successful hop")
+            content_length_value = response.headers.get("Content-Length", "")
+            if not POSITIVE_INTEGER.fullmatch(content_length_value):
+                fail("Actions artifact Content-Length is invalid")
+            content_length = int(content_length_value)
+            if content_length > MAX_ACTIONS_ARTIFACT_BYTES:
+                fail("Actions artifact download exceeds the fixed bound")
+            if response.headers.get("Content-Encoding", "") not in ("", "identity"):
+                fail("Actions artifact response encoding is invalid")
+            if response.headers.get("Transfer-Encoding", ""):
+                fail("Actions artifact transfer encoding is invalid")
+            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            actual = hashlib.sha256()
+            total = 0
+            with os.fdopen(descriptor, "wb") as sink:
+                descriptor = None
+                while True:
+                    chunk = response.read(min(1024 * 1024, content_length - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > content_length or total > MAX_ACTIONS_ARTIFACT_BYTES:
+                        fail("Actions artifact response exceeds its declared bound")
+                    actual.update(chunk)
+                    sink.write(chunk)
+            if total != content_length:
+                fail("Actions artifact response ended before its declared bound")
+            actual_sha256 = actual.hexdigest()
+            if not hmac.compare_digest(actual_sha256, expected):
+                fail("Actions artifact ZIP digest is invalid")
+            return actual_sha256
+    except RegistryError:
+        output.unlink(missing_ok=True)
+        raise
+    except urllib.error.HTTPError as exc:
+        output.unlink(missing_ok=True)
+        code = exc.code if isinstance(exc.code, int) and 100 <= exc.code <= 599 else 0
+        fail(f"Actions artifact download failed with HTTP {code}")
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        output.unlink(missing_ok=True)
+        fail("Actions artifact download failed")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def validate_exact_actions_request_inventory(archive_path: Path) -> None:
+    regular_file(archive_path, "Actions artifact archive", MAX_REQUEST_BYTES)
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            if len(members) != 1:
+                fail("Actions artifact inventory is not the exact registry request")
+            info = members[0]
+            relative = safe_relative(info.filename.rstrip("/"))
+            mode = (info.external_attr >> 16) & 0o170000
+            if (
+                relative != ACTIONS_REQUEST_NAME
+                or info.is_dir()
+                or mode not in (0, 0o100000)
+                or info.file_size <= 0
+                or info.file_size > MAX_REQUEST_BYTES
+            ):
+                fail("Actions artifact inventory is not the exact registry request")
+    except RegistryError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        fail("Actions artifact ZIP is invalid")
+
+
+def extract_actions_request(archive_path: Path, output: Path) -> Path:
+    # Reject extra inventory before any member bytes are extracted.
+    validate_exact_actions_request_inventory(archive_path)
+    inventory = safe_extract_actions_zip(archive_path, output)
+    if inventory != (ACTIONS_REQUEST_NAME,):
+        shutil.rmtree(output, ignore_errors=True)
+        fail("Actions artifact inventory is not the exact registry request")
+    return regular_file(output / ACTIONS_REQUEST_NAME, "Actions registry request", MAX_REQUEST_BYTES)
 
 
 def extract_request(archive_path: Path, output: Path) -> tuple[dict[str, Any], dict[str, Path]]:
@@ -807,24 +1162,132 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     return files
 
 
+def validate_registry_prefix(value: str, label: str = "expected registry prefix") -> str:
+    if not isinstance(value, str) or len(value) > 160 or not REGISTRY_PREFIX.fullmatch(value):
+        fail(f"{label} is invalid")
+    return value
+
+
+def validate_expected_request_prefix(archive_path: Path, expected_prefix: str) -> str:
+    expected = validate_registry_prefix(expected_prefix)
+    try:
+        with tempfile.TemporaryDirectory(prefix="paperdesk-registry-prefix-") as temporary:
+            request, _ = extract_request(archive_path, Path(temporary) / "extracted")
+            actual = request["registry"]["prefix"]
+    except RegistryError:
+        raise
+    except (OSError, tarfile.TarError, EOFError):
+        fail("registry request cannot be validated before storage access")
+    if not hmac.compare_digest(actual, expected):
+        fail("registry request prefix does not match the expected one-shot prefix")
+    return actual
+
+
+def one_shot_coordinates(
+    environment: MutableMapping[str, str],
+    opener: Any | None = None,
+) -> dict[str, str]:
+    artifact_id = required_environment_value(
+        environment, ACTIONS_GITHUB_ARTIFACT_ID_ENV, 20
+    )
+    artifact_sha256 = digest(required_environment_value(
+        environment, ACTIONS_ARTIFACT_ZIP_SHA256_ENV, 64
+    ), "Actions artifact ZIP digest")
+    request_sha256 = digest(required_environment_value(
+        environment, ACTIONS_REQUEST_SHA256_ENV, 64
+    ), "Actions registry request digest")
+    expected_prefix = validate_registry_prefix(required_environment_value(
+        environment, EXPECTED_PREFIX_ENV, 160
+    ))
+    token = required_environment_value(
+        environment, ACTIONS_GITHUB_TOKEN_ENV, MAX_GITHUB_TOKEN_CHARS
+    )
+    removed_token = environment.pop(ACTIONS_GITHUB_TOKEN_ENV, None)
+    if not isinstance(removed_token, str) or not hmac.compare_digest(removed_token, token):
+        fail("one-shot environment could not discard the GitHub credential")
+    try:
+        artifact_url, artifact_host = resolve_github_actions_artifact_url(
+            artifact_id, token, opener
+        )
+    finally:
+        token = ""
+        removed_token = ""
+    coordinates = {
+        "artifactId": positive(artifact_id, "GitHub Actions artifact ID"),
+        "url": artifact_url,
+        "host": artifact_host,
+        "artifactSha256": artifact_sha256,
+        "requestSha256": request_sha256,
+        "expectedPrefix": expected_prefix,
+    }
+    return coordinates
+
+
+def validate_identity_endpoint(endpoint: str) -> str:
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or endpoint != endpoint.strip()
+        or len(endpoint) > 2048
+        or any(ord(character) < 0x20 or ord(character) > 0x7e for character in endpoint)
+    ):
+        fail("App Service managed-identity endpoint is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        fail("App Service managed-identity endpoint is invalid")
+    if any((
+        parsed.scheme != "http",
+        username is not None,
+        password is not None,
+        port is None,
+        bool(parsed.query),
+        bool(parsed.fragment),
+        parsed.path not in {"/MSI/token", "/MSI/token/"},
+        not hostname,
+        "%" in (hostname or ""),
+    )):
+        fail("App Service managed-identity endpoint is invalid")
+    if hostname != "localhost":
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            fail("App Service managed-identity endpoint host is not local")
+        if not (address.is_loopback or address.is_link_local):
+            fail("App Service managed-identity endpoint host is not local")
+    return endpoint
+
+
 def identity_token(client_id: str) -> str:
     if not UUID.fullmatch(client_id):
         fail("bridge managed-identity client ID is invalid")
-    endpoint = os.environ.get("IDENTITY_ENDPOINT", "")
+    endpoint = validate_identity_endpoint(os.environ.get("IDENTITY_ENDPOINT", ""))
     header = os.environ.get("IDENTITY_HEADER", "")
-    if not endpoint.startswith("http://") or not header or "\r" in header or "\n" in header:
+    if not header or len(header) > 8192 or "\r" in header or "\n" in header:
         fail("App Service managed-identity endpoint is unavailable")
     query = urllib.parse.urlencode({
         "api-version": "2019-08-01",
         "resource": "https://storage.azure.com/",
         "client_id": client_id,
     })
-    request = urllib.request.Request(f"{endpoint}?{query}", headers={"X-IDENTITY-HEADER": header})
+    token_url = f"{endpoint}?{query}"
+    request = urllib.request.Request(token_url, headers={"X-IDENTITY-HEADER": header})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            document = json.load(response)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        fail(f"managed-identity token acquisition failed: {exc}")
+        with build_direct_identity_opener().open(request, timeout=30) as response:
+            if getattr(response, "status", 0) != 200 or response.geturl() != token_url:
+                fail("managed-identity token response boundary is invalid")
+            body = response.read(65537)
+            if len(body) > 65536:
+                fail("managed-identity token response is excessive")
+            document = json.loads(body)
+    except RegistryError:
+        raise
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        fail("managed-identity token acquisition failed")
     token = document.get("access_token") if isinstance(document, dict) else None
     if not isinstance(token, str) or len(token) < 100 or "\r" in token or "\n" in token:
         fail("managed-identity token response is invalid")
@@ -839,6 +1302,14 @@ def blob_url(blob_name: str, prefix: str) -> str:
     return f"/{CONTAINER}/{encoded}"
 
 
+def rbac_canary_blob_url(blob_name: str) -> str:
+    if not isinstance(blob_name, str) or not RBAC_CANARY_BLOB.fullmatch(blob_name):
+        fail("storage RBAC canary blob is outside the fixed canary prefix")
+    safe_relative(blob_name)
+    encoded = "/".join(urllib.parse.quote(part, safe="") for part in PurePosixPath(blob_name).parts)
+    return f"/{CONTAINER}/{encoded}"
+
+
 class StorageClient:
     def __init__(self, writer_token: str, reader_token: str):
         self.writer_token = writer_token
@@ -848,31 +1319,64 @@ class StorageClient:
     def _connection(self) -> http.client.HTTPSConnection:
         return http.client.HTTPSConnection(self.host, timeout=900, context=ssl.create_default_context())
 
-    def get(self, blob_name: str, prefix: str, maximum: int) -> tuple[int, bytes, dict[str, str]]:
+    @staticmethod
+    def _error_code(status: int, body: bytes, headers: dict[str, str]) -> str:
+        error_code = headers.get("x-ms-error-code", "")
+        if status >= 300 and not error_code and body:
+            match = re.search(rb"<Code>([A-Za-z0-9]+)</Code>", body)
+            error_code = match.group(1).decode("ascii") if match else ""
+        return error_code
+
+    def _get(
+        self, target: str, token: str, maximum: int
+    ) -> tuple[int, bytes, dict[str, str], str]:
         connection = self._connection()
-        path = blob_url(blob_name, prefix)
         headers = {
-            "Authorization": f"Bearer {self.reader_token}",
+            "Authorization": f"Bearer {token}",
             "x-ms-version": STORAGE_API_VERSION,
             "x-ms-date": email_date(),
         }
         try:
-            connection.request("GET", path, headers=headers)
+            connection.request("GET", target, headers=headers)
             response = connection.getresponse()
             body = response.read(maximum + 1)
             if len(body) > maximum:
                 fail("registry blob read exceeds the expected bound")
-            return response.status, body, {key.lower(): value for key, value in response.getheaders()}
+            response_headers = {key.lower(): value for key, value in response.getheaders()}
+            return (
+                response.status,
+                body,
+                response_headers,
+                self._error_code(response.status, body, response_headers),
+            )
         finally:
             connection.close()
 
-    def put_create_only(self, blob_name: str, prefix: str, path: Path, content_md5: str) -> tuple[int, str]:
+    def get(self, blob_name: str, prefix: str, maximum: int) -> tuple[int, bytes, dict[str, str]]:
+        status, body, headers, _ = self._get(
+            blob_url(blob_name, prefix), self.reader_token, maximum
+        )
+        return status, body, headers
+
+    def reader_get_canary(self, blob_name: str, maximum: int) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(rbac_canary_blob_url(blob_name), self.reader_token, maximum)
+
+    def writer_get_canary(self, blob_name: str, maximum: int) -> tuple[int, bytes, dict[str, str], str]:
+        return self._get(rbac_canary_blob_url(blob_name), self.writer_token, maximum)
+
+    def _put(
+        self,
+        target: str,
+        token: str,
+        path: Path,
+        content_md5: str,
+        create_only: bool,
+    ) -> tuple[int, str]:
         connection = self._connection()
-        target = blob_url(blob_name, prefix)
         size = path.stat().st_size
         connection.putrequest("PUT", target)
         headers = {
-            "Authorization": f"Bearer {self.writer_token}",
+            "Authorization": f"Bearer {token}",
             "x-ms-version": STORAGE_API_VERSION,
             "x-ms-date": email_date(),
             "x-ms-blob-type": "BlockBlob",
@@ -880,8 +1384,9 @@ class StorageClient:
             "Content-MD5": content_md5,
             "Content-Length": str(size),
             "Content-Type": "application/octet-stream",
-            "If-None-Match": "*",
         }
+        if create_only:
+            headers["If-None-Match"] = "*"
         for key, value in headers.items():
             connection.putheader(key, value)
         connection.endheaders()
@@ -895,13 +1400,14 @@ class StorageClient:
             response = connection.getresponse()
             body = response.read(65536)
             headers = {key.lower(): value for key, value in response.getheaders()}
-            error_code = headers.get("x-ms-error-code", "")
-            if response.status >= 300 and not error_code and body:
-                match = re.search(rb"<Code>([A-Za-z0-9]+)</Code>", body)
-                error_code = match.group(1).decode("ascii") if match else ""
-            return response.status, error_code
+            return response.status, self._error_code(response.status, body, headers)
         finally:
             connection.close()
+
+    def put_create_only(self, blob_name: str, prefix: str, path: Path, content_md5: str) -> tuple[int, str]:
+        return self._put(
+            blob_url(blob_name, prefix), self.writer_token, path, content_md5, True
+        )
 
     def put_bytes_create_only(self, blob_name: str, prefix: str, body: bytes) -> tuple[int, str]:
         with tempfile.NamedTemporaryFile(prefix="paperdesk-manifest-", delete=False) as handle:
@@ -913,6 +1419,45 @@ class StorageClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def _put_canary_bytes_create_only(
+        self, blob_name: str, token: str, body: bytes
+    ) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(prefix="paperdesk-rbac-canary-", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(
+                rbac_canary_blob_url(blob_name), token, path, encoded_md5, True
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def writer_put_canary_create_only(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        return self._put_canary_bytes_create_only(blob_name, self.writer_token, body)
+
+    def reader_put_canary_create_only(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        return self._put_canary_bytes_create_only(blob_name, self.reader_token, body)
+
+    def writer_put_canary_unconditional(self, blob_name: str, body: bytes) -> tuple[int, str]:
+        with tempfile.NamedTemporaryFile(prefix="paperdesk-rbac-overwrite-", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(body)
+        try:
+            encoded_md5 = base64.b64encode(
+                hashlib.md5(body, usedforsecurity=False).digest()
+            ).decode("ascii")
+            return self._put(
+                rbac_canary_blob_url(blob_name),
+                self.writer_token,
+                path,
+                encoded_md5,
+                False,
+            )
+        finally:
+            path.unlink(missing_ok=True)
 
 def email_date() -> str:
     from email.utils import format_datetime
@@ -929,11 +1474,19 @@ def verify_readback(body: bytes, headers: dict[str, str], record: dict[str, Any]
         fail("registry blob Content-MD5 property differs from the accepted source")
 
 
-def persist_request(archive_path: Path, client: StorageClient) -> dict[str, Any]:
+def persist_request(
+    archive_path: Path,
+    client: StorageClient,
+    expected_prefix: str | None = None,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="paperdesk-registry-request-") as temporary:
         root = Path(temporary) / "extracted"
         request, files = extract_request(archive_path, root)
         prefix = request["registry"]["prefix"]
+        if expected_prefix is not None:
+            expected = validate_registry_prefix(expected_prefix)
+            if not hmac.compare_digest(prefix, expected):
+                fail("registry request prefix does not match the expected one-shot prefix")
         records = {record["path"]: record for record in request["files"]}
         manifest_name = prefix + "registry-manifest.json"
         existing_status, existing_body, _ = client.get(manifest_name, prefix, 1024 * 1024)
@@ -1028,6 +1581,217 @@ def persist_request(archive_path: Path, client: StorageClient) -> dict[str, Any]
             "overwriteNegative": "not-run-completed" if completed else ("passed" if overwrite_proved else "not-run"),
             "outOfPrefixNegative": "passed",
         }
+
+
+def bounded_one_shot_result(
+    persisted: dict[str, Any],
+    expected_prefix: str,
+    artifact_sha256: str,
+    request_sha256: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(persisted, dict)
+        or persisted.get("status") != "complete"
+        or persisted.get("prefix") != expected_prefix
+        or persisted.get("fileCount") != 19
+        or not isinstance(persisted.get("createdBlobCount"), int)
+        or not 0 <= persisted["createdBlobCount"] <= 20
+        or persisted.get("overwriteNegative") not in {"passed", "not-run-completed"}
+        or persisted.get("outOfPrefixNegative") != "passed"
+    ):
+        fail("one-shot registry persistence result is invalid")
+    manifest_sha256 = digest(
+        str(persisted.get("manifestSha256", "")), "one-shot registry manifest digest"
+    )
+    document = {
+        "status": "complete",
+        "prefix": expected_prefix,
+        "artifactZipSha256": digest(artifact_sha256, "Actions artifact ZIP digest"),
+        "requestSha256": digest(request_sha256, "Actions registry request digest"),
+        "manifestSha256": manifest_sha256,
+        "fileCount": 19,
+        "createdBlobCount": persisted["createdBlobCount"],
+        "overwriteNegative": persisted["overwriteNegative"],
+        "outOfPrefixNegative": "passed",
+    }
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("one-shot registry persistence result exceeds its bound")
+    return document
+
+
+def persist_actions_artifact(
+    environment: MutableMapping[str, str] | None = None,
+    opener: Any | None = None,
+) -> dict[str, Any]:
+    coordinates = one_shot_coordinates(
+        os.environ if environment is None else environment,
+        opener,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="paperdesk-actions-artifact-") as temporary:
+            root = Path(temporary)
+            artifact_path = root / "actions-artifact.zip"
+            artifact_sha256 = download_actions_artifact(
+                coordinates["url"],
+                coordinates["host"],
+                coordinates["artifactSha256"],
+                artifact_path,
+                opener,
+            )
+            request_path = extract_actions_request(artifact_path, root / "artifact")
+            request_sha256 = sha256_file(request_path)
+            if not hmac.compare_digest(request_sha256, coordinates["requestSha256"]):
+                fail("Actions registry request digest is invalid")
+
+            # Validate the full request and its exact prefix before identity-token
+            # acquisition, StorageClient construction, or any storage data-plane call.
+            expected_prefix = validate_expected_request_prefix(
+                request_path, coordinates["expectedPrefix"]
+            )
+            if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+                fail("fixed writer and reader managed identities must be distinct")
+            client = StorageClient(
+                identity_token(REGISTRY_WRITER_CLIENT_ID),
+                identity_token(REGISTRY_READER_CLIENT_ID),
+            )
+            persisted = persist_request(request_path, client, expected_prefix=expected_prefix)
+            return bounded_one_shot_result(
+                persisted,
+                expected_prefix,
+                artifact_sha256,
+                request_sha256,
+            )
+    except RegistryError:
+        raise
+    except Exception:
+        fail("one-shot registry persistence failed at a closed boundary")
+
+
+def storage_rbac_canary(
+    environment: MutableMapping[str, str] | None = None,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    environment = os.environ if environment is None else environment
+    if ACTIONS_GITHUB_TOKEN_ENV in environment:
+        fail("storage RBAC canary must not receive a GitHub credential")
+    canary_blob = environment.pop(RBAC_CANARY_BLOB_ENV, "")
+    rbac_canary_blob_url(canary_blob)
+    reader_write_probe = canary_blob[:-5] + "-reader-write-denied.json"
+    rbac_canary_blob_url(reader_write_probe)
+    try:
+        rbac_canary_blob_url("v1/releases/outside-storage-rbac-canary.json")
+    except RegistryError:
+        pass
+    else:
+        fail("storage RBAC canary out-of-prefix negative did not fail closed")
+
+    body = canonical_json({
+        "blob": canary_blob,
+        "schemaVersion": 1,
+        "status": "storage-rbac-canary",
+    })
+    if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+        fail("fixed writer and reader managed identities must be distinct")
+    if client is None:
+        client = StorageClient(
+            identity_token(REGISTRY_WRITER_CLIENT_ID),
+            identity_token(REGISTRY_READER_CLIENT_ID),
+        )
+
+    create_status, create_code = client.writer_put_canary_create_only(canary_blob, body)
+    if create_status not in (201, 202) or create_code:
+        fail("storage RBAC writer create canary failed")
+
+    read_status, read_body, _, read_code = client.reader_get_canary(
+        canary_blob, len(body)
+    )
+    if read_status != 200 or read_code or read_body != body:
+        fail("storage RBAC reader read canary failed")
+
+    overwrite_status, overwrite_code = client.writer_put_canary_unconditional(
+        canary_blob, body
+    )
+    if (overwrite_status, overwrite_code) not in {
+        (403, "UnauthorizedBlobOverwrite"),
+        (403, "AuthorizationPermissionMismatch"),
+        (409, "BlobImmutableDueToPolicy"),
+    }:
+        fail("storage RBAC writer unconditional overwrite canary did not fail closed")
+
+    writer_read_status, _, _, writer_read_code = client.writer_get_canary(
+        canary_blob, 64 * 1024
+    )
+    if (writer_read_status, writer_read_code) != (
+        403,
+        "AuthorizationPermissionMismatch",
+    ):
+        fail("storage RBAC writer read canary did not fail closed")
+
+    reader_write_status, reader_write_code = client.reader_put_canary_create_only(
+        reader_write_probe, body
+    )
+    if (reader_write_status, reader_write_code) != (
+        403,
+        "AuthorizationPermissionMismatch",
+    ):
+        fail("storage RBAC reader create canary did not fail closed")
+
+    document = {
+        "schemaVersion": 1,
+        "status": "storage-rbac-ready",
+        "canaryBlob": canary_blob,
+        "writerCreate": "passed",
+        "readerRead": "passed",
+        "writerUnconditionalOverwriteDenied": "passed",
+        "writerReadDenied": "passed",
+        "readerWriteDenied": "passed",
+        "localPrefixGuard": "passed-before-network",
+    }
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("storage RBAC canary result exceeds its bound")
+    return document
+
+
+def runtime_canary(job_directory: Path | None = None) -> dict[str, Any]:
+    helper = Path(__file__).resolve()
+    regular_file(helper, "registry WebJob helper", 2 * 1024 * 1024)
+    job_directory = helper.parent if job_directory is None else job_directory.resolve()
+    if not job_directory.is_dir() or job_directory.is_symlink():
+        fail("registry WebJob directory must be one real directory")
+    runner = regular_file(job_directory / WEBJOB_RUNNER_NAME, "registry WebJob runner", 4096)
+    settings = regular_file(
+        job_directory / WEBJOB_SETTINGS_NAME, "registry WebJob settings", 4096
+    )
+    if os.name == "posix" and not runner.stat().st_mode & stat.S_IXUSR:
+        fail("registry WebJob runner must remain owner-executable")
+    runner_sha256 = sha256_file(runner)
+    settings_sha256 = sha256_file(settings)
+    if not hmac.compare_digest(runner_sha256, WEBJOB_RUNNER_SHA256):
+        fail("registry WebJob runner digest is invalid")
+    if not hmac.compare_digest(settings_sha256, WEBJOB_SETTINGS_SHA256):
+        fail("registry WebJob settings digest is invalid")
+    if sys.version_info[:2] != (3, 12):
+        fail("registry WebJob requires the reviewed Python 3.12 runtime")
+    if sys.flags.isolated != 1:
+        fail("registry WebJob helper must run in isolated Python mode")
+    if ACTIONS_GITHUB_TOKEN_ENV in os.environ:
+        fail("runtime canary must not receive a GitHub credential")
+    document = {
+        "schemaVersion": 1,
+        "status": "runtime-ready",
+        "python": "3.12",
+        "isolated": True,
+        "helperSha256": sha256_file(helper),
+        "runnerSha256": runner_sha256,
+        "settingsJobSha256": settings_sha256,
+        "writerClientId": REGISTRY_WRITER_CLIENT_ID,
+        "readerClientId": REGISTRY_READER_CLIENT_ID,
+    }
+    if REGISTRY_WRITER_CLIENT_ID == REGISTRY_READER_CLIENT_ID:
+        fail("fixed writer and reader managed identities must be distinct")
+    if len(canonical_json(document)) > MAX_ONE_SHOT_RESULT_BYTES:
+        fail("registry WebJob runtime canary result exceeds its bound")
+    return document
 
 
 def validate_existing_manifest(manifest: Any, request: dict[str, Any]) -> None:
@@ -1145,6 +1909,9 @@ def serve(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("persist-actions-artifact")
+    commands.add_parser("runtime-canary")
+    commands.add_parser("storage-rbac-canary")
     extract = commands.add_parser("extract-actions-artifact")
     extract.add_argument("--archive", required=True)
     extract.add_argument("--output", required=True)
@@ -1167,7 +1934,13 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.command == "extract-actions-artifact":
+        if args.command == "persist-actions-artifact":
+            print(json.dumps(persist_actions_artifact(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "runtime-canary":
+            print(json.dumps(runtime_canary(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "storage-rbac-canary":
+            print(json.dumps(storage_rbac_canary(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "extract-actions-artifact":
             safe_extract_actions_zip(Path(args.archive).resolve(), Path(args.output).resolve())
             print("Actions artifact extracted through bounded safe extraction.")
         elif args.command == "build":
