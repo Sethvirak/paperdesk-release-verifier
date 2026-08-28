@@ -2,20 +2,32 @@
   "schema": "paperdesk-registry-bridge-bootstrap-and-control-reader-authorization-v2",
   "schemaVersion": 2,
   "status": "governance-authorized-pending-manual-execution",
-  "authorizationId": "42d7b5e5-689e-4c33-a678-e98189f2162f",
+  "authorizationId": "42837840-02eb-40e7-96c7-22fd5eddff09",
   "validity": {
-    "notBefore": "2026-08-28T08:01:47Z",
-    "expiresAt": "2026-09-04T08:01:47Z",
+    "notBefore": "2026-08-28T08:45:23Z",
+    "expiresAt": "2026-09-04T08:45:23Z",
     "singleUse": true
   },
   "source": {
     "repository": "Sethvirak/paperdesk-release-verifier",
-    "baseMergeSha": "c45539a86b575f1a4d58c3aa11df8c34a32a23b0",
-    "baseTreeSha": "b46cacb9d75a09ce93595d015788da820010f1a4",
+    "baseMergeSha": "5777f01eda2723fe5809bb874145067e339972ec",
+    "baseTreeSha": "9c485e7edab63e9ce6eae045e774fe6845d78575",
     "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
     "requiredCheck": "test",
-    "authorizationRevision": "v4-canary-compatibility-correction",
-    "supersedesAuthorizationHeadSha": "99d9d24bf12db8e0615a4285235844a6f30edfd6"
+    "authorizationRevision": "v5-private-package-staging-and-receipt-truth",
+    "supersedesAuthorizationId": "42d7b5e5-689e-4c33-a678-e98189f2162f",
+    "supersedesAuthorizationHeadSha": "defac2223868d9c68454b1fb587fb9536e67449a",
+    "supersededAuthorizationWasUnconsumed": true,
+    "supersededExecutionMadeNoAzureMutations": true,
+    "supersessionReasons": [
+      "OneDeploy packageUri transport was not authorized",
+      "temporary deployment-marker roleName was absent",
+      "strict receipt required a role-definition ETag that Azure did not return"
+    ],
+    "supersessionBlockerEvidence": {
+      "filename": "registry-bridge-bootstrap-blocker-42d7b5e5-689e-4c33-a678-e98189f2162f-20260828T083313Z.json",
+      "sha256": "354a5d402696b9293d5096edb5de83dab84daf2af22507a04efc52d71158e663"
+    }
   },
   "authorizationScope": {
     "registryBridgeBootstrapAndProductionControlReadHardeningOnly": true,
@@ -33,6 +45,13 @@
     "watchdogProviderBootstrapAuthorized": false,
     "productionControlBroadRoleRemovalAuthorized": true,
     "productionControlReadProbeRoleCreationAuthorized": true,
+    "exactTemporaryPrivatePackageStagingAuthorized": true,
+    "temporaryExecutorIpv4StorageFirewallRuleAuthorized": true,
+    "entraCreateOnlyPackageUploadAndReadbackAuthorized": true,
+    "readOnlyUserDelegationSasAuthorized": true,
+    "packageStagingCleanupAuthorizedAndRequired": true,
+    "publicPackageOrContainerAuthorized": false,
+    "sharedKeyOrAccountSasAuthorized": false,
     "currentAzureCliCanaryExecutionAuthorized": false,
     "futureDirectArmCanaryOrFicChangeAuthorized": false
   },
@@ -84,7 +103,19 @@
     "productionControlPrincipalRemainsMutationDormant": true,
     "primaryProductionDeploymentPrincipalIsSeparateAndOutOfScope": true,
     "currentAzureCliCanaryBecomesFailClosedAfterHardening": true,
-    "futureDirectArmCanaryRequiresSeparateSignedTwoApprovalAuthorization": true
+    "futureDirectArmCanaryRequiresSeparateSignedTwoApprovalAuthorization": true,
+    "packageBytesRemainOutsidePublicGitHistory": true,
+    "packageStagingContainerMustContainOnlyTheExactReviewedBlob": true,
+    "temporaryFirewallRuleMustBeOneRuntimeVerifiedExecutorIpv4Host": true,
+    "temporaryFirewallRuleArmRepresentationMustBeBareIpv4WithoutSlash32": true,
+    "temporaryFirewallRuleCleartextMustNeverEnterExecutorControlledLogsEvidenceOrGit": true,
+    "executorMustKeepUserDelegationSasInMemoryAndOutOfLogsEvidenceAndGit": true,
+    "kuduPlatformDiagnosticsMayTransientlyContainPackageUri": true,
+    "allPackageStagingResourcesAndAssignmentsMustBeAbsentBeforeReceipt": true,
+    "oneDeployNetworkReachabilityIsAnExecutionPreconditionNotAnAssumption": true,
+    "bridgeModernOutboundVnetRoutingAllTrafficMustBeTrueBeforeOneDeploy": true,
+    "stagingCleanupIsLogicalDeletionUnderThirtyDaySoftDelete": true,
+    "failedOneDeployRequiresImmediateStagingCleanupAndAnewAuthorization": true
   },
   "resources": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
@@ -94,6 +125,9 @@
     "acceptedReleaseContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases",
     "resultContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
     "resultImmutabilityPolicyResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default",
+    "packageStagingContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5",
+    "packageStagingBlobBaseUri": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-registry-bootstrap-stage-76c9c8c5/paperdesk-registry-webjob-76c9c8c5.zip",
+    "bridgeIntegrationSubnetResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea/subnets/snet-appservice-integration",
     "writerIdentityResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
     "writerClientId": "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
     "writerPrincipalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
@@ -107,7 +141,7 @@
     "primaryDeploymentPrincipalId": "706d4431-c8d6-4bac-986b-251c2b54f1d3"
   },
   "initialState": {
-    "observedAt": "2026-08-28T07:21:16Z",
+    "observedAt": "2026-08-28T08:47:10Z",
     "bridge": {
       "state": "Stopped",
       "publicNetworkAccess": "Disabled",
@@ -127,6 +161,25 @@
       "allowProtectedAppendWritesAll": false
     },
     "resultContainerExists": false,
+    "packageStaging": {
+      "containerExists": false,
+      "temporaryRoleAssignmentsExist": false,
+      "storagePublicNetworkAccess": "Enabled",
+      "storageDefaultNetworkAction": "Deny",
+      "storageAllowBlobPublicAccess": false,
+      "storageAllowSharedKeyAccess": false,
+      "storageBypass": "None",
+      "storageIpRules": [],
+      "storageVirtualNetworkRules": [
+        "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea/subnets/snet-appservice-integration"
+      ],
+      "bridgeVnetRouteAllEnabled": true,
+      "bridgeOutboundVnetRoutingAllTraffic": false,
+      "bridgeOutboundVnetRoutingApplicationTraffic": true,
+      "blobSoftDeleteRetentionDays": 30,
+      "containerSoftDeleteRetentionDays": 30,
+      "subnetStorageServiceEndpointState": "Succeeded"
+    },
     "currentPermanentBridgeActions": [
       "Microsoft.Web/sites/Read",
       "Microsoft.Web/sites/start/Action",
@@ -176,6 +229,9 @@
   },
   "package": {
     "sha256": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
+    "md5Hex": "7e1a8ea43b756ce0db82d3166a6f3b39",
+    "contentMd5Base64": "fhqOpDt1bODbgtMWam87OQ==",
+    "size": 107987,
     "inventory": [
       {
         "path": "App_Data/jobs/triggered/paperdesk-accepted-release-registry/run.sh",
@@ -306,7 +362,126 @@
         "conditionVersion": null
       }
     ],
+    "packageStaging": {
+      "containerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5",
+      "blobBaseUri": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-registry-bootstrap-stage-76c9c8c5/paperdesk-registry-webjob-76c9c8c5.zip",
+      "expectedSize": 107987,
+      "expectedSha256": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
+      "publicAccess": "None",
+      "sharedKeyAllowed": false,
+      "accountSasAllowed": false,
+      "serviceSasAllowed": false,
+      "executorIpv4FirewallRule": {
+        "discoverySources": [
+          "https://api.ipify.org",
+          "https://checkip.amazonaws.com/"
+        ],
+        "derivation": "trim both HTTPS responses, require strict globally routable IPv4 parsing and exact string equality; abort on disagreement, invalid input, or any address change before upload",
+        "semanticScope": "one exact IPv4 host equivalent to /32",
+        "armRuleRepresentation": "bare IPv4 literal with no /32 suffix",
+        "maximumRulesDuringStaging": 1,
+        "maximumOpenSeconds": 1800,
+        "rawIpv4MayEnterExecutorControlledLogsEvidenceOrGit": false,
+        "preserveExistingNetworkAclsCanonicalPreimage": true,
+        "mustRestoreExactInitialIpRulesBeforeReceipt": true
+      },
+      "executorCreateAssignment": {
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d",
+        "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5/providers/Microsoft.Authorization/roleAssignments/70da6f1e-3ea2-4612-9194-ad5c132e7c36",
+        "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+        "principalType": "User",
+        "dataActions": [
+          "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+        ]
+      },
+      "executorReadAssignment": {
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/e005b62b-037b-4989-b492-932669ec0842",
+        "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5/providers/Microsoft.Authorization/roleAssignments/8474fffa-867e-4de9-a5e5-0af7ccc4a712",
+        "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+        "principalType": "User",
+        "dataActions": [
+          "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+        ]
+      },
+      "executorDelegatorAssignment": {
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/db58b8e5-c6ad-4a2a-8342-4190687cbf4a",
+        "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/providers/Microsoft.Authorization/roleAssignments/e0486136-547d-40b2-9870-11afaaed293b",
+        "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+        "principalType": "User",
+        "actions": [
+          "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"
+        ]
+      },
+      "userDelegationSas": {
+        "resource": "blob",
+        "permissions": "r",
+        "protocol": "https",
+        "signedIpAllowed": false,
+        "maximumLifetimeSeconds": 1800,
+        "signedStartMaximumSkewSeconds": 300,
+        "fullUriMayExistOnlyInExecutorProcessMemory": true,
+        "executorMayNotPrintPersistOrCommitFullUri": true,
+        "platformDiagnosticsMayTransientlyCapturePackageUri": true,
+        "platformExposureMitigation": "at most 1800-second lifetime, one read-only blob, immediate logical container deletion, and no retained executor transcript",
+        "mustSasGetAndReverifyExactBytesBeforeFirewallRestoration": true,
+        "receiptMustContainOnlyBaseUriAndFullUriSha256": true
+      },
+      "upload": {
+        "authorization": "Microsoft Entra bearer token only",
+        "blobType": "BlockBlob",
+        "precondition": "If-None-Match: *",
+        "contentType": "application/zip",
+        "contentLength": 107987,
+        "contentMd5Base64": "fhqOpDt1bODbgtMWam87OQ==",
+        "contentSha256Metadata": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
+        "mustReadBackAndRecomputeSha256": true,
+        "mustReadBackAndRecomputeMd5": true
+      },
+      "oneDeployRequest": {
+        "method": "PUT",
+        "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy",
+        "apiVersion": "2025-05-01",
+        "bodyShape": {
+          "properties": {
+            "packageUri": "runtime-in-memory-user-delegation-sas-for-exact-blob",
+            "type": "zip",
+            "clean": true,
+            "restart": false,
+            "ignorestack": false
+          }
+        },
+        "omittedProperties": [
+          "path",
+          "tag"
+        ],
+        "networkPreconditions": {
+          "bridgeState": "Stopped",
+          "bridgePublicNetworkAccess": "Disabled",
+          "outboundVnetRoutingAllTraffic": true,
+          "outboundVnetRoutingApplicationTraffic": true,
+          "onlyStorageNetworkPath": "existing bridge-integration subnet virtual-network rule",
+          "fetchFailurePolicy": "fail closed, run exact cleanup, do not reopen or broaden the executor firewall rule, and require a new authorization"
+        }
+      },
+      "cleanup": {
+        "deleteContainerByExactArmResourceId": true,
+        "deleteAllThreeExactRoleAssignments": true,
+        "deleteTemporaryDeploymentMarkerIfCreated": true,
+        "restoreExactInitialStorageNetworkRules": true,
+        "verifyContainerArmGetReturnsNotFoundAfterCleanup": true,
+        "dataPlaneNotFoundMayBeClaimedOnlyIfObservedFromAuthorizedVnetPath": true,
+        "logicalDeletionOnlyUnderSoftDelete": true,
+        "blobAndContainerSoftDeleteRetentionDays": 30,
+        "softDeletedPackageBytesMayRemainRecoverableAndBilled": true,
+        "immediatePhysicalPurgeClaimForbidden": true,
+        "mandatoryFinallyFromFirstStagingMutation": true,
+        "cleanupAuthorityLimitedToExactTemporaryResources": true,
+        "cleanupRequiredAfterSuccessOrFailure": true,
+        "receiptForbiddenUntilCleanupVerified": true
+      }
+    },
     "temporaryDeploymentMarker": {
+      "roleName": "PaperDesk Registry Bridge One-Time Deployment Marker",
       "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/a21758bb-8e92-48dd-91b3-fd1b044e9088",
       "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/961cf7d2-0dc5-45ba-ba1d-b7efe621b8ce",
       "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
@@ -356,7 +531,7 @@
   "executionPlan": {
     "kind": "ordered-arm-api-plan-v1",
     "canonicalization": "UTF-8 compact JSON of steps in declared order",
-    "sha256": "0896890252cf81b67474bc1eb4c3e62599e0e7653ab7675e6de5b4cd7cf68722",
+    "sha256": "fa60d2106c3d2722de79cd261f67c2303dd4f718bcc52d086ec5839b1d9fd78a",
     "steps": [
       {
         "order": 1,
@@ -419,7 +594,7 @@
         "operation": "configure-stopped-bridge",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
         "apiVersion": "2025-05-01",
-        "constraint": "PYTHON|3.12; alwaysOn true; webJobsEnabled true; scmIpSecurityRestrictionsUseMain true; state remains Stopped; publicNetworkAccess Disabled; main and SCM defaults Deny; FTP/SCM basic publishing disabled; exact two existing UAMIs"
+        "constraint": "PYTHON|3.12; alwaysOn true; webJobsEnabled true; scmIpSecurityRestrictionsUseMain true; set properties.outboundVnetRouting.allTraffic true and preserve properties.outboundVnetRouting.applicationTraffic true, then re-read both modern properties; legacy vnetRouteAllEnabled remains true; state remains Stopped; publicNetworkAccess Disabled; main and SCM defaults Deny; FTP/SCM basic publishing disabled; exact two existing UAMIs"
       },
       {
         "order": 10,
@@ -430,31 +605,80 @@
       },
       {
         "order": 11,
-        "operation": "create-one-time-deployment-marker-authority",
-        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-        "apiVersion": "2022-04-01",
-        "constraint": "exact temporary role and assignment IDs; exact two redeploy actions; operator is the reviewed human principal; governance marker only because executor retains standing Owner; no other grant"
+        "operation": "create-exact-private-package-staging-container",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5",
+        "apiVersion": "2025-06-01",
+        "constraint": "container must be absent immediately before create; publicAccess exactly None; no immutability policy; exact one reviewed blob allowed; no Shared Key"
       },
       {
         "order": 12,
-        "operation": "deploy-reviewed-package-once",
-        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy",
-        "apiVersion": "2025-05-01",
-        "constraint": "single OneDeploy of package SHA-256 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8; bridge remains stopped; capture exact live deployment object and response digest"
+        "operation": "create-three-temporary-package-staging-role-assignments",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e",
+        "apiVersion": "2022-04-01",
+        "constraint": "assign exact existing add-only and read-only custom roles at the exact staging container plus exact built-in Storage Blob Delegator at the storage account to the reviewed executor; exact preallocated IDs; unconditional; no role-definition creation"
       },
       {
         "order": 13,
-        "operation": "remove-all-bridge-redeploy-authority",
-        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-        "apiVersion": "2022-04-01",
-        "constraint": "delete exact temporary assignment and role; update permanent role to exact 12-action final set; extensions/Write and publish/Action absent"
+        "operation": "add-one-temporary-executor-ipv4-storage-rule",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e",
+        "apiVersion": "2025-06-01",
+        "constraint": "two independent HTTPS observations must return the same strict globally routable IPv4; add only that exact host as one bare IPv4 ARM rule with no /32 suffix; preserve canonical networkAcls preimage, default Deny, bypass None, allowBlobPublicAccess false, allowSharedKeyAccess false, all IPv6 and resource-access rules, and the sole existing bridge-integration-subnet VNet rule projected only as id plus action; the executor must never place the raw IP in controlled logs, evidence, transcripts, or Git; Azure control-plane retention is not claimed absent"
       },
       {
         "order": 14,
+        "operation": "upload-and-read-back-exact-reviewed-package",
+        "target": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-registry-bootstrap-stage-76c9c8c5/paperdesk-registry-webjob-76c9c8c5.zip",
+        "apiVersion": "2025-11-05",
+        "constraint": "Microsoft Entra bearer token only; Put Blob BlockBlob with If-None-Match star; content type application/zip; exactly 107987 bytes; Content-MD5 fhqOpDt1bODbgtMWam87OQ==; metadata SHA-256 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8; OAuth GET exact blob and recompute exact byte SHA-256 and MD5; no list or overwrite"
+      },
+      {
+        "order": 15,
+        "operation": "issue-in-memory-read-only-user-delegation-sas",
+        "target": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-registry-bootstrap-stage-76c9c8c5/paperdesk-registry-webjob-76c9c8c5.zip",
+        "apiVersion": "2025-11-05",
+        "constraint": "user delegation only; exact blob resource; sp=r; sr=b; spr=https; no sip; explicit start no more than five minutes in the past and expiry no more than 25 minutes in the future; total lifetime at most 1800 seconds; while the executor IP rule remains active, SAS-GET the exact blob and reverify size, SHA-256, MD5, and ZIP inventory; the executor keeps the full URI only in process memory and never prints, persists, includes it in evidence, or commits it; Kudu platform diagnostics may transiently capture packageUri, mitigated by the narrow scope and lifetime; retain only the base URI and SHA-256 of the full URI"
+      },
+      {
+        "order": 16,
+        "operation": "remove-temporary-executor-ipv4-storage-rule",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e",
+        "apiVersion": "2025-06-01",
+        "constraint": "remove the bare exact-host IPv4 rule immediately after OAuth upload, readback, and SAS generation and before OneDeploy; prove the canonical networkAcls hash equals the exact preimage with default Deny, bypass None, public blob access false, Shared Key false, all IPv6 and resource-access rules, and the sole bridge-integration-subnet VNet rule unchanged; abort and clean up if restoration cannot be proven"
+      },
+      {
+        "order": 17,
+        "operation": "create-one-time-deployment-marker-authority",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+        "apiVersion": "2022-04-01",
+        "constraint": "after staging upload, readback, SAS generation, and network ACL restoration succeed, create the exact temporary role named PaperDesk Registry Bridge One-Time Deployment Marker and its exact assignment ID with only the two reviewed redeploy actions; operator is the reviewed human principal; governance marker only because executor retains standing Owner; no other grant"
+      },
+      {
+        "order": 18,
+        "operation": "deploy-reviewed-package-once",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy",
+        "apiVersion": "2025-05-01",
+        "constraint": "one direct ARM PUT only; request properties are exactly packageUri from the in-memory SAS, type zip, clean true, restart false, ignorestack false; path and tag omitted; package SHA-256 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8; bridge remains stopped and modern outboundVnetRouting allTraffic and applicationTraffic are both re-read true; package fetch must traverse the already-allowed bridge-integration subnet; capture exact successful live deployment object and response digest without retaining the SAS; any fetch failure is fail-closed with exact cleanup, no firewall broadening, and a new authorization required"
+      },
+      {
+        "order": 19,
+        "operation": "delete-and-verify-all-package-staging-state",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5",
+        "apiVersion": "mixed-2025-06-01-and-2022-04-01",
+        "constraint": "run as a mandatory finally path after any partial staging or OneDeploy success or failure; delete the exact private container by ARM and delete the exact add-only, read-only, and delegator assignments; verify the container and blob are absent from the active namespace, all three assignments are absent, and exact initial storage network rules are restored; record that 30-day blob/container soft delete can retain about 108 KB as recoverable and billable bytes and do not claim immediate physical purge; if the deployment marker was created, continue with its exact cleanup in step 20; after mandatory cleanup steps 19 and 20 finish, any failed deployment or incomplete cleanup stops further execution and requires a new signed authorization; no receipt may be produced"
+      },
+      {
+        "order": 20,
+        "operation": "remove-all-bridge-redeploy-authority",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+        "apiVersion": "2022-04-01",
+        "constraint": "always delete the exact temporary assignment and role if created; after successful OneDeploy only, update the permanent role to the exact 12-action final set with extensions/Write and publish/Action absent; after failed OneDeploy, do not change the permanent role and stop only after the exact temporary authority and staging cleanup are verified; do not touch the production application or either storage data container"
+      },
+      {
+        "order": 21,
         "operation": "reseal-and-capture-receipt",
         "target": "fixed-production-control-rbac-bridge-and-result-storage",
         "apiVersion": "mixed-read-only",
-        "constraint": "production control has only the exact future direct-ARM sites/Read role; current az webapp show canary is explicitly incompatible and was not run; primary deploy assignment preservation is captured by a separate external ARM evidence annex because strict receipt schema v1 has no native field; bridge Stopped/private; no WebJob run; no accepted-release write; no result blob write; no transient settings; produce local receipt, annex, and checksums only"
+        "constraint": "production control has only the exact future direct-ARM sites/Read role; current az webapp show canary is explicitly incompatible and was not run; primary deploy assignment preservation and truthful permanent-role updatedOn/canonical-response evidence are captured by a separate external ARM annex because strict receipt schema v1 has no native fields; legacy bootstrapAuthority.roleDefinitionEtag is the exact sentinel unavailable and must not be represented as an HTTP ETag; package staging container and blob are absent from the active namespace, three temporary assignments and the temporary IP rule are absent, executor-controlled memory, logs, evidence, transcripts, and Git retain no SAS or delegation key, and the exact SAS expiry has passed before receipt creation; any Azure or Kudu diagnostic retention of the now-expired packageUri is explicitly disclosed; bridge Stopped/private; no WebJob run; no accepted-release write; no result blob write; no transient settings; produce local receipt, annexes, and checksums only"
       }
     ]
   },
@@ -474,7 +698,13 @@
     "grant the external-control principal any production action other than Microsoft.Web/sites/Read",
     "change production application configuration, files, state, deployment, release SHA, networking, identities, or data while replacing the control role",
     "run or claim operability of the current az webapp show canary after the broad production role is removed",
-    "modify the verifier workflow, caller workflow pin, federated identity credential, or create/activate a future direct ARM canary under this authorization"
+    "modify the verifier workflow, caller workflow pin, federated identity credential, or create/activate a future direct ARM canary under this authorization",
+    "commit, publish, release, or otherwise place the WebJob ZIP or any encoded form of its bytes in the public verifier repository",
+    "create any package staging container, blob, role assignment, SAS, or network rule other than the exact temporary packageStaging contract",
+    "use an account SAS, service SAS, Shared Key, public container, public blob, anonymous package URL, persistent package URL, or SAS permission other than read",
+    "print, log, persist, commit, upload as evidence, or include in any executor-controlled output or command transcript any user delegation key, SAS query, SAS signature, or full packageUri; Azure or Kudu platform diagnostics may transiently retain the packageUri despite this executor boundary",
+    "add more than one temporary storage IP rule, use any ARM representation other than one bare exact-host IPv4 literal, authorize IPv6 or an IP range broader than one host, change the existing VNet rule, or leave the temporary rule after package upload",
+    "list storage blobs, overwrite the package blob, stage more than one blob, or retain any package staging resource or assignment after the OneDeploy attempt"
   ],
   "requiredPostconditions": [
     "external-control principal broad Website Contributor assignment 71b7a7ec-c6c5-4654-bce9-3a66c323a8df is absent",
@@ -483,9 +713,12 @@
     "production App Service configuration, state, files, release SHA, networking, identities, and data are unchanged",
     "result container exists privately and its 30-day WORM policy is Locked before any future result write",
     "accepted-release container and its two existing role assignments are byte-for-byte unchanged",
-    "bridge is Stopped, private, sealed, PYTHON|3.12, AlwaysOn true, WebJobs enabled, and SCM uses main restrictions",
+    "bridge is Stopped, private, sealed, PYTHON|3.12, AlwaysOn true, WebJobs enabled, SCM uses main restrictions, modern outboundVnetRouting allTraffic is true, applicationTraffic is true, and legacy vnetRouteAllEnabled remains true",
     "bridge has exactly the two fixed UAMIs and exactly five non-secret persistent settings",
     "OneDeploy proves the exact reviewed package and deterministic three-file inventory",
+    "the exact package staging container and blob are absent from the active namespace, all three temporary package staging role assignments are absent, executor-controlled memory, logs, evidence, transcripts, and Git retain no SAS or user delegation key, and the exact SAS expiry passed before receipt creation; Azure or Kudu diagnostics may retain the now-expired packageUri; 30-day blob/container soft delete may retain about 108 KB as recoverable and billable bytes and no immediate physical purge is claimed",
+    "the storage account has its exact initial empty IP-rule set, default Deny, bypass None, public blob access disabled, Shared Key disabled, and sole bridge-integration-subnet VNet rule unchanged",
+    "the package staging evidence annex proves the exact base URI, size, create-only upload, Content-MD5, readback SHA-256 and MD5, in-memory read-only SAS policy, OneDeploy request-body digest, logical cleanup, soft-delete retention facts, and active-namespace absence without containing the SAS or executor public IP",
     "no WebJob was run and no accepted-release or result blob was read or written",
     "temporary deployment role definition and assignment are absent",
     "permanent bridge control role has exactly the reviewed 12 actions and no extensions/Write or publish/Action",
@@ -494,6 +727,7 @@
     "no production application, database, attachment, cleanup-watcher, or watchdog state changed",
     "a strict bootstrap receipt and checksum plus a separate external ARM production-control evidence annex and checksum were generated locally for a later signed two-approval PR",
     "current az webapp show canary was not run and is explicitly recorded as incompatible and fail-closed under the sole Microsoft.Web/sites/Read role",
+    "strict receipt bootstrapAuthority.roleDefinitionEtag is the exact sentinel unavailable; the external ARM annex states etagReturned false and records properties.updatedOn plus the canonical compact sorted-key role-definition response SHA-256; no value is represented as an HTTP ETag",
     "any future canary activation requires a separate signed two-approval workflow and FIC authorization using a raw exact-resource ARM GET plus Activity Log proof of no publishxml, configuration, write, restart, or deployment action"
   ],
   "requiredReceipt": {
@@ -509,6 +743,8 @@
     "activationStillNotAuthorized": true,
     "strictBootstrapReceiptSchemaUnchanged": true,
     "strictBootstrapReceiptDoesNotNativelyCaptureProductionControlHardening": true,
+    "legacyRoleDefinitionEtagFieldRequiredValue": "unavailable",
+    "legacyRoleDefinitionEtagFieldSemantic": "Azure role-definition GET returned no HTTP ETag; this sentinel is not an ETag and must be paired with properties.updatedOn and canonical response SHA-256 in the external ARM annex",
     "productionControlHardeningEvidenceMode": "separate-external-arm-evidence-annex-v1",
     "externalArmEvidenceAnnexPath": "evidence/registry-bridge-bootstrap-control-hardening-evidence.json",
     "externalArmEvidenceAnnexChecksumPath": "evidence/registry-bridge-bootstrap-control-hardening-evidence.json.sha256",
@@ -519,12 +755,79 @@
       "primaryProductionDeploymentPrincipalId",
       "primaryProductionDeploymentAssignmentId",
       "permanentBridgeAssignmentId",
+      "permanentBridgeRoleDefinitionEvidence",
       "productionApplicationUnchangedEvidence",
       "currentAzureCliCanaryCompatibility",
       "standingOwnerBoundary",
       "armRequestIdsAndResponseDigests"
     ],
+    "permanentBridgeRoleDefinitionEvidenceRequiredFields": [
+      "resourceId",
+      "apiVersion",
+      "etagReturned",
+      "httpEtag",
+      "propertiesUpdatedOn",
+      "canonicalResponseSha256",
+      "canonicalization",
+      "observedAt",
+      "clientRequestId",
+      "requestId",
+      "correlationRequestId",
+      "legacyReceiptFieldValue",
+      "legacyReceiptFieldSemantic"
+    ],
+    "permanentBridgeRoleDefinitionEvidenceRequiredValues": {
+      "etagReturned": false,
+      "httpEtag": null,
+      "canonicalization": "paperdesk-canonical-json-v1-recursive-unicode-code-point-key-order-arrays-preserved-compact-utf8-no-bom-no-trailing-newline",
+      "legacyReceiptFieldValue": "unavailable",
+      "legacyReceiptFieldSemantic": "not-an-http-etag"
+    },
     "externalArmEvidenceAnnexMustRecordCurrentCanaryIncompatible": true,
-    "externalArmEvidenceAnnexMustBeIncludedInSeparateSignedPr": true
+    "externalArmEvidenceAnnexMustAbortIfAnHttpEtagAppears": true,
+    "externalArmEvidenceAnnexMustBeIncludedInSeparateSignedPr": true,
+    "packageStagingEvidenceMode": "separate-local-redacted-evidence-annex-v1",
+    "packageStagingEvidenceAnnexPath": "evidence/registry-bridge-bootstrap-package-staging-evidence.json",
+    "packageStagingEvidenceAnnexChecksumPath": "evidence/registry-bridge-bootstrap-package-staging-evidence.json.sha256",
+    "packageStagingEvidenceAnnexRequiredFields": [
+      "storageAccountResourceId",
+      "containerResourceId",
+      "blobBaseUri",
+      "packageSize",
+      "packageSha256",
+      "uploadRequestId",
+      "readbackRequestId",
+      "readbackSha256",
+      "readbackMd5",
+      "sasReadbackSha256",
+      "sasReadbackMd5",
+      "userDelegationSasPolicy",
+      "userDelegationSasExpiresAt",
+      "userDelegationSasExpiryObserved",
+      "fullPackageUriSha256",
+      "oneDeployRequestBodySha256",
+      "oneDeployResponseSha256",
+      "networkAclsPreimageSha256",
+      "networkAclsRestoredSha256",
+      "networkRuleRestoration",
+      "roleAssignmentCleanup",
+      "containerDeleteRequestId",
+      "containerArmGetNotFoundEvidence",
+      "containerAndBlobCleanup",
+      "softDeleteRetentionDays",
+      "logicalDeletionOnly",
+      "recoverableUntil",
+      "secretRedactionAudit",
+      "standingOwnerBoundary"
+    ],
+    "packageStagingEvidenceForbiddenFields": [
+      "executorPublicIp",
+      "sas",
+      "sasQuery",
+      "sasSignature",
+      "userDelegationKey",
+      "fullPackageUri"
+    ],
+    "packageStagingEvidenceAnnexMustBeIncludedInSeparateSignedPr": true
   }
 }
