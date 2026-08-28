@@ -1,11 +1,11 @@
 {
-  "schema": "paperdesk-registry-bridge-bootstrap-and-control-reader-authorization-v1",
-  "schemaVersion": 1,
+  "schema": "paperdesk-registry-bridge-bootstrap-and-control-reader-authorization-v2",
+  "schemaVersion": 2,
   "status": "governance-authorized-pending-manual-execution",
-  "authorizationId": "e40598f2-8d8f-42fb-b0a4-b7b402a0ed4a",
+  "authorizationId": "42d7b5e5-689e-4c33-a678-e98189f2162f",
   "validity": {
-    "notBefore": "2026-08-28T07:42:39Z",
-    "expiresAt": "2026-09-04T07:42:39Z",
+    "notBefore": "2026-08-28T08:01:47Z",
+    "expiresAt": "2026-09-04T08:01:47Z",
     "singleUse": true
   },
   "source": {
@@ -13,7 +13,9 @@
     "baseMergeSha": "c45539a86b575f1a4d58c3aa11df8c34a32a23b0",
     "baseTreeSha": "b46cacb9d75a09ce93595d015788da820010f1a4",
     "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
-    "requiredCheck": "test"
+    "requiredCheck": "test",
+    "authorizationRevision": "v4-canary-compatibility-correction",
+    "supersedesAuthorizationHeadSha": "99d9d24bf12db8e0615a4285235844a6f30edfd6"
   },
   "authorizationScope": {
     "registryBridgeBootstrapAndProductionControlReadHardeningOnly": true,
@@ -30,7 +32,9 @@
     "cleanupWatcherBootstrapAuthorized": false,
     "watchdogProviderBootstrapAuthorized": false,
     "productionControlBroadRoleRemovalAuthorized": true,
-    "productionControlReadProbeRoleCreationAuthorized": true
+    "productionControlReadProbeRoleCreationAuthorized": true,
+    "currentAzureCliCanaryExecutionAuthorized": false,
+    "futureDirectArmCanaryOrFicChangeAuthorized": false
   },
   "approvalPolicy": {
     "baseBranch": "main",
@@ -78,7 +82,9 @@
     "abortOnAnyUnreviewedCommandOrLiveDrift": true,
     "receiptMustDiscloseStandingOwnerBoundary": true,
     "productionControlPrincipalRemainsMutationDormant": true,
-    "primaryProductionDeploymentPrincipalIsSeparateAndOutOfScope": true
+    "primaryProductionDeploymentPrincipalIsSeparateAndOutOfScope": true,
+    "currentAzureCliCanaryBecomesFailClosedAfterHardening": true,
+    "futureDirectArmCanaryRequiresSeparateSignedTwoApprovalAuthorization": true
   },
   "resources": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
@@ -141,8 +147,23 @@
       "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
       "createdOn": "2026-08-13T17:50:02.5630473Z",
       "createdBy": "b97bfa13-b375-4b27-93d7-141029dbc05b",
-      "observedUse": "read-only OIDC probe only; no retained evidence of production deployment by this principal",
-      "directAssignmentMustBeRemoved": true
+      "observedUse": "one workflow run labeled read-only OIDC probe; GitHub run 31813504238 and Azure Activity Log prove its az webapp show command invoked Microsoft.Web/sites/publishxml/Action; no retained evidence of production deployment by this principal",
+      "directAssignmentMustBeRemoved": true,
+      "currentCanaryCompatibility": {
+        "workflowRunId": 31813504238,
+        "workflowCommand": "az webapp show",
+        "runnerAzureCliVersion": "2.89.0",
+        "observedAzureAction": "Microsoft.Web/sites/publishxml/Action",
+        "observedCorrelationId": "b35f0dde-21f2-404c-9133-7cd9ec3582ff",
+        "implementationChain": "show_webapp -> show_app -> _fill_ftp_publishing_url -> list_publish_profiles",
+        "requiredCurrentActions": [
+          "Microsoft.Web/sites/Read",
+          "Microsoft.Web/sites/config/Read",
+          "Microsoft.Web/sites/publishxml/Action"
+        ],
+        "compatibleWithExactSitesReadOnlyRole": false,
+        "behaviorAfterBroadRoleRemoval": "fail-closed until a separate signed two-approval workflow/FIC change replaces az webapp show with a raw exact-resource ARM GET and Activity Log proves read-only behavior"
+      }
     },
     "primaryProductionDeploymentBoundary": {
       "principalId": "706d4431-c8d6-4bac-986b-251c2b54f1d3",
@@ -178,7 +199,7 @@
   },
   "rbacPlan": {
     "productionControlReadProbe": {
-      "roleName": "PaperDesk Production Control Read Probe",
+      "roleName": "PaperDesk Future Direct ARM Read Probe",
       "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
       "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
       "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
@@ -197,7 +218,7 @@
       "conditionVersion": null,
       "replacesRoleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
       "replacementOrder": "create-role-then-assign-then-delete-broad-assignment",
-      "purpose": "retain only the currently exercisable read-only OIDC App Service probe while every mutating external-control mode remains hard-stopped"
+      "purpose": "remove dormant broad production authority and pre-provision only the sole sites/Read grant needed by a future separately reviewed raw ARM GET canary; the current az webapp show canary is intentionally incompatible and will fail closed"
     },
     "primaryProductionDeploymentAssignmentMustRemainUnchanged": {
       "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2",
@@ -335,7 +356,7 @@
   "executionPlan": {
     "kind": "ordered-arm-api-plan-v1",
     "canonicalization": "UTF-8 compact JSON of steps in declared order",
-    "sha256": "abc5cea2bf291668a8404c92b4dd23246abaeab6be4bca6095d9b0c06b61b4c7",
+    "sha256": "0896890252cf81b67474bc1eb4c3e62599e0e7653ab7675e6de5b4cd7cf68722",
     "steps": [
       {
         "order": 1,
@@ -349,28 +370,28 @@
         "operation": "create-production-control-read-probe-role",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
         "apiVersion": "2022-04-01",
-        "constraint": "custom role; assignable only within the fixed subscription; actions exactly Microsoft.Web/sites/Read; all negative and data-action arrays empty"
+        "constraint": "custom role; assignable only within the fixed subscription; actions exactly Microsoft.Web/sites/Read; all negative and data-action arrays empty; this role does not preserve the current az webapp show canary"
       },
       {
         "order": 3,
         "operation": "assign-production-control-read-probe",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
         "apiVersion": "2022-04-01",
-        "constraint": "exact control principal and exact production App Service scope; unconditional; non-delegated"
+        "constraint": "exact control principal and exact production App Service scope; unconditional; non-delegated; assignment is for a future separately reviewed raw ARM GET canary only"
       },
       {
         "order": 4,
         "operation": "remove-production-control-broad-role",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
         "apiVersion": "2022-04-01",
-        "constraint": "delete only the exact control-principal Website Contributor assignment after the exact read-probe assignment exists; do not touch the separate primary deployment assignment"
+        "constraint": "delete only the exact control-principal Website Contributor assignment after the exact sites/Read assignment exists; accept the explicitly reviewed fail-closed loss of the current az webapp show canary; run no canary; do not touch the separate primary deployment assignment"
       },
       {
         "order": 5,
         "operation": "verify-production-control-rbac-hardening",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
         "apiVersion": "mixed-read-only",
-        "constraint": "broad assignment absent; exact read-probe role and assignment present; primary deployment assignment unchanged; production app configuration and release SHA unchanged"
+        "constraint": "broad assignment absent; exact future direct-ARM sites/Read role and assignment present; current az webapp show canary explicitly marked incompatible and not run; primary deployment assignment unchanged by separate ARM re-verification; production app configuration and release SHA unchanged"
       },
       {
         "order": 6,
@@ -433,7 +454,7 @@
         "operation": "reseal-and-capture-receipt",
         "target": "fixed-production-control-rbac-bridge-and-result-storage",
         "apiVersion": "mixed-read-only",
-        "constraint": "production control has exact read-only probe only; primary deploy assignment unchanged; bridge Stopped/private; no WebJob run; no accepted-release write; no result blob write; no transient settings; produce local receipt and checksum only"
+        "constraint": "production control has only the exact future direct-ARM sites/Read role; current az webapp show canary is explicitly incompatible and was not run; primary deploy assignment preservation is captured by a separate external ARM evidence annex because strict receipt schema v1 has no native field; bridge Stopped/private; no WebJob run; no accepted-release write; no result blob write; no transient settings; produce local receipt, annex, and checksums only"
       }
     ]
   },
@@ -451,7 +472,9 @@
     "repeat after any successful or partial execution without a new signed authorization",
     "change or delete the primary production deployment principal, its federated credential, or role assignment b24a4ca5-de40-47c8-90d8-caf08759dfb2",
     "grant the external-control principal any production action other than Microsoft.Web/sites/Read",
-    "change production application configuration, files, state, deployment, release SHA, networking, identities, or data while replacing the control role"
+    "change production application configuration, files, state, deployment, release SHA, networking, identities, or data while replacing the control role",
+    "run or claim operability of the current az webapp show canary after the broad production role is removed",
+    "modify the verifier workflow, caller workflow pin, federated identity credential, or create/activate a future direct ARM canary under this authorization"
   ],
   "requiredPostconditions": [
     "external-control principal broad Website Contributor assignment 71b7a7ec-c6c5-4654-bce9-3a66c323a8df is absent",
@@ -469,7 +492,9 @@
     "result container has exactly the three reviewed assignments reusing the existing append/read definitions",
     "FIC remains pinned to 22fdce42 and every GitHub workflow/provider runtime remains dormant",
     "no production application, database, attachment, cleanup-watcher, or watchdog state changed",
-    "a strict bootstrap receipt and checksum were generated locally for a separate signed two-approval PR"
+    "a strict bootstrap receipt and checksum plus a separate external ARM production-control evidence annex and checksum were generated locally for a later signed two-approval PR",
+    "current az webapp show canary was not run and is explicitly recorded as incompatible and fail-closed under the sole Microsoft.Web/sites/Read role",
+    "any future canary activation requires a separate signed two-approval workflow and FIC authorization using a raw exact-resource ARM GET plus Activity Log proof of no publishxml, configuration, write, restart, or deployment action"
   ],
   "requiredReceipt": {
     "path": "evidence/registry-bridge-bootstrap-receipt.json",
@@ -482,10 +507,24 @@
     "separateSignedPrRequired": true,
     "requiredApprovals": 2,
     "activationStillNotAuthorized": true,
-    "productionControlHardeningMustBeCaptured": true,
-    "removedBroadAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
-    "exactReadProbeRoleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
-    "exactReadProbeRoleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
-    "primaryProductionDeploymentAssignmentMustRemain": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2"
+    "strictBootstrapReceiptSchemaUnchanged": true,
+    "strictBootstrapReceiptDoesNotNativelyCaptureProductionControlHardening": true,
+    "productionControlHardeningEvidenceMode": "separate-external-arm-evidence-annex-v1",
+    "externalArmEvidenceAnnexPath": "evidence/registry-bridge-bootstrap-control-hardening-evidence.json",
+    "externalArmEvidenceAnnexChecksumPath": "evidence/registry-bridge-bootstrap-control-hardening-evidence.json.sha256",
+    "externalArmEvidenceAnnexRequiredFields": [
+      "removedBroadAssignmentId",
+      "exactSitesReadRoleDefinitionId",
+      "exactSitesReadRoleAssignmentId",
+      "primaryProductionDeploymentPrincipalId",
+      "primaryProductionDeploymentAssignmentId",
+      "permanentBridgeAssignmentId",
+      "productionApplicationUnchangedEvidence",
+      "currentAzureCliCanaryCompatibility",
+      "standingOwnerBoundary",
+      "armRequestIdsAndResponseDigests"
+    ],
+    "externalArmEvidenceAnnexMustRecordCurrentCanaryIncompatible": true,
+    "externalArmEvidenceAnnexMustBeIncludedInSeparateSignedPr": true
   }
 }
