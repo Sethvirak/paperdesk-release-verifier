@@ -1,0 +1,166 @@
+{
+  "schemaVersion": 1,
+  "contractId": "paperdesk-registry-bridge-cleanup-watcher-v1",
+  "status": "dormant-pending-independent-review-deployment-and-live-canary",
+  "immutableExternalControl": {
+    "repository": "Sethvirak/paperdesk-release-verifier",
+    "repositoryId": "1333353701",
+    "workflowPath": ".github/workflows/azure-production-control.yml",
+    "mergedMutatingCommitSha": null,
+    "activationRule": "The watcher package has no live entry point while mergedMutatingCommitSha is null. Activation requires an independently reviewed merged commit, fixed managed identities and exact roles, a deployed independent scheduler, retained runner-loss canaries for every phase, and an immutable bootstrap receipt."
+  },
+  "watcher": {
+    "appName": "paperdesk-registry-cleanup-watcher-9c4e0d0d",
+    "independence": "The watcher is not hosted by the registry bridge and does not depend on a GitHub-hosted runner surviving.",
+    "scheduleMaximumSeconds": 60,
+    "sessionLeaseSeconds": 600,
+    "cleanupLeaseSeconds": 600,
+    "canonicalJsonRequired": true,
+    "maximumSessionBytes": 65536,
+    "maximumResultEnvelopeBytes": 8192,
+    "maximumReceiptBytes": 65536
+  },
+  "bridge": {
+    "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+    "resourceGroup": "rg-master-data-structure-sea",
+    "name": "paperdesk-release-registry-bridge-9c4e0d0d",
+    "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+    "webJobName": "paperdesk-accepted-release-registry",
+    "sealedPostcondition": {
+      "state": "Stopped",
+      "publicNetworkAccess": "Disabled",
+      "linuxFxVersion": "PYTHON|3.12",
+      "alwaysOn": true,
+      "webJobsEnabled": true,
+      "scmIpSecurityRestrictionsUseMain": true,
+      "ftpsState": "Disabled",
+      "ipSecurityRestrictionsDefaultAction": "Deny",
+      "scmIpSecurityRestrictionsDefaultAction": "Deny",
+      "ftpBasicPublishingAllowed": false,
+      "scmBasicPublishingAllowed": false
+    },
+    "persistentSettings": {
+      "PAPERDESK_REGISTRY_HELPER_SHA256": "889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050",
+      "PAPERDESK_REGISTRY_PACKAGE_SHA256": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
+      "PAPERDESK_REGISTRY_RUNNER_SHA256": "47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b",
+      "PAPERDESK_REGISTRY_SETTINGS_SHA256": "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e",
+      "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false"
+    },
+    "transientSettings": [
+      "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
+      "PAPERDESK_REGISTRY_ARTIFACT_HOST",
+      "PAPERDESK_REGISTRY_ARTIFACT_URL",
+      "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
+      "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
+      "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID",
+      "PAPERDESK_REGISTRY_GITHUB_TOKEN",
+      "PAPERDESK_REGISTRY_OPERATION",
+      "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB",
+      "PAPERDESK_REGISTRY_REQUEST_SHA256",
+      "PAPERDESK_REGISTRY_RESULT_BLOB",
+      "PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA",
+      "PAPERDESK_REGISTRY_RESULT_EXECUTION",
+      "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT",
+      "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID",
+      "PAPERDESK_REGISTRY_RESULT_NONCE",
+      "PAPERDESK_REGISTRY_RESULT_PURPOSE"
+    ]
+  },
+  "storage": {
+    "resourceGroup": "rg-paperdesk-rollback-sea-20260808",
+    "account": "mdspdbak2608089c4e",
+    "state": {
+      "container": "paperdesk-registry-cleanup-state",
+      "blob": "v1/bridge/current.json",
+      "retention": "mutable-CAS-state-no-delete; every closed record is retained by an exact create-only WORM closure marker before the singleton may advance, and the next session must bind a distinct reviewed runner-authority generation",
+      "clockSource": "authenticated Azure Storage Date response header",
+      "fencing": "Every open or reclaimed lease increments one positive integer fence under an exact ETag compare-and-swap. A stale fence cannot heartbeat, bind ARM history, stage an assessment, or close a session."
+    },
+    "runnerAuthorityFences": {
+      "container": "paperdesk-registry-runner-authority-fences",
+      "path": "v1/registry-bridge-runner-authority-fences/<session-id>/<fence>.json",
+      "retentionDays": 90,
+      "immutabilityState": "Locked",
+      "watcherAccess": "read-only",
+      "producer": "independent reviewed authority-revocation control with create-only access",
+      "semantic": "The runnerAuthorityGenerationSha256 is recomputed from canonical schema, contract, fixed bridge, control workflow SHA, control principal object ID, federated credential resource ID, exact sorted mutating role assignment IDs, and reviewed producer commit SHA. Those exact coordinates are revoked, the fence observation time is not earlier than the last possible token expiry, and the watcher's current authenticated Azure Storage server time must not be earlier than that observation. The bridge runner has no access to this container."
+    },
+    "results": {
+      "container": "paperdesk-registry-webjob-results",
+      "retentionDays": 30,
+      "immutabilityState": "Locked",
+      "watcherAccess": "read-only",
+      "writesAllowed": false,
+      "deletesAllowed": false
+    },
+    "acceptedReleases": {
+      "container": "paperdesk-accepted-releases",
+      "watcherAccess": "none",
+      "writesAllowed": false,
+      "deletesAllowed": false
+    },
+    "cleanupEvidence": {
+      "container": "paperdesk-watchdog-evidence",
+      "path": "v1/registry-bridge-cleanup/<session-id>/<fence>.json",
+      "closurePath": "v1/registry-bridge-cleanup/<session-id>/<fence>.closed.json",
+      "retentionDays": 90,
+      "immutabilityState": "Locked",
+      "writeMode": "canonical-create-only-exact-byte-idempotent-replay",
+      "deletesAllowed": false
+    }
+  },
+  "session": {
+    "schema": "paperdesk-registry-bridge-cleanup-session-v1",
+    "phases": [
+      "armed",
+      "settings-written",
+      "bridge-started",
+      "webjob-triggered",
+      "result-observed",
+      "runner-complete"
+    ],
+    "modes": {
+      "preflight": [
+        ["storage-rbac-canary", "preflight-storage", 1],
+        ["runtime-canary", "preflight-runtime", 1]
+      ],
+      "persistence": [
+        ["runtime-canary", "persistence-runtime", 1],
+        ["persist-actions-artifact", "persistence-result", 1],
+        ["persist-actions-artifact", "persistence-result", 2]
+      ]
+    },
+    "runnerLossRule": "After the server-timestamped lease expires, the watcher increments the fence before any cleanup. Before any receipt it must bind an independently produced locked-WORM fence for the exact runner-authority generation and rerun stop, reseal, transient-setting deletion, and the final snapshot only after that authority is revoked and every prior token is expired. Every non-null ARM history ID and web_job_id is unique, each history ID is under the fixed bridge and WebJob resource, and each ARM start time must not follow its end time. Missing authority fence, history binding, result, a partial matrix, a non-success history, an envelope mismatch, or an ARM web_job_id mismatch can never produce a receipt."
+  },
+  "authority": {
+    "allowedControlOperations": [
+      "read fixed bridge site/config/settings/basic-publishing-policy",
+      "read fixed triggered-WebJob history",
+      "stop fixed bridge",
+      "set fixed bridge network defaults to deny and SCM to use main restrictions",
+      "disable fixed bridge FTP and SCM basic publishing",
+      "delete only the exact transient setting names",
+      "read exact result blobs",
+      "read the exact independent runner-authority fence",
+      "CAS the fixed cleanup state blob without delete",
+      "create-only and exact-byte-read cleanup receipts in the fixed evidence container"
+    ],
+    "forbiddenControlOperations": [
+      "start bridge",
+      "run WebJob",
+      "deploy or publish",
+      "write role definitions or assignments",
+      "write result blobs",
+      "write accepted-release blobs",
+      "delete any blob",
+      "log app-setting values, credentials, tokens, request URLs, or response bodies"
+    ]
+  },
+  "receipt": {
+    "schema": "paperdesk-registry-bridge-cleanup-receipt-v1",
+    "completeStatus": "sealed-reconciled",
+    "indeterminateStatus": "sealed-indeterminate",
+    "idempotency": "The independent authority fence is read and bound before the claim-bound cleanup assessment is freshly rerun and the same fence lease is CAS-renewed immediately before evidence creation. Every create response is followed by exact-byte readback. A retry at the same fence must produce byte-identical canonical receipt bytes; an existing different receipt is a hard conflict. After the closed-state CAS, an exact WORM closure marker binds the closed-state digest, authority fence, and receipt. A cleanup receipt is authoritative only through that immutable closure marker, which remains retained after the singleton state advances."
+  }
+}

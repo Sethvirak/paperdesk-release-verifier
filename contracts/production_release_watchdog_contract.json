@@ -1,0 +1,390 @@
+{
+  "schemaVersion": 2,
+  "contractId": "paperdesk-production-release-watchdog-provider-state-v2",
+  "status": "dormant-pending-immutable-external-control",
+  "sourceRepository": {
+    "repository": "Sethvirak/MasterDataStructure",
+    "repositoryId": "1287744543",
+    "repositoryOwner": "Sethvirak",
+    "repositoryOwnerId": "202535166",
+    "ref": "refs/heads/main",
+    "productionWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
+    "rollbackWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+    "persistenceWorkflow": ".github/workflows/persist-accepted-release.yml"
+  },
+  "provider": {
+    "origin": "https://paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net",
+    "stateMethod": "GET",
+    "statePath": "/api/watchdog-state/v2",
+    "transitionMethod": "POST",
+    "transitionPath": "/api/watchdog-state/v2/transitions",
+    "audience": "api://paperdesk-watchdog-evidence-v2",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "authorizationHeader": "Authorization: Bearer <GitHub OIDC>",
+    "requestContentType": "application/json",
+    "requestType": "watchdog-state-transition",
+    "conditionalHeader": "If-Match",
+    "stateETagHeader": "ETag",
+    "maximumRequestBytes": 65536,
+    "maximumResponseBytes": 65536,
+    "redirectsAllowed": false,
+    "canonicalJsonRequired": true,
+    "acceptedStatuses": {
+      "created": 201,
+      "idempotentReplay": 200,
+      "malformedRequest": 400,
+      "unauthenticated": 401,
+      "wrongCaller": 403,
+      "lifecycleConflict": 409,
+      "staleStateETag": 412,
+      "providerUnavailable": 503
+    }
+  },
+  "oidc": {
+    "tokenRepository": "Sethvirak/MasterDataStructure",
+    "tokenRepositoryId": "1287744543",
+    "tokenRepositoryOwner": "Sethvirak",
+    "tokenRepositoryOwnerId": "202535166",
+    "ref": "refs/heads/main",
+    "environment": "paperdesk-production-control",
+    "subject": "repo:Sethvirak/MasterDataStructure:environment:paperdesk-production-control",
+    "requiredClaims": [
+      "iss",
+      "aud",
+      "sub",
+      "repository",
+      "repository_owner",
+      "repository_id",
+      "repository_owner_id",
+      "ref",
+      "sha",
+      "workflow_ref",
+      "workflow_sha",
+      "event_name",
+      "run_id",
+      "run_attempt",
+      "environment",
+      "job_workflow_ref",
+      "job_workflow_sha",
+      "iat",
+      "nbf",
+      "exp"
+    ],
+    "maximumLifetimeSeconds": 900,
+    "runBinding": {
+      "publish-candidate": {
+        "eventName": "workflow_dispatch",
+        "runIdField": "candidateRunId",
+        "runAttemptField": "candidateRunAttempt"
+      },
+      "accept-candidate": {
+        "eventName": "workflow_run",
+        "runIdSource": "oidc-persistence-caller",
+        "runAttemptSource": "oidc-persistence-caller",
+        "mustDifferFromRunIdField": "acceptanceRunId"
+      },
+      "rollback-workflow-observed": {
+        "eventName": "workflow_dispatch",
+        "runIdField": "workflowRunId",
+        "runAttempt": 1
+      },
+      "rollback-authorize": {
+        "eventName": "workflow_dispatch",
+        "runIdField": "workflowRunId",
+        "runAttempt": 1
+      },
+      "rollback-completed": {
+        "eventName": "workflow_dispatch",
+        "runIdField": "workflowRunId",
+        "runAttempt": 1
+      }
+    }
+  },
+  "immutableExternalControl": {
+    "repository": "Sethvirak/paperdesk-release-verifier",
+    "repositoryId": "1333353701",
+    "workflowPath": ".github/workflows/azure-production-control.yml",
+    "mergedMutatingCommitSha": null,
+    "requiredOperations": [
+      "publish-candidate",
+      "accept-candidate",
+      "rollback-workflow-observed",
+      "rollback-authorize",
+      "rollback-completed"
+    ],
+    "requiredOutputs": [
+      "operation_receipt_name",
+      "operation_receipt_sha256",
+      "watchdog_state_sha256",
+      "watchdog_state_etag",
+      "transition_receipt_sha256"
+    ],
+    "activationRule": "A PaperDesk workflow may use this control only after an independently reviewed commit containing all five required operations is merged, its full 40-character SHA is placed in source, the prior mutating SHA is denied, and live OIDC/provider/Kudu/Azure canaries pass.",
+    "rollbackAtomicityRule": "The immutable control, not PaperDesk, must record rollback-workflow-observed, re-read the provider claim and exact attempt receipt, compare Kudu server/paperdesk-release-sha.txt to expectedCurrentLiveSha immediately before Azure mutation, deploy only the accepted rollback runtime, verify Kudu equals restoredSourceSha, and record rollback-completed before returning success."
+  },
+  "state": {
+    "topLevelFields": [
+      "schemaVersion",
+      "generatedAt",
+      "sourceRepository",
+      "rollbackBaseline",
+      "pendingCandidate"
+    ],
+    "rollbackBaselineFields": [
+      "schemaVersion",
+      "receiptSha256",
+      "evidencePath",
+      "sourceSha",
+      "sourceRunId",
+      "sourceRunAttempt",
+      "acceptanceRunId",
+      "acceptanceRunAttempt",
+      "acceptedReleaseManifestSha256",
+      "acceptedReleasePrefix",
+      "reviewWorkflowRef",
+      "reviewWorkflowSha",
+      "reviewRunId",
+      "reviewRunAttempt",
+      "reviewEnvironment",
+      "preparedAt"
+    ],
+    "pendingCandidateFields": [
+      "candidateSha",
+      "candidateRunId",
+      "candidateRunAttempt",
+      "completedAt",
+      "deadline",
+      "acceptedReceiptPresent",
+      "liveSha",
+      "dispatchGuard",
+      "rollback"
+    ],
+    "dispatchGuardFields": [
+      "status",
+      "generation",
+      "claimId",
+      "leaseExpiresAt",
+      "watchdogRunId",
+      "watchdogRunAttempt",
+      "decisionReceiptSha256",
+      "decisionEvidenceETag",
+      "attemptReceiptSha256",
+      "workflowRunId",
+      "authorizationReceiptSha256"
+    ],
+    "dispatchGuardStatuses": [
+      "available",
+      "claimed",
+      "dispatching",
+      "requested",
+      "authorized"
+    ],
+    "dispatchGuardGenerationType": "positive-integer",
+    "rollbackFields": [
+      "sourceSha",
+      "sourceRunId",
+      "sourceRunAttempt",
+      "acceptanceRunId",
+      "acceptanceRunAttempt",
+      "baselineReceiptSha256"
+    ]
+  },
+  "transitions": {
+    "publish-candidate": {
+      "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
+      "requestFields": [
+        "schemaVersion",
+        "requestType",
+        "operation",
+        "expectedStateSha256",
+        "candidateSha",
+        "candidateRunId",
+        "candidateRunAttempt",
+        "completedAt",
+        "deadline",
+        "liveSha",
+        "verificationReceiptSha256",
+        "productionControlReceiptSha256",
+        "rollbackBaselineReceiptSha256"
+      ],
+      "responseFields": [
+        "schemaVersion",
+        "status",
+        "operation",
+        "previousStateSha256",
+        "stateSha256",
+        "stateETag",
+        "transitionReceiptSha256",
+        "transitionEvidencePath",
+        "transitionEvidenceETag",
+        "transitionEvidenceVersionId"
+      ],
+      "responseStatus": "candidate-published",
+      "preconditions": [
+        "provider state has one reviewed rollback baseline and no pending candidate",
+        "candidateSha equals OIDC sha and candidateRunId/candidateRunAttempt equal the OIDC run",
+        "liveSha equals candidateSha and the production control receipt proves that SHA through Kudu after deployment",
+        "the provider recomputes and enforces deadline as exactly 1,440 minutes after completedAt",
+        "rollbackBaselineReceiptSha256 equals rollbackBaseline.receiptSha256"
+      ]
+    },
+    "accept-candidate": {
+      "callerWorkflow": ".github/workflows/persist-accepted-release.yml",
+      "requestFields": [
+        "schemaVersion",
+        "requestType",
+        "operation",
+        "expectedStateSha256",
+        "candidateSha",
+        "candidateRunId",
+        "candidateRunAttempt",
+        "acceptanceRunId",
+        "acceptanceRunAttempt",
+        "productionAcceptanceReceiptSha256",
+        "acceptedReleaseManifestSha256",
+        "acceptedReleasePrefix",
+        "registryManifestETag",
+        "registryManifestVersionId"
+      ],
+      "responseFields": [
+        "schemaVersion",
+        "status",
+        "operation",
+        "previousStateSha256",
+        "stateSha256",
+        "stateETag",
+        "transitionReceiptSha256",
+        "transitionEvidencePath",
+        "transitionEvidenceETag",
+        "transitionEvidenceVersionId"
+      ],
+      "responseStatus": "candidate-accepted",
+      "preconditions": [
+        "the exact pending candidate is live and its deadline has not passed",
+        "dispatchGuard is available and attemptReceiptSha256 is null",
+        "OIDC workflow_ref is the exact persist-accepted-release.yml workflow_run consumer; its OIDC run is distinct from the source acceptanceRunId and is retained in transition WORM evidence",
+        "the accepted-release WORM manifest and production acceptance receipt bind the candidate, candidate run, acceptance run, registry ETag, and registry version ID",
+        "the provider rereads the exact WORM manifest, promotes it to rollbackBaseline, and clears only the matching pending candidate"
+      ]
+    },
+    "rollback-workflow-observed": {
+      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "requestFields": [
+        "schemaVersion",
+        "requestType",
+        "operation",
+        "expectedStateSha256",
+        "decisionReceiptSha256",
+        "decisionEvidenceETag",
+        "claimId",
+        "dispatchGuardGeneration",
+        "attemptReceiptSha256",
+        "expectedCurrentLiveSha",
+        "workflowRunId"
+      ],
+      "responseFields": [
+        "schemaVersion",
+        "status",
+        "operation",
+        "previousStateSha256",
+        "stateSha256",
+        "stateETag",
+        "transitionReceiptSha256",
+        "transitionEvidencePath",
+        "transitionEvidenceETag",
+        "transitionEvidenceVersionId"
+      ],
+      "responseStatus": "requested-recorded",
+      "preconditions": [
+        "OIDC run_id equals workflowRunId and OIDC workflow_ref is the exact rollback workflow",
+        "pendingCandidate.liveSha and pendingCandidate.candidateSha equal expectedCurrentLiveSha",
+        "dispatchGuard is dispatching and its generation and attemptReceiptSha256 equal the request",
+        "claimId, decision receipt digest, decision evidence ETag, and exact WORM attempt bytes all match provider metadata"
+      ]
+    },
+    "rollback-authorize": {
+      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "requestFields": [
+        "schemaVersion",
+        "requestType",
+        "operation",
+        "expectedStateSha256",
+        "decisionReceiptSha256",
+        "decisionEvidenceETag",
+        "claimId",
+        "dispatchGuardGeneration",
+        "attemptReceiptSha256",
+        "workflowRunId",
+        "expectedCurrentLiveSha",
+        "kuduObservedLiveSha",
+        "kuduObservedAt",
+        "kuduRequestSha256",
+        "kuduResponseSha256"
+      ],
+      "responseFields": [
+        "schemaVersion",
+        "status",
+        "operation",
+        "previousStateSha256",
+        "stateSha256",
+        "stateETag",
+        "transitionReceiptSha256",
+        "transitionEvidencePath",
+        "transitionEvidenceETag",
+        "transitionEvidenceVersionId"
+      ],
+      "responseStatus": "rollback-authorized",
+      "preconditions": [
+        "rollback-workflow-observed was recorded for this exact workflowRunId, claimId, generation, attempt receipt, decision receipt, and evidence ETag",
+        "the immutable external control rereads the fresh provider state and exact WORM attempt receipt",
+        "kuduObservedLiveSha equals expectedCurrentLiveSha and the Kudu request/response digests bind the immediately preceding observation",
+        "the provider writes and reads back the authorization WORM receipt before changing requested to authorized"
+      ]
+    },
+    "rollback-completed": {
+      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "requestFields": [
+        "schemaVersion",
+        "requestType",
+        "operation",
+        "expectedStateSha256",
+        "claimId",
+        "dispatchGuardGeneration",
+        "attemptReceiptSha256",
+        "workflowRunId",
+        "authorizationReceiptSha256",
+        "expectedCurrentLiveSha",
+        "rolledBackLiveSha",
+        "liveVerificationReceiptSha256",
+        "completedAt"
+      ],
+      "responseFields": [
+        "schemaVersion",
+        "status",
+        "operation",
+        "previousStateSha256",
+        "stateSha256",
+        "stateETag",
+        "transitionReceiptSha256",
+        "transitionEvidencePath",
+        "transitionEvidenceETag",
+        "transitionEvidenceVersionId"
+      ],
+      "responseStatus": "rollback-completed",
+      "preconditions": [
+        "rollback-workflow-observed was recorded for this exact workflowRunId, claimId, generation, and attempt receipt",
+        "the immutable external control receipt proves Kudu equaled expectedCurrentLiveSha immediately before Azure mutation",
+        "the same control operation deployed the accepted rollback runtime and its live verification receipt proves Kudu equals rolledBackLiveSha after mutation",
+        "rolledBackLiveSha equals rollbackBaseline.sourceSha and completion clears only the matching pending candidate"
+      ]
+    }
+  },
+  "reconciliation": {
+    "wormRetentionDays": 90,
+    "writeReceiptBeforeStateCas": true,
+    "readBackExactReceiptBeforeStateCas": true,
+    "idempotency": "An exact replay may return HTTP 200 only when operation, OIDC run, request body, prior state digest and ETag, and reconciliation receipt are identical.",
+    "automaticRelease": "Only an expired claimed lease with no attempt WORM receipt may return to available automatically.",
+    "manualReview": "Any attempt-present indeterminate outcome requires the protected paperdesk-watchdog-reconciliation environment; candidate acceptance may never clear claimed, dispatching, requested, or authorized state."
+  }
+}
