@@ -14,7 +14,11 @@
     "baseTreeSha": "7f1842321d07ca3e218cf9fc662564affe7b8f2f",
     "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
     "requiredCheck": "test",
-    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery",
+    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery-executor-bound",
+    "supersedesUnboundAuthorizationPullRequestNumber": 12,
+    "supersedesUnboundAuthorizationMergeSha": "b238c677b7f08adf36c65d7176c15633f62fa56b",
+    "supersededUnboundAuthorizationWasUnconsumed": true,
+    "authorizationIdResourcesAndPlanUnchanged": true,
     "supersedesAuthorizationId": "75411cb7-dd69-4a9f-b571-f79c8c6cd597",
     "supersedesAuthorizationHeadSha": "61546f3f7686fc9d546f9dae60808fcfd0aa9ea7",
     "supersedesAuthorizationMergeSha": "1c71726aa67bce6f15ee23443cd14500ebc6c94c",
@@ -166,6 +170,32 @@
       "evidence/registry-bridge-bootstrap-authorization.json.sha256"
     ]
   },
+  "executionArtifactBinding": {
+    "schemaVersion": "paperdesk-v8-executor-binding-v1",
+    "executorSha256": "28d4c2bf5060a8705bdc5785b01f6e6c8f511472797af72169859dc5d890ca38",
+    "executorSidecarSha256": "447e65cffb4f8eec4751bd5c7a1429361732ae3bf921b81f14ba3b2dd3989784",
+    "exactConfirmationPhrase": "Authorize Azure execution under authorization aaac49a9-1646-4772-be3a-1ff9cbe9eed5 using signed executor binding",
+    "exactConfirmationPhraseSha256": "e654eb6fef842c0a6a49cc38888bf841d65e3f8522bb5a207fa979b228b4d2b7",
+    "repository": "Sethvirak/paperdesk-release-verifier",
+    "headRefName": "codex/bind-v8-executor-governance-20260828",
+    "baseRefName": "main",
+    "authorizationPath": "evidence/registry-bridge-bootstrap-authorization.json",
+    "authorizationSidecarPath": "evidence/registry-bridge-bootstrap-authorization.json.sha256",
+    "executorGitHubIdentity": {
+      "login": "Sethvirak",
+      "id": 202535166
+    },
+    "expectedStandingOwnerProjection": {
+      "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/microsoft.authorization/roleassignments/866ddec6-43d2-4da8-8e64-02678257795a",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+      "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+      "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+      "principalType": "User",
+      "condition": null,
+      "conditionVersion": null,
+      "delegatedManagedIdentityResourceId": null
+    }
+  },
   "executor": {
     "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
     "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
@@ -220,7 +250,10 @@
     "immutabilityPolicyChildDeleteIsForbidden": true,
     "productionApplicationDeleteLockMutationAuthorized": false,
     "oneDeployAttemptAllowanceForThisAuthorization": 1,
-    "receiptRequiresBothOldAndFreshStagingNamespacesAbsent": true
+    "receiptRequiresBothOldAndFreshStagingNamespacesAbsent": true,
+    "executionRequiresExactSignedExecutorArtifactBinding": true,
+    "unboundPullRequest12ArtifactMayNotAuthorizeAzureExecution": true,
+    "localAuthorizationBytesMustEqualMergedGitHubContents": true
   },
   "resources": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
