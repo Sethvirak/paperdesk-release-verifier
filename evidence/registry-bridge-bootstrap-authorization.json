@@ -1,42 +1,48 @@
 {
+  "schema": "paperdesk-registry-bridge-bootstrap-and-control-reader-authorization-v1",
   "schemaVersion": 1,
-  "kind": "paperdesk-registry-bridge-bootstrap-authorization",
-  "status": "authorized-not-executed",
-  "authorizationId": "a9598581-4ec2-4d89-a51e-ac34a81feb6f",
-  "issuedAt": "2026-08-28T07:20:00Z",
-  "notBefore": "2026-08-28T07:20:00Z",
-  "expiresAt": "2026-09-04T07:20:00Z",
-  "singleUse": true,
-  "scope": {
+  "status": "governance-authorized-pending-manual-execution",
+  "authorizationId": "e40598f2-8d8f-42fb-b0a4-b7b402a0ed4a",
+  "validity": {
+    "notBefore": "2026-08-28T07:42:39Z",
+    "expiresAt": "2026-09-04T07:42:39Z",
+    "singleUse": true
+  },
+  "source": {
     "repository": "Sethvirak/paperdesk-release-verifier",
-    "bootstrapTarget": "registry-bridge-only",
-    "reviewedDormantSourceHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
-    "reviewedDormantSourceMergeSha": "c45539a86b575f1a4d58c3aa11df8c34a32a23b0",
+    "baseMergeSha": "c45539a86b575f1a4d58c3aa11df8c34a32a23b0",
+    "baseTreeSha": "b46cacb9d75a09ce93595d015788da820010f1a4",
+    "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
+    "requiredCheck": "test"
+  },
+  "authorizationScope": {
+    "registryBridgeBootstrapAndProductionControlReadHardeningOnly": true,
+    "manualSupervisedExecutionAuthorizedAfterAllGates": true,
+    "automaticOrUnattendedExecutionAuthorized": false,
     "productionApplicationDeploymentAuthorized": false,
     "productionRollbackAuthorized": false,
+    "acceptedReleaseBlobWriteAuthorized": false,
     "acceptedReleasePersistenceAuthorized": false,
+    "resultBlobWriteAuthorized": false,
+    "webJobOrCanaryExecutionAuthorized": false,
     "workflowActivationAuthorized": false,
     "oidcOrFederatedCredentialChangeAuthorized": false,
     "cleanupWatcherBootstrapAuthorized": false,
-    "watchdogProviderBootstrapAuthorized": false
-  },
-  "operator": {
-    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
-    "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
-    "principalType": "User",
-    "humanOperator": true
+    "watchdogProviderBootstrapAuthorized": false,
+    "productionControlBroadRoleRemovalAuthorized": true,
+    "productionControlReadProbeRoleCreationAuthorized": true
   },
   "approvalPolicy": {
     "baseBranch": "main",
-    "requiredApprovals": 2,
-    "requiredReviewers": [
+    "requiredExactHeadApprovals": 2,
+    "trustedApprovers": [
       {
         "login": "jecebella168-cmyk",
-        "numericId": 316989178
+        "userId": 316989178
       },
       {
         "login": "jecebella169-cmyk",
-        "numericId": 322025901
+        "userId": 322025901
       }
     ],
     "requiredCheck": {
@@ -48,69 +54,104 @@
     "requireValidSignatureOnMerge": true,
     "dismissStaleReviews": true,
     "requireLastPushApproval": true,
-    "approversMustDifferFromAuthorAndOperator": true,
+    "approversMustDifferFromAuthorAndExecutor": true,
     "allowedDiffPaths": [
       "evidence/registry-bridge-bootstrap-authorization.json",
       "evidence/registry-bridge-bootstrap-authorization.json.sha256"
     ]
   },
-  "executionGate": {
-    "executableOnlyAfterSignedProtectedMerge": true,
-    "authorizationHeadShaMustEqualBothApprovalCommitIds": true,
-    "authorizationMergeShaMustBeCapturedInReceipt": true,
-    "currentTimeMustBeWithinAuthorizationWindow": true,
-    "authorizationChecksumMustMatch": true,
-    "exactTwoFileDiffMustMatchAllowlist": true,
-    "noPriorReceiptForAuthorization": true,
-    "failClosedOnAnyLiveDrift": true
+  "executor": {
+    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+    "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+    "principalType": "User",
+    "humanOperator": true,
+    "standingSubscriptionOwner": true,
+    "standingOwnerAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleAssignments/866ddec6-43d2-4da8-8e64-02678257795a",
+    "executionMode": "manual-command-by-command-supervision"
+  },
+  "technicalBoundary": {
+    "leastPrivilegeTechnicallyEnforcedForExecutor": false,
+    "authorizationIsGovernanceEvidence": true,
+    "standingOwnerAuthorityIsOutOfBand": true,
+    "noAutomaticExecution": true,
+    "finalUserConfirmationRequiredAfterSignedMergeAndBeforeFirstMutation": true,
+    "abortOnAnyUnreviewedCommandOrLiveDrift": true,
+    "receiptMustDiscloseStandingOwnerBoundary": true,
+    "productionControlPrincipalRemainsMutationDormant": true,
+    "primaryProductionDeploymentPrincipalIsSeparateAndOutOfScope": true
   },
   "resources": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
     "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
-    "bridge": {
-      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "resourceGroup": "rg-master-data-structure-sea",
-      "name": "paperdesk-release-registry-bridge-9c4e0d0d",
-      "webJobName": "paperdesk-accepted-release-registry",
-      "webApiVersion": "2025-05-01",
-      "writerIdentityResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
-      "writerClientId": "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
-      "writerPrincipalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
-      "readerIdentityResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
-      "readerClientId": "a52c21e2-b465-4f01-88b8-44bb5fb8b306",
-      "readerPrincipalId": "c78102ff-17cd-459e-8da4-c7a900db0f86"
-    },
-    "storage": {
-      "resourceGroup": "rg-paperdesk-rollback-sea-20260808",
-      "account": "mdspdbak2608089c4e",
-      "acceptedReleaseContainerScope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases",
-      "resultContainerScope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
-      "resultImmutabilityPolicyId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default"
-    }
+    "bridgeResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+    "storageAccountResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e",
+    "acceptedReleaseContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases",
+    "resultContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
+    "resultImmutabilityPolicyResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default",
+    "writerIdentityResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
+    "writerClientId": "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
+    "writerPrincipalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
+    "readerIdentityResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+    "readerClientId": "a52c21e2-b465-4f01-88b8-44bb5fb8b306",
+    "readerPrincipalId": "c78102ff-17cd-459e-8da4-c7a900db0f86",
+    "controlClientId": "ecdb7a1b-8a57-4345-8a9e-b5e16ca0e20d",
+    "controlPrincipalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+    "productionApplicationResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+    "primaryDeploymentClientId": "6597de86-c5c4-4cb9-8126-55c311aee2f9",
+    "primaryDeploymentPrincipalId": "706d4431-c8d6-4bac-986b-251c2b54f1d3"
   },
-  "requiredLivePreconditions": {
+  "initialState": {
+    "observedAt": "2026-08-28T07:21:16Z",
     "bridge": {
       "state": "Stopped",
       "publicNetworkAccess": "Disabled",
+      "runtime": "NODE|24-lts",
+      "alwaysOn": false,
+      "webJobsEnabled": false,
+      "scmIpSecurityRestrictionsUseMain": false,
       "ftpsState": "Disabled",
       "ipSecurityRestrictionsDefaultAction": "Deny",
       "scmIpSecurityRestrictionsDefaultAction": "Deny",
-      "ftpBasicPublishingAllowed": false,
-      "scmBasicPublishingAllowed": false,
-      "attachedManagedIdentityPrincipalIds": [
-        "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
-        "c78102ff-17cd-459e-8da4-c7a900db0f86"
-      ]
+      "appSettingNames": []
     },
-    "acceptedReleaseContainer": {
+    "acceptedReleaseWorm": {
       "state": "Locked",
-      "immutabilityPeriodSinceCreationInDays": 30,
+      "days": 30,
       "allowProtectedAppendWrites": false,
       "allowProtectedAppendWritesAll": false
     },
-    "resultContainerMustBeAbsent": true,
-    "bootstrapReceiptMustBeAbsent": true,
-    "workflowMergedMutatingCommitShaMustRemainNull": true
+    "resultContainerExists": false,
+    "currentPermanentBridgeActions": [
+      "Microsoft.Web/sites/Read",
+      "Microsoft.Web/sites/start/Action",
+      "Microsoft.Web/sites/stop/Action",
+      "Microsoft.Web/sites/config/Read",
+      "Microsoft.Web/sites/config/Write",
+      "Microsoft.Web/sites/config/list/Action",
+      "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Read",
+      "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Write",
+      "Microsoft.Web/sites/publish/Action"
+    ],
+    "ficPinnedWorkflowSha": "22fdce42afd454cc153fc49c0472d1e2c28d1684",
+    "productionControl": {
+      "broadRoleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
+      "broadRoleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/de139f84-1756-47ae-9be6-808fbbe84772",
+      "broadRoleName": "Website Contributor",
+      "principalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+      "createdOn": "2026-08-13T17:50:02.5630473Z",
+      "createdBy": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+      "observedUse": "read-only OIDC probe only; no retained evidence of production deployment by this principal",
+      "directAssignmentMustBeRemoved": true
+    },
+    "primaryProductionDeploymentBoundary": {
+      "principalId": "706d4431-c8d6-4bac-986b-251c2b54f1d3",
+      "clientId": "6597de86-c5c4-4cb9-8126-55c311aee2f9",
+      "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2",
+      "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/de139f84-1756-47ae-9be6-808fbbe84772",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+      "mustRemainUnchanged": true
+    }
   },
   "package": {
     "sha256": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
@@ -135,17 +176,49 @@
       }
     ]
   },
-  "rolePlan": {
-    "acceptedReleaseTrustAnchorsMustRemainUnchanged": [
+  "rbacPlan": {
+    "productionControlReadProbe": {
+      "roleName": "PaperDesk Production Control Read Probe",
+      "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
+      "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+      "principalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+      "principalType": "ServicePrincipal",
+      "assignableScopes": [
+        "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"
+      ],
+      "actions": [
+        "Microsoft.Web/sites/Read"
+      ],
+      "notActions": [],
+      "dataActions": [],
+      "notDataActions": [],
+      "condition": null,
+      "conditionVersion": null,
+      "replacesRoleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
+      "replacementOrder": "create-role-then-assign-then-delete-broad-assignment",
+      "purpose": "retain only the currently exercisable read-only OIDC App Service probe while every mutating external-control mode remains hard-stopped"
+    },
+    "primaryProductionDeploymentAssignmentMustRemainUnchanged": {
+      "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2",
+      "principalId": "706d4431-c8d6-4bac-986b-251c2b54f1d3",
+      "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/de139f84-1756-47ae-9be6-808fbbe84772",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d"
+    },
+    "acceptedReleaseExistingMustRemainUnchanged": [
       {
         "subject": "helperWriter",
         "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d",
         "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases/providers/Microsoft.Authorization/roleAssignments/0151259f-6f5b-408e-a633-e927fa6773bc",
         "principalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
         "actions": [],
+        "notActions": [],
         "dataActions": [
           "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
-        ]
+        ],
+        "notDataActions": [],
+        "condition": null,
+        "conditionVersion": null
       },
       {
         "subject": "helperReader",
@@ -153,16 +226,19 @@
         "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases/providers/Microsoft.Authorization/roleAssignments/44d5161c-3104-4de2-8e9b-3d640f013cfb",
         "principalId": "c78102ff-17cd-459e-8da4-c7a900db0f86",
         "actions": [],
+        "notActions": [],
         "dataActions": [
           "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
-        ]
+        ],
+        "notDataActions": [],
+        "condition": null,
+        "conditionVersion": null
       }
     ],
-    "resultRolesToCreate": [
+    "resultAssignmentsToCreate": [
       {
         "subject": "helperWriter",
-        "roleName": "PaperDesk Registry Result Blob Append Writer",
-        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/afab1826-ebde-4174-8a96-fee074724e57",
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d",
         "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/a2ecf16a-05f8-48ab-8a7d-597386b79dbe",
         "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
         "principalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
@@ -174,15 +250,11 @@
         ],
         "notDataActions": [],
         "condition": null,
-        "conditionVersion": null,
-        "assignableScopes": [
-          "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"
-        ]
+        "conditionVersion": null
       },
       {
         "subject": "helperReader",
-        "roleName": "PaperDesk Registry Result Blob Reader",
-        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/d9470ddb-a49c-4983-9d9a-5d672123df20",
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/e005b62b-037b-4989-b492-932669ec0842",
         "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/186e9f6c-f83f-4446-bf7e-31cfcd8aa802",
         "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
         "principalId": "c78102ff-17cd-459e-8da4-c7a900db0f86",
@@ -194,15 +266,11 @@
         ],
         "notDataActions": [],
         "condition": null,
-        "conditionVersion": null,
-        "assignableScopes": [
-          "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"
-        ]
+        "conditionVersion": null
       },
       {
         "subject": "controlReader",
-        "roleName": "PaperDesk Registry Result Control Reader",
-        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/83c13638-ea3d-4068-bd4f-b749c013ad00",
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/e005b62b-037b-4989-b492-932669ec0842",
         "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/bbe31225-889b-457f-bd15-06d7cb05f0b6",
         "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
         "principalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
@@ -214,14 +282,10 @@
         ],
         "notDataActions": [],
         "condition": null,
-        "conditionVersion": null,
-        "assignableScopes": [
-          "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"
-        ]
+        "conditionVersion": null
       }
     ],
-    "temporaryDeploymentRole": {
-      "roleName": "PaperDesk Registry Bridge One-Time Bootstrap Deployer",
+    "temporaryDeploymentMarker": {
       "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/a21758bb-8e92-48dd-91b3-fd1b044e9088",
       "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/961cf7d2-0dc5-45ba-ba1d-b7efe621b8ce",
       "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
@@ -239,11 +303,13 @@
       ],
       "mustBeDeletedBeforeReceipt": true
     },
-    "permanentBridgeRole": {
-      "controlPrincipalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+    "permanentBridgeFinal": {
       "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/ad33ece7-baeb-47d1-b096-6ee55ff2efcc",
       "roleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/58620e18-38d4-4978-8d5b-7150c8002015",
-      "finalActions": [
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+      "principalId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+      "principalType": "ServicePrincipal",
+      "actions": [
         "Microsoft.Web/sites/Read",
         "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Read",
         "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Write",
@@ -257,114 +323,153 @@
         "Microsoft.Web/sites/triggeredwebjobs/read",
         "Microsoft.Web/sites/triggeredwebjobs/run/action"
       ],
+      "notActions": [],
+      "dataActions": [],
+      "notDataActions": [],
       "removedActions": [
         "Microsoft.Web/sites/extensions/Write",
         "Microsoft.Web/sites/publish/Action"
-      ],
-      "actions": [],
-      "notActions": [],
-      "dataActions": [],
-      "notDataActions": []
+      ]
     }
   },
-  "allowedMutations": [
-    {
-      "order": 1,
-      "operation": "verify-preconditions",
-      "target": "all-fixed-coordinates",
-      "constraint": "read-only; abort on any mismatch"
-    },
-    {
-      "order": 2,
-      "operation": "create-result-container",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
-      "constraint": "private container only; no public access"
-    },
-    {
-      "order": 3,
-      "operation": "lock-result-container",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default",
-      "constraint": "30-day WORM; Locked; protected append writes disabled; complete before any result blob"
-    },
-    {
-      "order": 4,
-      "operation": "create-result-rbac",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
-      "constraint": "only the three exact role definitions and assignments in rolePlan.resultRolesToCreate; no groups, wildcard actions, conditions, or broad Storage roles"
-    },
-    {
-      "order": 5,
-      "operation": "configure-stopped-bridge",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "PYTHON|3.12; alwaysOn=true; webJobsEnabled=true; scmIpSecurityRestrictionsUseMain=true; publicNetworkAccess=Disabled; both IP defaults Deny; FTP and SCM basic publishing disabled; preserve only the two fixed UAMIs"
-    },
-    {
-      "order": 6,
-      "operation": "set-persistent-settings",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "only WEBSITE_SKIP_RUNNING_KUDUAGENT=false plus the four exact package/member SHA-256 settings"
-    },
-    {
-      "order": 7,
-      "operation": "create-temporary-deployment-authority",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "only the exact temporary role definition and assignment; no other principal or action"
-    },
-    {
-      "order": 8,
-      "operation": "deploy-package-once",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "one OneDeploy of package.sha256 only; capture exact deployment resource, timestamps, status, and package digest"
-    },
-    {
-      "order": 9,
-      "operation": "remove-redeploy-authority",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "delete the exact temporary assignment and role; rewrite the permanent role to finalActions; extensions/Write and publish/Action must be absent"
-    },
-    {
-      "order": 10,
-      "operation": "run-bootstrap-canaries",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "start only for one runtime-canary and one storage-rbac-canary; accepted-release writes limited to one immutable v1/canaries/storage-rbac path; result writes limited to exact attestation paths; persist-actions-artifact forbidden"
-    },
-    {
-      "order": 11,
-      "operation": "stop-and-reseal",
-      "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
-      "constraint": "state Stopped; public and SCM ingress remain disabled; remove all transient settings; retain only five persistent settings"
-    },
-    {
-      "order": 12,
-      "operation": "capture-bootstrap-receipt",
-      "target": "local-evidence-only",
-      "constraint": "produce the required receipt and checksum; do not commit, push, activate a workflow, or deploy PaperDesk under this authorization"
-    }
-  ],
+  "executionPlan": {
+    "kind": "ordered-arm-api-plan-v1",
+    "canonicalization": "UTF-8 compact JSON of steps in declared order",
+    "sha256": "abc5cea2bf291668a8404c92b4dd23246abaeab6be4bca6095d9b0c06b61b4c7",
+    "steps": [
+      {
+        "order": 1,
+        "operation": "reverify-live-preconditions",
+        "target": "all-fixed-coordinates",
+        "apiVersion": "mixed-read-only",
+        "constraint": "GET only; abort on any mismatch; capture hashes and request IDs"
+      },
+      {
+        "order": 2,
+        "operation": "create-production-control-read-probe-role",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
+        "apiVersion": "2022-04-01",
+        "constraint": "custom role; assignable only within the fixed subscription; actions exactly Microsoft.Web/sites/Read; all negative and data-action arrays empty"
+      },
+      {
+        "order": 3,
+        "operation": "assign-production-control-read-probe",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
+        "apiVersion": "2022-04-01",
+        "constraint": "exact control principal and exact production App Service scope; unconditional; non-delegated"
+      },
+      {
+        "order": 4,
+        "operation": "remove-production-control-broad-role",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
+        "apiVersion": "2022-04-01",
+        "constraint": "delete only the exact control-principal Website Contributor assignment after the exact read-probe assignment exists; do not touch the separate primary deployment assignment"
+      },
+      {
+        "order": 5,
+        "operation": "verify-production-control-rbac-hardening",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+        "apiVersion": "mixed-read-only",
+        "constraint": "broad assignment absent; exact read-probe role and assignment present; primary deployment assignment unchanged; production app configuration and release SHA unchanged"
+      },
+      {
+        "order": 6,
+        "operation": "create-private-result-container",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
+        "apiVersion": "2025-06-01",
+        "constraint": "publicAccess None; no Shared Key; no blob write"
+      },
+      {
+        "order": 7,
+        "operation": "create-and-lock-result-immutability-policy",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default",
+        "apiVersion": "2025-06-01",
+        "constraint": "30 days; Locked; allowProtectedAppendWrites false; allowProtectedAppendWritesAll false; lock before any future result write"
+      },
+      {
+        "order": 8,
+        "operation": "create-three-result-role-assignments",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
+        "apiVersion": "2022-04-01",
+        "constraint": "reuse only existing writer and reader custom role definitions; exact three preallocated assignment IDs; unconditional; no role-definition creation"
+      },
+      {
+        "order": 9,
+        "operation": "configure-stopped-bridge",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+        "apiVersion": "2025-05-01",
+        "constraint": "PYTHON|3.12; alwaysOn true; webJobsEnabled true; scmIpSecurityRestrictionsUseMain true; state remains Stopped; publicNetworkAccess Disabled; main and SCM defaults Deny; FTP/SCM basic publishing disabled; exact two existing UAMIs"
+      },
+      {
+        "order": 10,
+        "operation": "set-five-persistent-settings",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/config/appsettings",
+        "apiVersion": "2025-05-01",
+        "constraint": "only WEBSITE_SKIP_RUNNING_KUDUAGENT=false and the four reviewed package/member SHA-256 values; no secret or transient setting"
+      },
+      {
+        "order": 11,
+        "operation": "create-one-time-deployment-marker-authority",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+        "apiVersion": "2022-04-01",
+        "constraint": "exact temporary role and assignment IDs; exact two redeploy actions; operator is the reviewed human principal; governance marker only because executor retains standing Owner; no other grant"
+      },
+      {
+        "order": 12,
+        "operation": "deploy-reviewed-package-once",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy",
+        "apiVersion": "2025-05-01",
+        "constraint": "single OneDeploy of package SHA-256 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8; bridge remains stopped; capture exact live deployment object and response digest"
+      },
+      {
+        "order": 13,
+        "operation": "remove-all-bridge-redeploy-authority",
+        "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+        "apiVersion": "2022-04-01",
+        "constraint": "delete exact temporary assignment and role; update permanent role to exact 12-action final set; extensions/Write and publish/Action absent"
+      },
+      {
+        "order": 14,
+        "operation": "reseal-and-capture-receipt",
+        "target": "fixed-production-control-rbac-bridge-and-result-storage",
+        "apiVersion": "mixed-read-only",
+        "constraint": "production control has exact read-only probe only; primary deploy assignment unchanged; bridge Stopped/private; no WebJob run; no accepted-release write; no result blob write; no transient settings; produce local receipt and checksum only"
+      }
+    ]
+  },
   "forbiddenMutations": [
+    "start the bridge or run any WebJob, runtime canary, storage-RBAC canary, or persist-actions-artifact operation",
+    "write, overwrite, read, list, copy, or delete any accepted-release blob",
+    "write any result blob during bootstrap",
     "deploy, roll back, restart, or finalize the PaperDesk production application",
-    "run persist-accepted-release or create accepted-release manifests or production release records",
-    "write accepted-release storage outside the single fixed storage-rbac canary prefix",
     "dispatch or modify GitHub workflows, remove hard stops, or set mergedMutatingCommitSha",
-    "create, rotate, or delete OIDC federated credentials or GitHub secrets",
-    "enable public or SCM ingress, FTP/SCM basic publishing, Shared Key, or broad Storage roles",
+    "create, rotate, or delete any OIDC federated credential, GitHub secret, UAMI, or control principal",
+    "enable public or SCM ingress, FTP/SCM basic publishing, Shared Key, or a broad built-in Storage role",
     "read or write customer, application, SQLite, PostgreSQL, attachment, or live PaperDesk data",
     "provision the cleanup watcher, watchdog provider, scheduler, environments, or their identities",
-    "create any resource, role, assignment, app setting, package, or blob not explicitly allowlisted",
-    "repeat this authorization after any successful or partial execution without a new reviewed authorization"
+    "create any resource, role definition, assignment, app setting, package, or blob not explicitly allowlisted",
+    "repeat after any successful or partial execution without a new signed authorization",
+    "change or delete the primary production deployment principal, its federated credential, or role assignment b24a4ca5-de40-47c8-90d8-caf08759dfb2",
+    "grant the external-control principal any production action other than Microsoft.Web/sites/Read",
+    "change production application configuration, files, state, deployment, release SHA, networking, identities, or data while replacing the control role"
   ],
   "requiredPostconditions": [
-    "result container exists and is locked for 30-day WORM before its first write",
-    "accepted-release container remains locked for 30-day WORM and its two trust-anchor assignments remain unchanged",
-    "bridge is stopped, private, sealed, PYTHON|3.12, AlwaysOn true, WebJobs enabled, and SCM uses main restrictions",
-    "bridge has exactly the two fixed UAMIs and exactly five persistent settings",
-    "OneDeploy proves the exact package digest and deterministic inventory",
-    "runtime and storage-RBAC canaries succeeded without accepted-release persistence",
-    "temporary deployment role and assignment are deleted",
-    "permanent control role has exactly finalActions and no extensions/Write or publish/Action",
-    "three result-container roles and assignments exactly match the reviewed IDs and least-privilege actions",
-    "no workflow, OIDC, production application, database, attachment, cleanup-watcher, or watchdog state changed",
-    "a strict bootstrap receipt and checksum were produced for separate signed review"
+    "external-control principal broad Website Contributor assignment 71b7a7ec-c6c5-4654-bce9-3a66c323a8df is absent",
+    "external-control principal has the exact custom read-probe role and assignment with sole action Microsoft.Web/sites/Read at the exact production App Service scope",
+    "separate primary deployment principal 706d4431-c8d6-4bac-986b-251c2b54f1d3 and assignment b24a4ca5-de40-47c8-90d8-caf08759dfb2 are unchanged",
+    "production App Service configuration, state, files, release SHA, networking, identities, and data are unchanged",
+    "result container exists privately and its 30-day WORM policy is Locked before any future result write",
+    "accepted-release container and its two existing role assignments are byte-for-byte unchanged",
+    "bridge is Stopped, private, sealed, PYTHON|3.12, AlwaysOn true, WebJobs enabled, and SCM uses main restrictions",
+    "bridge has exactly the two fixed UAMIs and exactly five non-secret persistent settings",
+    "OneDeploy proves the exact reviewed package and deterministic three-file inventory",
+    "no WebJob was run and no accepted-release or result blob was read or written",
+    "temporary deployment role definition and assignment are absent",
+    "permanent bridge control role has exactly the reviewed 12 actions and no extensions/Write or publish/Action",
+    "result container has exactly the three reviewed assignments reusing the existing append/read definitions",
+    "FIC remains pinned to 22fdce42 and every GitHub workflow/provider runtime remains dormant",
+    "no production application, database, attachment, cleanup-watcher, or watchdog state changed",
+    "a strict bootstrap receipt and checksum were generated locally for a separate signed two-approval PR"
   ],
   "requiredReceipt": {
     "path": "evidence/registry-bridge-bootstrap-receipt.json",
@@ -373,8 +478,14 @@
     "status": "bootstrap-complete",
     "reviewedSourceShaMustEqualAuthorizationPrHead": true,
     "reviewedMergeShaMustEqualAuthorizationMerge": true,
+    "mustDiscloseStandingOwnerBoundary": true,
     "separateSignedPrRequired": true,
     "requiredApprovals": 2,
-    "activationStillNotAuthorized": true
+    "activationStillNotAuthorized": true,
+    "productionControlHardeningMustBeCaptured": true,
+    "removedBroadAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df",
+    "exactReadProbeRoleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/05496bb6-a586-4d92-8336-b8e7b9367db0",
+    "exactReadProbeRoleAssignmentId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
+    "primaryProductionDeploymentAssignmentMustRemain": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2"
   }
 }
