@@ -1,4 +1,4 @@
-name: PaperDesk accepted-release deadline watchdog
+name: PaperDesk accepted-release deadline watchdog v2
 
 on:
   schedule:
@@ -9,131 +9,165 @@ permissions:
   contents: read
 
 concurrency:
-  group: paperdesk-accepted-release-deadline-watchdog
+  group: paperdesk-accepted-release-deadline-watchdog-v2
   cancel-in-progress: false
 
 jobs:
   enforce_deadline:
-    name: Enforce pending candidate acceptance deadline
-    if: github.event_name == 'workflow_dispatch' || vars.PAPERDESK_WATCHDOG_MODE == 'accepted-release-deadline-v1'
+    name: Evaluate provider state and request one claim-bound rollback
+    if: github.event_name == 'workflow_dispatch' || vars.PAPERDESK_WATCHDOG_MODE == 'accepted-release-deadline-v2'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: paperdesk-watchdog
     permissions:
       contents: read
+      id-token: write
     steps:
-      - name: Check out immutable watchdog control
+      - name: Check out exact watchdog workflow source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          repository: Sethvirak/paperdesk-release-verifier
-          ref: aa9ac0d7f3de54fe159763f52d40730abccbaa8d
+          ref: ${{ github.workflow_sha }}
           fetch-depth: 1
           clean: true
           persist-credentials: false
 
-      - name: Verify pinned watchdog bytes and safe provider coordinates
+      - name: Verify exact dormant v2 source and fixed coordinates
         env:
-          PAPERDESK_SOURCE_REPOSITORY: ${{ vars.PAPERDESK_SOURCE_REPOSITORY }}
-          PAPERDESK_WATCHDOG_MODE: ${{ vars.PAPERDESK_WATCHDOG_MODE }}
-          PAPERDESK_WATCHDOG_RUNBOOK_URL: ${{ vars.PAPERDESK_WATCHDOG_RUNBOOK_URL }}
-          PAPERDESK_WATCHDOG_STATE_HOST: ${{ vars.PAPERDESK_WATCHDOG_STATE_HOST }}
-          PAPERDESK_WATCHDOG_STATE_URL: ${{ vars.PAPERDESK_WATCHDOG_STATE_URL }}
+          BASELINE_RECEIPT_SHA256: ${{ vars.PAPERDESK_WATCHDOG_BASELINE_RECEIPT_SHA256 }}
+          RUNBOOK_URL: ${{ vars.PAPERDESK_WATCHDOG_RUNBOOK_URL }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "aa9ac0d7f3de54fe159763f52d40730abccbaa8d"
+          test "$(git rev-parse HEAD)" = "${GITHUB_WORKFLOW_SHA}"
+          test "${GITHUB_REPOSITORY}" = "Sethvirak/paperdesk-release-verifier"
+          test "${GITHUB_REF}" = "refs/heads/main"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          echo '893b721221c92778bee928cb20423ad1397a8f91cdd9cda2d7718f5b265d8b55  scripts/check_deadline.py' | sha256sum --check --strict
-          test "${PAPERDESK_WATCHDOG_MODE}" = "accepted-release-deadline-v1"
-          [[ "${PAPERDESK_SOURCE_REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          echo 'f8b3e9123eff6555eb6201b3784a1ebe7c222a586ca778eea914fb68a212da0f  scripts/check_deadline.py' | sha256sum --check --strict
+          echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
+          echo 'd75faceed241cc19295f36417ec986bc0580b665815b80e7b04647ae16d696cc  scripts/watchdog_contract.py' | sha256sum --check --strict
+          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          echo '2cb79ab61577bf0e6bcce279da5d837c81a9b1ffb52ca54531163b639feb343e  provider/accepted_release_manifest.py' | sha256sum --check --strict
+          echo 'cfe32a359a2dd77e6656c9dcabc1c7260d98f9e20196a1d8dd14268c811d96fd  contracts/production_release_watchdog_contract.json' | sha256sum --check --strict
+          test "${#BASELINE_RECEIPT_SHA256}" -eq 64
+          [[ "${BASELINE_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          python3 scripts/watchdog_evidence.py validate-config
           python3 scripts/check_deadline.py \
             --validate-config-only \
-            --state-url "${PAPERDESK_WATCHDOG_STATE_URL}" \
-            --state-host "${PAPERDESK_WATCHDOG_STATE_HOST}" \
-            --runbook-url "${PAPERDESK_WATCHDOG_RUNBOOK_URL}" \
-            --source-repository "${PAPERDESK_SOURCE_REPOSITORY}" \
+            --state-url 'https://paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net/api/watchdog-state/v2' \
+            --state-host 'paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net' \
+            --runbook-url "${RUNBOOK_URL}" \
+            --source-repository 'Sethvirak/MasterDataStructure' \
             --watchdog-workflow-ref "${GITHUB_WORKFLOW_REF}" \
-            --watchdog-run-id "${GITHUB_RUN_ID}" \
-            --watchdog-run-attempt "${GITHUB_RUN_ATTEMPT}"
-
-      - name: Download bounded fresh watchdog state
-        env:
-          PAPERDESK_WATCHDOG_STATE_TOKEN: ${{ secrets.PAPERDESK_WATCHDOG_STATE_TOKEN }}
-          PAPERDESK_WATCHDOG_STATE_URL: ${{ vars.PAPERDESK_WATCHDOG_STATE_URL }}
-        run: |
-          set -euo pipefail
-          test "${#PAPERDESK_WATCHDOG_STATE_TOKEN}" -ge 20
-          [[ "${PAPERDESK_WATCHDOG_STATE_TOKEN}" != *$'\n'* ]]
-          [[ "${PAPERDESK_WATCHDOG_STATE_TOKEN}" != *$'\r'* ]]
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --proto '=https' \
-            --tlsv1.2 \
-            --max-redirs 0 \
-            --max-time 30 \
-            --max-filesize 65536 \
-            --header "Authorization: Bearer ${PAPERDESK_WATCHDOG_STATE_TOKEN}" \
-            --output "${RUNNER_TEMP}/paperdesk-watchdog-state.json" \
-            "${PAPERDESK_WATCHDOG_STATE_URL}"
-
-      - name: Validate deadline state and create decision receipt
-        id: decision
-        env:
-          PAPERDESK_SOURCE_REPOSITORY: ${{ vars.PAPERDESK_SOURCE_REPOSITORY }}
-          PAPERDESK_WATCHDOG_RUNBOOK_URL: ${{ vars.PAPERDESK_WATCHDOG_RUNBOOK_URL }}
-          PAPERDESK_WATCHDOG_STATE_HOST: ${{ vars.PAPERDESK_WATCHDOG_STATE_HOST }}
-          PAPERDESK_WATCHDOG_STATE_URL: ${{ vars.PAPERDESK_WATCHDOG_STATE_URL }}
-        run: |
-          set -euo pipefail
-          mkdir "${RUNNER_TEMP}/paperdesk-watchdog-receipts"
-          python3 scripts/check_deadline.py \
-            --state "${RUNNER_TEMP}/paperdesk-watchdog-state.json" \
-            --state-url "${PAPERDESK_WATCHDOG_STATE_URL}" \
-            --state-host "${PAPERDESK_WATCHDOG_STATE_HOST}" \
-            --runbook-url "${PAPERDESK_WATCHDOG_RUNBOOK_URL}" \
-            --source-repository "${PAPERDESK_SOURCE_REPOSITORY}" \
-            --watchdog-workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --watchdog-workflow-sha "${GITHUB_WORKFLOW_SHA}" \
+            --control-checkout-sha "$(git rev-parse HEAD)" \
             --watchdog-run-id "${GITHUB_RUN_ID}" \
             --watchdog-run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --github-output "${GITHUB_OUTPUT}" \
-            --output "${RUNNER_TEMP}/paperdesk-watchdog-receipts/decision-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            --baseline-receipt-sha256 "${BASELINE_RECEIPT_SHA256}"
 
-      - name: Dispatch exact accepted rollback for an overdue live candidate
-        if: steps.decision.outputs.decision == 'dispatch-rollback'
-        env:
-          GH_TOKEN: ${{ secrets.PAPERDESK_ROLLBACK_DISPATCH_TOKEN }}
-          PAPERDESK_SOURCE_REPOSITORY: ${{ vars.PAPERDESK_SOURCE_REPOSITORY }}
-          ROLLBACK_ACCEPTANCE_RUN_ID: ${{ steps.decision.outputs.rollback_acceptance_run_id }}
-          ROLLBACK_SOURCE_RUN_ID: ${{ steps.decision.outputs.rollback_source_run_id }}
-          ROLLBACK_SOURCE_SHA: ${{ steps.decision.outputs.rollback_source_sha }}
+      - name: Source-dormant hard stop before GitHub OIDC or provider calls
         run: |
           set -euo pipefail
-          test "${#GH_TOKEN}" -ge 20
-          [[ "${GH_TOKEN}" != *$'\n'* ]]
-          [[ "${GH_TOKEN}" != *$'\r'* ]]
-          gh api \
-            --method POST \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "/repos/${PAPERDESK_SOURCE_REPOSITORY}/actions/workflows/manual-azure-production-rollback.yml/dispatches" \
-            -f ref=main \
-            -f "inputs[source_run_id]=${ROLLBACK_SOURCE_RUN_ID}" \
-            -f "inputs[source_sha]=${ROLLBACK_SOURCE_SHA}" \
-            -f "inputs[acceptance_run_id]=${ROLLBACK_ACCEPTANCE_RUN_ID}" \
-            -f 'inputs[confirmation]=ROLLBACK PAPERDESK PRODUCTION'
-          jq \
-            --arg requestedAt "$(date --utc '+%Y-%m-%dT%H:%M:%S.000Z')" \
-            '. + {dispatch: {status: "requested", requestedAt: $requestedAt}}' \
-            "${RUNNER_TEMP}/paperdesk-watchdog-receipts/decision-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" \
-            > "${RUNNER_TEMP}/paperdesk-watchdog-receipts/rollback-dispatch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          echo 'Watchdog v2 activation is blocked: mergedMutatingCommitSha is null, the independently reviewed initial baseline is absent, and live provider/GitHub App canaries have not passed.' >&2
+          exit 1
 
-      - name: Retain watchdog decision and dispatch receipts
-        if: always()
+      - name: Fetch exact canonical provider state with transient OIDC
+        id: state
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "${RUNNER_TEMP}/paperdesk-watchdog-v2"
+          python3 scripts/watchdog_evidence.py fetch-state \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog' \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-v2/state.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Create bounded claim decision from exact fresh state
+        id: decision
+        env:
+          BASELINE_RECEIPT_SHA256: ${{ vars.PAPERDESK_WATCHDOG_BASELINE_RECEIPT_SHA256 }}
+          RUNBOOK_URL: ${{ vars.PAPERDESK_WATCHDOG_RUNBOOK_URL }}
+          STATE_ETAG: ${{ steps.state.outputs.state_etag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check_deadline.py \
+            --state "${RUNNER_TEMP}/paperdesk-watchdog-v2/state.json" \
+            --state-etag "${STATE_ETAG}" \
+            --state-url 'https://paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net/api/watchdog-state/v2' \
+            --state-host 'paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net' \
+            --runbook-url "${RUNBOOK_URL}" \
+            --source-repository 'Sethvirak/MasterDataStructure' \
+            --watchdog-workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --watchdog-workflow-sha "${GITHUB_WORKFLOW_SHA}" \
+            --control-checkout-sha "$(git rev-parse HEAD)" \
+            --watchdog-run-id "${GITHUB_RUN_ID}" \
+            --watchdog-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --baseline-receipt-sha256 "${BASELINE_RECEIPT_SHA256}" \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-v2/decision.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Atomically WORM-record and CAS-claim an overdue candidate
+        if: steps.decision.outputs.decision == 'dispatch-rollback'
+        id: claim
+        run: |
+          set -euo pipefail
+          python3 scripts/watchdog_evidence.py claim \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog' \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --decision "${RUNNER_TEMP}/paperdesk-watchdog-v2/decision.json" \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-v2/claim.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Release only an expired unattempted claim through provider reconciliation
+        if: steps.decision.outputs.decision == 'rollback-claim-expired-unattempted'
+        env:
+          CLAIM_ID: ${{ steps.decision.outputs.claim_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/watchdog_evidence.py reconcile \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog' \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --claim-id "${CLAIM_ID}" \
+            --mode automatic \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-v2/reconciliation-auto.json"
+
+      - name: Ask provider to WORM-record attempt and return HTTP 200 run binding
+        if: steps.decision.outputs.decision == 'dispatch-rollback'
+        run: |
+          set -euo pipefail
+          python3 scripts/watchdog_evidence.py provider-dispatch \
+            --repository "${GITHUB_REPOSITORY}" \
+            --caller-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --environment 'paperdesk-watchdog' \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --claim "${RUNNER_TEMP}/paperdesk-watchdog-v2/claim.json" \
+            --output "${RUNNER_TEMP}/paperdesk-watchdog-v2/dispatch.json"
+
+      - name: Retain non-secret local projections for review
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: paperdesk-watchdog-receipts-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/paperdesk-watchdog-receipts
-          if-no-files-found: warn
+          name: paperdesk-watchdog-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paperdesk-watchdog-v2
+          if-no-files-found: error
           retention-days: 90
           compression-level: 0

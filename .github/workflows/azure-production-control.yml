@@ -127,7 +127,7 @@ jobs:
   azure_production_control:
     name: Authorize exact PaperDesk Azure production operation
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     environment: paperdesk-production-control
     concurrency:
       group: paperdesk-immutable-azure-production-control
@@ -347,6 +347,15 @@ jobs:
             and .state == "Enabled"
             and .user == {name: $clientId, type: "servicePrincipal"}
           ' <<< "${account_json}" >/dev/null
+          service_principal_json="$(az ad sp show --id "${AZURE_CLIENT_ID}" --output json)"
+          jq --exit-status \
+            --arg clientId "${AZURE_CLIENT_ID}" '
+            .appId == $clientId
+            and (.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+            and .servicePrincipalType == "Application"
+            and .accountEnabled == true
+          ' <<< "${service_principal_json}" >/dev/null
+          echo "control_principal_id=$(jq -r '.id' <<< "${service_principal_json}")" >> "${GITHUB_OUTPUT}"
           echo "confirmed=true" >> "${GITHUB_OUTPUT}"
 
       - name: OIDC canary reads only the exact App Service resource
@@ -551,6 +560,30 @@ jobs:
           ' <<< "${policy}" > "${snapshot}"
           test -f "${snapshot}" && test ! -L "${snapshot}" && test "$(stat --format=%s "${snapshot}")" -le 8192
 
+      - name: Capture exact live locked registry result WORM policy through Azure control identity
+        if: inputs.operation == 'persist-accepted-release' || inputs.operation == 'registry-bridge-preflight'
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          policy_id="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/immutabilityPolicies/default"
+          policy="$(az rest --method get --url "https://management.azure.com${policy_id}?api-version=2025-06-01")"
+          jq --exit-status --arg id "${policy_id}" '
+            .id == $id
+            and .name == "default"
+            and .type == "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
+            and (.etag | type == "string" and length > 0)
+            and .properties.state == "Locked"
+            and .properties.immutabilityPeriodSinceCreationInDays == 30
+            and (.properties.allowProtectedAppendWrites // false) == false
+            and (.properties.allowProtectedAppendWritesAll // false) == false
+          ' <<< "${policy}" >/dev/null
+          snapshot="${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json"
+          jq --arg observedAt "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" --arg storageAccount mdspdbak2608089c4e --arg container paperdesk-registry-webjob-results '
+            {resourceId: .id, storageAccount: $storageAccount, container: $container, state: .properties.state, immutabilityPeriodSinceCreationInDays: .properties.immutabilityPeriodSinceCreationInDays, allowProtectedAppendWrites: (.properties.allowProtectedAppendWrites // false), allowProtectedAppendWritesAll: (.properties.allowProtectedAppendWritesAll // false), etag: .etag, observedAt: $observedAt}
+          ' <<< "${policy}" > "${snapshot}"
+          test -f "${snapshot}" && test ! -L "${snapshot}" && test "$(stat --format=%s "${snapshot}")" -le 8192
+
       - name: Check out immutable registry control and bootstrap trust anchor
         if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -566,6 +599,8 @@ jobs:
         id: registry_bootstrap
         if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'persist-accepted-release'
         env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CONTROL_PRINCIPAL_ID: ${{ steps.azure_session.outputs.control_principal_id }}
           CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
           EXPECTED_HELPER_SHA256: 889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050
           EXPECTED_PACKAGE_SHA256: 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8
@@ -580,19 +615,78 @@ jobs:
           readonly checksum="${receipt}.sha256"
           test "$(git -C "${control_root}" rev-parse HEAD)" = "${CONTROL_WORKFLOW_SHA}"
           test -z "$(git -C "${control_root}" status --porcelain=v1 --untracked-files=all)"
-          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 32768
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 262144
           test -f "${checksum}" && test ! -L "${checksum}" && test "$(wc -l < "${checksum}")" -eq 1
           checksum_line="$(cat "${checksum}")"
           [[ "${checksum_line}" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]registry-bridge-bootstrap-receipt\.json$ ]]
           (cd "${anchor_dir}" && sha256sum --check --strict "${receipt_name}.sha256")
           receipt_sha256="$(sha256sum "${receipt}" | cut -d ' ' -f 1)"
           jq --exit-status \
+            --arg azureClientId "${AZURE_CLIENT_ID}" \
+            --arg azureControlPrincipalId "${AZURE_CONTROL_PRINCIPAL_ID}" \
             --arg packageSha256 "${EXPECTED_PACKAGE_SHA256}" \
             --arg helperSha256 "${EXPECTED_HELPER_SHA256}" \
             --arg runnerSha256 "${EXPECTED_RUNNER_SHA256}" \
             --arg settingsSha256 "${EXPECTED_SETTINGS_SHA256}" '
+            def result_subject($subject; $identityType; $identityResourceId; $clientId; $principalId; $dataAction):
+              ($subject | keys) == ["actions", "assignableScopes", "clientId", "condition", "conditionVersion", "dataActions", "identityResourceId", "identityType", "notActions", "notDataActions", "principalId", "principalType", "roleAssignmentId", "roleAssignmentSha256", "roleDefinitionId", "roleDefinitionSha256", "tenantId"]
+              and $subject.identityType == $identityType
+              and $subject.identityResourceId == $identityResourceId
+              and ($subject.clientId | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and ($clientId == null or $subject.clientId == $clientId)
+              and $subject.principalId == $principalId
+              and $subject.tenantId == "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"
+              and $subject.principalType == "ServicePrincipal"
+              and ($subject.roleAssignmentId | test("^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft\\.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft\\.Authorization/roleAssignments/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and ($subject.roleAssignmentSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+              and ($subject.roleDefinitionId | test("^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft\\.Authorization/roleDefinitions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and ($subject.roleDefinitionSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+              and $subject.condition == null
+              and $subject.conditionVersion == null
+              and $subject.actions == []
+              and $subject.notActions == []
+              and $subject.dataActions == [$dataAction]
+              and $subject.notDataActions == []
+              and $subject.assignableScopes == ["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"];
+            def direct_role_entry($subject; $name):
+              {
+                subject: $name,
+                roleAssignmentId: ($subject.roleAssignmentId | ascii_downcase),
+                roleDefinitionId: ($subject.roleDefinitionId | ascii_downcase),
+                scope: ($subject.roleAssignmentId | sub("/providers/Microsoft.Authorization/roleAssignments/[0-9a-f-]{36}$"; "") | ascii_downcase),
+                principalId: ($subject.principalId | ascii_downcase),
+                principalType: $subject.principalType,
+                condition: $subject.condition,
+                conditionVersion: $subject.conditionVersion,
+                delegatedManagedIdentityResourceId: null,
+                roleAssignmentSha256: $subject.roleAssignmentSha256,
+                roleDefinitionSha256: $subject.roleDefinitionSha256,
+                actions: ($subject.actions | sort),
+                notActions: ($subject.notActions | sort),
+                dataActions: ($subject.dataActions | sort),
+                notDataActions: ($subject.notDataActions | sort)
+              };
+            def direct_role_shape:
+              (keys == ["actions", "condition", "conditionVersion", "dataActions", "delegatedManagedIdentityResourceId", "notActions", "notDataActions", "principalId", "principalType", "roleAssignmentId", "roleAssignmentSha256", "roleDefinitionId", "roleDefinitionSha256", "scope", "subject"])
+              and (.subject == "helperWriter" or .subject == "helperReader" or .subject == "controlReader")
+              and (.roleAssignmentId | type == "string" and . == ascii_downcase and length <= 1024 and test("^/[a-z0-9._/-]+/providers/microsoft\\.authorization/roleassignments/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and (.roleDefinitionId | type == "string" and . == ascii_downcase and length <= 1024 and test("^/[a-z0-9._/-]+/providers/microsoft\\.authorization/roledefinitions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and (.scope | type == "string" and . == ascii_downcase and length <= 1024 and test("^/[a-z0-9._/-]+$"))
+              and (.principalId | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+              and .principalType == "ServicePrincipal"
+              and .condition == null
+              and .conditionVersion == null
+              and .delegatedManagedIdentityResourceId == null
+              and (.roleAssignmentSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+              and (.roleDefinitionSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+              and all([.actions, .notActions, .dataActions, .notDataActions][];
+                type == "array"
+                and length <= 128
+                and . == (unique | sort)
+                and all(.[]; type == "string" and length > 0 and length <= 512 and test("^[^\\r\\n]+$"))
+              );
             . as $root
-            | keys == ["bootstrapAuthority", "bridge", "deployment", "package", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "storageRbac", "webJob"]
+            | keys == ["bootstrapAuthority", "bridge", "deployment", "package", "resultStorageRbac", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "storageRbac", "webJob"]
             and .schemaVersion == 1
             and .status == "bootstrap-complete"
             and (.reviewedSourceSha | test("^[0-9a-f]{40}$") and . != ("0" * 40))
@@ -670,6 +764,92 @@ jobs:
             and .storageRbac.reader.notDataActions == []
             and .storageRbac.reader.assignableScopes == ["/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"]
             and (.storageRbac.reader.roleDefinitionSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and (.resultStorageRbac | keys) == ["containerResourceId", "controlReader", "helperReader", "helperWriter", "identityAudit", "immutabilityPolicy", "subscriptionRoleAudit"]
+            and .resultStorageRbac.containerResourceId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results"
+            and (.resultStorageRbac.identityAudit | keys) == ["capturedAt", "controlReaderMemberOf", "helperReaderMemberOf", "helperWriterMemberOf", "pimScheduleAudit"]
+            and (.resultStorageRbac.identityAudit.capturedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and .resultStorageRbac.identityAudit.helperWriterMemberOf == []
+            and .resultStorageRbac.identityAudit.helperReaderMemberOf == []
+            and .resultStorageRbac.identityAudit.controlReaderMemberOf == []
+            and .resultStorageRbac.identityAudit.pimScheduleAudit == {status: "unavailable", reason: "AadPremiumLicenseRequired", boundary: "tenant-has-no-P2-or-Identity-Governance-license; no-PIM-success-is-claimed"}
+            and (.resultStorageRbac.immutabilityPolicy | keys) == ["allowProtectedAppendWrites", "allowProtectedAppendWritesAll", "capturedAt", "etag", "immutabilityPeriodSinceCreationInDays", "resourceId", "state"]
+            and .resultStorageRbac.immutabilityPolicy.resourceId == (.resultStorageRbac.containerResourceId + "/immutabilityPolicies/default")
+            and .resultStorageRbac.immutabilityPolicy.state == "Locked"
+            and .resultStorageRbac.immutabilityPolicy.immutabilityPeriodSinceCreationInDays == 30
+            and .resultStorageRbac.immutabilityPolicy.allowProtectedAppendWrites == false
+            and .resultStorageRbac.immutabilityPolicy.allowProtectedAppendWritesAll == false
+            and (.resultStorageRbac.immutabilityPolicy.etag | type == "string" and length > 0 and length <= 256 and test("^[^\\r\\n]+$"))
+            and (.resultStorageRbac.immutabilityPolicy.capturedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and result_subject(
+              .resultStorageRbac.helperWriter;
+              "ManagedIdentity";
+              .bridge.writerIdentityResourceId;
+              .bridge.writerClientId;
+              .bridge.writerPrincipalId;
+              "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+            )
+            and result_subject(
+              .resultStorageRbac.helperReader;
+              "ManagedIdentity";
+              .bridge.readerIdentityResourceId;
+              .bridge.readerClientId;
+              .bridge.readerPrincipalId;
+              "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+            )
+            and result_subject(
+              .resultStorageRbac.controlReader;
+              "ServicePrincipal";
+              null;
+              $azureClientId;
+              .bootstrapAuthority.controlPrincipalId;
+              "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+            )
+            and (.resultStorageRbac.subscriptionRoleAudit | keys) == ["administrativeBoundary", "capturedAt", "directAssignments", "directAssignmentsSha256", "effectiveAssignmentsMatchDirect", "effectiveAssignmentsSha256"]
+            and (.resultStorageRbac.subscriptionRoleAudit.capturedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and .resultStorageRbac.subscriptionRoleAudit.administrativeBoundary == "all-direct-principal-role-assignments-at-above-or-below-subscription; assignedTo-effective-inventory-must-exactly-match-direct-inventory-to-reject-active-group-derived-grants; only-the-fixed-bridge-role-and-receipt-bound-read-only-control-management-roles-are-allowed; PIM-remains-unavailable-without-P2-or-Identity-Governance"
+            and (.resultStorageRbac.subscriptionRoleAudit.directAssignmentsSha256 | test("^[0-9a-f]{64}$") and . != ("0" * 64))
+            and .resultStorageRbac.subscriptionRoleAudit.effectiveAssignmentsMatchDirect == true
+            and .resultStorageRbac.subscriptionRoleAudit.effectiveAssignmentsSha256 == .resultStorageRbac.subscriptionRoleAudit.directAssignmentsSha256
+            and (.resultStorageRbac.subscriptionRoleAudit.directAssignments | type == "array" and length >= 6 and length <= 64)
+            and .resultStorageRbac.subscriptionRoleAudit.directAssignments == (.resultStorageRbac.subscriptionRoleAudit.directAssignments | sort_by(.roleAssignmentId))
+            and ([.resultStorageRbac.subscriptionRoleAudit.directAssignments[].roleAssignmentId] | unique | length) == (.resultStorageRbac.subscriptionRoleAudit.directAssignments | length)
+            and all(.resultStorageRbac.subscriptionRoleAudit.directAssignments[]; direct_role_shape)
+            and ([.resultStorageRbac.subscriptionRoleAudit.directAssignments[] | select(.subject == "helperWriter")] | sort_by(.roleAssignmentId)) == ([
+              direct_role_entry($root.storageRbac.writer; "helperWriter"),
+              direct_role_entry($root.resultStorageRbac.helperWriter; "helperWriter")
+            ] | sort_by(.roleAssignmentId))
+            and ([.resultStorageRbac.subscriptionRoleAudit.directAssignments[] | select(.subject == "helperReader")] | sort_by(.roleAssignmentId)) == ([
+              direct_role_entry($root.storageRbac.reader; "helperReader"),
+              direct_role_entry($root.resultStorageRbac.helperReader; "helperReader")
+            ] | sort_by(.roleAssignmentId))
+            and ([.resultStorageRbac.subscriptionRoleAudit.directAssignments[]
+              | select(.subject == "controlReader" and ((.dataActions | length) > 0 or (.notDataActions | length) > 0))]
+              | sort_by(.roleAssignmentId)) == ([direct_role_entry($root.resultStorageRbac.controlReader; "controlReader")] | sort_by(.roleAssignmentId))
+            and ([.resultStorageRbac.subscriptionRoleAudit.directAssignments[]
+              | select(.subject == "controlReader" and .roleAssignmentId == ($root.bootstrapAuthority.permanentRoleAssignmentId | ascii_downcase))]
+              | length) == 1
+            and all(.resultStorageRbac.subscriptionRoleAudit.directAssignments[] | select(.subject == "controlReader");
+              if .roleAssignmentId == ($root.resultStorageRbac.controlReader.roleAssignmentId | ascii_downcase) then
+                . == direct_role_entry($root.resultStorageRbac.controlReader; "controlReader")
+              elif .roleAssignmentId == ($root.bootstrapAuthority.permanentRoleAssignmentId | ascii_downcase) then
+                .roleDefinitionId == ($root.bootstrapAuthority.permanentRoleDefinitionId | ascii_downcase)
+                and .scope == ($root.bootstrapAuthority.permanentRoleAssignmentId | sub("/providers/Microsoft.Authorization/roleAssignments/[0-9a-f-]{36}$"; "") | ascii_downcase)
+                and .principalId == ($root.bootstrapAuthority.controlPrincipalId | ascii_downcase)
+                and .actions == ($root.bootstrapAuthority.permanentActions | sort)
+                and .notActions == []
+                and .dataActions == []
+                and .notDataActions == []
+              else
+                (.actions | length) > 0
+                and all(.actions[];
+                  (contains("*") | not)
+                  and (ascii_downcase | endswith("/read"))
+                )
+                and .notActions == []
+                and .dataActions == []
+                and .notDataActions == []
+              end
+            )
             and (.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]
             and .deployment.apiVersion == "2025-05-01"
             and .deployment.resourceId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy"
@@ -694,6 +874,7 @@ jobs:
             and .webJob == {name: "paperdesk-accepted-release-registry", apiVersion: "2025-05-01", runCommand: "run.sh"}
             and (.bootstrapAuthority | keys) == ["automationRedeployAudit", "controlPrincipalId", "permanentActions", "permanentRoleAssignmentId", "permanentRoleDefinitionId", "removedActions", "roleDefinitionEtag", "verifiedAbsent", "verifiedRemovedAt"]
             and .bootstrapAuthority.controlPrincipalId == "915f5478-68d3-4382-bc37-faadabdc78d6"
+            and .bootstrapAuthority.controlPrincipalId == $azureControlPrincipalId
             and .bootstrapAuthority.permanentRoleDefinitionId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/ad33ece7-baeb-47d1-b096-6ee55ff2efcc"
             and .bootstrapAuthority.permanentRoleAssignmentId == "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/58620e18-38d4-4978-8d5b-7150c8002015"
             and (.bootstrapAuthority.roleDefinitionEtag | type == "string" and length > 0 and length <= 256 and test("^[^\\r\\n]+$"))
@@ -753,6 +934,9 @@ jobs:
           ' "${receipt}" >/dev/null
           inventory_sha256="$(jq --sort-keys --compact-output '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory' "${receipt}" | sha256sum | cut -d ' ' -f 1)"
           test "${inventory_sha256}" = "$(jq -r '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventorySha256' "${receipt}")"
+          result_role_inventory_sha256="$(jq --sort-keys --compact-output '.resultStorageRbac.subscriptionRoleAudit.directAssignments' "${receipt}" | sha256sum | cut -d ' ' -f 1)"
+          test "${result_role_inventory_sha256}" = "$(jq -r '.resultStorageRbac.subscriptionRoleAudit.directAssignmentsSha256' "${receipt}")"
+          test "${result_role_inventory_sha256}" = "$(jq -r '.resultStorageRbac.subscriptionRoleAudit.effectiveAssignmentsSha256' "${receipt}")"
           deployment_started_epoch="$(date --date="$(jq -r '.deployment.liveDeployment.startedAt' "${receipt}")" '+%s')"
           deployment_completed_epoch="$(date --date="$(jq -r '.deployment.liveDeployment.completedAt' "${receipt}")" '+%s')"
           authority_removed_epoch="$(date --date="$(jq -r '.bootstrapAuthority.verifiedRemovedAt' "${receipt}")" '+%s')"
@@ -792,7 +976,7 @@ jobs:
           receipt="${receipt_dir}/${receipt_name}"
           test "$(find "${receipt_dir}" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
           test -f "${receipt}" && test ! -L "${receipt}"
-          test "$(stat --format=%s "${receipt}")" -le 32768
+          test "$(stat --format=%s "${receipt}")" -le 1048576
           test "$(sha256sum "${receipt}" | cut -d ' ' -f 1)" = "${PREFLIGHT_RECEIPT_SHA256}"
           run_json="$(gh api --method GET "/repos/${SOURCE_REPOSITORY}/actions/runs/${PREFLIGHT_RUN_ID}")"
           jq --exit-status \
@@ -819,8 +1003,9 @@ jobs:
             --arg controlWorkflowRef "${CONTROL_WORKFLOW_REF}" \
             --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
             --slurpfile currentBootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
-            --slurpfile currentWorm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" '
-            .schemaVersion == 2
+            --slurpfile currentWorm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" \
+            --slurpfile currentResultWorm "${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json" '
+            .schemaVersion == 3
             and .status == "success"
             and .operation == "registry-bridge-preflight"
             and .sourceRepository == $repository
@@ -847,14 +1032,16 @@ jobs:
             and .registryPreflightRunId == ""
             and .registryPreflightRunAttempt == ""
             and .registryPreflightReceiptSha256 == ""
+            and .registryPersistence == null
             and (.registryBridgePreflight | type == "object")
-            and .registryBridgePreflight.schemaVersion == 1
+            and .registryBridgePreflight.schemaVersion == 2
             and .registryBridgePreflight.status == "success"
             and (.registryBridgePreflight.observedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
             and .registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}
             and .registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment
             and .registryBridgePreflight.bridge == $currentBootstrap[0].bridge
             and .registryBridgePreflight.storageRbac == $currentBootstrap[0].storageRbac
+            and .registryBridgePreflight.resultStorageRbac == $currentBootstrap[0].resultStorageRbac
             and (.registryBridgePreflight.storageRbacCanary | keys) == ["blob", "endedAt", "helperContract", "historyId", "historyStatus", "result", "resultSha256", "startedAt", "webJobId"]
             and (.registryBridgePreflight.storageRbacCanary.blob | test("^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\\.json$"))
             and .registryBridgePreflight.storageRbacCanary.helperContract == "fixed-reviewed-helper-storage-rbac-v1"
@@ -889,9 +1076,45 @@ jobs:
             and .registryBridgePreflight.wormPolicy.allowProtectedAppendWrites == $currentWorm[0].allowProtectedAppendWrites
             and .registryBridgePreflight.wormPolicy.allowProtectedAppendWritesAll == $currentWorm[0].allowProtectedAppendWritesAll
             and .registryBridgePreflight.wormPolicy.etag == $currentWorm[0].etag
+            and (.registryBridgePreflight.resultWormPolicy | keys) == ["allowProtectedAppendWrites", "allowProtectedAppendWritesAll", "container", "etag", "immutabilityPeriodSinceCreationInDays", "observedAt", "resourceId", "state", "storageAccount"]
+            and .registryBridgePreflight.resultWormPolicy.resourceId == $currentResultWorm[0].resourceId
+            and .registryBridgePreflight.resultWormPolicy.storageAccount == "mdspdbak2608089c4e"
+            and .registryBridgePreflight.resultWormPolicy.container == "paperdesk-registry-webjob-results"
+            and .registryBridgePreflight.resultWormPolicy.state == "Locked"
+            and .registryBridgePreflight.resultWormPolicy.immutabilityPeriodSinceCreationInDays == 30
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWrites == false
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWritesAll == false
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWrites == $currentResultWorm[0].allowProtectedAppendWrites
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWritesAll == $currentResultWorm[0].allowProtectedAppendWritesAll
+            and .registryBridgePreflight.resultWormPolicy.etag == $currentResultWorm[0].etag
+            and .registryBridgePreflight.resultWormPolicy.resourceId == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.resourceId
+            and .registryBridgePreflight.resultWormPolicy.state == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.state
+            and .registryBridgePreflight.resultWormPolicy.immutabilityPeriodSinceCreationInDays == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.immutabilityPeriodSinceCreationInDays
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWrites == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWrites
+            and .registryBridgePreflight.resultWormPolicy.allowProtectedAppendWritesAll == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWritesAll
+            and .registryBridgePreflight.resultWormPolicy.etag == $currentBootstrap[0].resultStorageRbac.immutabilityPolicy.etag
+            and .registryBridgePreflight.resultAttestations.schema == "paperdesk-registry-webjob-result-set-v1"
+            and .registryBridgePreflight.resultAttestations.status == "valid"
+            and .registryBridgePreflight.resultAttestations.mode == "preflight"
+            and .registryBridgePreflight.resultAttestations.persistenceCase == null
+            and .registryBridgePreflight.resultAttestations.githubRunId == $runId
+            and .registryBridgePreflight.resultAttestations.githubRunAttempt == $runAttempt
+            and .registryBridgePreflight.resultAttestations.controlWorkflowSha == ($controlWorkflowRef | split("@") | .[1])
+            and .registryBridgePreflight.resultAttestations.packageSha256 == $currentBootstrap[0].package.sha256
+            and .registryBridgePreflight.resultAttestations.helperSha256 == ($currentBootstrap[0].package.inventory[] | select(.path | endswith("/accepted_release_registry.py")) | .sha256)
+            and (.registryBridgePreflight.resultAttestations.executions | length) == 2
+            and ([.registryBridgePreflight.resultAttestations.executions[] | [.purpose, .execution]] | sort) == ([
+              ["preflight-runtime", 1],
+              ["preflight-storage", 1]
+            ] | sort)
+            and .registryBridgePreflight.resultAttestations.executions[0].resultSha256 == .registryBridgePreflight.storageRbacCanary.resultSha256
+            and .registryBridgePreflight.resultAttestations.executions[0].history.historyId == .registryBridgePreflight.storageRbacCanary.historyId
+            and .registryBridgePreflight.resultAttestations.executions[0].history.webJobsRunId == .registryBridgePreflight.storageRbacCanary.webJobId
+            and .registryBridgePreflight.resultAttestations.executions[1].history.historyId == .registryBridgePreflight.webJob.historyId
+            and .registryBridgePreflight.resultAttestations.executions[1].history.webJobsRunId == .registryBridgePreflight.webJob.webJobId
           ' "${receipt}" >/dev/null
           embedded_storage_rbac_result="$(jq --sort-keys --compact-output '.registryBridgePreflight.storageRbacCanary.result' "${receipt}")"
-          embedded_storage_rbac_result_sha256="$(printf '%s' "${embedded_storage_rbac_result}" | sha256sum | cut -d ' ' -f 1)"
+          embedded_storage_rbac_result_sha256="$(printf '%s\n' "${embedded_storage_rbac_result}" | sha256sum | cut -d ' ' -f 1)"
           test "${embedded_storage_rbac_result_sha256}" = "$(jq -r '.registryBridgePreflight.storageRbacCanary.resultSha256' "${receipt}")"
           preflight_observed_at="$(jq -r '.registryBridgePreflight.observedAt' "${receipt}")"
           preflight_observed_epoch="$(date --date="${preflight_observed_at}" '+%s')"
@@ -1032,6 +1255,7 @@ jobs:
           BOOTSTRAP_RECEIPT_SHA256: ${{ steps.registry_bootstrap.outputs.receipt_sha256 }}
           BRIDGE_APP_NAME: paperdesk-release-registry-bridge-9c4e0d0d
           BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea
+          CONTROL_WORKFLOW_SHA: ${{ steps.immutable_coordinates.outputs.control_workflow_sha }}
           EXPECTED_HELPER_SHA256: 889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050
           EXPECTED_PACKAGE_SHA256: 76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8
           EXPECTED_RUNNER_SHA256: 47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b
@@ -1046,11 +1270,14 @@ jobs:
           set -euo pipefail
           readonly webjob_name="paperdesk-accepted-release-registry"
           readonly web_api_version="2025-05-01"
+          readonly result_account="mdspdbak2608089c4e"
+          readonly result_container="paperdesk-registry-webjob-results"
           transient_settings_file=""
           webjob_ended_at=""
           webjob_history_id=""
           live_onedeploy_deployment=""
           live_storage_rbac=""
+          live_result_storage_rbac=""
           webjob_run_id=""
           webjob_run_command=""
           webjob_started_at=""
@@ -1061,6 +1288,23 @@ jobs:
           storage_rbac_canary_result_sha256=""
           storage_rbac_canary_run_id=""
           storage_rbac_canary_started_at=""
+          result_purpose=""
+          result_execution=""
+          result_nonce=""
+          result_blob=""
+          result_envelope_path=""
+          result_proof_path=""
+          result_evidence_root="${RUNNER_TEMP}/paperdesk-registry-webjob-results"
+          preflight_storage_proof=""
+          preflight_runtime_proof=""
+          persistence_runtime_proof=""
+          persistence_result_one_proof=""
+          persistence_result_two_proof=""
+          preflight_result_set="${RUNNER_TEMP}/paperdesk-registry-preflight-result-set.json"
+          persistence_result_set="${RUNNER_TEMP}/paperdesk-registry-persistence-result-set.json"
+          persistence_proof="${RUNNER_TEMP}/paperdesk-registry-persistence-proof.json"
+          declare -A used_result_nonces=()
+          declare -A used_result_blobs=()
           readonly transient_settings=(
             PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256
             PAPERDESK_REGISTRY_ARTIFACT_URL
@@ -1178,13 +1422,23 @@ jobs:
           }
 
           verify_live_storage_subject() {
-            local subject expected principal_id container_scope expected_container_scope assignments_path expected_assignments_path assignments_url expected_assignments_url assignments_response assignments role_assignment_sha256 role_definition_id role_definition role_definition_sha256
-            subject="$1"
-            expected="$(jq --compact-output --arg subject "${subject}" '.storageRbac[$subject]' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            local contract subject expected expected_assignment_id principal_id container_scope expected_container_scope assignments_path expected_assignments_path assignments_url expected_assignments_url assignments_response assignments role_assignment_sha256 role_definition_id role_definition role_definition_sha256
+            contract="$1"
+            subject="$2"
+            expected="$(jq --compact-output --arg contract "${contract}" --arg subject "${subject}" '.[$contract][$subject]' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
             test -n "${expected}"
+            expected_assignment_id="$(jq -r '.roleAssignmentId | ascii_downcase' <<< "${expected}")"
             principal_id="$(jq -r '.principalId' <<< "${expected}")"
-            container_scope="$(jq -r '.storageRbac.containerResourceId' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
-            expected_container_scope="/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases"
+            container_scope="$(jq -r --arg contract "${contract}" '.[$contract].containerResourceId' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            case "${contract}" in
+              storageRbac)
+                expected_container_scope="/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases"
+                ;;
+              resultStorageRbac)
+                expected_container_scope="/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results"
+                ;;
+              *) return 1 ;;
+            esac
             test "${container_scope}" = "${expected_container_scope}"
             [[ "${principal_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
             expected_assignments_path="${expected_container_scope}/providers/Microsoft.Authorization/roleAssignments"
@@ -1212,11 +1466,14 @@ jobs:
                 and (.properties.roleDefinitionId | type) == "string"
                 and (.properties.principalId | type) == "string"
                 and (.properties.principalType | type) == "string"
+                and ((.properties.delegatedManagedIdentityResourceId // null) == null)
               )
             ' <<< "${assignments_response}" >/dev/null
-            assignments="$(jq --compact-output '
+            assignments="$(jq --compact-output --arg expectedAssignmentId "${expected_assignment_id}" '
               [
-                .value[] | {
+                .value[]
+                | select((.id | ascii_downcase) == $expectedAssignmentId)
+                | {
                   id: .id,
                   scope: .properties.scope,
                   roleDefinitionId: .properties.roleDefinitionId,
@@ -1291,10 +1548,178 @@ jobs:
               and .identity.userAssignedIdentities[$bootstrap[0].storageRbac.reader.identityResourceId]
                 == {clientId: $bootstrap[0].storageRbac.reader.clientId, principalId: $bootstrap[0].storageRbac.reader.principalId}
             ' <<< "${site_json}" >/dev/null
-            verify_live_storage_subject writer
-            verify_live_storage_subject reader
+            verify_live_storage_subject storageRbac writer
+            verify_live_storage_subject storageRbac reader
             live_storage_rbac="$(jq --compact-output '.storageRbac' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
             test -n "${live_storage_rbac}"
+          }
+
+          verify_subscription_direct_role_assignments() {
+            local subscription_scope audit_file next_file audit_sha256 subject expected principal_id direct_response effective_response direct_coordinates effective_coordinates assignment role_definition role_definition_id role_assignment_sha256 role_definition_sha256 item
+            local -a assignments
+            subscription_scope="/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c"
+            audit_file="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-result-rbac.XXXXXX.json")"
+            printf '[]\n' > "${audit_file}"
+            for subject in helperWriter helperReader controlReader; do
+              expected="$(jq --compact-output --arg subject "${subject}" '.resultStorageRbac[$subject]' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+              principal_id="$(jq -r '.principalId' <<< "${expected}")"
+              [[ "${principal_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+              direct_response="$(az rest \
+                --method get \
+                --url "https://management.azure.com${subscription_scope}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&%24filter=principalId%20eq%20%27${principal_id}%27" \
+                --only-show-errors \
+                --output json)"
+              effective_response="$(az rest \
+                --method get \
+                --url "https://management.azure.com${subscription_scope}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&%24filter=assignedTo%28%27${principal_id}%27%29" \
+                --only-show-errors \
+                --output json)"
+              jq --exit-status --arg principalId "${principal_id}" '
+                type == "object"
+                and (.value | type) == "array"
+                and ((.nextLink // "") == "")
+                and all(.value[];
+                  .type == "Microsoft.Authorization/roleAssignments"
+                  and (.id | type == "string" and length > 0)
+                  and (.properties.roleDefinitionId | type == "string" and length > 0)
+                  and (.properties.scope | type == "string" and length > 0)
+                  and ((.properties.principalId | ascii_downcase) == ($principalId | ascii_downcase))
+                  and .properties.principalType == "ServicePrincipal"
+                  and ((.properties.delegatedManagedIdentityResourceId // null) == null)
+                )
+              ' <<< "${direct_response}" >/dev/null
+              jq --exit-status '
+                type == "object"
+                and (.value | type) == "array"
+                and ((.nextLink // "") == "")
+                and all(.value[];
+                  .type == "Microsoft.Authorization/roleAssignments"
+                  and (.id | type == "string" and length > 0)
+                  and (.properties.roleDefinitionId | type == "string" and length > 0)
+                  and (.properties.scope | type == "string" and length > 0)
+                  and (.properties.principalId | type == "string" and length > 0)
+                  and (.properties.principalType | type == "string" and length > 0)
+                  and ((.properties.delegatedManagedIdentityResourceId // null) == null)
+                )
+              ' <<< "${effective_response}" >/dev/null
+              direct_coordinates="$(jq --compact-output '
+                [.value[] | {
+                  roleAssignmentId: (.id | ascii_downcase),
+                  roleDefinitionId: (.properties.roleDefinitionId | ascii_downcase),
+                  scope: (.properties.scope | ascii_downcase),
+                  principalId: (.properties.principalId | ascii_downcase),
+                  principalType: .properties.principalType,
+                  condition: (.properties.condition // null),
+                  conditionVersion: (.properties.conditionVersion // null)
+                }] | sort_by(.roleAssignmentId)
+              ' <<< "${direct_response}")"
+              effective_coordinates="$(jq --compact-output '
+                [.value[] | {
+                  roleAssignmentId: (.id | ascii_downcase),
+                  roleDefinitionId: (.properties.roleDefinitionId | ascii_downcase),
+                  scope: (.properties.scope | ascii_downcase),
+                  principalId: (.properties.principalId | ascii_downcase),
+                  principalType: .properties.principalType,
+                  condition: (.properties.condition // null),
+                  conditionVersion: (.properties.conditionVersion // null)
+                }] | sort_by(.roleAssignmentId)
+              ' <<< "${effective_response}")"
+              test "${effective_coordinates}" = "${direct_coordinates}"
+              mapfile -t assignments < <(jq --compact-output '.value[]' <<< "${direct_response}")
+              for assignment in "${assignments[@]}"; do
+                role_definition_id="$(jq -r '.properties.roleDefinitionId' <<< "${assignment}")"
+                role_definition="$(az rest \
+                  --method get \
+                  --url "https://management.azure.com${role_definition_id}?api-version=2022-04-01" \
+                  --only-show-errors \
+                  --output json)"
+                jq --exit-status --arg roleDefinitionId "${role_definition_id}" '
+                  ((.id | ascii_downcase) == ($roleDefinitionId | ascii_downcase))
+                  and .type == "Microsoft.Authorization/roleDefinitions"
+                  and (.properties.permissions | type) == "array"
+                  and (.properties.permissions | length) > 0
+                  and all(.properties.permissions[];
+                    (.actions | type) == "array"
+                    and (.notActions | type) == "array"
+                    and (.dataActions | type) == "array"
+                    and (.notDataActions | type) == "array"
+                  )
+                ' <<< "${role_definition}" >/dev/null
+                role_assignment_sha256="$(jq --sort-keys --compact-output '
+                  {
+                    id: .id,
+                    scope: .properties.scope,
+                    roleDefinitionId: .properties.roleDefinitionId,
+                    principalId: .properties.principalId,
+                    principalType: .properties.principalType,
+                    condition: (.properties.condition // null),
+                    conditionVersion: (.properties.conditionVersion // null)
+                  }
+                ' <<< "${assignment}" | sha256sum | cut -d ' ' -f 1)"
+                role_definition_sha256="$(jq --sort-keys --compact-output '.' <<< "${role_definition}" | sha256sum | cut -d ' ' -f 1)"
+                item="$(jq --null-input --compact-output \
+                  --arg subject "${subject}" \
+                  --arg roleAssignmentId "$(jq -r '.id' <<< "${assignment}")" \
+                  --arg roleDefinitionId "${role_definition_id}" \
+                  --arg scope "$(jq -r '.properties.scope' <<< "${assignment}")" \
+                  --arg principalId "$(jq -r '.properties.principalId' <<< "${assignment}")" \
+                  --arg principalType "$(jq -r '.properties.principalType' <<< "${assignment}")" \
+                  --argjson condition "$(jq '.properties.condition // null' <<< "${assignment}")" \
+                  --argjson conditionVersion "$(jq '.properties.conditionVersion // null' <<< "${assignment}")" \
+                  --argjson delegatedManagedIdentityResourceId "$(jq '.properties.delegatedManagedIdentityResourceId // null' <<< "${assignment}")" \
+                  --arg roleAssignmentSha256 "${role_assignment_sha256}" \
+                  --arg roleDefinitionSha256 "${role_definition_sha256}" \
+                  --argjson actions "$(jq '[.properties.permissions[].actions[]] | unique | sort' <<< "${role_definition}")" \
+                  --argjson notActions "$(jq '[.properties.permissions[].notActions[]] | unique | sort' <<< "${role_definition}")" \
+                  --argjson dataActions "$(jq '[.properties.permissions[].dataActions[]] | unique | sort' <<< "${role_definition}")" \
+                  --argjson notDataActions "$(jq '[.properties.permissions[].notDataActions[]] | unique | sort' <<< "${role_definition}")" '
+                  {
+                    subject: $subject,
+                    roleAssignmentId: ($roleAssignmentId | ascii_downcase),
+                    roleDefinitionId: ($roleDefinitionId | ascii_downcase),
+                    scope: ($scope | ascii_downcase),
+                    principalId: ($principalId | ascii_downcase),
+                    principalType: $principalType,
+                    condition: $condition,
+                    conditionVersion: $conditionVersion,
+                    delegatedManagedIdentityResourceId: $delegatedManagedIdentityResourceId,
+                    roleAssignmentSha256: $roleAssignmentSha256,
+                    roleDefinitionSha256: $roleDefinitionSha256,
+                    actions: $actions,
+                    notActions: $notActions,
+                    dataActions: $dataActions,
+                    notDataActions: $notDataActions
+                  }
+                ')"
+                next_file="${audit_file}.next"
+                jq --argjson item "${item}" '. + [$item] | sort_by(.roleAssignmentId | ascii_downcase)' "${audit_file}" > "${next_file}"
+                mv "${next_file}" "${audit_file}"
+              done
+            done
+            jq --exit-status \
+              --slurpfile bootstrap paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json '
+              . == ($bootstrap[0].resultStorageRbac.subscriptionRoleAudit.directAssignments | sort_by(.roleAssignmentId | ascii_downcase))
+              and length >= 6
+              and length <= 64
+              and (map(.roleAssignmentId | ascii_downcase) | unique | length) == length
+              and ([.[] | select(.subject == "helperWriter")] | length) == 2
+              and ([.[] | select(.subject == "helperReader")] | length) == 2
+              and ([.[] | select(.subject == "controlReader")] | length) >= 2
+              and all(.[]; .condition == null and .conditionVersion == null and .delegatedManagedIdentityResourceId == null)
+            ' "${audit_file}" >/dev/null
+            audit_sha256="$(jq --sort-keys --compact-output '.' "${audit_file}" | sha256sum | cut -d ' ' -f 1)"
+            test "${audit_sha256}" = "$(jq -r '.resultStorageRbac.subscriptionRoleAudit.directAssignmentsSha256' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            test "${audit_sha256}" = "$(jq -r '.resultStorageRbac.subscriptionRoleAudit.effectiveAssignmentsSha256' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            rm -f "${audit_file}"
+          }
+
+          verify_live_result_storage_rbac() {
+            verify_live_storage_subject resultStorageRbac helperWriter
+            verify_live_storage_subject resultStorageRbac helperReader
+            verify_live_storage_subject resultStorageRbac controlReader
+            verify_subscription_direct_role_assignments
+            live_result_storage_rbac="$(jq --compact-output '.resultStorageRbac' paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json)"
+            test -n "${live_result_storage_rbac}"
           }
 
           cleanup_bridge() {
@@ -1379,6 +1804,10 @@ jobs:
                 test -n "${run_json}"
                 status="$(jq -r '.status' <<< "${run_json}")"
                 case "${status}" in
+                  Initializing|Running)
+                    sleep 5
+                    continue
+                    ;;
                   Success)
                     jq --exit-status --arg job "${webjob_name}" '
                       (.history_id | type == "string" and length > 0)
@@ -1414,7 +1843,7 @@ jobs:
                     done
                     return 0
                     ;;
-                  Failed|Error|Aborted)
+                  Failed|Error|Aborted|Stopped)
                     echo "Registry WebJob failed at the ARM history boundary." >&2
                     return 1
                     ;;
@@ -1430,12 +1859,262 @@ jobs:
             return 1
           }
 
+          prepare_result_coordinates() {
+            local purpose execution nonce expected_operation
+            purpose="$1"
+            execution="$2"
+            case "${purpose}:${execution}" in
+              preflight-storage:1) expected_operation="storage-rbac-canary" ;;
+              preflight-runtime:1|persistence-runtime:1) expected_operation="runtime-canary" ;;
+              persistence-result:1|persistence-result:2) expected_operation="persist-actions-artifact" ;;
+              *)
+                echo "Registry result purpose/execution is outside the fixed five-execution matrix." >&2
+                return 1
+                ;;
+            esac
+            nonce="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+            [[ "${nonce}" =~ ^[0-9a-f]{32}$ ]]
+            test -z "${used_result_nonces[${nonce}]+x}"
+            result_purpose="${purpose}"
+            result_execution="${execution}"
+            result_nonce="${nonce}"
+            result_blob="v1/results/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${purpose}/${execution}/${nonce}.json"
+            [[ "${result_blob}" =~ ^v1/results/[1-9][0-9]*/[1-9][0-9]*/(preflight-storage|preflight-runtime|persistence-runtime|persistence-result)/[12]/[0-9a-f]{32}\.json$ ]]
+            test -z "${used_result_blobs[${result_blob}]+x}"
+            used_result_nonces["${nonce}"]="${expected_operation}:${purpose}:${execution}"
+            used_result_blobs["${result_blob}"]="${expected_operation}:${purpose}:${execution}"
+          }
+
+          capture_bound_webjob_result() {
+            local helper_operation proof_name
+            local -a validator_command
+            helper_operation="$1"
+            test -n "${result_purpose}"
+            [[ "${result_execution}" =~ ^[12]$ ]]
+            [[ "${result_nonce}" =~ ^[0-9a-f]{32}$ ]]
+            test "${result_blob}" = "v1/results/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${result_purpose}/${result_execution}/${result_nonce}.json"
+            test -n "${webjob_history_id}"
+            test -n "${webjob_run_id}"
+            test -n "${webjob_started_at}"
+            test -n "${webjob_ended_at}"
+            result_envelope_path="${result_evidence_root}/${result_purpose}-${result_execution}-${result_nonce}.json"
+            proof_name="${result_purpose}-${result_execution}-${result_nonce}.proof.json"
+            result_proof_path="${result_evidence_root}/${proof_name}"
+            test ! -e "${result_envelope_path}" && test ! -L "${result_envelope_path}"
+            test ! -e "${result_proof_path}" && test ! -L "${result_proof_path}"
+            az storage blob download \
+              --account-name "${result_account}" \
+              --container-name "${result_container}" \
+              --name "${result_blob}" \
+              --file "${result_envelope_path}" \
+              --auth-mode login \
+              --overwrite false \
+              --only-show-errors \
+              --output none
+            test -f "${result_envelope_path}" && test ! -L "${result_envelope_path}"
+            test "$(stat --format=%s "${result_envelope_path}")" -le 8192
+            validator_command=(
+              python3 paperdesk-registry-control/scripts/validate_registry_webjob_result.py validate
+              --input "${result_envelope_path}"
+              --output "${result_proof_path}"
+              --operation "${helper_operation}"
+              --purpose "${result_purpose}"
+              --execution "${result_execution}"
+              --nonce "${result_nonce}"
+              --result-blob "${result_blob}"
+              --github-run-id "${GITHUB_RUN_ID}"
+              --github-run-attempt "${GITHUB_RUN_ATTEMPT}"
+              --control-workflow-sha "${CONTROL_WORKFLOW_SHA}"
+              --package-sha256 "${EXPECTED_PACKAGE_SHA256}"
+              --helper-sha256 "${EXPECTED_HELPER_SHA256}"
+              --webjobs-run-id "${webjob_run_id}"
+              --history-id "${webjob_history_id}"
+              --history-status Success
+              --started-at "${webjob_started_at}"
+              --ended-at "${webjob_ended_at}"
+            )
+            if [ "${helper_operation}" = "persist-actions-artifact" ]; then
+              validator_command+=(
+                --expected-prefix "${expected_prefix}"
+                --artifact-zip-sha256 "${REGISTRY_TRANSFER_ARTIFACT_SHA256}"
+                --request-sha256 "${request_digest}"
+              )
+            fi
+            "${validator_command[@]}"
+            test -f "${result_proof_path}" && test ! -L "${result_proof_path}"
+            test "$(stat --format=%s "${result_proof_path}")" -le 16384
+            jq --exit-status \
+              --arg operation "${helper_operation}" \
+              --arg purpose "${result_purpose}" \
+              --argjson execution "${result_execution}" \
+              --arg nonce "${result_nonce}" \
+              --arg blob "${result_blob}" \
+              --arg historyId "${webjob_history_id}" \
+              --arg webJobsRunId "${webjob_run_id}" '
+              .schema == "paperdesk-registry-webjob-result-proof-v1"
+              and .status == "valid"
+              and .operation == $operation
+              and .purpose == $purpose
+              and .execution == $execution
+              and .nonce == $nonce
+              and .resultBlob == $blob
+              and .history.historyId == $historyId
+              and .history.webJobsRunId == $webJobsRunId
+              and .history.status == "Success"
+            ' "${result_proof_path}" >/dev/null
+            case "${result_purpose}:${result_execution}" in
+              preflight-storage:1)
+                preflight_storage_proof="${result_proof_path}"
+                storage_rbac_canary_result="$(jq --compact-output '.result' "${result_proof_path}")"
+                storage_rbac_canary_result_sha256="$(jq -r '.resultSha256' "${result_proof_path}")"
+                ;;
+              preflight-runtime:1) preflight_runtime_proof="${result_proof_path}" ;;
+              persistence-runtime:1) persistence_runtime_proof="${result_proof_path}" ;;
+              persistence-result:1) persistence_result_one_proof="${result_proof_path}" ;;
+              persistence-result:2) persistence_result_two_proof="${result_proof_path}" ;;
+              *) return 1 ;;
+            esac
+          }
+
+          build_bound_result_set() {
+            local mode output
+            mode="$1"
+            output="$2"
+            test ! -e "${output}" && test ! -L "${output}"
+            case "${mode}" in
+              preflight)
+                test -n "${preflight_storage_proof}"
+                test -n "${preflight_runtime_proof}"
+                python3 paperdesk-registry-control/scripts/validate_registry_webjob_result.py build-set \
+                  --mode preflight \
+                  --proof "${preflight_storage_proof}" \
+                  --proof "${preflight_runtime_proof}" \
+                  --output "${output}"
+                ;;
+              persistence)
+                test -n "${persistence_runtime_proof}"
+                test -n "${persistence_result_one_proof}"
+                test -n "${persistence_result_two_proof}"
+                python3 paperdesk-registry-control/scripts/validate_registry_webjob_result.py build-set \
+                  --mode persistence \
+                  --proof "${persistence_runtime_proof}" \
+                  --proof "${persistence_result_one_proof}" \
+                  --proof "${persistence_result_two_proof}" \
+                  --output "${output}"
+                ;;
+              *) return 1 ;;
+            esac
+            test -f "${output}" && test ! -L "${output}"
+            test "$(stat --format=%s "${output}")" -le 65536
+            jq --exit-status --arg mode "${mode}" '
+              .schema == "paperdesk-registry-webjob-result-set-v1"
+              and .status == "valid"
+              and .mode == $mode
+            ' "${output}" >/dev/null
+          }
+
+          write_persistence_proof() {
+            local proof_temp
+            test -f "${persistence_result_set}" && test ! -L "${persistence_result_set}"
+            test -f "${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json"
+            test -n "${live_result_storage_rbac}"
+            test -n "${live_onedeploy_deployment}"
+            test ! -e "${persistence_proof}" && test ! -L "${persistence_proof}"
+            proof_temp="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-persistence-proof.XXXXXX.json")"
+            chmod 600 "${proof_temp}"
+            jq --null-input \
+              --arg observedAt "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" \
+              --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
+              --argjson liveOneDeploy "${live_onedeploy_deployment}" \
+              --argjson liveResultStorageRbac "${live_result_storage_rbac}" \
+              --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
+              --slurpfile resultWorm "${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json" \
+              --slurpfile resultSet "${persistence_result_set}" '
+              {
+                schemaVersion: 1,
+                status: "success",
+                observedAt: $observedAt,
+                packageBootstrap: {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]},
+                oneDeploy: {
+                  apiVersion: $bootstrap[0].deployment.apiVersion,
+                  resourceId: $bootstrap[0].deployment.resourceId,
+                  liveDeployment: $liveOneDeploy
+                },
+                resultStorageRbac: $liveResultStorageRbac,
+                resultWormPolicy: $resultWorm[0],
+                resultAttestations: $resultSet[0]
+              }
+            ' > "${proof_temp}"
+            test -f "${proof_temp}" && test ! -L "${proof_temp}"
+            test "$(stat --format=%s "${proof_temp}")" -le 786432
+            jq --exit-status \
+              --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
+              --arg githubRunId "${GITHUB_RUN_ID}" \
+              --arg githubRunAttempt "${GITHUB_RUN_ATTEMPT}" \
+              --arg controlWorkflowSha "${CONTROL_WORKFLOW_SHA}" \
+              --arg expectedPrefix "${expected_prefix}" \
+              --arg artifactSha256 "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" \
+              --arg requestSha256 "${request_digest}" \
+              --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" '
+              .schemaVersion == 1
+              and .status == "success"
+              and .packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}
+              and .oneDeploy == $bootstrap[0].deployment
+              and .resultStorageRbac == $bootstrap[0].resultStorageRbac
+              and .resultWormPolicy.container == "paperdesk-registry-webjob-results"
+              and .resultWormPolicy.state == "Locked"
+              and .resultWormPolicy.immutabilityPeriodSinceCreationInDays == 30
+              and .resultWormPolicy.resourceId == $bootstrap[0].resultStorageRbac.immutabilityPolicy.resourceId
+              and .resultWormPolicy.allowProtectedAppendWrites == $bootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWrites
+              and .resultWormPolicy.allowProtectedAppendWritesAll == $bootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWritesAll
+              and .resultWormPolicy.etag == $bootstrap[0].resultStorageRbac.immutabilityPolicy.etag
+              and .resultAttestations.schema == "paperdesk-registry-webjob-result-set-v1"
+              and .resultAttestations.status == "valid"
+              and .resultAttestations.mode == "persistence"
+              and .resultAttestations.githubRunId == $githubRunId
+              and .resultAttestations.githubRunAttempt == $githubRunAttempt
+              and .resultAttestations.controlWorkflowSha == $controlWorkflowSha
+              and .resultAttestations.packageSha256 == $bootstrap[0].package.sha256
+              and .resultAttestations.helperSha256 == ($bootstrap[0].package.inventory[] | select(.path | endswith("/accepted_release_registry.py")) | .sha256)
+              and (.resultAttestations.persistenceCase == "created-or-recovered-then-idempotent"
+                or .resultAttestations.persistenceCase == "already-complete-before-both-executions")
+              and (.resultAttestations.executions | length) == 3
+              and ([.resultAttestations.executions[] | [.purpose, .execution]] | sort) == ([
+                ["persistence-result", 1],
+                ["persistence-result", 2],
+                ["persistence-runtime", 1]
+              ] | sort)
+              and all(.resultAttestations.executions[] | select(.operation == "persist-actions-artifact");
+                .result.prefix == $expectedPrefix
+                and .result.artifactZipSha256 == $artifactSha256
+                and .result.requestSha256 == $requestSha256
+              )
+            ' "${proof_temp}" >/dev/null
+            test ! -e "${persistence_proof}" && test ! -L "${persistence_proof}"
+            mv -- "${proof_temp}" "${persistence_proof}"
+          }
+
           run_runtime_canary() {
+            local purpose
+            purpose="$1"
+            case "${purpose}" in
+              preflight-runtime|persistence-runtime) ;;
+              *) return 1 ;;
+            esac
             verify_live_onedeploy_anchor
+            prepare_result_coordinates "${purpose}" 1
             az webapp config appsettings set \
               --name "${BRIDGE_APP_NAME}" \
               --resource-group "${BRIDGE_RESOURCE_GROUP}" \
-              --settings PAPERDESK_REGISTRY_OPERATION=runtime-canary \
+              --settings \
+                PAPERDESK_REGISTRY_OPERATION=runtime-canary \
+                PAPERDESK_REGISTRY_RESULT_PURPOSE="${result_purpose}" \
+                PAPERDESK_REGISTRY_RESULT_EXECUTION="${result_execution}" \
+                PAPERDESK_REGISTRY_RESULT_NONCE="${result_nonce}" \
+                PAPERDESK_REGISTRY_RESULT_BLOB="${result_blob}" \
+                PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID="${GITHUB_RUN_ID}" \
+                PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT}" \
+                PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA="${CONTROL_WORKFLOW_SHA}" \
               --only-show-errors \
               --output none
             az webapp start --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
@@ -1445,21 +2124,26 @@ jobs:
             delete_transient_settings
             assert_bridge_stopped_and_sealed
             verify_live_onedeploy_anchor
+            capture_bound_webjob_result runtime-canary
           }
 
           run_storage_rbac_canary() {
-            local canary_nonce
             verify_live_onedeploy_anchor
-            canary_nonce="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
-            [[ "${canary_nonce}" =~ ^[0-9a-f]{32}$ ]]
-            storage_rbac_canary_blob="v1/canaries/storage-rbac/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${canary_nonce}.json"
-            capture_bound_storage_rbac_canary_result
+            prepare_result_coordinates preflight-storage 1
+            storage_rbac_canary_blob="v1/canaries/storage-rbac/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${result_nonce}.json"
             az webapp config appsettings set \
               --name "${BRIDGE_APP_NAME}" \
               --resource-group "${BRIDGE_RESOURCE_GROUP}" \
               --settings \
                 PAPERDESK_REGISTRY_OPERATION=storage-rbac-canary \
                 PAPERDESK_REGISTRY_RBAC_CANARY_BLOB="${storage_rbac_canary_blob}" \
+                PAPERDESK_REGISTRY_RESULT_PURPOSE="${result_purpose}" \
+                PAPERDESK_REGISTRY_RESULT_EXECUTION="${result_execution}" \
+                PAPERDESK_REGISTRY_RESULT_NONCE="${result_nonce}" \
+                PAPERDESK_REGISTRY_RESULT_BLOB="${result_blob}" \
+                PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID="${GITHUB_RUN_ID}" \
+                PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT}" \
+                PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA="${CONTROL_WORKFLOW_SHA}" \
               --only-show-errors \
               --output none
             az webapp start --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --only-show-errors >/dev/null
@@ -1473,28 +2157,11 @@ jobs:
             delete_transient_settings
             assert_bridge_stopped_and_sealed
             verify_live_onedeploy_anchor
-          }
-
-          capture_bound_storage_rbac_canary_result() {
-            # The helper-side canonical result channel is implemented, but this workflow
-            # does not yet provision or receipt-bind its dedicated locked-WORM container,
-            # pass five unique coordinate sets, download exact blobs with Entra login, or
-            # bind each ARM web_job_id to the envelope WEBJOBS_RUN_ID. Generic ARM History
-            # Success is not a result attestation. Activation still lacks all five reviewed
-            # executions: preflight storage/runtime, persistence runtime, and persistence
-            # #1/#2 with an exact idempotence comparison.
-            # Each persistence result must bind its exact prefix, request/artifact digests,
-            # manifestSha256, fileCount, createdBlobCount, and both negative checks.
-            # Retry attestation accepts only two cases while immutable outcome fields match:
-            # A) run #1 creates/recovers 1..20 blobs with overwriteNegative=passed and
-            # replay is 0/not-run-completed; B) an entry was already complete before this
-            # workflow and both calls are 0/not-run-completed. Any mismatch fails closed.
-            echo "Registry bridge activation is impossible until separately reviewed workflow/RBAC orchestration binds all five exact helper envelopes to their WebJob histories, operations, nonces, immutable control/package/helper digests, and the dedicated locked-WORM result container without weakening sealed SCM or public access." >&2
-            return 1
+            capture_bound_webjob_result storage-rbac-canary
           }
 
           write_preflight_proof() {
-            local site_json config_json settings_json policies_json proof identity_keys storage_rbac_canary_result_canonical
+            local site_json config_json settings_json policies_json proof proof_temp identity_keys storage_rbac_canary_result_canonical
             verify_live_onedeploy_anchor
             test -n "${live_onedeploy_deployment}"
             test -n "${webjob_history_id}"
@@ -1503,12 +2170,15 @@ jobs:
             test -n "${webjob_started_at}"
             test -n "${webjob_ended_at}"
             test -n "${live_storage_rbac}"
+            test -n "${live_result_storage_rbac}"
             [[ "${storage_rbac_canary_blob}" =~ ^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\.json$ ]]
             test -n "${storage_rbac_canary_history_id}"
             test -n "${storage_rbac_canary_run_id}"
             test -n "${storage_rbac_canary_started_at}"
             test -n "${storage_rbac_canary_ended_at}"
             test -n "${storage_rbac_canary_result}"
+            test -f "${preflight_result_set}" && test ! -L "${preflight_result_set}"
+            test -f "${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json"
             test "${#storage_rbac_canary_result}" -le 4096
             jq --exit-status --arg blob "${storage_rbac_canary_blob}" '
               keys == ["canaryBlob", "localPrefixGuard", "readerRead", "readerWriteDenied", "schemaVersion", "status", "writerCreate", "writerReadDenied", "writerUnconditionalOverwriteDenied"]
@@ -1523,7 +2193,7 @@ jobs:
               and .localPrefixGuard == "passed-before-network"
             ' <<< "${storage_rbac_canary_result}" >/dev/null
             storage_rbac_canary_result_canonical="$(jq --sort-keys --compact-output '.' <<< "${storage_rbac_canary_result}")"
-            storage_rbac_canary_result_sha256="$(printf '%s' "${storage_rbac_canary_result_canonical}" | sha256sum | cut -d ' ' -f 1)"
+            storage_rbac_canary_result_sha256="$(printf '%s\n' "${storage_rbac_canary_result_canonical}" | sha256sum | cut -d ' ' -f 1)"
             [[ "${storage_rbac_canary_result_sha256}" =~ ^[0-9a-f]{64}$ ]]
             site_json="$(az webapp show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
             config_json="$(az webapp config show --name "${BRIDGE_APP_NAME}" --resource-group "${BRIDGE_RESOURCE_GROUP}" --output json)"
@@ -1543,6 +2213,9 @@ jobs:
                 == {clientId: "a52c21e2-b465-4f01-88b8-44bb5fb8b306", principalId: "c78102ff-17cd-459e-8da4-c7a900db0f86"}
             ' <<< "${site_json}" >/dev/null
             proof="${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-proof.json"
+            test ! -e "${proof}" && test ! -L "${proof}"
+            proof_temp="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-proof.XXXXXX.json")"
+            chmod 600 "${proof_temp}"
             jq --null-input \
               --arg observedAt "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" \
               --arg resourceId "$(jq -r '.id' <<< "${site_json}")" \
@@ -1581,10 +2254,13 @@ jobs:
               --argjson storageRbacCanaryResult "${storage_rbac_canary_result_canonical}" \
               --argjson liveOneDeploy "${live_onedeploy_deployment}" \
               --argjson liveStorageRbac "${live_storage_rbac}" \
+              --argjson liveResultStorageRbac "${live_result_storage_rbac}" \
               --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" \
-              --slurpfile worm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" '
+              --slurpfile worm "${RUNNER_TEMP}/paperdesk-registry-worm-snapshot.json" \
+              --slurpfile resultWorm "${RUNNER_TEMP}/paperdesk-registry-result-worm-snapshot.json" \
+              --slurpfile resultSet "${preflight_result_set}" '
               {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 status: "success",
                 observedAt: $observedAt,
                 packageBootstrap: {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]},
@@ -1634,6 +2310,7 @@ jobs:
                   endedAt: $endedAt
                 },
                 storageRbac: $liveStorageRbac,
+                resultStorageRbac: $liveResultStorageRbac,
                 storageRbacCanary: {
                   blob: $storageRbacCanaryBlob,
                   helperContract: "fixed-reviewed-helper-storage-rbac-v1",
@@ -1645,17 +2322,22 @@ jobs:
                   resultSha256: $storageRbacCanaryResultSha256,
                   result: $storageRbacCanaryResult
                 },
-                wormPolicy: $worm[0]
+                wormPolicy: $worm[0],
+                resultWormPolicy: $resultWorm[0],
+                resultAttestations: $resultSet[0]
               }
-            ' > "${proof}"
-            test -f "${proof}" && test ! -L "${proof}" && test "$(stat --format=%s "${proof}")" -le 32768
+            ' > "${proof_temp}"
+            test -f "${proof_temp}" && test ! -L "${proof_temp}" && test "$(stat --format=%s "${proof_temp}")" -le 786432
             jq --exit-status \
               --arg bootstrapReceiptSha256 "${BOOTSTRAP_RECEIPT_SHA256}" \
               --slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json" '
-              .packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}
+              .schemaVersion == 2
+              and .status == "success"
+              and .packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}
               and .oneDeploy == $bootstrap[0].deployment
               and .bridge == $bootstrap[0].bridge
               and .storageRbac == $bootstrap[0].storageRbac
+              and .resultStorageRbac == $bootstrap[0].resultStorageRbac
               and (.storageRbacCanary | keys) == ["blob", "endedAt", "helperContract", "historyId", "historyStatus", "result", "resultSha256", "startedAt", "webJobId"]
               and (.storageRbacCanary.blob | test("^v1/canaries/storage-rbac/[1-9][0-9]*/[1-9][0-9]*/[0-9a-f]{32}\\.json$"))
               and .storageRbacCanary.historyStatus == "Success"
@@ -1670,14 +2352,46 @@ jobs:
               and .storageRbacCanary.result.writerReadDenied == "passed"
               and .storageRbacCanary.result.readerWriteDenied == "passed"
               and .storageRbacCanary.result.localPrefixGuard == "passed-before-network"
+              and .resultAttestations.schema == "paperdesk-registry-webjob-result-set-v1"
+              and .resultAttestations.status == "valid"
+              and .resultAttestations.mode == "preflight"
+              and (.resultAttestations.executions | length) == 2
+              and ([.resultAttestations.executions[] | [.purpose, .execution]] | sort) == ([
+                ["preflight-runtime", 1],
+                ["preflight-storage", 1]
+              ] | sort)
+              and .resultAttestations.executions[0].resultSha256 == .storageRbacCanary.resultSha256
+              and .resultAttestations.executions[0].history.historyId == .storageRbacCanary.historyId
+              and .resultAttestations.executions[0].history.webJobsRunId == .storageRbacCanary.webJobId
+              and .resultAttestations.executions[0].history.startedAt == .storageRbacCanary.startedAt
+              and .resultAttestations.executions[0].history.endedAt == .storageRbacCanary.endedAt
+              and .resultAttestations.executions[1].history.historyId == .webJob.historyId
+              and .resultAttestations.executions[1].history.webJobsRunId == .webJob.webJobId
+              and .resultAttestations.executions[1].history.startedAt == .webJob.startedAt
+              and .resultAttestations.executions[1].history.endedAt == .webJob.endedAt
+              and .resultWormPolicy.container == "paperdesk-registry-webjob-results"
+              and .resultWormPolicy.state == "Locked"
+              and .resultWormPolicy.immutabilityPeriodSinceCreationInDays == 30
+              and .resultWormPolicy.resourceId == $bootstrap[0].resultStorageRbac.immutabilityPolicy.resourceId
+              and .resultWormPolicy.state == $bootstrap[0].resultStorageRbac.immutabilityPolicy.state
+              and .resultWormPolicy.immutabilityPeriodSinceCreationInDays == $bootstrap[0].resultStorageRbac.immutabilityPolicy.immutabilityPeriodSinceCreationInDays
+              and .resultWormPolicy.allowProtectedAppendWrites == $bootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWrites
+              and .resultWormPolicy.allowProtectedAppendWritesAll == $bootstrap[0].resultStorageRbac.immutabilityPolicy.allowProtectedAppendWritesAll
+              and .resultWormPolicy.etag == $bootstrap[0].resultStorageRbac.immutabilityPolicy.etag
               and .webJob.runCommand == $bootstrap[0].webJob.runCommand
               and .webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"
-            ' "${proof}" >/dev/null
+            ' "${proof_temp}" >/dev/null
+            test ! -e "${proof}" && test ! -L "${proof}"
+            mv -- "${proof_temp}" "${proof}"
           }
 
           run_persistence_once() {
+            local execution
+            execution="$1"
+            [[ "${execution}" =~ ^[12]$ ]]
             assert_bridge_stopped_and_sealed
             verify_live_onedeploy_anchor
+            prepare_result_coordinates persistence-result "${execution}"
             transient_settings_file="$(mktemp "${RUNNER_TEMP}/paperdesk-registry-settings.XXXXXX.json")"
             chmod 600 "${transient_settings_file}"
             jq --null-input \
@@ -1685,7 +2399,14 @@ jobs:
               --arg artifactId "${REGISTRY_TRANSFER_ARTIFACT_ID}" \
               --arg artifactSha256 "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" \
               --arg requestSha256 "${request_digest}" \
-              --arg expectedPrefix "${expected_prefix}" '
+              --arg expectedPrefix "${expected_prefix}" \
+              --arg resultPurpose "${result_purpose}" \
+              --arg resultExecution "${result_execution}" \
+              --arg resultNonce "${result_nonce}" \
+              --arg resultBlob "${result_blob}" \
+              --arg resultGitHubRunId "${GITHUB_RUN_ID}" \
+              --arg resultGitHubRunAttempt "${GITHUB_RUN_ATTEMPT}" \
+              --arg resultControlWorkflowSha "${CONTROL_WORKFLOW_SHA}" '
               (env.TRANSIENT_GITHUB_TOKEN // "") as $githubToken
               | if (($githubToken | type) == "string" and ($githubToken | length) > 0 and ($githubToken | length) <= 4096)
                 then [
@@ -1694,7 +2415,14 @@ jobs:
                   {name:"PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID", value:$artifactId, slotSetting:false},
                   {name:"PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256", value:$artifactSha256, slotSetting:false},
                   {name:"PAPERDESK_REGISTRY_REQUEST_SHA256", value:$requestSha256, slotSetting:false},
-                  {name:"PAPERDESK_REGISTRY_EXPECTED_PREFIX", value:$expectedPrefix, slotSetting:false}
+                  {name:"PAPERDESK_REGISTRY_EXPECTED_PREFIX", value:$expectedPrefix, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_PURPOSE", value:$resultPurpose, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_EXECUTION", value:$resultExecution, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_NONCE", value:$resultNonce, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_BLOB", value:$resultBlob, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID", value:$resultGitHubRunId, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT", value:$resultGitHubRunAttempt, slotSetting:false},
+                  {name:"PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA", value:$resultControlWorkflowSha, slotSetting:false}
                 ]
                 else error("transient GitHub credential is unavailable")
                 end
@@ -1714,15 +2442,23 @@ jobs:
             delete_transient_settings
             assert_bridge_stopped_and_sealed
             verify_live_onedeploy_anchor
+            capture_bound_webjob_result persist-actions-artifact
           }
 
-          trap cleanup_bridge EXIT INT TERM
+          trap cleanup_bridge EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           assert_bridge_stopped_and_sealed
           verify_live_onedeploy_anchor
           verify_live_storage_rbac
+          verify_live_result_storage_rbac
+          test ! -e "${result_evidence_root}" && test ! -L "${result_evidence_root}"
+          mkdir "${result_evidence_root}"
+          chmod 700 "${result_evidence_root}"
           if [ "${OPERATION}" = "registry-bridge-preflight" ]; then
             run_storage_rbac_canary
-            run_runtime_canary
+            run_runtime_canary preflight-runtime
+            build_bound_result_set preflight "${preflight_result_set}"
             write_preflight_proof
             cleanup_bridge
             trap - EXIT INT TERM
@@ -1736,16 +2472,15 @@ jobs:
           [[ "${REGISTRY_TRANSFER_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
           expected_prefix="v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/"
 
-          # This incomplete dormant path remains unreachable behind the independent-review
-          # hard stop above. Activation requires a later reviewed commit that binds all
-          # five exact helper results (preflight storage/runtime, persistence runtime,
-          # and both persistence runs), an
-          # independently reviewed canonical package-bootstrap receipt and checksum from
-          # this immutable checkout, exact-workflow FIC rotation, narrow WebJob RBAC,
-          # removed bootstrap publish authority, and old-workflow denial proof.
-          run_runtime_canary
-          run_persistence_once
-          run_persistence_once
+          # The five-execution result contract is complete dormant source. Activation
+          # remains impossible behind the pre-OIDC hard stops until an independently
+          # reviewed bootstrap receipt binds the result-container WORM/RBAC boundary and
+          # the independent runner-loss cleanup watcher is deployed and live-canaried.
+          run_runtime_canary persistence-runtime
+          run_persistence_once 1
+          run_persistence_once 2
+          build_bound_result_set persistence "${persistence_result_set}"
+          write_persistence_proof
           unset TRANSIENT_GITHUB_TOKEN
           cleanup_bridge
           trap - EXIT INT TERM
@@ -1862,6 +2597,7 @@ jobs:
         id: receipt
         if: always()
         env:
+          COORDINATES_SUCCEEDED: ${{ steps.immutable_coordinates.outcome == 'success' }}
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
@@ -1886,19 +2622,47 @@ jobs:
         run: |
           set -euo pipefail
           receipt_dir="${RUNNER_TEMP}/paperdesk-external-control-receipt"
-          receipt_name="paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          if [ "${COORDINATES_SUCCEEDED}" = "true" ]; then
+            receipt_stem="paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          else
+            receipt_stem="paperdesk-external-control-invalid-coordinates-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          receipt_name="${receipt_stem}.json"
           mkdir "${receipt_dir}"
           registry_bridge_preflight=null
           preflight_proof="${RUNNER_TEMP}/paperdesk-registry-bridge-preflight-proof.json"
-          if [ -f "${preflight_proof}" ] && [ ! -L "${preflight_proof}" ]; then
-            test "$(stat --format=%s "${preflight_proof}")" -le 32768
-            registry_bridge_preflight="$(jq --compact-output '.' "${preflight_proof}")"
-          elif [ "${OPERATION}" = "registry-bridge-preflight" ] && [ "${{ job.status }}" = "success" ]; then
-            echo "A successful registry bridge preflight must retain its exact proof." >&2
-            exit 1
+          if [ "${OPERATION}" = "registry-bridge-preflight" ]; then
+            if [ -f "${preflight_proof}" ] && [ ! -L "${preflight_proof}" ] \
+              && [ "$(stat --format=%s "${preflight_proof}")" -le 786432 ] \
+              && jq --exit-status 'type == "object"' "${preflight_proof}" >/dev/null 2>&1; then
+              registry_bridge_preflight="$(jq --compact-output '.' "${preflight_proof}")"
+            elif [ "${{ job.status }}" = "success" ]; then
+              echo "A successful registry bridge preflight must retain its exact proof." >&2
+              exit 1
+            elif [ -e "${preflight_proof}" ] || [ -L "${preflight_proof}" ]; then
+              registry_bridge_preflight='{"reason":"proof-malformed-oversized-or-unsafe","schemaVersion":0,"status":"unavailable"}'
+            else
+              registry_bridge_preflight='{"reason":"proof-not-produced","schemaVersion":0,"status":"unavailable"}'
+            fi
+          fi
+          registry_persistence=null
+          persistence_proof="${RUNNER_TEMP}/paperdesk-registry-persistence-proof.json"
+          if [ "${OPERATION}" = "persist-accepted-release" ]; then
+            if [ -f "${persistence_proof}" ] && [ ! -L "${persistence_proof}" ] \
+              && [ "$(stat --format=%s "${persistence_proof}")" -le 786432 ] \
+              && jq --exit-status 'type == "object"' "${persistence_proof}" >/dev/null 2>&1; then
+              registry_persistence="$(jq --compact-output '.' "${persistence_proof}")"
+            elif [ "${{ job.status }}" = "success" ]; then
+              echo "A successful accepted-release persistence run must retain its exact three-execution result proof." >&2
+              exit 1
+            elif [ -e "${persistence_proof}" ] || [ -L "${persistence_proof}" ]; then
+              registry_persistence='{"reason":"proof-malformed-oversized-or-unsafe","schemaVersion":0,"status":"unavailable"}'
+            else
+              registry_persistence='{"reason":"proof-not-produced","schemaVersion":0,"status":"unavailable"}'
+            fi
           fi
           jq --null-input \
-            --arg schemaVersion '2' \
+            --arg schemaVersion '3' \
             --arg status "${{ job.status }}" \
             --arg operation "${OPERATION}" \
             --arg sourceRepository "${SOURCE_REPOSITORY}" \
@@ -1925,17 +2689,20 @@ jobs:
             --arg registryPreflightRunAttempt "${REGISTRY_PREFLIGHT_RUN_ATTEMPT}" \
             --arg registryPreflightReceiptSha256 "${REGISTRY_PREFLIGHT_RECEIPT_SHA256}" \
             --argjson registryBridgePreflight "${registry_bridge_preflight}" \
+            --argjson registryPersistence "${registry_persistence}" \
             --arg registryPrefix "$(if [ "${OPERATION}" = "persist-accepted-release" ]; then printf 'v1/releases/%s/%s/%s/' "${SOURCE_SHA}" "${SOURCE_RUN_ID}" "${ACCEPTANCE_RUN_ID}"; fi)" \
-            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, callerWorkflowRef: $callerWorkflowRef, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPreflightSourceSha: $registryPreflightSourceSha, registryPreflightRunId: $registryPreflightRunId, registryPreflightRunAttempt: $registryPreflightRunAttempt, registryPreflightReceiptSha256: $registryPreflightReceiptSha256, registryBridgePreflight: $registryBridgePreflight, registryPrefix: $registryPrefix}' \
+            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, callerWorkflowRef: $callerWorkflowRef, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPreflightSourceSha: $registryPreflightSourceSha, registryPreflightRunId: $registryPreflightRunId, registryPreflightRunAttempt: $registryPreflightRunAttempt, registryPreflightReceiptSha256: $registryPreflightReceiptSha256, registryBridgePreflight: $registryBridgePreflight, registryPersistence: $registryPersistence, registryPrefix: $registryPrefix}' \
             > "${receipt_dir}/${receipt_name}"
-          echo "operation_receipt_name=paperdesk-external-control-${OPERATION}-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
+          test -f "${receipt_dir}/${receipt_name}" && test ! -L "${receipt_dir}/${receipt_name}"
+          test "$(stat --format=%s "${receipt_dir}/${receipt_name}")" -le 1048576
+          echo "operation_receipt_name=${receipt_stem}" >> "${GITHUB_OUTPUT}"
           echo "operation_receipt_sha256=$(sha256sum "${receipt_dir}/${receipt_name}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"
 
       - name: Retain immutable-control receipt
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: paperdesk-external-control-${{ inputs.operation }}-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.receipt.outputs.operation_receipt_name }}
           path: ${{ runner.temp }}/paperdesk-external-control-receipt
           if-no-files-found: error
           retention-days: 90
