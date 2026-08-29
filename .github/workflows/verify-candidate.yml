@@ -91,7 +91,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: Sethvirak/paperdesk-release-verifier
-          ref: aa9ac0d7f3de54fe159763f52d40730abccbaa8d
+          ref: 511d45ceb916dc4eaa64dbf96675adce36b5d213
           fetch-depth: 1
           clean: true
           persist-credentials: false
@@ -101,11 +101,11 @@ jobs:
         working-directory: paperdesk-verifier-control
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "aa9ac0d7f3de54fe159763f52d40730abccbaa8d"
+          test "$(git rev-parse HEAD)" = "511d45ceb916dc4eaa64dbf96675adce36b5d213"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           printf '%s  %s\n' \
-            '4e54f5bee030feb30ed3fae6a1d7a9363573c558fbb8b901d176789816f90acf' 'scripts/verify_candidate.py' \
-            '893b721221c92778bee928cb20423ad1397a8f91cdd9cda2d7718f5b265d8b55' 'scripts/check_deadline.py' | sha256sum --check --strict
+            '2ef303b87e8ffb3cece2bc8a1aa6f80e2c91859ecdcdc4dfff968fd1999f35f2' 'scripts/verify_candidate.py' \
+            'f8b3e9123eff6555eb6201b3784a1ebe7c222a586ca778eea914fb68a212da0f' 'scripts/check_deadline.py' | sha256sum --check --strict
 
       - name: Check out exact PaperDesk source without persisted credentials
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

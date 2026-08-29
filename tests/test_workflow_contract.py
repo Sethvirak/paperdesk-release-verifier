@@ -126,6 +126,44 @@ class WorkflowContractTests(unittest.TestCase):
             {"actions": "read", "contents": "read"},
         )
 
+    def test_artifact_verifier_pins_exact_approved_control_bytes(self):
+        source = self.workflow(VERIFY)
+        control_sha = "511d45ceb916dc4eaa64dbf96675adce36b5d213"
+        verifier_sha256 = "2ef303b87e8ffb3cece2bc8a1aa6f80e2c91859ecdcdc4dfff968fd1999f35f2"
+        deadline_sha256 = "f8b3e9123eff6555eb6201b3784a1ebe7c222a586ca778eea914fb68a212da0f"
+        checkout = workflow_step(source, "Check out immutable independent verifier controls")
+        verification = workflow_step(source, "Verify independently pinned control bytes")
+
+        self.assertEqual(
+            re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", checkout),
+            [control_sha],
+        )
+        self.assertEqual(
+            re.findall(r'test "\$\(git rev-parse HEAD\)" = "([0-9a-f]{40})"', verification),
+            [control_sha],
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^            '([0-9a-f]{64})' 'scripts/([^']+)'", verification),
+            [
+                (verifier_sha256, "verify_candidate.py"),
+                (deadline_sha256, "check_deadline.py"),
+            ],
+        )
+        for stale in (
+            "aa9ac0d7f3de54fe159763f52d40730abccbaa8d",
+            "4e54f5bee030feb30ed3fae6a1d7a9363573c558fbb8b901d176789816f90acf",
+            "893b721221c92778bee928cb20423ad1397a8f91cdd9cda2d7718f5b265d8b55",
+        ):
+            self.assertNotIn(stale, source)
+        self.assertEqual(
+            hashlib.sha256((ROOT / "scripts" / "verify_candidate.py").read_bytes()).hexdigest(),
+            verifier_sha256,
+        )
+        self.assertEqual(
+            hashlib.sha256((ROOT / "scripts" / "check_deadline.py").read_bytes()).hexdigest(),
+            deadline_sha256,
+        )
+
     def test_azure_login_lives_only_in_pinned_external_control(self):
         source = self.workflow(CONTROL)
         self.assertIn("id-token: write", source)
