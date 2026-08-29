@@ -2,7 +2,7 @@
   "schema": "paperdesk-registry-bridge-bootstrap-and-control-reader-authorization-v2",
   "schemaVersion": 2,
   "status": "governance-authorized-pending-manual-execution",
-  "authorizationId": "aaac49a9-1646-4772-be3a-1ff9cbe9eed5",
+  "authorizationId": "65832320-2465-4a74-93c5-032e2a6eeba2",
   "validity": {
     "notBefore": "2026-08-28T14:48:29Z",
     "expiresAt": "2026-09-04T14:48:29Z",
@@ -14,10 +14,67 @@
     "baseTreeSha": "7f1842321d07ca3e218cf9fc662564affe7b8f2f",
     "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
     "requiredCheck": "test",
-    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery-executor-bound-owner-only",
+    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery-executor-bound-owner-only-production-semantic-boundary-authsettingsv2-healthy-readiness",
     "supersedesUnboundAuthorizationPullRequestNumber": 12,
     "supersedesUnboundAuthorizationMergeSha": "b238c677b7f08adf36c65d7176c15633f62fa56b",
     "supersededUnboundAuthorizationWasUnconsumed": true,
+    "supersedesOwnerOnlyAuthorizationPullRequestNumber": 13,
+    "supersedesOwnerOnlyAuthorizationHeadSha": "da2431df5d59470c9ea3cde10ba8486c0a16c25b",
+    "supersedesOwnerOnlyAuthorizationMergeSha": "5d7e11287b6b2cce4a02f21baa26a830c3590fb9",
+    "supersedesOwnerOnlyAuthorizationSha256": "691d9d57685e74959c972555b56cdeaaed4b1eb0a5bb25ea93a59dd8593500f6",
+    "supersedesOwnerOnlyAuthorizationSidecarSha256": "76b3690ac5e1344ae14564d11e610472f95c4030c7e6bbf4e1441be4bbf1e418",
+    "supersededOwnerOnlyAuthorizationWasUnconsumed": true,
+    "supersededOwnerOnlyPreflightFailure": {
+      "mode": "default-no-flag-read-only",
+      "code": "PRODUCTION_APPLICATION_DRIFT",
+      "expectedCanonicalSha256": "27257dc80c2d5867d68dea964d73db9a8444acefc9574e02d6ef5335b06f10b2",
+      "observedCanonicalSha256": "5a328e21a047b4c3595e28d3e5f4648823b293c3367c24579963ee22f94b3846",
+      "azureMutationStarted": false,
+      "executionStateCreated": false,
+      "executionLockCreated": false,
+      "receiptCreated": false
+    },
+    "supersedesExecutorBoundAuthorizationPullRequestNumber": 13,
+    "supersedesExecutorBoundAuthorizationHeadSha": "da2431df5d59470c9ea3cde10ba8486c0a16c25b",
+    "supersedesExecutorBoundAuthorizationMergeSha": "5d7e11287b6b2cce4a02f21baa26a830c3590fb9",
+    "supersededExecutorBoundAuthorizationSha256": "691d9d57685e74959c972555b56cdeaaed4b1eb0a5bb25ea93a59dd8593500f6",
+    "supersededExecutorBoundAuthorizationSidecarSha256": "76b3690ac5e1344ae14564d11e610472f95c4030c7e6bbf4e1441be4bbf1e418",
+    "supersededExecutorBoundAuthorizationWasUnconsumed": true,
+    "supersededExecutorBoundPreflightMode": "default-no-flag-read-only",
+    "supersededExecutorBoundPreflightFailure": "PRODUCTION_APPLICATION_DRIFT",
+    "supersededExecutorBoundPreflightMadeNoAzureMutations": true,
+    "supersededExecutorBoundExecutionStateCreated": false,
+    "supersededExecutorBoundExecutionLockCreated": false,
+    "supersededExecutorBoundReceiptCreated": false,
+    "supersededExecutorBoundExpectedProductionApplicationCanonicalSha256": "27257dc80c2d5867d68dea964d73db9a8444acefc9574e02d6ef5335b06f10b2",
+    "replacementObservedProductionApplicationCanonicalSha256": "5a328e21a047b4c3595e28d3e5f4648823b293c3367c24579963ee22f94b3846",
+    "abandonedUnpublishedPreimageRefresh": {
+      "authorizationId": "aaac49a9-1646-4772-be3a-1ff9cbe9eed5",
+      "authorizationSha256": "2eba2bf9f739b8c4c87222289a27b1707278bfe65ad6e06daaf969701a331802",
+      "authorizationSidecarSha256": "89cfa11083e665b5205f34487854d38733b937e2b08657b3c14518bcfd16de3d",
+      "executorSha256": "2a7663bc5335a3898795c15d5eb1f6434e8fecafc720d80c9700bc27cbf1bae7",
+      "executorSidecarSha256": "9a941a203e033a902525b98cff5567a0159ccc60ccf21b25ebecfe3e5f91f9c3",
+      "publishedToGitHub": false,
+      "remoteBranchCreated": false,
+      "pullRequestCreated": false,
+      "azureMutationStarted": false,
+      "executionStateCreated": false,
+      "executionLockCreated": false,
+      "receiptCreated": false,
+      "reason": "independent review rejected a full ARM response hash as the sole drift predicate because the prior raw body was not retained and provider-managed fields cannot be attributed field-by-field"
+    },
+    "semanticBoundaryAmendment": {
+      "newAuthorizationIdRequired": true,
+      "reusesOnlyNeverCreatedStagingCoordinates": true,
+      "fullArmResponseHashIsInformationalOnly": true,
+      "fullArmResponseHashEnforced": false,
+      "authSettingsV2SemanticBoundaryEnforced": true,
+      "executionRequiresHealthyReadiness": true,
+      "readiness503ExceptionAllowed": false,
+      "productionMutationAuthorized": false,
+      "productionDeploymentAuthorized": false,
+      "productionActivationAuthorized": false
+    },
     "authorizationIdResourcesAndPlanUnchanged": false,
     "supersedesAuthorizationId": "75411cb7-dd69-4a9f-b571-f79c8c6cd597",
     "supersedesAuthorizationHeadSha": "61546f3f7686fc9d546f9dae60808fcfd0aa9ea7",
@@ -163,12 +220,12 @@
   },
   "executionArtifactBinding": {
     "schemaVersion": "paperdesk-v8-executor-binding-v1",
-    "executorSha256": "ddf5fa97cbd1e685d662d0336326607fe7c6338c82895403cc1b93de4841485c",
-    "executorSidecarSha256": "360f5f0ceecf52af49f08e0c54ee74c7f8f3d0e9f45272044fc064bac7d5e5da",
-    "exactConfirmationPhrase": "Authorize Azure execution under authorization aaac49a9-1646-4772-be3a-1ff9cbe9eed5 using signed executor binding",
-    "exactConfirmationPhraseSha256": "e654eb6fef842c0a6a49cc38888bf841d65e3f8522bb5a207fa979b228b4d2b7",
+    "executorSha256": "774e0a25bdc22ae3095f32b7e0cddbbd9648c19fd12f9b2ed8877cd1f8c5a589",
+    "executorSidecarSha256": "a7637b198d871b9f0d4ffa3d1b319fed77ff736d319d067ddea419b0cd639646",
+    "exactConfirmationPhrase": "Authorize Azure execution under authorization 65832320-2465-4a74-93c5-032e2a6eeba2 using signed executor binding",
+    "exactConfirmationPhraseSha256": "d7df1b3d99248d5dfa1c78a0c3907d7f321d0d2d0b4394436a46ec54643c5641",
     "repository": "Sethvirak/paperdesk-release-verifier",
-    "headRefName": "codex/bind-v8-executor-governance-20260828",
+    "headRefName": "codex/v8-production-semantic-boundary-20260829",
     "baseRefName": "main",
     "authorizationPath": "evidence/registry-bridge-bootstrap-authorization.json",
     "authorizationSidecarPath": "evidence/registry-bridge-bootstrap-authorization.json.sha256",
@@ -409,9 +466,267 @@
       "mustRemainUnchanged": true
     },
     "productionApplication": {
-      "canonicalSha256": "27257dc80c2d5867d68dea964d73db9a8444acefc9574e02d6ef5335b06f10b2",
-      "state": "Running",
-      "identityType": "SystemAssigned",
+      "boundarySchemaVersion": "paperdesk-production-application-boundary-v2",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+      "fullArmResponseSha256InformationalAtAuthorization": "5a328e21a047b4c3595e28d3e5f4648823b293c3367c24579963ee22f94b3846",
+      "fullArmResponseHashEnforced": false,
+      "siteSemanticProjectionSha256": "7fa8e954cbcde725f8fdb8bf0e7b538b3142923933a6c9982be04f1edcf7a543",
+      "siteSemanticProjection": {
+        "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/sites/master-data-structure-sea-9c4e0d0d",
+        "name": "master-data-structure-sea-9c4e0d0d",
+        "type": "Microsoft.Web/sites",
+        "kind": "app,linux",
+        "location": "Southeast Asia",
+        "tags": {
+          "hidden-link: /app-insights-resource-id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.insights/components/appi-master-data-structure-sea"
+        },
+        "identity": {
+          "type": "SystemAssigned",
+          "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+          "principalId": "b856ea96-e96a-420a-9137-79e1e7a85ef4",
+          "userAssignedIdentityIds": []
+        },
+        "properties": {
+          "enabled": true,
+          "httpsOnly": true,
+          "publicNetworkAccess": "Enabled",
+          "clientAffinityEnabled": true,
+          "clientAffinityProxyEnabled": false,
+          "clientCertEnabled": false,
+          "clientCertMode": "Required",
+          "clientCertExclusionPaths": [],
+          "hostNames": [
+            "app.master-data-structure.com",
+            "master-data-structure-sea-9c4e0d0d.azurewebsites.net"
+          ],
+          "enabledHostNames": [
+            "app.master-data-structure.com",
+            "master-data-structure-sea-9c4e0d0d.azurewebsites.net",
+            "master-data-structure-sea-9c4e0d0d.scm.azurewebsites.net"
+          ],
+          "hostNamesDisabled": false,
+          "serverFarmId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/serverfarms/asp-master-data-structure-b1-sea",
+          "virtualNetworkSubnetId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.network/virtualnetworks/vnet-master-data-structure-sea/subnets/snet-appservice-integration",
+          "outboundVnetRouting": {
+            "allTraffic": false,
+            "applicationTraffic": true,
+            "backupRestoreTraffic": false,
+            "contentShareTraffic": false,
+            "imagePullTraffic": false
+          },
+          "scmSiteAlsoStopped": false,
+          "keyVaultReferenceIdentity": "SystemAssigned",
+          "storageAccountRequired": false,
+          "reserved": true,
+          "hyperV": false,
+          "isXenon": false
+        }
+      },
+      "webConfigSemanticProjectionSha256": "c7403f0fbf173f642c035cda92dff926a892f7266a992e7c284d6fa9127aad3b",
+      "webConfigSemanticProjection": {
+        "linuxFxVersion": "NODE|24-lts",
+        "appCommandLine": "npm start",
+        "alwaysOn": true,
+        "healthCheckPath": "/api/health/ready",
+        "http20Enabled": true,
+        "minTlsVersion": "1.2",
+        "minTlsCipherSuite": null,
+        "scmMinTlsVersion": "1.2",
+        "scmMinTlsCipherSuite": null,
+        "ftpsState": "Disabled",
+        "remoteDebuggingEnabled": false,
+        "webSocketsEnabled": false,
+        "webJobsEnabled": false,
+        "scmType": "None",
+        "use32BitWorkerProcess": true,
+        "acrUseManagedIdentityCreds": false,
+        "acrUserManagedIdentityID": null,
+        "ipSecurityRestrictionsDefaultAction": null,
+        "scmIpSecurityRestrictionsDefaultAction": null,
+        "scmIpSecurityRestrictionsUseMain": false,
+        "vnetRouteAllEnabled": true,
+        "publicNetworkAccess": "Enabled",
+        "cors": null,
+        "ipSecurityRestrictions": [
+          {
+            "ipAddress": "Any",
+            "vnetSubnetResourceId": null,
+            "action": "Allow",
+            "priority": 2147483647,
+            "name": "Allow all",
+            "tag": null,
+            "headers": null
+          }
+        ],
+        "scmIpSecurityRestrictions": [
+          {
+            "ipAddress": "Any",
+            "vnetSubnetResourceId": null,
+            "action": "Allow",
+            "priority": 2147483647,
+            "name": "Allow all",
+            "tag": null,
+            "headers": null
+          }
+        ]
+      },
+      "authSettingsV2SemanticProjectionSha256": "c0aba9bd2f692706b57e8bc5e6bd61f1bbe6102e7e55d696b72d0e3fc235ad74",
+      "authSettingsV2SemanticProjection": {
+        "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/sites/master-data-structure-sea-9c4e0d0d/config/authsettingsv2",
+        "name": "authsettingsV2",
+        "type": "Microsoft.Web/sites/config",
+        "kind": null,
+        "propertiesKeySet": [
+          "clearInboundClaimsMapping",
+          "globalValidation",
+          "httpSettings",
+          "identityProviders",
+          "login",
+          "platform",
+          "prmConfig"
+        ],
+        "propertiesCanonicalSha256": "8175b46ccd9dfc43f87cb0ab34e5fb9c49342e5429a92c588e3dab1364479b55",
+        "clearInboundClaimsMapping": "false",
+        "platform": {
+          "enabled": true,
+          "runtimeVersion": "~1"
+        },
+        "globalValidation": {
+          "requireAuthentication": false,
+          "unauthenticatedClientAction": "AllowAnonymous",
+          "redirectToProvider": "AzureActiveDirectory",
+          "excludedPaths": [
+            "/api/app-health"
+          ]
+        },
+        "httpSettings": {
+          "requireHttps": true,
+          "routes": {
+            "apiPrefix": "/.auth"
+          },
+          "forwardProxy": {
+            "convention": "NoProxy"
+          }
+        },
+        "loginPolicy": {
+          "cookieExpiration": {
+            "convention": "FixedTime",
+            "timeToExpiration": "08:00:00"
+          },
+          "nonce": {
+            "validateNonce": true,
+            "nonceExpirationInterval": "00:05:00"
+          },
+          "preserveUrlFragmentsForLogins": true,
+          "routes": {},
+          "tokenStore": {
+            "enabled": true,
+            "tokenRefreshExtensionHours": 72,
+            "fileSystemConfigured": false,
+            "azureBlobStorageConfigured": false
+          }
+        },
+        "identityProviderNames": [
+          "apple",
+          "azureActiveDirectory",
+          "facebook",
+          "gitHub",
+          "google",
+          "legacyMicrosoftAccount",
+          "twitter"
+        ],
+        "identityProvidersCanonicalSha256": "7c1a7d4a0d667e7140cd2411f72c64012f66f504cd605d2ec4e7780bb6ba73cb",
+        "prmConfigCanonicalSha256": "b28150a9ed4db2eff8711c342ffce5db38403b39a5fced14aae4ccab57d20b22"
+      },
+      "authSettingsV2PropertiesCanonicalSha256": "8175b46ccd9dfc43f87cb0ab34e5fb9c49342e5429a92c588e3dab1364479b55",
+      "authSettingsV2PropertiesKeySetCanonicalSha256": "50f5fae412c23b781466917ff8628a4a5f6fe6335156b907474f78156f27eb1d",
+      "authSettingsV2PropertiesCount": 7,
+      "appSettingsCanonicalSha256": "94fab146a20fbd6ae8b9317cf947b9585cc189dc1faca33bf4f2c73788287514",
+      "appSettingsKeySetCanonicalSha256": "276de7819ce5d9ce2854129274f4ae42890a51b34fff8002ae4dd1d99bfda24f",
+      "appSettingsCount": 77,
+      "deployedCommitSha": "cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
+      "recoveryExpectedDeployedSha": "cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
+      "releaseCommitParityRequired": true,
+      "connectionStringsCanonicalSha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "connectionStringMetadataProjectionSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "connectionStringCount": 0,
+      "ftpPublishingPolicySemanticProjectionSha256": "dcdbf3f077bece7f49d826b97f25b3a6350e9c9333cac670dc2ee74332f061c9",
+      "ftpPublishingPolicySemanticProjection": {
+        "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/sites/master-data-structure-sea-9c4e0d0d/basicpublishingcredentialspolicies/ftp",
+        "name": "ftp",
+        "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+        "allow": false
+      },
+      "scmPublishingPolicySemanticProjectionSha256": "df4d6f715e99e768e08df84c458f835b5390d0f130f9136aed8a86ac0306e34b",
+      "scmPublishingPolicySemanticProjection": {
+        "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/sites/master-data-structure-sea-9c4e0d0d/basicpublishingcredentialspolicies/scm",
+        "name": "scm",
+        "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+        "allow": false
+      },
+      "hostNameBindingsSemanticProjectionSha256": "5bdf0f8cde412ead71a82e03be434d833353600017d983eec7102a9f8298f858",
+      "hostNameBindingsSemanticProjection": [
+        {
+          "name": "master-data-structure-sea-9c4e0d0d/app.master-data-structure.com",
+          "hostNameType": "Verified",
+          "sslState": "SniEnabled",
+          "certificateResourceId": null
+        },
+        {
+          "name": "master-data-structure-sea-9c4e0d0d/master-data-structure-sea-9c4e0d0d.azurewebsites.net",
+          "hostNameType": "Verified",
+          "sslState": null,
+          "certificateResourceId": null
+        }
+      ],
+      "deploymentInventorySemanticProjectionSha256": "e51093a7b008224d50bb4d11b32aac0c59dc5a077f19cca559089106e37a92f3",
+      "deploymentPropertyIdSetSha256": "3f405fccf4cdd62eb17a7176ed4c89a88d568e4af2d014cb5608a9232fc8e8e9",
+      "deploymentCount": 10,
+      "activeDeploymentId": "54214e75-d66c-4a62-8d04-17d5b48b6b52",
+      "activeDeployment": {
+        "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourcegroups/rg-master-data-structure-sea/providers/microsoft.web/sites/master-data-structure-sea-9c4e0d0d/deployments/54214e75-d66c-4a62-8d04-17d5b48b6b52",
+        "name": "master-data-structure-sea-9c4e0d0d/54214e75-d66c-4a62-8d04-17d5b48b6b52",
+        "type": "Microsoft.Web/sites/deployments",
+        "properties": {
+          "id": "54214e75-d66c-4a62-8d04-17d5b48b6b52",
+          "active": true,
+          "complete": true,
+          "status": 4,
+          "deployer": "OneDeploy",
+          "received_time": "2026-08-15T08:16:25.3427913Z",
+          "start_time": "2026-08-15T08:16:27.8154116Z",
+          "end_time": "2026-08-15T08:27:27.6726781Z",
+          "last_success_end_time": "2026-08-15T08:27:27.6726781Z",
+          "is_readonly": true,
+          "is_temp": false,
+          "site_name": "master-data-structure-sea-9c4e0d0d"
+        }
+      },
+      "siteRuntimePredicates": {
+        "state": "Running",
+        "availabilityState": "Normal",
+        "usageState": "Normal",
+        "runtimeAvailabilityState": "Normal",
+        "contentAvailabilityState": "Normal"
+      },
+      "runtimeHealthPolicy": {
+        "appName": "Master Data Structure",
+        "appVersion": "30.0.0",
+        "runningMode": "postgres-production-backend",
+        "storageEngine": "postgres",
+        "diagnostics": "restricted",
+        "healthyReadyAllowed": true,
+        "knownPreexistingReadyFailureAllowed": false,
+        "executionRequiresHealthyReady": true,
+        "productionActivationRequiresHealthyReady": true,
+        "readyAttachmentMalware": {
+          "required": true,
+          "ingestionReady": true,
+          "code": "attachment-malware-scan-ready"
+        }
+      },
+      "runtimeHealthPolicyCanonicalSha256": "14578c34da972cbdd8c524fc7e1d0eb574e431e2d1b33f3adf2ba7d5fd8e58f0",
+      "semanticBoundaryCanonicalSha256": "112a12750d49be2f53149ec2678f7c32002f6b7060461f83d2ce70b9fc23c21e",
       "mustRemainUnchanged": true
     },
     "productionApplicationDeleteLock": {
@@ -931,7 +1246,7 @@
   "executionPlan": {
     "kind": "ordered-arm-api-plan-v1",
     "canonicalization": "UTF-8 compact JSON of steps in declared order",
-      "sha256": "4f3865d9f2fc6486135e518ced65557203ebc328f7ee8e1f5cc44b64311cdb89",
+    "sha256": "417eb9f95e5ce4abcf42c09abeaac10c70ee55a9638453eb12979aa573e614a3",
     "steps": [
       {
         "order": 1,
@@ -951,8 +1266,8 @@
         "order": 3,
         "operation": "reverify-inherited-production-control-hardening-and-lock",
         "target": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
-        "apiVersion": "mixed-2022-04-01-and-2020-05-01-read-only",
-        "constraint": "broad assignment /subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df remains HTTP 404; exact future direct-ARM sites/Read role and assignment remain exact, unconditional and non-delegated; primary deployment assignment remains exact; production application canonical SHA-256 remains 27257dc80c2d5867d68dea964d73db9a8444acefc9574e02d6ef5335b06f10b2; exact CanNotDelete lock remains present with semantic canonical SHA-256 30816612d2357c267e8c1bdd4d55faf978f750b355df9a765d11f2cb20b5bdee; no lock or production-control mutation is authorized"
+        "apiVersion": "mixed-2025-05-01-2022-03-01-2022-04-01-and-2020-05-01-read-only",
+        "constraint": "broad assignment /subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/71b7a7ec-c6c5-4654-bce9-3a66c323a8df remains HTTP 404; exact direct-ARM sites/Read role and assignment remain exact, unconditional and non-delegated; primary deployment assignment remains exact; enforce signed production site, web-config, authsettingsV2, app-settings and connection-string digests, disabled FTP/SCM publishing, hostname bindings, exact active OneDeploy deployment 54214e75-d66c-4a62-8d04-17d5b48b6b52, release commit parity cef0242719d8f1ab19297c854f9d5e9c81dc3ead, runtime predicates, and the signed semantic boundary SHA-256; full ARM response SHA-256 5a328e21a047b4c3595e28d3e5f4648823b293c3367c24579963ee22f94b3846 is informational only and never pass/fail; liveness, app-health, security-info, and readiness must all be healthy, and no 503 readiness exception is accepted because the current public response cannot prove attachment malware is the sole blocker; exact CanNotDelete lock remains present with semantic canonical SHA-256 30816612d2357c267e8c1bdd4d55faf978f750b355df9a765d11f2cb20b5bdee; no production application, deployment, lock, or production-control mutation is authorized"
       },
       {
         "order": 4,
@@ -994,7 +1309,7 @@
         "operation": "close-recovery-phase-a-and-gate-fresh-phase-b",
         "target": "fixed-inherited-state-and-old-staging-namespace",
         "apiVersion": "mixed-read-only",
-        "constraint": "prove the old v7 parent container is HTTP 404, all old temporary assignments and marker remain absent, storage ACLs remain exact, OneDeploy remains empty, production hardening/result boundary/stopped bridge/lock remain exact, and no unauthorized mutation occurred; record the Phase A evidence digest. Phase B may begin only after every predicate passes; otherwise stop with no retry, no deployment and no receipt"
+        "constraint": "prove the old v7 parent container is HTTP 404, all old temporary assignments and marker remain absent, storage ACLs remain exact, bridge OneDeploy remains empty, the signed production semantic boundary including authsettingsV2 remains exact, production readiness is healthy HTTP 200, production hardening/result boundary/stopped bridge/lock remain exact, and no unauthorized mutation occurred; record the Phase A evidence digest without enforcing the informational full ARM response hash. Phase B may begin only after every predicate passes; otherwise stop with no retry, no deployment and no receipt"
       },
       {
         "order": 10,
@@ -1078,7 +1393,7 @@
         "operation": "wait-for-sas-expiry-and-final-read-only-reverification",
         "target": "fixed-production-control-rbac-bridge-result-storage-and-both-staging-namespaces",
         "apiVersion": "mixed-read-only",
-        "constraint": "wait until the exact in-memory user-delegation SAS expiry has passed; prove both the inherited v7 and fresh v8 containers are absent from the active namespace, every old and fresh temporary assignment and marker is absent, the temporary IP rule is absent and storage ACLs exact, bridge remains Stopped/private, permanent role is exact final only after successful OneDeploy, result and accepted-release boundaries are exact, production app and lock unchanged, no WebJob run and no accepted-release/result write; any mismatch forbids receipt"
+        "constraint": "wait until the exact in-memory user-delegation SAS expiry has passed; prove both the inherited v7 and fresh v8 containers are absent from the active namespace, every old and fresh temporary assignment and marker is absent, the temporary IP rule is absent and storage ACLs exact, bridge remains Stopped/private, permanent role is exact final only after successful OneDeploy, result and accepted-release boundaries are exact, the production semantic boundary including authsettingsV2 and the lock remain unchanged, production runtime health including readiness remains healthy, no WebJob run and no accepted-release/result write; any mismatch forbids receipt"
       },
       {
         "order": 22,
@@ -1125,7 +1440,7 @@
     "consumed authorization 75411cb7-dd69-4a9f-b571-f79c8c6cd597 is recorded with state SHA-256 0eb8a0fdf7602cdf11759d90eb2716be7533e25e78329bf8992d9d277ceab572, completed steps 1-11 and 21, partial steps 12 and 20, failure CLEANUP_INCOMPLETE, and no package upload, SAS, IP rule, marker, OneDeploy, WebJob execution, or receipt",
     "the inherited v7 residual container /subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5 is deleted only after the exact inactive-policy compound predicate passes and is polled to ARM HTTP 404; its child policy was never deleted; the old namespace was never recreated, adopted, or reused",
     "external-control principal broad Website Contributor assignment 71b7a7ec-c6c5-4654-bce9-3a66c323a8df remains absent and the exact custom read-probe role and assignment with sole Microsoft.Web/sites/Read remain unchanged",
-    "separate primary deployment principal and assignment remain exact; production App Service configuration, state, files, release SHA, networking, identities, data, and CanNotDelete lock remain unchanged throughout v8",
+    "separate primary deployment principal and assignment remain exact; the production App Service signed semantic boundary covers site identity, runtime predicates, web configuration, authsettingsV2, secret-bearing configuration digests, publishing policies, hostname bindings, active deployment and release-SHA parity and remains unchanged throughout v8; the full ARM response hash is informational only; liveness, app-health, security-info and readiness all remain healthy, with no 503 exception; the CanNotDelete lock remains exact and production mutation, deployment and activation remain unauthorized",
     "result container remains private with its inherited v7 30-day Locked WORM policy and exact three assignments; no result resource mutation or blob write is attributed to v8",
     "accepted-release container, Locked policy, two role assignments, role definitions, and all blobs remain unchanged and no accepted-release read, list, write, copy, or delete occurred",
     "bridge remains Stopped, private, sealed, PYTHON|3.12, AlwaysOn true, WebJobs enabled, scmSiteAlsoStopped false, SCM uses main restrictions, modern outboundVnetRouting allTraffic and applicationTraffic true, legacy vnetRouteAllEnabled true, exact two UAMIs, and exactly five persistent non-secret settings",
@@ -1168,6 +1483,81 @@
       "standingOwnerBoundary",
       "armRequestIdsAndResponseDigests"
     ],
+    "productionApplicationBoundaryEvidenceRequiredFields": [
+      "resourceId",
+      "boundarySchemaVersion",
+      "fullArmResponseHashEnforced",
+      "authorizationFullArmResponseSha256Informational",
+      "preflightFullArmResponseSha256Informational",
+      "finalFullArmResponseSha256Informational",
+      "preflightSemanticBoundaryCanonicalSha256",
+      "finalSemanticBoundaryCanonicalSha256",
+      "unchanged",
+      "siteSemanticProjectionSha256",
+      "webConfigSemanticProjectionSha256",
+      "authSettingsV2SemanticProjectionSha256",
+      "authSettingsV2PropertiesCanonicalSha256",
+      "authSettingsV2PropertiesKeySetCanonicalSha256",
+      "authSettingsV2PropertiesCount",
+      "appSettingsCanonicalSha256",
+      "appSettingsKeySetCanonicalSha256",
+      "appSettingsCount",
+      "connectionStringsCanonicalSha256",
+      "connectionStringMetadataProjectionSha256",
+      "connectionStringCount",
+      "ftpPublishingPolicySemanticProjectionSha256",
+      "scmPublishingPolicySemanticProjectionSha256",
+      "hostNameBindingsSemanticProjectionSha256",
+      "deploymentInventorySemanticProjectionSha256",
+      "deploymentPropertyIdSetSha256",
+      "deploymentCount",
+      "activeDeploymentId",
+      "deployedCommitSha",
+      "recoveryExpectedDeployedSha",
+      "releaseCommitParityVerified",
+      "siteRuntimePredicates",
+      "runtimeHealthPolicyCanonicalSha256",
+      "runtimeHealthState",
+      "runtimeHealthEvidence",
+      "broadAssignmentAbsentHttpStatus",
+      "exactReadRolePresentHttpStatus",
+      "exactReadAssignmentPresentHttpStatus",
+      "primaryDeploymentAssignmentPresentHttpStatus"
+    ],
+    "productionApplicationBoundaryEvidenceRequiredValues": {
+      "boundarySchemaVersion": "paperdesk-production-application-boundary-v2",
+      "fullArmResponseHashEnforced": false,
+      "preflightSemanticBoundaryCanonicalSha256": "112a12750d49be2f53149ec2678f7c32002f6b7060461f83d2ce70b9fc23c21e",
+      "finalSemanticBoundaryCanonicalSha256": "112a12750d49be2f53149ec2678f7c32002f6b7060461f83d2ce70b9fc23c21e",
+      "unchanged": true,
+      "siteSemanticProjectionSha256": "7fa8e954cbcde725f8fdb8bf0e7b538b3142923933a6c9982be04f1edcf7a543",
+      "webConfigSemanticProjectionSha256": "c7403f0fbf173f642c035cda92dff926a892f7266a992e7c284d6fa9127aad3b",
+      "authSettingsV2SemanticProjectionSha256": "c0aba9bd2f692706b57e8bc5e6bd61f1bbe6102e7e55d696b72d0e3fc235ad74",
+      "authSettingsV2PropertiesCanonicalSha256": "8175b46ccd9dfc43f87cb0ab34e5fb9c49342e5429a92c588e3dab1364479b55",
+      "authSettingsV2PropertiesKeySetCanonicalSha256": "50f5fae412c23b781466917ff8628a4a5f6fe6335156b907474f78156f27eb1d",
+      "authSettingsV2PropertiesCount": 7,
+      "appSettingsCanonicalSha256": "94fab146a20fbd6ae8b9317cf947b9585cc189dc1faca33bf4f2c73788287514",
+      "appSettingsKeySetCanonicalSha256": "276de7819ce5d9ce2854129274f4ae42890a51b34fff8002ae4dd1d99bfda24f",
+      "appSettingsCount": 77,
+      "connectionStringsCanonicalSha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "connectionStringMetadataProjectionSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "connectionStringCount": 0,
+      "ftpPublishingPolicySemanticProjectionSha256": "dcdbf3f077bece7f49d826b97f25b3a6350e9c9333cac670dc2ee74332f061c9",
+      "scmPublishingPolicySemanticProjectionSha256": "df4d6f715e99e768e08df84c458f835b5390d0f130f9136aed8a86ac0306e34b",
+      "hostNameBindingsSemanticProjectionSha256": "5bdf0f8cde412ead71a82e03be434d833353600017d983eec7102a9f8298f858",
+      "deploymentInventorySemanticProjectionSha256": "e51093a7b008224d50bb4d11b32aac0c59dc5a077f19cca559089106e37a92f3",
+      "deploymentPropertyIdSetSha256": "3f405fccf4cdd62eb17a7176ed4c89a88d568e4af2d014cb5608a9232fc8e8e9",
+      "deploymentCount": 10,
+      "activeDeploymentId": "54214e75-d66c-4a62-8d04-17d5b48b6b52",
+      "deployedCommitSha": "cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
+      "recoveryExpectedDeployedSha": "cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
+      "releaseCommitParityVerified": true,
+      "runtimeHealthPolicyCanonicalSha256": "14578c34da972cbdd8c524fc7e1d0eb574e431e2d1b33f3adf2ba7d5fd8e58f0",
+      "broadAssignmentAbsentHttpStatus": 404,
+      "exactReadRolePresentHttpStatus": 200,
+      "exactReadAssignmentPresentHttpStatus": 200,
+      "primaryDeploymentAssignmentPresentHttpStatus": 200
+    },
     "permanentBridgeRoleDefinitionEvidenceRequiredFields": [
       "resourceId",
       "apiVersion",
@@ -1316,7 +1706,7 @@
       "oneDeployActivityLogAuthorizationAction": "Microsoft.Web/sites/extensions/write",
       "oneDeployActivityLogResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/extensions/onedeploy",
       "oneDeployActivityLogCallerObjectId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
-      "authorizationId": "aaac49a9-1646-4772-be3a-1ff9cbe9eed5",
+      "authorizationId": "65832320-2465-4a74-93c5-032e2a6eeba2",
       "supersededAuthorizationId": "75411cb7-dd69-4a9f-b571-f79c8c6cd597",
       "freshContainerResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-v8-aaac49a9",
       "freshBlobBaseUri": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-registry-bootstrap-v8-aaac49a9/paperdesk-registry-webjob-v8-76c9c8c5.zip",
