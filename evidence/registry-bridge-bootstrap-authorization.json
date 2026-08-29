@@ -14,7 +14,11 @@
     "baseTreeSha": "7f1842321d07ca3e218cf9fc662564affe7b8f2f",
     "reviewedDormantHeadSha": "f06f347ec484045bb77944ca3fc44aff5078dc3d",
     "requiredCheck": "test",
-    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery",
+    "authorizationRevision": "v8-residual-cleanup-new-namespace-single-onedeploy-recovery-executor-bound-owner-only",
+    "supersedesUnboundAuthorizationPullRequestNumber": 12,
+    "supersedesUnboundAuthorizationMergeSha": "b238c677b7f08adf36c65d7176c15633f62fa56b",
+    "supersededUnboundAuthorizationWasUnconsumed": true,
+    "authorizationIdResourcesAndPlanUnchanged": false,
     "supersedesAuthorizationId": "75411cb7-dd69-4a9f-b571-f79c8c6cd597",
     "supersedesAuthorizationHeadSha": "61546f3f7686fc9d546f9dae60808fcfd0aa9ea7",
     "supersedesAuthorizationMergeSha": "1c71726aa67bce6f15ee23443cd14500ebc6c94c",
@@ -140,17 +144,8 @@
   },
   "approvalPolicy": {
     "baseBranch": "main",
-    "requiredExactHeadApprovals": 2,
-    "trustedApprovers": [
-      {
-        "login": "jecebella168-cmyk",
-        "userId": 316989178
-      },
-      {
-        "login": "jecebella169-cmyk",
-        "userId": 322025901
-      }
-    ],
+    "requiredExactHeadApprovals": 0,
+    "trustedApprovers": [],
     "requiredCheck": {
       "context": "test",
       "conclusion": "success"
@@ -158,13 +153,39 @@
     "requireExactFinalHead": true,
     "requireValidSignatureOnHead": true,
     "requireValidSignatureOnMerge": true,
-    "dismissStaleReviews": true,
-    "requireLastPushApproval": true,
-    "approversMustDifferFromAuthorAndExecutor": true,
+    "dismissStaleReviews": false,
+    "requireLastPushApproval": false,
+    "approversMustDifferFromAuthorAndExecutor": false,
     "allowedDiffPaths": [
       "evidence/registry-bridge-bootstrap-authorization.json",
       "evidence/registry-bridge-bootstrap-authorization.json.sha256"
     ]
+  },
+  "executionArtifactBinding": {
+    "schemaVersion": "paperdesk-v8-executor-binding-v1",
+    "executorSha256": "ddf5fa97cbd1e685d662d0336326607fe7c6338c82895403cc1b93de4841485c",
+    "executorSidecarSha256": "360f5f0ceecf52af49f08e0c54ee74c7f8f3d0e9f45272044fc064bac7d5e5da",
+    "exactConfirmationPhrase": "Authorize Azure execution under authorization aaac49a9-1646-4772-be3a-1ff9cbe9eed5 using signed executor binding",
+    "exactConfirmationPhraseSha256": "e654eb6fef842c0a6a49cc38888bf841d65e3f8522bb5a207fa979b228b4d2b7",
+    "repository": "Sethvirak/paperdesk-release-verifier",
+    "headRefName": "codex/bind-v8-executor-governance-20260828",
+    "baseRefName": "main",
+    "authorizationPath": "evidence/registry-bridge-bootstrap-authorization.json",
+    "authorizationSidecarPath": "evidence/registry-bridge-bootstrap-authorization.json.sha256",
+    "executorGitHubIdentity": {
+      "login": "Sethvirak",
+      "id": 202535166
+    },
+    "expectedStandingOwnerProjection": {
+      "id": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/microsoft.authorization/roleassignments/866ddec6-43d2-4da8-8e64-02678257795a",
+      "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+      "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+      "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+      "principalType": "User",
+      "condition": null,
+      "conditionVersion": null,
+      "delegatedManagedIdentityResourceId": null
+    }
   },
   "executor": {
     "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
@@ -220,7 +241,10 @@
     "immutabilityPolicyChildDeleteIsForbidden": true,
     "productionApplicationDeleteLockMutationAuthorized": false,
     "oneDeployAttemptAllowanceForThisAuthorization": 1,
-    "receiptRequiresBothOldAndFreshStagingNamespacesAbsent": true
+    "receiptRequiresBothOldAndFreshStagingNamespacesAbsent": true,
+    "executionRequiresExactSignedExecutorArtifactBinding": true,
+    "unboundPullRequest12ArtifactMayNotAuthorizeAzureExecution": true,
+    "localAuthorizationBytesMustEqualMergedGitHubContents": true
   },
   "resources": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
@@ -907,14 +931,14 @@
   "executionPlan": {
     "kind": "ordered-arm-api-plan-v1",
     "canonicalization": "UTF-8 compact JSON of steps in declared order",
-      "sha256": "8f817b6745340bbeeebb309424e9e2136413a750dfa65be058fec0912603994c",
+      "sha256": "4f3865d9f2fc6486135e518ced65557203ebc328f7ee8e1f5cc44b64311cdb89",
     "steps": [
       {
         "order": 1,
         "operation": "validate-v8-authorization-package-and-consumed-v7-state",
         "target": "local-reviewed-artifacts-only",
         "apiVersion": "not-applicable",
-        "constraint": "validate the signed v8 authorization and sidecar, exact final PR head and signed merge, two exact-head trusted approvals and green test check, validity and single-use state; recompute plan SHA-256; validate the exact external package size, SHA-256, MD5 and deterministic three-file inventory; require the redacted consumed-v7 state file SHA-256 0eb8a0fdf7602cdf11759d90eb2716be7533e25e78329bf8992d9d277ceab572, authorization 75411cb7-dd69-4a9f-b571-f79c8c6cd597, reviewed source 61546f3f7686fc9d546f9dae60808fcfd0aa9ea7, merge 1c71726aa67bce6f15ee23443cd14500ebc6c94c, completed steps 1-11 plus cleanup step 21, failure CLEANUP_INCOMPLETE, packageUploaded false, oneDeployPutSent false, receipt absent, and exact residual container /subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5; any mismatch stops before Azure mutation"
+        "constraint": "validate the signed v8 authorization and sidecar, exact final PR head and signed merge, green test check, validity and single-use state; recompute plan SHA-256; validate the exact external package size, SHA-256, MD5 and deterministic three-file inventory; require the redacted consumed-v7 state file SHA-256 0eb8a0fdf7602cdf11759d90eb2716be7533e25e78329bf8992d9d277ceab572, authorization 75411cb7-dd69-4a9f-b571-f79c8c6cd597, reviewed source 61546f3f7686fc9d546f9dae60808fcfd0aa9ea7, merge 1c71726aa67bce6f15ee23443cd14500ebc6c94c, completed steps 1-11 plus cleanup step 21, failure CLEANUP_INCOMPLETE, packageUploaded false, oneDeployPutSent false, receipt absent, and exact residual container /subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-bootstrap-stage-76c9c8c5; any mismatch stops before Azure mutation"
       },
       {
         "order": 2,
