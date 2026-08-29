@@ -114,6 +114,11 @@ def tree_records(root: Path, excluded: set[str] | None = None) -> list[dict[str,
     return records
 
 
+def stable_json(value: Any) -> bytes:
+    """Match PaperDesk's recursively key-sorted, two-space stable JSON bytes."""
+    return (json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+
+
 def directory_digest(root: Path) -> str:
     records = [
         {"path": record["path"], "bytes": record["size"], "sha256": record["sha256"]}
@@ -121,8 +126,8 @@ def directory_digest(root: Path) -> str:
     ]
     if not records:
         fail("directory digest target must contain regular files")
-    encoded = (json.dumps(records, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    return sha256_bytes(encoded)
+    records.sort(key=lambda record: record["path"].encode("utf-8"))
+    return sha256_bytes(stable_json(records))
 
 
 def compare_file(actual: Path, expected: Path, label: str) -> None:
