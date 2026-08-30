@@ -7706,16 +7706,27 @@ class AzureCliRestSession:
         )
 
     @staticmethod
+    def _azure_cli_executable() -> str:
+        # The Azure CLI MSI exposes ``az.cmd`` on Windows.  ``subprocess`` does
+        # not apply PATHEXT when resolving the extensionless ``az`` name, so
+        # using that POSIX launcher fails before even the read-only preflight.
+        return "az.cmd" if sys.platform == "win32" else "az"
+
+    @staticmethod
     def _run_az_json(arguments: Sequence[str], label: str) -> Mapping[str, Any]:
-        process = subprocess.run(
-            ["az", *arguments, "--output", "json"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=45,
-            text=True,
-            encoding="utf-8",
-        )
+        executable = AzureCliRestSession._azure_cli_executable()
+        try:
+            process = subprocess.run(
+                [executable, *arguments, "--output", "json"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=45,
+                text=True,
+                encoding="utf-8",
+            )
+        except (OSError, subprocess.SubprocessError):
+            fail(f"Azure CLI {label} failed")
         if process.returncode != 0 or not 1 <= len(process.stdout) <= 1024 * 1024:
             fail(f"Azure CLI {label} failed")
         try:
