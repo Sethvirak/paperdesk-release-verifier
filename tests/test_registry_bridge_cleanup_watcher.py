@@ -506,7 +506,7 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
             if operation == "stop-bridge"
         ]
         self.assertGreaterEqual(len(stop_indexes), 2)
-        self.assertLess(fence_index, stop_indexes[-1])
+        self.assertLess(fence_index, stop_indexes[0])
         self.assertEqual(
             receipt["authorityFence"]["runnerAuthorityGenerationSha256"],
             AUTHORITY_GENERATION_SHA,
@@ -529,6 +529,7 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
         boundary = FakeBoundary(session)
         boundary.install_valid_results(session)
         claim = watcher.claim_expired_session(boundary, "watcher-a")
+        claim = watcher.bind_authority_fence(boundary, claim)
         with self.assertRaisesRegex(watcher.CleanupContractError, "assessment-not-fresh"):
             watcher.stage_assessment(boundary, claim, {"outcome": "complete"})
         self.assertIn("stop-bridge", boundary.operations)
@@ -553,6 +554,7 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
                 boundary = FakeBoundary(session)
                 boundary.install_valid_results(session)
                 claim = watcher.claim_expired_session(boundary, "watcher-a")
+                claim = watcher.bind_authority_fence(boundary, claim)
                 claim = watcher.stage_assessment(boundary, claim)
                 boundary.now = "2026-08-23T00:22:00.000Z"
                 expected_error = "receipt-claim-expired"
@@ -573,6 +575,9 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
             sweep_review(boundary)
         self.assertEqual(boundary.evidence, {})
         self.assertIn("read-authority-fence", boundary.operations)
+        self.assertNotIn("stop-bridge", boundary.operations)
+        self.assertNotIn("reseal-bridge", boundary.operations)
+        self.assertNotIn("delete-exact-transient-settings", boundary.operations)
         boundary = FakeBoundary(session)
         boundary.install_valid_results(session)
         boundary.failures.add("early-authority-fence")
@@ -786,6 +791,7 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
         boundary = FakeBoundary(session)
         boundary.install_valid_results(session)
         claim = watcher.claim_expired_session(boundary, "watcher-a")
+        claim = watcher.bind_authority_fence(boundary, claim)
         assessment = watcher.assess_cleanup(boundary, claim.session)
         claim = watcher.stage_assessment(boundary, claim, assessment)
         path = watcher.receipt_path(claim.session)
@@ -882,12 +888,25 @@ class RegistryBridgeCleanupWatcherTests(unittest.TestCase):
             self.assertEqual(manifest["packageSha256"], second_manifest["packageSha256"])
             self.assertEqual(manifest["status"], "built-source-ready-activation-blocked")
             self.assertIsNone(manifest["mergedMutatingCommitSha"])
+            self.assertEqual(manifest["schemaVersion"], 2)
+            self.assertEqual(manifest["transport"], "independent-singleton-continuous-webjob")
+            self.assertFalse(manifest["publicHttpIngress"])
             with zipfile.ZipFile(first) as archive:
                 self.assertEqual(archive.namelist(), [member for _, member, _, _ in builder.SOURCES])
                 for info in archive.infolist():
                     self.assertEqual(info.date_time, builder.FIXED_TIMESTAMP)
-                contract = json.loads(archive.read("contracts/registry_bridge_cleanup_contract.json"))
+                root = "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/"
+                self.assertTrue(all(name.startswith(root) for name in archive.namelist()))
+                self.assertEqual(
+                    archive.getinfo(root + "run.sh").external_attr >> 16 & 0o777,
+                    0o755,
+                )
+                contract = json.loads(archive.read(root + "registry_bridge_cleanup_contract.json"))
                 self.assertIsNone(contract["immutableExternalControl"]["mergedMutatingCommitSha"])
+                self.assertTrue(all(
+                    value is None
+                    for value in contract["watcher"]["managedIdentityClientIds"].values()
+                ))
 
 
 if __name__ == "__main__":

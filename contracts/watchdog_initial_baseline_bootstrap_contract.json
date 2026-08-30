@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "contractId": "paperdesk-watchdog-initial-baseline-bootstrap-v1",
+  "status": "dormant-pending-truthful-immutable-evidence",
+  "immutableExternalControl": {
+    "repository": "Sethvirak/paperdesk-release-verifier",
+    "workflowPath": ".github/workflows/initialize-watchdog-rollback-baseline.yml",
+    "mergedAdmissionCommitSha": null
+  },
+  "admission": {
+    "oneTimeOnly": true,
+    "providerStateMustBeAbsent": true,
+    "evidenceFile": "evidence/watchdog-initial-rollback-baseline.json",
+    "evidenceChecksumFile": "evidence/watchdog-initial-rollback-baseline.json.sha256",
+    "evidenceValidator": "scripts.watchdog_evidence.validate_initial_baseline exact v2 projection",
+    "reviewEnvironment": "paperdesk-watchdog-baseline",
+    "requiredWorkflowRef": "Sethvirak/paperdesk-release-verifier/.github/workflows/initialize-watchdog-rollback-baseline.yml@refs/heads/main",
+    "requiredWorm": {
+      "storageAccount": "mdspdbak2608089c4e",
+      "container": "paperdesk-watchdog-evidence",
+      "state": "Locked",
+      "minimumRetentionDays": 90,
+      "writeMode": "create-only-exact-byte-readback"
+    },
+    "activationRule": "Admission remains impossible while mergedAdmissionCommitSha is null or either exact canonical evidence file is absent. A later independently reviewed commit must bind the truthful retained WORM receipt, its checksum, the immutable workflow SHA, and proof that provider state is still absent before one create-only initialization."
+  },
+  "prohibitions": {
+    "synthesizeEvidence": true,
+    "deriveBaselineFromMutableLiveState": true,
+    "replaceExistingProviderState": true,
+    "retryAmbiguousStateCreation": true,
+    "acceptBranchOrTagAsImmutableWorkflow": true
+  }
+}

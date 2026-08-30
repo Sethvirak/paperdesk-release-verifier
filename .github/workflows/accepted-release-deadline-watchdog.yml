@@ -44,7 +44,7 @@ jobs:
           echo 'f8b3e9123eff6555eb6201b3784a1ebe7c222a586ca778eea914fb68a212da0f  scripts/check_deadline.py' | sha256sum --check --strict
           echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
           echo 'd75faceed241cc19295f36417ec986bc0580b665815b80e7b04647ae16d696cc  scripts/watchdog_contract.py' | sha256sum --check --strict
-          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          echo 'dc29237eaee6e1a521d4e4658f038bf8b647c068168812668200753080e98a06  provider/watchdog_state_provider.py' | sha256sum --check --strict
           echo '2cb79ab61577bf0e6bcce279da5d837c81a9b1ffb52ca54531163b639feb343e  provider/accepted_release_manifest.py' | sha256sum --check --strict
           echo 'cfe32a359a2dd77e6656c9dcabc1c7260d98f9e20196a1d8dd14268c811d96fd  contracts/production_release_watchdog_contract.json' | sha256sum --check --strict
           test "${#BASELINE_RECEIPT_SHA256}" -eq 64

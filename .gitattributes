@@ -1,5 +1,7 @@
 webjobs/paperdesk-accepted-release-registry/run.sh text eol=lf
 webjobs/paperdesk-accepted-release-registry/settings.job text eol=lf
+webjobs/paperdesk-registry-cleanup-watcher/run.sh text eol=lf
+webjobs/paperdesk-registry-cleanup-watcher/settings.job text eol=lf
 scripts/check_deadline.py text eol=lf
 scripts/watchdog_contract.py text eol=lf
 scripts/watchdog_evidence.py text eol=lf
@@ -7,3 +9,5 @@ provider/accepted_release_manifest.py text eol=lf
 provider/watchdog_state_provider.py text eol=lf
 provider/startup.sh text eol=lf
 contracts/production_release_watchdog_contract.json text eol=lf
+contracts/registry_bridge_cleanup_contract.json text eol=lf
+contracts/watchdog_initial_baseline_bootstrap_contract.json text eol=lf

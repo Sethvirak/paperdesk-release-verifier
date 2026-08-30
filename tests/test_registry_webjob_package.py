@@ -80,22 +80,17 @@ class RegistryWebJobPackageTests(unittest.TestCase):
                 .encode("utf-8"),
             )
 
+            # This legacy package builder remains independently deterministic,
+            # but V2 has one remote-WORM bridge package and may not retain the
+            # old three-phase OneDeploy/WebJob activation path.
             workflow = CONTROL.read_text(encoding="utf-8")
-            file_digests = {record["path"]: record["sha256"] for record in first_result["files"]}
-            expected_hashes = {
-                "EXPECTED_PACKAGE_SHA256": first_result["packageSha256"],
-                "EXPECTED_RUNNER_SHA256": file_digests[f"{expected_root}/run.sh"],
-                "EXPECTED_SETTINGS_SHA256": file_digests[f"{expected_root}/settings.job"],
-                "EXPECTED_HELPER_SHA256": file_digests[
-                    f"{expected_root}/accepted_release_registry.py"
-                ],
-            }
-            for setting, expected_digest in expected_hashes.items():
-                self.assertEqual(
-                    workflow.count(f"{setting}: {expected_digest}"),
-                    3,
-                    f"{setting} must bind preflight verification, bridge execution, and always-seal",
-                )
+            for setting in (
+                "EXPECTED_PACKAGE_SHA256",
+                "EXPECTED_RUNNER_SHA256",
+                "EXPECTED_SETTINGS_SHA256",
+                "EXPECTED_HELPER_SHA256",
+            ):
+                self.assertNotIn(setting, workflow)
 
     def test_source_inventory_is_fixed_and_rejects_existing_output(self):
         self.assertEqual(len(builder.SOURCES), 3)

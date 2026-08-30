@@ -42,15 +42,22 @@ jobs:
           test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
-          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          echo 'dc29237eaee6e1a521d4e4658f038bf8b647c068168812668200753080e98a06  provider/watchdog_state_provider.py' | sha256sum --check --strict
           echo 'cfe32a359a2dd77e6656c9dcabc1c7260d98f9e20196a1d8dd14268c811d96fd  contracts/production_release_watchdog_contract.json' | sha256sum --check --strict
           python3 scripts/watchdog_evidence.py validate-config
+          python3 scripts/validate_watchdog_baseline_bootstrap.py validate-source
 
       - name: Source-dormant hard stop before baseline OIDC or state creation
         run: |
           set -euo pipefail
-          echo 'Initial baseline activation is blocked until evidence/watchdog-initial-rollback-baseline.json and its 90-day WORM receipt are independently reviewed and added by a separate commit.' >&2
+          echo 'Initial baseline activation is blocked until the one-time admission contract binds a reviewed merged workflow SHA and truthful canonical WORM evidence plus checksum are added by a separate commit.' >&2
           exit 1
+
+      - name: Validate one-time baseline bootstrap admission before any OIDC request
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_watchdog_baseline_bootstrap.py validate-admission \
+            --expected-merged-sha "${GITHUB_WORKFLOW_SHA}"
 
       - name: Verify exact independently reviewed baseline projection
         env:

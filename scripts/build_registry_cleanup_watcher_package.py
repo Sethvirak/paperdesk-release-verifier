@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the dormant registry cleanup watcher review package deterministically."""
+"""Build the dormant deployable cleanup watcher package deterministically."""
 
 from __future__ import annotations
 
@@ -15,19 +15,43 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
-CONTRACT_SHA256 = "2042a420c8da9ab30f5a71bd50c75fb023118fa4bba3709c5913024ea8334f90"
+CONTRACT_SHA256 = "3b7da11ea2677a5128fd0cc3a4a1dcc25a8f1e10957d6c00fd9ccccecb8ee4fc"
 SOURCES = (
     (
         ROOT / "provider" / "registry_bridge_cleanup_watcher.py",
-        "provider/registry_bridge_cleanup_watcher.py",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/registry_bridge_cleanup_watcher.py",
         0o644,
         512 * 1024,
     ),
     (
-        ROOT / "contracts" / "registry_bridge_cleanup_contract.json",
-        "contracts/registry_bridge_cleanup_contract.json",
+        ROOT / "provider" / "registry_bridge_cleanup_azure.py",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/registry_bridge_cleanup_azure.py",
+        0o644,
+        512 * 1024,
+    ),
+    (
+        ROOT / "provider" / "registry_bridge_cleanup_runtime.py",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/registry_bridge_cleanup_runtime.py",
         0o644,
         128 * 1024,
+    ),
+    (
+        ROOT / "contracts" / "registry_bridge_cleanup_contract.json",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/registry_bridge_cleanup_contract.json",
+        0o644,
+        128 * 1024,
+    ),
+    (
+        ROOT / "webjobs" / "paperdesk-registry-cleanup-watcher" / "run.sh",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/run.sh",
+        0o755,
+        16 * 1024,
+    ),
+    (
+        ROOT / "webjobs" / "paperdesk-registry-cleanup-watcher" / "settings.job",
+        "App_Data/jobs/continuous/paperdesk-registry-cleanup-watcher/settings.job",
+        0o644,
+        4096,
     ),
 )
 
@@ -75,6 +99,32 @@ def validate_contract(body: bytes) -> None:
         raise PackageError("cleanup watcher contract is not safely dormant")
 
 
+def validate_runner(body: bytes) -> None:
+    text = body.decode("utf-8")
+    required = (
+        "set -euo pipefail",
+        'WEBSITE_SITE_NAME:-',
+        "paperdesk-registry-cleanup-watcher-9c4e0d0d",
+        "python3 -I registry_bridge_cleanup_runtime.py --continuous",
+    )
+    if any(text.count(value) != 1 for value in required):
+        raise PackageError("cleanup watcher runner is not the exact scheduled entry")
+    for forbidden in ("curl ", "wget ", "az ", "--once", "http://", "https://"):
+        if forbidden in text:
+            raise PackageError("cleanup watcher runner expands the reviewed boundary")
+
+
+def validate_settings(body: bytes) -> None:
+    try:
+        document = json.loads(body, object_pairs_hook=duplicate_rejector)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PackageError("cleanup watcher settings.job is invalid") from exc
+    if document != {"is_singleton": True, "stopping_wait_time": 30}:
+        raise PackageError("cleanup watcher settings.job is not the singleton contract")
+    if body != b'{"is_singleton":true,"stopping_wait_time":30}\n':
+        raise PackageError("cleanup watcher settings.job bytes are not canonical")
+
+
 def build(output: Path) -> dict[str, object]:
     output = output.resolve()
     if output.exists() or output.is_symlink():
@@ -85,6 +135,10 @@ def build(output: Path) -> dict[str, object]:
         body = source_bytes(source, maximum)
         if member.endswith("registry_bridge_cleanup_contract.json"):
             validate_contract(body)
+        elif member.endswith("/run.sh"):
+            validate_runner(body)
+        elif member.endswith("/settings.job"):
+            validate_settings(body)
         bodies.append((member, mode, body))
     records: list[dict[str, object]] = []
     with tempfile.NamedTemporaryFile(
@@ -112,9 +166,11 @@ def build(output: Path) -> dict[str, object]:
     finally:
         temporary.unlink(missing_ok=True)
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "status": "built-source-ready-activation-blocked",
         "appName": "paperdesk-registry-cleanup-watcher-9c4e0d0d",
+        "transport": "independent-singleton-continuous-webjob",
+        "publicHttpIngress": False,
         "mergedMutatingCommitSha": None,
         "packageSha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "files": records,

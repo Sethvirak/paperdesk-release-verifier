@@ -1,4 +1,6 @@
 import io
+import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -137,6 +139,145 @@ class ArchiveVerificationTests(unittest.TestCase):
             handle.addfile(member, io.BytesIO(payload))
         with self.assertRaisesRegex(ValueError, "size differs|bytes differ"):
             verifier.verify_archive(hostile, self.expected)
+
+
+class ManifestModeContractTests(unittest.TestCase):
+    @staticmethod
+    def record(path, mode="0644", **extra):
+        result = {"path": path, "size": 1, "sha256": "a" * 64}
+        if mode is not None:
+            result["mode"] = mode
+        result.update(extra)
+        return result
+
+    def test_package_input_modes_are_required_and_path_authorized(self):
+        records = [
+            self.record(verifier.EXECUTABLE_PACKAGE_SOURCE, "0755"),
+            self.record("app.js", generatedOwner="generated-shadcn"),
+        ]
+        verifier.validate_records(
+            records,
+            "package input files",
+            require_mode=True,
+            allow_generated_owner=True,
+        )
+        for record in (
+            self.record("app.js", None),
+            self.record("app.js", 0o644),
+            self.record("app.js", "0777"),
+            self.record("app.js", "0755"),
+            self.record(verifier.EXECUTABLE_PACKAGE_SOURCE, "0644"),
+        ):
+            with self.subTest(record=record), self.assertRaisesRegex(ValueError, "invalid record|unauthorized mode"):
+                verifier.validate_records(
+                    [record],
+                    "package input files",
+                    require_mode=True,
+                    allow_generated_owner=True,
+                )
+
+    def test_record_schemas_are_context_specific(self):
+        release = self.record(verifier.RELEASE_MATERIALS[0])
+        verifier.validate_records([release], "release materials", require_mode=True)
+        dependency = self.record("dependency/package.json", mode=None)
+        verifier.validate_records([dependency], "production dependencies")
+        runtime = self.record("server/paperdesk-release-sha.txt")
+        verifier.validate_records([runtime], "runtime files", require_mode=True)
+        release_without_mode = {key: value for key, value in release.items() if key != "mode"}
+        runtime_without_mode = {key: value for key, value in runtime.items() if key != "mode"}
+        for record, label, options in (
+            (release_without_mode, "release materials", {"require_mode": True}),
+            ({**release, "mode": "0755"}, "release materials", {"require_mode": True}),
+            ({**release, "generatedOwner": "unexpected"}, "release materials", {"require_mode": True}),
+            ({**dependency, "mode": "0644"}, "production dependencies", {}),
+            (runtime_without_mode, "runtime files", {"require_mode": True}),
+            ({**runtime, "generatedOwner": "unexpected"}, "runtime files", {"require_mode": True}),
+        ):
+            with self.subTest(label=label, record=record), self.assertRaisesRegex(ValueError, "invalid record|unauthorized mode"):
+                verifier.validate_records([record], label, **options)
+
+    def test_manifest_boundaries_accept_exact_modes_and_reject_runtime_tamper(self):
+        source_sha = "b" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_root = Path(temporary)
+            source_files = {
+                verifier.EXECUTABLE_PACKAGE_SOURCE: b"#!/bin/sh\n",
+                "app.js": b"trusted\n",
+            }
+            for relative, body in source_files.items():
+                path = runtime_root.joinpath(*relative.split("/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+                if os.name != "nt":
+                    path.chmod(0o755 if relative == verifier.EXECUTABLE_PACKAGE_SOURCE else 0o644)
+
+            input_records = []
+            for relative in sorted(source_files):
+                path = runtime_root.joinpath(*relative.split("/"))
+                input_records.append({
+                    "path": relative,
+                    "size": path.stat().st_size,
+                    "sha256": verifier.sha256_file(path),
+                    "mode": verifier.authorized_file_mode(relative),
+                })
+            release_records = [self.record(path) for path in verifier.RELEASE_MATERIALS]
+            input_document = {
+                "schema": "paperdesk-azure-package-input-manifest-v1",
+                "repositoryCommit": source_sha,
+                "files": input_records,
+                "releaseMaterials": release_records,
+                "productionDependencies": [],
+            }
+            embedded_input = runtime_root / verifier.RUNTIME_INPUT
+            embedded_input.parent.mkdir(parents=True, exist_ok=True)
+            embedded_input.write_text(json.dumps(input_document), encoding="utf-8")
+            release_marker = runtime_root / verifier.RELEASE_SHA
+            release_marker.write_text(f"{source_sha}\n", encoding="utf-8")
+            if os.name != "nt":
+                embedded_input.chmod(0o644)
+                release_marker.chmod(0o644)
+
+            runtime_records = verifier.tree_records(runtime_root)
+            runtime_records = [
+                {**record, "mode": verifier.authorized_file_mode(record["path"])}
+                for record in runtime_records
+            ]
+            runtime_document = {
+                "schema": "paperdesk-azure-runtime-file-manifest-v1",
+                "repositoryCommit": source_sha,
+                "releaseSha": source_sha,
+                "selfExcludedPath": verifier.RUNTIME_MANIFEST,
+                "inputManifest": {
+                    "path": verifier.RUNTIME_INPUT,
+                    "sha256": verifier.sha256_file(embedded_input),
+                },
+                "files": runtime_records,
+            }
+            verifier.verify_manifest_boundaries(input_document, runtime_document, source_sha, runtime_root)
+            tampered = {**runtime_document, "files": [dict(record) for record in runtime_records]}
+            executable = next(
+                record for record in tampered["files"] if record["path"] == verifier.EXECUTABLE_PACKAGE_SOURCE
+            )
+            executable["mode"] = "0644"
+            with self.assertRaisesRegex(ValueError, "unauthorized mode"):
+                verifier.verify_manifest_boundaries(input_document, tampered, source_sha, runtime_root)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode evidence is enforced on the Linux verifier runner")
+    def test_reconstructed_package_source_mode_downgrade_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canary = root.joinpath(*verifier.EXECUTABLE_PACKAGE_SOURCE.split("/"))
+            canary.parent.mkdir(parents=True)
+            canary.write_text("#!/bin/sh\n", encoding="utf-8")
+            canary.chmod(0o644)
+            record = {
+                "path": verifier.EXECUTABLE_PACKAGE_SOURCE,
+                "size": canary.stat().st_size,
+                "sha256": verifier.sha256_file(canary),
+                "mode": "0755",
+            }
+            with self.assertRaisesRegex(ValueError, "reconstructed package source mode"):
+                verifier.verify_package_source_modes(root, [record])
 
 
 if __name__ == "__main__":
