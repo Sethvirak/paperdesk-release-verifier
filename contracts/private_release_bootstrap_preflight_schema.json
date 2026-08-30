@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperdesk.invalid/contracts/private-release-bootstrap-preflight-v1.schema.json",
+  "title": "PaperDesk private release V2 bootstrap preflight",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "status", "observedAt", "projection", "projectionSha256"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "status": {"const": "observed-read-only"},
+    "observedAt": {"type": "string", "format": "date-time"},
+    "projectionSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "planId", "probes", "operationAdmissions", "postconditionAdmissions", "productionBoundaryObservation"],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "planId": {"const": "paperdesk-private-release-v2-bootstrap-v1"},
+        "probes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "phase", "method", "url", "requestBodySha256", "status", "responseSha256", "validatorId", "validatorContract"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"},
+              "phase": {"enum": ["preflight", "readback"]},
+              "method": {"enum": ["GET", "POST"]},
+              "url": {"type": "string", "minLength": 20, "maxLength": 2048},
+              "requestBodySha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "status": {"type": "integer", "minimum": 200, "maximum": 599},
+              "responseSha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "validatorId": {"type": ["string", "null"], "pattern": "^(operation|postcondition):[a-z][a-zA-Z0-9-]{1,95}$"},
+              "validatorContract": {"type": ["object", "null"]}
+            }
+          }
+        },
+        "operationAdmissions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operationId", "status", "probeIds", "desiredProbeIds", "context"],
+            "properties": {
+              "operationId": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"},
+              "status": {"enum": ["absent", "exact", "owned-present"]},
+              "probeIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+              "desiredProbeIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+              "context": {"type": "object"}
+            }
+          }
+        },
+        "postconditionAdmissions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["postconditionId", "probeIds"],
+            "properties": {
+              "postconditionId": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"},
+              "probeIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+            }
+          }
+        },
+        "productionBoundaryObservation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["probeIds", "sourceProjection"],
+          "properties": {
+            "probeIds": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {"type": "string"}
+            },
+            "sourceProjection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sitePosture", "appSettingsSha256", "deploymentInventory", "oneDeployInventory"],
+              "properties": {
+                "sitePosture": {"type": "object"},
+                "appSettingsSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "deploymentInventory": {"type": "array"},
+                "oneDeployInventory": {"type": "array"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

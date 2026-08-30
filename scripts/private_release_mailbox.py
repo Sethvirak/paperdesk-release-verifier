@@ -16,6 +16,7 @@ TENANT="aba83bd8-3e5c-4a87-9eb1-7bca070685b2"
 PRODUCTION_SYSTEM_CLIENT_ID="a9935122-5592-467f-ba75-68844f46de1a"
 PRODUCTION_SYSTEM_PRINCIPAL_ID="b856ea96-e96a-420a-9137-79e1e7a85ef4"
 MAX_REQUEST=32768; MAX_RESULT=65536; MAX_ZIP=1073741824; MAX_MEMBERS=25000
+MAX_ACTIVATION_DOCUMENT=32768
 KEY_RECOVERY_HORIZON_SECONDS=30*24*60*60
 BOOTSTRAP_BASELINE={
     "sourceSha":"cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
@@ -38,6 +39,9 @@ BOOTSTRAP_BASELINE={
     "localEvidenceSha256":"76057b91193ca671dde356da25a1c1c8f8775c32c63f53a747312dec22f81d4c",
 }
 FIXED_COORDS={"subscriptionId":SUBSCRIPTION,"bridgeResourceGroup":"rg-master-data-structure-sea","bridgeApp":"paperdesk-release-registry-bridge-v2-9c4e0d0d","bridgeWebJob":"paperdesk-accepted-release-registry","productionResourceGroup":"rg-master-data-structure-sea","productionApp":"master-data-structure-sea-9c4e0d0d","registryAccount":"mdspdbak2608089c4e","registryContainer":"paperdesk-accepted-releases","resultContainer":"paperdesk-registry-webjob-results","packageAccount":"mdspdbak2608089c4e","packageContainer":"paperdesk-deployment-packages","controllerLockResourceGroup":"rg-paperdesk-rollback-sea-20260808","controllerLockContainer":"paperdesk-release-controller-lock","activationFenceContainer":"paperdesk-release-activation-control","activationFenceBlob":"v2/production-activation-fence.json","signingVault":"kv-mds-sea-9c4e0d0d","signingKeyName":"paperdesk-release-result-signing","managementApiVersion":"2025-04-01","webApiVersion":"2025-05-01","bootstrapBaseline":BOOTSTRAP_BASELINE}
+ACTIVATION_DOCUMENT_FIELDS={"schemaVersion","status","activation","fixed","limits","rule"}
+ACTIVATION_LIMITS={"requestBytes":MAX_REQUEST,"resultBytes":MAX_RESULT,"clockSkewSeconds":30,"requestLifetimeSeconds":900,"mailboxPolls":180,"mailboxPollSeconds":5,"mailboxRetainedPairs":200,"deploymentZipBytes":MAX_ZIP,"deploymentZipMembers":MAX_MEMBERS}
+ACTIVATION_RULE="No credential construction, mailbox request, WebJob run, signing, production configuration mutation, or cleanup is permitted until every activation field is exact and non-null and the merged workflow SHA self-binds the runtime workflow SHA."
 OWNER_REPOSITORY="Sethvirak/MasterDataStructure"; OWNER_REPOSITORY_ID="1287744543"; OWNER_ID="202535166"
 OWNER_WORKFLOW_ID="306965591"
 OWNER_WORKFLOW_NAME="Build and deploy Node.js app to Azure Web App: master-data-structure-sea-9c4e0d0d"
@@ -60,7 +64,7 @@ GRAPH_APP_ID="00000003-0000-0000-c000-000000000000"
 GRAPH_APPLICATION_READ_ALL_ROLE_ID="9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30"
 
 def bridge_owner_policy(operation):
-    if operation in {"bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","prepare-rollback","complete-rollback"}:
+    if operation in {"registry-bridge-preflight","bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","prepare-rollback","complete-rollback"}:
         events={"workflow_dispatch"} if operation in {"bootstrap-prepare","bootstrap-consume","prepare-rollback","complete-rollback"} else OWNER_WORKFLOW_EVENTS
         return {"workflowId":OWNER_WORKFLOW_ID,"workflowName":OWNER_WORKFLOW_NAME,"workflowPath":OWNER_WORKFLOW_PATH,"workflowRef":OWNER_WORKFLOW_REF,"events":events}
     if operation=="persist-accepted-release":
@@ -184,7 +188,7 @@ def b64u_decode(value,label):
     try: return base64.urlsafe_b64decode(value+"="*((4-len(value)%4)%4))
     except Exception: fail(label)
 
-ACTIVATION_FIELDS={"mergedControlWorkflowSha","mailboxResourceGroup","mailboxPublisherClientId","mailboxPublisherPrincipalId","mailboxRoleDefinitionId","mailboxRoleAssignmentId","controllerLockRoleDefinitionId","controllerLockRoleAssignmentId","controllerLockRoleAssignmentScope","controllerLockRoleDefinitionActions","controllerLockForbiddenDataActions","tenantId","bridgeManagedIdentityClientId","bridgeManagedIdentityPrincipalId","bridgeManagedIdentityResourceId","registryWriterManagedIdentityClientId","registryWriterManagedIdentityPrincipalId","registryWriterManagedIdentityResourceId","registryReaderManagedIdentityClientId","registryReaderManagedIdentityPrincipalId","registryReaderManagedIdentityResourceId","signerManagedIdentityClientId","signerManagedIdentityPrincipalId","signerManagedIdentityResourceId","signerRoleDefinitionId","signerRoleAssignmentId","signerRoleAssignmentScope","signerRoleDefinitionDataActions","signerForbiddenRoleAssignments","signingKeyId","signingKeyVersion","signingPublicJwk","bridgePackageSha256","productionActivationManagedIdentityClientId","productionActivationManagedIdentityPrincipalId","productionActivationManagedIdentityResourceId","productionActivationRoleDefinitionId","productionActivationRoleAssignmentId","productionActivationRoleAssignmentScope","productionActivationRoleDefinitionActions","productionActivationForbiddenRoleAssignments","productionPackageReaderRoleAssignmentId","productionPackageReaderRoleScope","productionForbiddenDataPlaneAssignments","productionSystemIdentityClientId","productionSystemIdentityPrincipalId","packageWriterRoleAssignmentId","packageReaderRoleAssignmentId","activationFence","provisioningEvidenceSha256"}
+ACTIVATION_FIELDS={"mergedControlWorkflowSha","mailboxResourceGroup","mailboxPublisherClientId","mailboxPublisherPrincipalId","mailboxRoleDefinitionId","mailboxRoleAssignmentId","controllerLockRoleDefinitionId","controllerLockRoleAssignmentId","controllerLockRoleAssignmentScope","controllerLockRoleDefinitionActions","controllerLockForbiddenDataActions","tenantId","bridgeManagedIdentityClientId","bridgeManagedIdentityPrincipalId","bridgeManagedIdentityResourceId","registryWriterManagedIdentityClientId","registryWriterManagedIdentityPrincipalId","registryWriterManagedIdentityResourceId","registryReaderManagedIdentityClientId","registryReaderManagedIdentityPrincipalId","registryReaderManagedIdentityResourceId","signerManagedIdentityClientId","signerManagedIdentityPrincipalId","signerManagedIdentityResourceId","signerRoleDefinitionId","signerRoleAssignmentId","signerRoleAssignmentScope","signerRoleDefinitionDataActions","signerForbiddenRoleAssignments","signingKeyId","signingKeyVersion","signingPublicJwk","bridgePackageSourceSha","bridgePackageSha256","productionActivationManagedIdentityClientId","productionActivationManagedIdentityPrincipalId","productionActivationManagedIdentityResourceId","productionActivationRoleDefinitionId","productionActivationRoleAssignmentId","productionActivationRoleAssignmentScope","productionActivationRoleDefinitionActions","productionActivationForbiddenRoleAssignments","productionPackageReaderRoleAssignmentId","productionPackageReaderRoleScope","productionForbiddenDataPlaneAssignments","productionSystemIdentityClientId","productionSystemIdentityPrincipalId","packageWriterRoleAssignmentId","packageReaderRoleAssignmentId","activationFence","provisioningEvidenceSha256"}
 @dataclasses.dataclass(frozen=True)
 class Activation:
     workflow_sha:str; mailbox_resource_group:str; tenant_id:str
@@ -194,18 +198,36 @@ class Activation:
     registry_reader_client_id:str; registry_reader_principal_id:str
     signer_client_id:str; signer_principal_id:str
     signing_key_id:str; signing_key_version:str; signing_public_jwk:dict
-    bridge_package_sha256:str
+    bridge_package_source_sha:str; bridge_package_sha256:str
     production_activation_client_id:str; production_activation_principal_id:str
     production_principal_id:str
     activation_fence:dict; provisioning_evidence:dict
 
-def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_sha256,provisioning_evidence=None):
-    if not isinstance(doc,dict) or doc.get("schemaVersion")!=1 or doc.get("fixed")!=FIXED_COORDS: fail("activation-fixed-coordinates")
+def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_sha256,provisioning_evidence=None,raw_document=None,pre_s2_evidence_validation=False):
+    if type(pre_s2_evidence_validation) is not bool:fail("activation-pre-s2-mode")
+    encoded=canonical(doc)
+    if len(encoded)>MAX_ACTIVATION_DOCUMENT:fail("activation-document-size")
+    if raw_document is not None and (not isinstance(raw_document,str) or raw_document.encode()!=encoded):fail("activation-document-canonical")
+    # Exact source-owned root/fixed/limit/rule maps make credentials, tokens,
+    # private keys, and other unreviewed fields structurally impossible here.
+    if (not isinstance(doc,dict) or set(doc)!=ACTIVATION_DOCUMENT_FIELDS or doc.get("schemaVersion")!=1
+            or doc.get("status")!="activated" or doc.get("fixed")!=FIXED_COORDS
+            or doc.get("limits")!=ACTIVATION_LIMITS or doc.get("rule")!=ACTIVATION_RULE):fail("activation-document")
     activation=doc.get("activation") if isinstance(doc,dict) else None
     if not isinstance(activation,dict) or set(activation)!=ACTIVATION_FIELDS or any(value is None for value in activation.values()): fail("activation-incomplete")
     rg=activation["mailboxResourceGroup"]
     if not isinstance(rg,str) or not re.fullmatch(r"[A-Za-z0-9._()-]{1,90}",rg): fail("activation-mailbox-rg")
     if not SHA40.fullmatch(str(runtime_workflow_sha)) or activation["mergedControlWorkflowSha"]!=runtime_workflow_sha: fail("activation-workflow-sha")
+    if not SHA40.fullmatch(str(activation["bridgePackageSourceSha"])):fail("activation-package-source-sha")
+    same_package_and_workflow_source=(activation["bridgePackageSourceSha"]==activation["mergedControlWorkflowSha"])
+    if pre_s2_evidence_validation:
+        # Only the receipt assembler's source-derived, pre-S2 provisional
+        # document may have a package built from the reviewed S1-prime source.
+        # S2 is the later evidence-only commit and therefore differs.  The
+        # production activation path never opts in, and a completed activation
+        # with a distinct bootstrap package source cannot use this mode.
+        if not same_package_and_workflow_source:fail("activation-pre-s2-source")
+    elif same_package_and_workflow_source:fail("activation-package-source-sha")
     if not SHA256.fullmatch(str(observed_bridge_package_sha256)) or activation["bridgePackageSha256"]!=observed_bridge_package_sha256: fail("activation-package-sha")
     for field in ("mailboxPublisherClientId","mailboxPublisherPrincipalId","mailboxRoleDefinitionId","mailboxRoleAssignmentId","controllerLockRoleDefinitionId","controllerLockRoleAssignmentId","tenantId","bridgeManagedIdentityClientId","bridgeManagedIdentityPrincipalId","registryWriterManagedIdentityClientId","registryWriterManagedIdentityPrincipalId","registryReaderManagedIdentityClientId","registryReaderManagedIdentityPrincipalId","signerManagedIdentityClientId","signerManagedIdentityPrincipalId","signerRoleDefinitionId","signerRoleAssignmentId","productionActivationManagedIdentityClientId","productionActivationManagedIdentityPrincipalId","productionActivationRoleDefinitionId","productionActivationRoleAssignmentId","productionPackageReaderRoleAssignmentId","productionSystemIdentityClientId","productionSystemIdentityPrincipalId","packageWriterRoleAssignmentId","packageReaderRoleAssignmentId"):
         if not GUID.fullmatch(str(activation[field])): fail("activation-id")
@@ -229,6 +251,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
         identity_resources.append(value.lower())
     if len(set(identity_resources))!=len(identity_resources):fail("activation-identity-resource")
     key_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.KeyVault/vaults/{FIXED_COORDS['signingVault']}/keys/{FIXED_COORDS['signingKeyName']}"
+    vault_scope=key_scope.rsplit("/keys/",1)[0]
     if (activation["signerRoleAssignmentScope"]!=key_scope
             or activation["signerRoleDefinitionDataActions"]!=["Microsoft.KeyVault/vaults/keys/sign/action"]
             or activation["signerForbiddenRoleAssignments"]!=[]): fail("activation-signer-role")
@@ -281,13 +304,16 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
     parse_time(publisher_identity.get("observedAt"),"activation-publisher-identity-observed")
     role_fields={"roleDefinitionResourceId","roleDefinitionSha256","roleAssignmentResourceId","roleAssignmentSha256","principalId","principalType","tenantId","identityClientId","identityResourceId","scope","condition","conditionVersion","delegatedManagedIdentityResourceId","assignableScopes","actions","notActions","dataActions","notDataActions"}
     roles=evidence.get("roles")
-    expected_role_names={"publisherMailbox","publisherBridgeController","publisherControllerLock","publisherAcceptedCustodyAudit","publisherPackageCustodyAudit","publisherResultCustodyAudit","publisherAudit","publisherWebIdentityAudit","publisherKeyPostureAudit","bridgeMailboxResult","bridgeActivationFence","bridgeKeyRead","writerRegistryAdd","writerPackageAdd","readerRegistryRead","readerPackageRead","signerKeySign","productionActivation","productionSystemPackageRead","productionSystemAttachmentContributor","productionSystemSecretsUser"}
+    expected_role_names={"publisherMailbox","publisherBridgeController","publisherControllerLock","publisherAcceptedCustodyAudit","publisherPackageCustodyAudit","publisherResultCustodyAudit","publisherAudit","publisherWebIdentityAudit","publisherKeyPostureAudit","publisherUamiMetadataAudit","publisherNetworkMetadataAudit","publisherStorageMetadataAudit","publisherProductionWebMetadataAudit","bridgeMailboxResult","bridgeActivationFence","bridgeKeyRead","writerRegistryAdd","writerPackageAdd","readerRegistryRead","readerPackageRead","signerKeySign","productionActivation","productionSystemPackageRead","productionSystemAttachmentContributor","productionSystemSecretsUser"}
     if not isinstance(roles,dict) or set(roles)!=expected_role_names:fail("activation-provisioning-roles")
     mailbox_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{rg}"
     registry_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/{FIXED_COORDS['registryAccount']}/blobServices/default/containers/{FIXED_COORDS['registryContainer']}"
     result_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/{FIXED_COORDS['registryAccount']}/blobServices/default/containers/paperdesk-registry-webjob-results"
     bridge_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/sites/{FIXED_COORDS['bridgeApp']}"
     subscription_scope=f"/subscriptions/{SUBSCRIPTION}"
+    master_rg_scope=f"{subscription_scope}/resourceGroups/{FIXED_COORDS['bridgeResourceGroup']}"
+    vnet_scope=f"{master_rg_scope}/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea"
+    storage_scope=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/{FIXED_COORDS['registryAccount']}"
     bridge_actions=["Microsoft.Web/sites/Read","Microsoft.Web/sites/start/Action","Microsoft.Web/sites/stop/Action","Microsoft.Web/sites/config/list/Action","Microsoft.Web/sites/config/Read","Microsoft.Web/sites/config/Write","Microsoft.Web/sites/basicPublishingCredentialsPolicies/Read","Microsoft.Web/sites/sourcecontrols/read","Microsoft.Web/sites/triggeredwebjobs/read","Microsoft.Web/sites/triggeredwebjobs/history/read","Microsoft.Web/sites/triggeredwebjobs/run/action"]
     audit_actions=["Microsoft.Authorization/roleAssignments/read","Microsoft.Authorization/roleDefinitions/read"]
     custody_actions=["Microsoft.Storage/storageAccounts/blobServices/containers/read","Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read"]
@@ -306,10 +332,14 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
         "publisherPackageCustodyAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,package_scope,custody_actions,[]),
         "publisherResultCustodyAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,result_scope,custody_actions,[]),
         "publisherAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,subscription_scope,audit_actions,[]),
-        "publisherWebIdentityAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,subscription_scope,["Microsoft.Web/sites/read"],[]),
-        "publisherKeyPostureAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,key_scope,["Microsoft.KeyVault/vaults/read","Microsoft.KeyVault/vaults/keys/read"],[]),
+        "publisherWebIdentityAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,master_rg_scope,["Microsoft.Web/sites/read"],[]),
+        "publisherKeyPostureAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,vault_scope,["Microsoft.KeyVault/vaults/read","Microsoft.KeyVault/vaults/keys/read"],[]),
+        "publisherUamiMetadataAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,master_rg_scope,["Microsoft.ManagedIdentity/userAssignedIdentities/read"],[]),
+        "publisherNetworkMetadataAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,vnet_scope,["Microsoft.Network/virtualNetworks/read","Microsoft.Network/virtualNetworks/subnets/read"],[]),
+        "publisherStorageMetadataAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,storage_scope,["Microsoft.Storage/storageAccounts/read"],[]),
+        "publisherProductionWebMetadataAudit":(None,None,activation["mailboxPublisherPrincipalId"],activation["mailboxPublisherClientId"],None,production_scope,["Microsoft.Web/sites/config/read"],[]),
         "bridgeMailboxResult":(None,None,activation["bridgeManagedIdentityPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityResourceId"],mailbox_scope,["Microsoft.Resources/deployments/read","Microsoft.Resources/deployments/write"],[]),
-        "bridgeActivationFence":(None,fence["bridgeRoleAssignmentId"],activation["bridgeManagedIdentityPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityResourceId"],fence_scope,[],["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/lease/action"]),
+        "bridgeActivationFence":(None,fence["bridgeRoleAssignmentId"],activation["bridgeManagedIdentityPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityResourceId"],fence_scope,[],["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]),
         "bridgeKeyRead":(None,None,activation["bridgeManagedIdentityPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityResourceId"],key_scope,[],["Microsoft.KeyVault/vaults/keys/read"]),
         "writerRegistryAdd":(None,None,activation["registryWriterManagedIdentityPrincipalId"],activation["registryWriterManagedIdentityClientId"],activation["registryWriterManagedIdentityResourceId"],registry_scope,[],["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]),
         "writerPackageAdd":(None,activation["packageWriterRoleAssignmentId"],activation["registryWriterManagedIdentityPrincipalId"],activation["registryWriterManagedIdentityClientId"],activation["registryWriterManagedIdentityResourceId"],package_scope,[],["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]),
@@ -370,14 +400,15 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
     bridge_runtime=evidence.get("bridgeRuntime")
     bridge_runtime_fields={"siteResourceId","packageBlob","packageSha256","packageSize","packageEtag","packageVersionId","packageUrl","packageReaderIdentityResourceId","criticalAppSettings","criticalAppSettingsSha256","sitePosture","sitePostureSha256","siteInventoryQuery","sensitiveIdentityResourceIds","sensitiveIdentityAttachmentSha256","resourceGraphAttachmentInventory","identityAssignmentBoundaries","bridgeMutationBoundary","legacyBridgeRetirement","networkTopology","bootstrapReceiptPath","bootstrapReceiptSha256","observedAt"}
     expected_bridge_site=f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/sites/{FIXED_COORDS['bridgeApp']}"
-    package_blob=f"v2/control/{activation['bridgePackageSha256']}/paperdesk-private-release-bridge.zip"
+    package_blob=f"v2/control/{activation['bridgePackageSourceSha']}/paperdesk-private-release-bridge.zip"
     version=bridge_runtime.get("packageVersionId") if isinstance(bridge_runtime,dict) else None
     package_url=f"https://{FIXED_COORDS['packageAccount']}.blob.core.windows.net/{FIXED_COORDS['packageContainer']}/{package_blob}?versionid={version}"
     critical={"WEBSITE_RUN_FROM_PACKAGE":package_url,"WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID":activation["registryReaderManagedIdentityResourceId"],"WEBSITE_SKIP_RUNNING_KUDUAGENT":"false","PAPERDESK_BRIDGE_PACKAGE_SHA256":activation["bridgePackageSha256"]}
     posture=bridge_runtime.get("sitePosture") if isinstance(bridge_runtime,dict) else None
     posture_fields={"siteResourceId","name","type","kind","serverFarmId","httpsOnly","publicNetworkAccess","virtualNetworkSubnetId","outboundVnetRouting","webConfig","ftpBasicAuthAllowed","scmBasicAuthAllowed","sourceControl"}
     web_config={"alwaysOn":True,"linuxFxVersion":"PYTHON|3.12","ftpsState":"Disabled","minTlsVersion":"1.2","scmMinTlsVersion":"1.2","scmType":"None","http20Enabled":True,"vnetRouteAllEnabled":True}
-    outbound_routing={"allTraffic":True,"applicationTraffic":True}
+    bridge_outbound_routing={"allTraffic":True,"applicationTraffic":True}
+    production_outbound_routing={"allTraffic":False,"applicationTraffic":True}
     site_inventory_query=f"https://management.azure.com/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Web/sites?api-version=2025-03-01"
     sensitive_ids=sorted(identity_resources)
     expected_attachments={expected_bridge_site.lower():sensitive_ids}
@@ -410,7 +441,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
         "virtualNetwork":{"addressSpacePrefixes"},
         "integrationSubnet":{"virtualNetworkResourceId","delegations","serviceEndpoints","routeTableResourceId","networkSecurityGroupResourceId"},
         "packageStorageAccount":{"publicNetworkAccess","allowBlobPublicAccess","defaultAction","bypass","ipRules","resourceAccessRules","virtualNetworkRules"},
-        "productionSite":{"virtualNetworkSubnetId","outboundVnetRouting"},
+        "productionSite":{"virtualNetworkSubnetId","outboundVnetRouting","legacyVnetRouteAllEnabled"},
     }
     topology_items={"virtualNetwork":vnet,"integrationSubnet":subnet,"packageStorageAccount":storage_topology,"productionSite":production_topology}
     topology_shape_ok=isinstance(topology,dict) and set(topology)==topology_fields and topology.get("mode")=="service-endpoint-firewall-v1"
@@ -430,7 +461,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
             or not isinstance(posture.get("serverFarmId"),str) or not re.fullmatch(rf"/subscriptions/{SUBSCRIPTION}/resourceGroups/[A-Za-z0-9._()-]+/providers/Microsoft\.Web/serverfarms/[A-Za-z0-9._()-]+",posture["serverFarmId"],re.I)
             or posture.get("httpsOnly") is not True or posture.get("publicNetworkAccess")!="Disabled"
             or not isinstance(posture.get("virtualNetworkSubnetId"),str) or not re.fullmatch(rf"/subscriptions/{SUBSCRIPTION}/resourceGroups/[A-Za-z0-9._()-]+/providers/Microsoft\.Network/virtualNetworks/[A-Za-z0-9._()-]+/subnets/[A-Za-z0-9._()-]+",posture["virtualNetworkSubnetId"],re.I)
-            or posture.get("outboundVnetRouting")!=outbound_routing or posture.get("webConfig")!=web_config or posture.get("ftpBasicAuthAllowed") is not False or posture.get("scmBasicAuthAllowed") is not False
+            or posture.get("outboundVnetRouting")!=bridge_outbound_routing or posture.get("webConfig")!=web_config or posture.get("ftpBasicAuthAllowed") is not False or posture.get("scmBasicAuthAllowed") is not False
             or posture.get("sourceControl") not in ({"status":404},{"status":200,"repoUrl":None,"branch":None,"isManualIntegration":False})
             or bridge_runtime.get("sitePostureSha256")!=digest(canonical(posture))
             or bridge_runtime.get("siteInventoryQuery")!=site_inventory_query or bridge_runtime.get("sensitiveIdentityResourceIds")!=sensitive_ids
@@ -463,7 +494,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
             or storage_topology.get("ipRules")!=[] or storage_topology.get("resourceAccessRules")!=[]
             or storage_topology.get("virtualNetworkRules")!=[{"id":subnet.get("resourceId"),"action":"Allow","state":"Succeeded"}]
             or production_topology.get("resourceId")!=production_scope or production_topology.get("virtualNetworkSubnetId")!=subnet.get("resourceId")
-            or production_topology.get("outboundVnetRouting")!=outbound_routing
+            or production_topology.get("outboundVnetRouting")!=production_outbound_routing or production_topology.get("legacyVnetRouteAllEnabled") is not True
             or bridge_runtime.get("bootstrapReceiptPath")!="evidence/private-release-bridge-runtime-receipt.json"
             or not SHA256.fullmatch(str(bridge_runtime.get("bootstrapReceiptSha256")))):fail("activation-bridge-runtime")
     parse_time(graph_inventory.get("observedAt"),"activation-bridge-resource-graph-observed")
@@ -473,7 +504,6 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
     parse_time(bridge_runtime.get("observedAt"),"activation-bridge-runtime-observed")
     key_boundary=evidence.get("keyVaultBoundary")
     key_boundary_fields={"vaultResourceId","vaultApiVersion","vaultProjection","vaultProjectionSha256","keyResourceId","keyApiVersion","keyProjection","keyProjectionSha256","keyDataPlaneGetUrl","keyDataPlaneProjection","keyDataPlaneProjectionSha256","minimumRemainingLifetimeSeconds","roleAssignmentsQuery","ownerRoleDefinitionId","allowedNonOwnerSensitiveAssignmentIds","sensitiveActionUniverse","sensitiveActionUniverseSha256","sensitiveAssignmentProjectionSha256","temporaryKeyProvisioningAssignmentIdsPresent","observedAt"}
-    vault_scope=key_scope.rsplit("/keys/",1)[0]
     vault_projection=key_boundary.get("vaultProjection") if isinstance(key_boundary,dict) else None
     vault_projection_fields={"id","name","type","location","properties"};vault_properties_fields={"enableRbacAuthorization","enablePurgeProtection","softDeleteRetentionInDays","publicNetworkAccess","networkAcls"};network_acl_fields={"bypass","defaultAction","ipRules","virtualNetworkRules"}
     vault_properties=vault_projection.get("properties") if isinstance(vault_projection,dict) else None
@@ -584,7 +614,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
     if (not isinstance(jwk,dict) or set(jwk)!={"kid","kty","n","e","key_ops"} or jwk.get("kid")!=key_id+"/"+version
             or jwk.get("kty")!="RSA" or jwk.get("e")!="AQAB" or not isinstance(jwk.get("n"),str)
             or not re.fullmatch(r"[A-Za-z0-9_-]{384,1024}",jwk["n"]) or jwk.get("key_ops")!=["sign","verify"]): fail("activation-jwk")
-    return Activation(runtime_workflow_sha,rg,activation["tenantId"],activation["mailboxPublisherClientId"],activation["mailboxPublisherPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityPrincipalId"],activation["registryWriterManagedIdentityClientId"],activation["registryWriterManagedIdentityPrincipalId"],activation["registryReaderManagedIdentityClientId"],activation["registryReaderManagedIdentityPrincipalId"],activation["signerManagedIdentityClientId"],activation["signerManagedIdentityPrincipalId"],key_id,version,jwk,observed_bridge_package_sha256,activation["productionActivationManagedIdentityClientId"],activation["productionActivationManagedIdentityPrincipalId"],activation["productionSystemIdentityPrincipalId"],dict(fence),dict(evidence))
+    return Activation(runtime_workflow_sha,rg,activation["tenantId"],activation["mailboxPublisherClientId"],activation["mailboxPublisherPrincipalId"],activation["bridgeManagedIdentityClientId"],activation["bridgeManagedIdentityPrincipalId"],activation["registryWriterManagedIdentityClientId"],activation["registryWriterManagedIdentityPrincipalId"],activation["registryReaderManagedIdentityClientId"],activation["registryReaderManagedIdentityPrincipalId"],activation["signerManagedIdentityClientId"],activation["signerManagedIdentityPrincipalId"],key_id,version,jwk,activation["bridgePackageSourceSha"],observed_bridge_package_sha256,activation["productionActivationManagedIdentityClientId"],activation["productionActivationManagedIdentityPrincipalId"],activation["productionSystemIdentityPrincipalId"],dict(fence),dict(evidence))
 
 def validate_bridge_runtime_receipt(receipt,activation):
     if not isinstance(activation,Activation):fail("bridge-runtime-receipt-activation")
@@ -631,16 +661,16 @@ def validate_live_signing_key(projection,activation,*,now):
     return dict(projection)
 
 def load_activation(path,*,runtime_workflow_sha,observed_bridge_package_sha256,provisioning_evidence_path=None):
-    try: doc=json.loads(Path(path).read_text(encoding="utf-8"))
+    try: raw=Path(path).read_text(encoding="utf-8");doc=json.loads(raw)
     except Exception: fail("activation-contract")
     if provisioning_evidence_path is None:fail("activation-provisioning-evidence-required")
     try:evidence=json.loads(Path(provisioning_evidence_path).read_text(encoding="utf-8"))
     except Exception:fail("activation-provisioning-evidence")
-    return load_activation_document(doc,runtime_workflow_sha=runtime_workflow_sha,observed_bridge_package_sha256=observed_bridge_package_sha256,provisioning_evidence=evidence)
+    return load_activation_document(doc,runtime_workflow_sha=runtime_workflow_sha,observed_bridge_package_sha256=observed_bridge_package_sha256,provisioning_evidence=evidence,raw_document=raw)
 
 DESCRIPTOR_FIELDS={"blob","sha256","size","etag","versionId"}
-REQUEST_FIELDS={"schemaVersion","requestType","operation","repositoryId","ownerId","controlWorkflowSha","sourceSha","sourceRunId","sourceRunAttempt","artifactId","artifactSha256","artifactMember","artifactMemberSha256","acceptanceRunId","acceptanceRunAttempt","logicalOperationId","nonce","issuedAt","expiresAt","acceptedBaseline","pendingRelease","consumedMarker","rollbackPreparation","activationPlan","activationProof"}
-OPERATIONS={"bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","abort-candidate","persist-accepted-release","prepare-rollback","complete-rollback"}
+REQUEST_FIELDS={"schemaVersion","requestType","operation","repositoryId","ownerId","controlWorkflowSha","sourceSha","sourceRunId","sourceRunAttempt","candidateRunId","candidateRunAttempt","artifactId","artifactSha256","artifactMember","artifactMemberSha256","acceptanceRunId","acceptanceRunAttempt","logicalOperationId","nonce","issuedAt","expiresAt","acceptedBaseline","pendingRelease","consumedMarker","rollbackPreparation","activationPlan","activationProof"}
+OPERATIONS={"registry-bridge-preflight","bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","abort-candidate","persist-accepted-release","prepare-rollback","complete-rollback"}
 TRANSIENT_CONTROL_FIELDS={"schemaVersion","state","repository","repositoryId","ownerId","callerSha","workflowId","workflowName","workflowPath","workflowRef","event","headBranch","runId","runAttempt","operation","sourceSha","requestName","originalSettingsSha256","githubTokenSha256","provisioningEvidenceSha256","bridgeRuntimeReceiptSha256","acquiredAt","expiresAt"}
 TRANSIENT_LIFETIME_SECONDS=7200
 
@@ -754,12 +784,18 @@ def activation_plan_from_fence(fence):
 
 def validate_request(value,*,now):
     if not isinstance(value,dict) or set(value)!=REQUEST_FIELDS: fail("request-fields")
-    if value["schemaVersion"]!=1 or value["requestType"]!="paperdesk-private-release-request": fail("request-schema")
+    if value["schemaVersion"]!=2 or value["requestType"]!="paperdesk-private-release-request": fail("request-schema")
     if value["operation"] not in OPERATIONS: fail("request-operation")
     for key in ("sourceSha","controlWorkflowSha"):
         if not isinstance(value[key],str) or not SHA40.fullmatch(value[key]): fail("request-"+key)
     for key in ("sourceRunId","sourceRunAttempt","acceptanceRunId","acceptanceRunAttempt","repositoryId","ownerId"):
         if not isinstance(value[key],str) or not POSITIVE.fullmatch(value[key]): fail("request-"+key)
+    if value["operation"]=="persist-accepted-release":
+        for key in ("candidateRunId","candidateRunAttempt"):
+            if not isinstance(value[key],str) or not POSITIVE.fullmatch(value[key]):fail("request-"+key)
+        if len({value["sourceRunId"],value["candidateRunId"],value["acceptanceRunId"]})!=3:fail("request-run-identity-reuse")
+    elif value["candidateRunId"] is not None or value["candidateRunAttempt"] is not None:
+        fail("request-unexpected-candidate-coordinate")
     if value["operation"] in {"prepare-rollback","complete-rollback"}:
         if not SHA256.fullmatch(str(value["logicalOperationId"])):fail("request-logical-operation")
     elif value["logicalOperationId"] is not None:fail("request-unexpected-logical-operation")
@@ -819,6 +855,7 @@ def validate_result(value,request):
         validate_descriptor(records["cleanupObligation"],"result-cleanup-obligation",prefix=f"v2/cleanup-obligations/{request['sourceSha']}/",suffix=".json")
     metadata=value["metadata"]
     required={
+        "registry-bridge-preflight":{"acceptedBaseline"},
         "bootstrap-prepare":{"claim","result","manifest","deploymentBundle","acceptedBaseline"},
         "bootstrap-consume":{"claim","result","manifest","acceptedBaseline","consumedMarker"},
         "prepare-candidate":{"claim","result","manifest","deploymentBundle","acceptedBaseline","pendingRelease"},
@@ -834,6 +871,16 @@ def validate_result(value,request):
     if request["operation"]=="consume-candidate" and isinstance(metadata,dict) and metadata.get("activationStatus")=="aborted":required={"claim","result","manifest","acceptedBaseline","pendingRelease","cleanupObligation"}
     if {key for key,item in records.items() if item is not None}!=required: fail("result-record-set")
     if not isinstance(metadata,dict) or metadata.get("schemaVersion")!=1 or metadata.get("operation")!=request["operation"]: fail("result-metadata")
+    if request["operation"]=="registry-bridge-preflight":
+        expected={"schemaVersion","operation","sourceSha","baselineMode","servedIndexSha256","oneDeployInvariant","currentProductionProof"}
+        if (set(metadata)!=expected or metadata.get("sourceSha")!=request["sourceSha"]
+                or metadata.get("baselineMode") not in {"bootstrap","strict"}
+                or not SHA256.fullmatch(str(metadata.get("servedIndexSha256")))
+                or metadata.get("oneDeployInvariant")!=BOOTSTRAP_BASELINE["oneDeployInvariant"]):fail("result-registry-preflight-metadata")
+        validate_current_production_proof(metadata.get("currentProductionProof"),request=request,baseline=metadata)
+    if request["operation"]=="persist-accepted-release":
+        coordinates=validate_release_coordinates(metadata.get("releaseCoordinates"),"result-release-coordinates")
+        if coordinates!={field:request[field] for field in RELEASE_COORDINATE_FIELDS}:fail("result-release-coordinate-binding")
     if request["operation"]=="prepare-candidate":
         terminal=metadata.get("terminalState")
         if terminal not in {"pending","consumed"}:fail("result-candidate-terminal")
@@ -1128,10 +1175,52 @@ def attach_cleanup_obligation(boundary,request,durable,control):
     records["cleanupObligation"]=_worm_descriptor(obligation)
     return durable
 
+DEPLOYMENT_COORDINATE_FIELDS={"candidateRunId","candidateRunAttempt"}
+RELEASE_COORDINATE_FIELDS={"sourceRunId","sourceRunAttempt",*DEPLOYMENT_COORDINATE_FIELDS,"acceptanceRunId","acceptanceRunAttempt"}
+def validate_deployment_coordinates(value,label="deployment-coordinates"):
+    if not isinstance(value,dict) or set(value)!=DEPLOYMENT_COORDINATE_FIELDS:fail(label)
+    if any(not isinstance(value[field],str) or not POSITIVE.fullmatch(value[field]) for field in DEPLOYMENT_COORDINATE_FIELDS):fail(label)
+    return dict(value)
+
+def validate_release_coordinates(value,label="accepted-release-coordinates"):
+    if not isinstance(value,dict) or set(value)!=RELEASE_COORDINATE_FIELDS:fail(label)
+    if any(not isinstance(value[field],str) or not POSITIVE.fullmatch(value[field]) for field in RELEASE_COORDINATE_FIELDS):fail(label)
+    if len({value["sourceRunId"],value["candidateRunId"],value["acceptanceRunId"]})!=3:fail(label+"-identity-reuse")
+    return dict(value)
+
+def _validate_strict_release_binding(boundary,*,source_sha,release_coordinates,pending,pending_doc,consumed,consumed_doc):
+    coordinates=validate_release_coordinates(release_coordinates)
+    expected_deployment={field:coordinates[field] for field in DEPLOYMENT_COORDINATE_FIELDS}
+    pending_fields={"schemaVersion","lifecycle","sourceSha","execution","deploymentCoordinates","artifact","acceptedBaseline","servedIndexSha256","oneDeployInvariant","deploymentBundle"}
+    execution_fields={"repositoryId","ownerId","sourceRunId","sourceRunAttempt","artifactId"}
+    execution=pending_doc.get("execution") if isinstance(pending_doc,dict) else None
+    if (not isinstance(pending_doc,dict) or set(pending_doc)!=pending_fields or pending_doc.get("schemaVersion")!=1
+            or pending_doc.get("lifecycle")!="pending" or pending_doc.get("sourceSha")!=source_sha
+            or not isinstance(execution,dict) or set(execution)!=execution_fields
+            or execution.get("sourceRunId")!=coordinates["sourceRunId"]
+            or execution.get("sourceRunAttempt")!=coordinates["sourceRunAttempt"]
+            or validate_deployment_coordinates(pending_doc.get("deploymentCoordinates"),"accepted-pending-deployment-coordinates")!=expected_deployment):fail("accepted-pending-coordinate-binding")
+    validate_descriptor(pending_doc.get("acceptedBaseline"),"accepted-pending-baseline",prefix="v2/accepted/",suffix="/manifest.json")
+    validate_descriptor(pending_doc.get("deploymentBundle"),"accepted-pending-bundle",prefix="v1/pending/",suffix="/deployment.zip")
+    consumed_fields={"schemaVersion","lifecycle","pendingRelease","acceptedBaseline","sourceSha","deploymentCoordinates","activationFence","activationProof"}
+    if (not isinstance(consumed_doc,dict) or set(consumed_doc)!=consumed_fields or consumed_doc.get("schemaVersion")!=1
+            or consumed_doc.get("lifecycle")!="candidate-consumed" or consumed_doc.get("sourceSha")!=source_sha
+            or validate_deployment_coordinates(consumed_doc.get("deploymentCoordinates"),"accepted-consumed-deployment-coordinates")!=expected_deployment
+            or consumed_doc.get("deploymentCoordinates")!=pending_doc["deploymentCoordinates"]
+            or consumed_doc.get("pendingRelease")!=_worm_descriptor(pending)
+            or consumed_doc.get("acceptedBaseline")!=pending_doc["acceptedBaseline"]
+            or _worm_descriptor(consumed).get("blob")!=str(PurePosixPath(pending.blob).parent/"consumed.json")):fail("accepted-consumed-coordinate-binding")
+    fence=validate_activation_fence(consumed_doc.get("activationFence"),"accepted-consumed-fence")
+    if fence.get("sourceSha")!=source_sha or fence.get("release")!=_worm_descriptor(pending):fail("accepted-consumed-coordinate-binding")
+    return coordinates
+
 def _load_accepted(boundary,descriptor,package_boundary=None):
     manifest,doc=_read_json(boundary,descriptor,"accepted-manifest")
-    expected={"schemaVersion","lifecycle","baselineMode","sourceSha","artifact","servedIndexSha256","oneDeployInvariant","healthPolicy","deploymentBundle","consumedMarker"}
-    if not isinstance(doc,dict) or set(doc)!=expected or doc.get("schemaVersion")!=1 or doc.get("lifecycle")!="accepted" or doc.get("baselineMode") not in {"bootstrap","strict"}: fail("accepted-manifest-shape")
+    base_fields={"schemaVersion","lifecycle","baselineMode","sourceSha","artifact","servedIndexSha256","oneDeployInvariant","healthPolicy","deploymentBundle","consumedMarker"}
+    mode=doc.get("baselineMode") if isinstance(doc,dict) else None
+    expected=base_fields if mode=="bootstrap" else base_fields|{"releaseCoordinates"}
+    expected_schema=1 if mode=="bootstrap" else 2
+    if not isinstance(doc,dict) or set(doc)!=expected or doc.get("schemaVersion")!=expected_schema or doc.get("lifecycle")!="accepted" or mode not in {"bootstrap","strict"}: fail("accepted-manifest-shape")
     if (not SHA40.fullmatch(str(doc["sourceSha"])) or not SHA256.fullmatch(str(doc["servedIndexSha256"]))
             or doc.get("oneDeployInvariant")!=BOOTSTRAP_BASELINE["oneDeployInvariant"]): fail("accepted-manifest-identity")
     bundle=validate_descriptor(doc["deploymentBundle"],"accepted-bundle",prefix="v1/accepted/",suffix="/deployment.zip")
@@ -1145,8 +1234,71 @@ def _load_accepted(boundary,descriptor,package_boundary=None):
                 or doc["oneDeployInvariant"]!=BOOTSTRAP_BASELINE["oneDeployInvariant"]
                 or policy!={"readyStatus":BOOTSTRAP_BASELINE["readinessHttpStatus"],"readyCode":BOOTSTRAP_BASELINE["readinessCode"],"runtimeMarkerRequired":False}
                 or consumed_doc.get("lifecycle")!="bootstrap-consumed" or consumed_doc.get("sourceSha")!=doc["sourceSha"]): fail("accepted-bootstrap-binding")
-    elif policy!={"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True} or consumed_doc.get("lifecycle")!="candidate-consumed" or consumed_doc.get("sourceSha")!=doc["sourceSha"]: fail("accepted-strict-binding")
+    else:
+        artifact=doc.get("artifact")
+        artifact_fields={"id","outerSha256","member","memberSha256","pendingRelease","acceptedTransfer"}
+        if (policy!={"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True}
+                or not isinstance(artifact,dict) or set(artifact)!=artifact_fields
+                or not POSITIVE.fullmatch(str(artifact.get("id"))) or not SHA256.fullmatch(str(artifact.get("outerSha256")))
+                or not isinstance(artifact.get("member"),str) or PurePosixPath(artifact["member"]).name!=artifact["member"]
+                or not SHA256.fullmatch(str(artifact.get("memberSha256")))):fail("accepted-strict-binding")
+        pending_desc=validate_descriptor(artifact.get("pendingRelease"),"accepted-pending",prefix=f"v2/pending/{doc['sourceSha']}/",suffix="/manifest.json")
+        validate_descriptor(artifact.get("acceptedTransfer"),"accepted-transfer",prefix=f"v2/accepted/{doc['sourceSha']}/",suffix="/accepted-release-transfer.tar.gz")
+        pending,pending_doc=_read_json(boundary,pending_desc,"accepted-pending")
+        _validate_strict_release_binding(boundary,source_sha=doc["sourceSha"],release_coordinates=doc["releaseCoordinates"],pending=pending,pending_doc=pending_doc,consumed=consumed_record,consumed_doc=consumed_doc)
     return manifest,doc,observed,consumed_record
+
+def resolve_current_accepted(boundary,source_sha,package_boundary):
+    """Resolve one current accepted manifest without a mutable pointer or list.
+
+    Normal V2 persistence commits one canonical strict manifest at the exact
+    source-keyed path.  The immutable bootstrap-consumed path is the sole
+    initial fallback.  Both paths are probed on every call so an overlapping or
+    conflicting namespace is ambiguity, never an ordering decision.
+    """
+    if not SHA40.fullmatch(str(source_sha)):fail("accepted-current-source")
+    strict_blob=f"v2/accepted/{source_sha}/manifest.json"
+    bootstrap_blob=f"v2/accepted/{source_sha}/bootstrap-consumed/manifest.json"
+    strict=_read_current(boundary,strict_blob)
+    bootstrap=_read_current(boundary,bootstrap_blob)
+    if strict is not None and bootstrap is not None:fail("accepted-current-ambiguous")
+    if strict is None and bootstrap is None:fail("accepted-current-absent")
+    if bootstrap is not None and source_sha!=BOOTSTRAP_BASELINE["sourceSha"]:fail("accepted-current-binding")
+    record=strict if strict is not None else bootstrap
+    descriptor=_worm_descriptor(record)
+    manifest,doc,bundle,consumed=_load_accepted(boundary,descriptor,package_boundary)
+    expected_mode="strict" if strict is not None else "bootstrap"
+    if (manifest!=record or doc.get("sourceSha")!=source_sha or doc.get("baselineMode")!=expected_mode
+            or expected_mode=="bootstrap" and source_sha!=BOOTSTRAP_BASELINE["sourceSha"]):fail("accepted-current-binding")
+    return manifest,doc,bundle,consumed
+
+def validate_current_production_proof(proof,*,request,baseline):
+    """Bind one read-only production observation to the resolved manifest."""
+    if (not isinstance(request,dict) or request.get("operation")!="registry-bridge-preflight"
+            or not isinstance(baseline,dict) or baseline.get("sourceSha")!=request.get("sourceSha")
+            or baseline.get("baselineMode") not in {"bootstrap","strict"}
+            or baseline.get("oneDeployInvariant")!=BOOTSTRAP_BASELINE["oneDeployInvariant"]):fail("registry-preflight-proof-input")
+    replay=dict(request)
+    replay["operation"]="bootstrap-consume" if baseline["baselineMode"]=="bootstrap" else "consume-candidate"
+    validate_activation_proof(proof,replay)
+    expected_one={**baseline["oneDeployInvariant"],"historicalActiveDeployment":{"id":baseline["oneDeployInvariant"]["historicalActiveDeploymentId"],"status":4,"complete":True,"deployer":"OneDeploy"}}
+    if (proof.get("sourceSha")!=request["sourceSha"] or proof.get("index",{}).get("sha256")!=baseline.get("servedIndexSha256")
+            or proof.get("oneDeployInvariant")!=expected_one):fail("registry-preflight-live-binding")
+    return dict(proof)
+
+def registry_bridge_preflight(boundary,request,*,now,package_boundary,production_observe):
+    """Read and live-prove the source-keyed accepted baseline without writes."""
+    request,_,_=validate_request(request,now=now)
+    if request["operation"]!="registry-bridge-preflight":fail("registry-preflight-operation")
+    if not callable(production_observe):fail("registry-preflight-observer")
+    accepted,baseline,_,_=resolve_current_accepted(boundary,request["sourceSha"],package_boundary)
+    profile={"sourceSha":baseline["sourceSha"],"baselineMode":baseline["baselineMode"],"servedIndexSha256":baseline["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"deploymentBundle":baseline["deploymentBundle"]}
+    settlement=production_observe(profile)
+    if (not isinstance(settlement,dict) or settlement.get("healthy") is not True
+            or settlement.get("sourceSha")!=request["sourceSha"]):fail("registry-preflight-live")
+    proof=validate_current_production_proof(settlement.get("proof"),request=request,baseline=baseline)
+    records=_empty_records();records["acceptedBaseline"]=_worm_descriptor(accepted)
+    return _durable(records,{"operation":"registry-bridge-preflight","sourceSha":request["sourceSha"],"baselineMode":baseline["baselineMode"],"servedIndexSha256":baseline["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"currentProductionProof":proof})
 
 def prepare_bootstrap(boundary,request,tar_gz,*,now,package_boundary):
     request,raw,request_sha=validate_request(request,now=now)
@@ -1204,17 +1356,19 @@ def prepare_candidate(boundary,request,tar_gz,*,now,package_boundary):
     claim=_create_or_read_exact(boundary,candidate_prefix+f"/requests/{request_sha}/claim.json",raw)
     deploy_record=_create_or_read_exact(package_boundary,f"v1/pending/{request['sourceSha']}/{request['sourceRunId']}-{request['sourceRunAttempt']}-{request['artifactId']}/deployment.zip",deploy)
     result=_create_or_read_exact(boundary,candidate_prefix+f"/requests/{request_sha}/result.json",canonical({"schemaVersion":1,"operation":"prepare-candidate","requestSha256":request_sha,"sourceSha":request["sourceSha"],"deploymentZipSha256":digest(deploy)}))
-    manifest_body=canonical({"schemaVersion":1,"lifecycle":"pending","sourceSha":request["sourceSha"],"execution":{"repositoryId":request["repositoryId"],"ownerId":request["ownerId"],"sourceRunId":request["sourceRunId"],"sourceRunAttempt":request["sourceRunAttempt"],"artifactId":request["artifactId"]},"artifact":{"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"]},"acceptedBaseline":_worm_descriptor(accepted),"servedIndexSha256":base["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"deploymentBundle":_worm_descriptor(deploy_record)})
+    deployment_coordinates={"candidateRunId":request["acceptanceRunId"],"candidateRunAttempt":request["acceptanceRunAttempt"]}
+    manifest_body=canonical({"schemaVersion":1,"lifecycle":"pending","sourceSha":request["sourceSha"],"execution":{"repositoryId":request["repositoryId"],"ownerId":request["ownerId"],"sourceRunId":request["sourceRunId"],"sourceRunAttempt":request["sourceRunAttempt"],"artifactId":request["artifactId"]},"deploymentCoordinates":deployment_coordinates,"artifact":{"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"]},"acceptedBaseline":_worm_descriptor(accepted),"servedIndexSha256":base["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"deploymentBundle":_worm_descriptor(deploy_record)})
     manifest=_create_or_read_exact(boundary,candidate_prefix+"/manifest.json",manifest_body)
     records=_empty_records();records.update({"claim":_worm_descriptor(claim),"result":_worm_descriptor(result),"manifest":_worm_descriptor(manifest),"deploymentBundle":_worm_descriptor(deploy_record),"acceptedBaseline":_worm_descriptor(accepted),"pendingRelease":_worm_descriptor(manifest)})
     metadata={"operation":"prepare-candidate","sourceSha":request["sourceSha"],"baselineMode":baseline["baselineMode"],"servedIndexSha256":base["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"baselineSourceSha":baseline["sourceSha"],"baselineServedIndexSha256":baseline["servedIndexSha256"],"baselineDeploymentBundle":baseline["deploymentBundle"],"terminalState":"pending","terminalActivationFence":None,"terminalActivationProof":None}
     consumed_current=_read_current(boundary,candidate_prefix+"/consumed.json")
     if consumed_current is not None:
         consumed,consumed_doc=_read_json(boundary,_worm_descriptor(consumed_current),"candidate-consumed-recovery")
-        expected={"schemaVersion","lifecycle","pendingRelease","acceptedBaseline","sourceSha","activationFence","activationProof"}
+        expected={"schemaVersion","lifecycle","pendingRelease","acceptedBaseline","sourceSha","deploymentCoordinates","activationFence","activationProof"}
         if (not isinstance(consumed_doc,dict) or set(consumed_doc)!=expected or consumed_doc.get("schemaVersion")!=1 or consumed_doc.get("lifecycle")!="candidate-consumed"
                 or consumed_doc.get("pendingRelease")!=_worm_descriptor(manifest) or consumed_doc.get("acceptedBaseline")!=_worm_descriptor(accepted)
-                or consumed_doc.get("sourceSha")!=request["sourceSha"]):fail("candidate-consumed-recovery-binding")
+                or consumed_doc.get("sourceSha")!=request["sourceSha"]
+                or validate_deployment_coordinates(consumed_doc.get("deploymentCoordinates"),"candidate-consumed-recovery-deployment")!=deployment_coordinates):fail("candidate-consumed-recovery-binding")
         validate_activation_fence(consumed_doc["activationFence"],"candidate-consumed-recovery-fence")
         replay=dict(request);replay.update({"operation":"consume-candidate","artifactId":"","artifactSha256":"","artifactMember":"","artifactMemberSha256":"","pendingRelease":_worm_descriptor(manifest),"activationPlan":activation_plan_from_fence(consumed_doc["activationFence"]),"activationProof":consumed_doc["activationProof"]})
         validate_activation_proof(consumed_doc["activationProof"],replay)
@@ -1229,13 +1383,17 @@ def consume_candidate(boundary,request,*,now,activation_proof,activation_fence):
     if activation_plan_from_fence(activation_fence)!=request["activationPlan"]:fail("candidate-consume-fence-plan")
     accepted,baseline=_read_json(boundary,request["acceptedBaseline"],"candidate-baseline")
     pending,pending_doc=_read_json(boundary,request["pendingRelease"],"candidate-pending")
-    if pending_doc.get("lifecycle")!="pending" or pending_doc.get("sourceSha")!=request["sourceSha"] or pending_doc.get("acceptedBaseline")!=_worm_descriptor(accepted): fail("candidate-pending-binding")
+    deployment_coordinates=validate_deployment_coordinates(pending_doc.get("deploymentCoordinates"),"candidate-pending-deployment")
+    expected_deployment={"candidateRunId":request["acceptanceRunId"],"candidateRunAttempt":request["acceptanceRunAttempt"]}
+    if (pending_doc.get("lifecycle")!="pending" or pending_doc.get("sourceSha")!=request["sourceSha"]
+            or pending_doc.get("acceptedBaseline")!=_worm_descriptor(accepted)
+            or deployment_coordinates!=expected_deployment): fail("candidate-pending-binding")
     proof=activation_proof;proof_request=dict(request);proof_request["activationProof"]=proof
     validate_activation_proof(proof,proof_request)
     if proof["index"]["sha256"]!=pending_doc.get("servedIndexSha256") or proof["oneDeployInvariant"]!={**pending_doc.get("oneDeployInvariant",{}),"historicalActiveDeployment":{"id":BOOTSTRAP_BASELINE["oneDeployInvariant"]["historicalActiveDeploymentId"],"status":4,"complete":True,"deployer":"OneDeploy"}}: fail("candidate-proof-binding")
     marker_blob=str(PurePosixPath(pending.blob).parent/"consumed.json")
     if _read_current(boundary,str(PurePosixPath(pending.blob).parent/"aborted.json")) is not None:fail("candidate-terminal-conflict")
-    marker_body=canonical({"schemaVersion":1,"lifecycle":"candidate-consumed","pendingRelease":_worm_descriptor(pending),"acceptedBaseline":_worm_descriptor(accepted),"sourceSha":request["sourceSha"],"activationFence":activation_fence,"activationProof":proof})
+    marker_body=canonical({"schemaVersion":1,"lifecycle":"candidate-consumed","pendingRelease":_worm_descriptor(pending),"acceptedBaseline":_worm_descriptor(accepted),"sourceSha":request["sourceSha"],"deploymentCoordinates":deployment_coordinates,"activationFence":activation_fence,"activationProof":proof})
     marker=_create_or_read_exact(boundary,marker_blob,marker_body)
     prefix=str(PurePosixPath(pending.blob).parent/f"consume/{request_sha}");claim=_create_or_read_exact(boundary,prefix+"/claim.json",raw)
     result=_create_or_read_exact(boundary,prefix+"/result.json",canonical({"schemaVersion":1,"operation":"consume-candidate","requestSha256":request_sha,"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(marker)}))
@@ -1268,21 +1426,37 @@ def persist_accepted_release(boundary,request,transfer_tar,*,now,package_boundar
     if request["operation"]!="persist-accepted-release": fail("accepted-operation")
     pending,pending_doc=_read_json(boundary,request["pendingRelease"],"accepted-pending")
     consumed,consumed_doc=_read_json(boundary,request["consumedMarker"],"accepted-consumed")
-    if consumed_doc.get("lifecycle")!="candidate-consumed" or consumed_doc.get("pendingRelease")!=_worm_descriptor(pending) or pending_doc.get("sourceSha")!=request["sourceSha"]: fail("accepted-lifecycle-binding")
+    release_coordinates={field:request[field] for field in RELEASE_COORDINATE_FIELDS}
+    _validate_strict_release_binding(boundary,source_sha=request["sourceSha"],release_coordinates=release_coordinates,pending=pending,pending_doc=pending_doc,consumed=consumed,consumed_doc=consumed_doc)
+    canonical_blob=f"v2/accepted/{request['sourceSha']}/manifest.json"
+    existing=_read_current(boundary,canonical_blob)
+    if existing is not None:
+        _,existing_doc,_,_=_load_accepted(boundary,_worm_descriptor(existing),package_boundary)
+        artifact=existing_doc["artifact"]
+        if (existing_doc.get("releaseCoordinates")!=release_coordinates
+                or artifact.get("pendingRelease")!=_worm_descriptor(pending)
+                or existing_doc.get("consumedMarker")!=_worm_descriptor(consumed)):fail("accepted-recovery-coordinate-binding")
     bundle_desc=validate_descriptor(pending_doc.get("deploymentBundle"),"accepted-pending-bundle")
     bundle=_read_exact(package_boundary,bundle_desc,"accepted-pending-bundle")
-    prefix=f"v2/accepted/{request['sourceSha']}/{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}"
+    prefix=(f"v2/accepted/{request['sourceSha']}/"
+            f"{request['candidateRunId']}-{request['candidateRunAttempt']}/"
+            f"{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}")
     # Promote the exact pending package into the accepted immutable namespace
     # before committing the manifest. Future candidate and rollback loaders
     # accept only v1/accepted/* package coordinates.
-    accepted_bundle=_create_or_read_exact(package_boundary,f"v1/accepted/{request['sourceSha']}/{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}/deployment.zip",bundle.body)
+    accepted_bundle=_create_or_read_exact(package_boundary,
+        f"v1/accepted/{request['sourceSha']}/{request['candidateRunId']}-{request['candidateRunAttempt']}/{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}/deployment.zip",bundle.body)
     claim=_create_or_read_exact(boundary,prefix+f"/requests/{request_sha}/claim.json",raw)
     transfer=_create_or_read_exact(boundary,prefix+"/accepted-release-transfer.tar.gz",transfer_tar)
-    result=_create_or_read_exact(boundary,prefix+f"/requests/{request_sha}/result.json",canonical({"schemaVersion":1,"operation":"persist-accepted-release","requestSha256":request_sha,"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(consumed),"transferSha256":digest(transfer_tar)}))
-    manifest_body=canonical({"schemaVersion":1,"lifecycle":"accepted","baselineMode":"strict","sourceSha":request["sourceSha"],"artifact":{"id":request["artifactId"],"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"],"pendingRelease":_worm_descriptor(pending),"acceptedTransfer":_worm_descriptor(transfer)},"servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"],"healthPolicy":{"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True},"deploymentBundle":_worm_descriptor(accepted_bundle),"consumedMarker":_worm_descriptor(consumed)})
-    manifest=_create_or_read_exact(boundary,prefix+"/manifest.json",manifest_body)
+    result=_create_or_read_exact(boundary,prefix+f"/requests/{request_sha}/result.json",canonical({"schemaVersion":2,"operation":"persist-accepted-release","requestSha256":request_sha,"releaseCoordinates":release_coordinates,"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(consumed),"transferSha256":digest(transfer_tar)}))
+    manifest_body=canonical({"schemaVersion":2,"lifecycle":"accepted","baselineMode":"strict","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"artifact":{"id":request["artifactId"],"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"],"pendingRelease":_worm_descriptor(pending),"acceptedTransfer":_worm_descriptor(transfer)},"servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"],"healthPolicy":{"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True},"deploymentBundle":_worm_descriptor(accepted_bundle),"consumedMarker":_worm_descriptor(consumed)})
+    # The source-keyed canonical manifest is the final commit and the only
+    # strict accepted-baseline coordinate exposed to later read-only preflight
+    # calls.  A second acceptance attempt for the same source must be byte
+    # identical or the create/read reconciliation fails closed.
+    manifest=_create_or_read_exact(boundary,canonical_blob,manifest_body)
     records=_empty_records();records.update({"claim":_worm_descriptor(claim),"result":_worm_descriptor(result),"manifest":_worm_descriptor(manifest),"deploymentBundle":_worm_descriptor(accepted_bundle),"acceptedBaseline":_worm_descriptor(manifest),"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(consumed)})
-    return _durable(records,{"operation":"persist-accepted-release","sourceSha":request["sourceSha"],"baselineMode":"strict","servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"]})
+    return _durable(records,{"operation":"persist-accepted-release","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"baselineMode":"strict","servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"]})
 
 def prepare_rollback(boundary,request,*,now,package_boundary):
     request,raw,request_sha=validate_request(request,now=now)

@@ -1,0 +1,443 @@
+{
+  "schemaVersion": 1,
+  "planId": "paperdesk-private-release-v2-bootstrap-v1",
+  "status": "source-dormant",
+  "repository": "Sethvirak/paperdesk-release-verifier",
+  "sourceRequirements": {
+    "branch": "main",
+    "remote": "origin/main",
+    "cleanWorktree": true,
+    "mergedMainExact": true,
+    "signatureRequired": true,
+    "signingPrincipal": "paperdesk-release-signing-2026-08-30",
+    "signingKeyFingerprint": "SHA256:nOONZLlhHx9b03fmAPkCqfhYzp0CFZuHfLPc1T0rfA4",
+    "allowedSignersPath": "contracts/paperdesk_release_signing_allowed_signers"
+  },
+  "azure": {
+    "cloud": "AzureCloud",
+    "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+    "location": "southeastasia",
+    "managementEndpoint": "https://management.azure.com",
+    "graphEndpoint": "https://graph.microsoft.com",
+    "credentialBoundary": "azure-cli-current-account-after-one-shot-authorization-only"
+  },
+  "resourceInventory": [
+    {
+      "id": "azureSingleUseClaim",
+      "type": "Microsoft.Resources/deployments",
+      "resourceIdTemplate": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Resources/deployments/paperdesk-v2-bootstrap-${authorization.authorizationId}",
+      "nameTemplate": "paperdesk-v2-bootstrap-${authorization.authorizationId}",
+      "policy": "preflight-absent-deterministic-name-create-http-201-only-never-delete"
+    },
+    {
+      "id": "mailboxResourceGroup",
+      "type": "Microsoft.Resources/resourceGroups",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-release-mailbox-sea",
+      "name": "rg-paperdesk-release-mailbox-sea",
+      "policy": "create-or-adopt-exact"
+    },
+    {
+      "id": "bridgeAppServicePlan",
+      "type": "Microsoft.Web/serverfarms",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/serverfarms/asp-master-data-structure-b1-sea",
+      "name": "asp-master-data-structure-b1-sea",
+      "policy": "adopt-existing-exact-no-compute-expansion"
+    },
+    {
+      "id": "integrationVnet",
+      "type": "Microsoft.Network/virtualNetworks",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea",
+      "name": "vnet-master-data-structure-sea",
+      "addressSpacePrefixes": ["10.41.0.0/16"],
+      "policy": "adopt-existing-exact"
+    },
+    {
+      "id": "integrationSubnet",
+      "type": "Microsoft.Network/virtualNetworks/subnets",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea/subnets/snet-appservice-integration",
+      "name": "snet-appservice-integration",
+      "addressPrefix": "10.41.1.0/26",
+      "delegation": "Microsoft.Web/serverFarms",
+      "serviceEndpoint": "Microsoft.Storage",
+      "policy": "adopt-existing-exact"
+    },
+    {
+      "id": "productionSite",
+      "type": "Microsoft.Web/sites",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d",
+      "name": "master-data-structure-sea-9c4e0d0d",
+      "policy": "adopt-existing-exact"
+    },
+    {
+      "id": "bridgeSite",
+      "type": "Microsoft.Web/sites",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-v2-9c4e0d0d",
+      "name": "paperdesk-release-registry-bridge-v2-9c4e0d0d",
+      "policy": "create-or-adopt-exact"
+    },
+    {
+      "id": "storageAccount",
+      "type": "Microsoft.Storage/storageAccounts",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e",
+      "name": "mdspdbak2608089c4e",
+      "policy": "adopt-existing-exact-no-network-downgrade"
+    },
+    {
+      "id": "acceptedContainer",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-accepted-releases",
+      "name": "paperdesk-accepted-releases",
+      "policy": "adopt-existing-private"
+    },
+    {
+      "id": "resultContainer",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results",
+      "name": "paperdesk-registry-webjob-results",
+      "policy": "adopt-existing-private"
+    },
+    {
+      "id": "packageContainer",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-deployment-packages",
+      "name": "paperdesk-deployment-packages",
+      "policy": "create-or-adopt-private"
+    },
+    {
+      "id": "controllerLockContainer",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-release-controller-lock",
+      "name": "paperdesk-release-controller-lock",
+      "policy": "create-or-adopt-private-empty"
+    },
+    {
+      "id": "activationFenceContainer",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-release-activation-control",
+      "name": "paperdesk-release-activation-control",
+      "policy": "create-or-adopt-private"
+    },
+    {
+      "id": "activationFenceBlob",
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers/blobs",
+      "resourceId": "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-release-activation-control/v2/production-activation-fence.json",
+      "name": "v2/production-activation-fence.json",
+      "policy": "create-only-initial-idle"
+    },
+    {
+      "id": "signingVault",
+      "type": "Microsoft.KeyVault/vaults",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d",
+      "name": "kv-mds-sea-9c4e0d0d",
+      "policy": "adopt-existing-equal-or-stricter-no-network-downgrade"
+    },
+    {
+      "id": "signingKey",
+      "type": "Microsoft.KeyVault/vaults/keys",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing",
+      "name": "paperdesk-release-result-signing",
+      "policy": "create-new-rsa-3072-nonexportable-version-or-adopt-exact"
+    },
+    {
+      "id": "publisherApplication",
+      "type": "Microsoft.Graph/applications",
+      "resourceId": "graph://applications/by-displayName/paperdesk-release-publisher-v2-9c4e0d0d",
+      "name": "paperdesk-release-publisher-v2-9c4e0d0d",
+      "policy": "create-or-adopt-unique-exact-no-credentials"
+    },
+    {
+      "id": "publisherServicePrincipal",
+      "type": "Microsoft.Graph/servicePrincipals",
+      "resourceId": "graph://servicePrincipals/by-appId/${publisherApplication.appId}",
+      "name": "paperdesk-release-publisher-v2-9c4e0d0d",
+      "policy": "create-or-adopt-unique-exact-no-credentials"
+    },
+    {
+      "id": "publisherFederatedCredential",
+      "type": "Microsoft.Graph/applications/federatedIdentityCredentials",
+      "resourceId": "graph://applications/${publisherApplication.id}/federatedIdentityCredentials/paperdesk-production-control-v2",
+      "name": "paperdesk-production-control-v2",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "audiences": ["api://AzureADTokenExchange"],
+      "subject": null,
+      "claimsMatchingExpressionLanguageVersion": 1,
+      "claimsMatchingExpressionTemplate": "claims['sub'] eq 'repo:Sethvirak/MasterDataStructure:environment:paperdesk-production-control' and claims['repository_id'] eq '1287744543' and claims['repository_owner_id'] eq '202535166' and claims['job_workflow_ref'] eq 'Sethvirak/paperdesk-release-verifier/.github/workflows/azure-production-control.yml@${authorization.source.mergedMain.commitSha}'",
+      "policy": "sole-create-or-adopt-exact-signed-bootstrap-source-sha"
+    },
+    {
+      "id": "publisherGraphPermission",
+      "type": "Microsoft.Graph/servicePrincipals/appRoleAssignments",
+      "resourceId": "graph://servicePrincipals/${publisherServicePrincipal.id}/appRoleAssignments/Application.Read.All",
+      "name": "Application.Read.All",
+      "policy": "create-or-adopt-exact-material-tenant-read-permission"
+    },
+    {
+      "id": "legacyPublisherBoundary",
+      "type": "Microsoft.Graph/applications+servicePrincipals+federatedIdentityCredentials",
+      "resourceId": "graph://applications/f80b1856-f955-4c97-b63f-682c244da14d/servicePrincipal/915f5478-68d3-4382-bc37-faadabdc78d6",
+      "name": "mds-external-production-control-oidc",
+      "policy": "adopt-exact-preflight-then-remove-sole-stale-fic-and-three-pinned-assignments-only"
+    },
+    {
+      "id": "bridgeIdentity",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-paperdesk-release-bridge-v2",
+      "name": "id-paperdesk-release-bridge-v2",
+      "policy": "create-or-adopt-exact"
+    },
+    {
+      "id": "registryWriterIdentity",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-writer",
+      "name": "uami-paperdesk-accepted-release-writer",
+      "clientId": "1a0d95c5-bbd5-4b57-bd6c-6d5645a50e16",
+      "principalId": "2fda0f07-5dc6-4a46-b63a-9cf2616d9011",
+      "policy": "adopt-existing-exact-detach-legacy-attach-v2-only"
+    },
+    {
+      "id": "registryReaderIdentity",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-paperdesk-accepted-release-reader",
+      "name": "uami-paperdesk-accepted-release-reader",
+      "clientId": "a52c21e2-b465-4f01-88b8-44bb5fb8b306",
+      "principalId": "c78102ff-17cd-459e-8da4-c7a900db0f86",
+      "policy": "adopt-existing-exact-detach-legacy-attach-v2-only"
+    },
+    {
+      "id": "signerIdentity",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-paperdesk-release-signer-v2",
+      "name": "id-paperdesk-release-signer-v2",
+      "policy": "create-or-adopt-exact"
+    },
+    {
+      "id": "productionActivationIdentity",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-paperdesk-release-production-activation-v2",
+      "name": "id-paperdesk-release-production-activation-v2",
+      "policy": "create-or-adopt-exact"
+    },
+    {
+      "id": "productionSystemIdentity",
+      "type": "Microsoft.ManagedIdentity/systemAssignedIdentities",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/identity",
+      "name": "master-data-structure-sea-9c4e0d0d",
+      "clientId": "a9935122-5592-467f-ba75-68844f46de1a",
+      "principalId": "b856ea96-e96a-420a-9137-79e1e7a85ef4",
+      "policy": "adopt-existing-exact-client-a9935122-principal-b856ea96"
+    },
+    {
+      "id": "legacyBridgeSite",
+      "type": "Microsoft.Web/sites",
+      "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d",
+      "name": "paperdesk-release-registry-bridge-9c4e0d0d",
+      "policy": "adopt-existing-stopped-private-no-uami-no-transient-settings"
+    }
+  ],
+  "roleMatrix": [
+    {"name": "publisherMailbox", "definitionId": "dd7a2a79-fcd5-5757-b23d-81fde78f72a2", "assignmentId": "b61be89a-faa9-54e3-ad5c-3be1a9efec46", "principal": "publisherServicePrincipal", "scope": "mailboxResourceGroup", "actions": ["Microsoft.Resources/deployments/read", "Microsoft.Resources/deployments/write", "Microsoft.Resources/deployments/delete"], "dataActions": []},
+    {"name": "publisherBridgeController", "definitionId": "5c603553-0179-5584-a24d-26fbb69f75ca", "assignmentId": "22f71389-466c-5141-b758-6c2fded6315d", "principal": "publisherServicePrincipal", "scope": "bridgeSite", "actions": ["Microsoft.Web/sites/Read", "Microsoft.Web/sites/start/Action", "Microsoft.Web/sites/stop/Action", "Microsoft.Web/sites/config/list/Action", "Microsoft.Web/sites/config/Read", "Microsoft.Web/sites/config/Write", "Microsoft.Web/sites/basicPublishingCredentialsPolicies/Read", "Microsoft.Web/sites/sourcecontrols/read", "Microsoft.Web/sites/triggeredwebjobs/read", "Microsoft.Web/sites/triggeredwebjobs/history/read", "Microsoft.Web/sites/triggeredwebjobs/run/action"], "dataActions": []},
+    {"name": "publisherControllerLock", "definitionId": "248f6a32-9557-5c79-8d97-5c899314dfa1", "assignmentId": "1131783c-cb47-53d3-a49a-0eb21f08ffd0", "principal": "publisherServicePrincipal", "scope": "controllerLockContainer", "actions": ["Microsoft.Storage/storageAccounts/blobServices/containers/read", "Microsoft.Storage/storageAccounts/blobServices/containers/lease/action"], "dataActions": []},
+    {"name": "publisherAcceptedCustodyAudit", "definitionId": "6a8e2ce0-e7c8-585d-b809-e113fd4785c4", "assignmentId": "4ea9c972-a205-5b8d-bbbd-1e348612901b", "principal": "publisherServicePrincipal", "scope": "acceptedContainer", "actions": ["Microsoft.Storage/storageAccounts/blobServices/containers/read", "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read"], "dataActions": []},
+    {"name": "publisherPackageCustodyAudit", "definitionId": "6a8e2ce0-e7c8-585d-b809-e113fd4785c4", "assignmentId": "398321bb-8430-5b4f-ba24-34888278cd71", "principal": "publisherServicePrincipal", "scope": "packageContainer", "actions": ["Microsoft.Storage/storageAccounts/blobServices/containers/read", "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read"], "dataActions": []},
+    {"name": "publisherResultCustodyAudit", "definitionId": "6a8e2ce0-e7c8-585d-b809-e113fd4785c4", "assignmentId": "ba735ec1-5c18-5e6c-b3df-1ff6b93c0075", "principal": "publisherServicePrincipal", "scope": "resultContainer", "actions": ["Microsoft.Storage/storageAccounts/blobServices/containers/read", "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read"], "dataActions": []},
+    {"name": "publisherAudit", "definitionId": "dad9d057-feeb-5268-a320-a01f9b65e77e", "assignmentId": "a797b861-5581-5170-b848-a4c8a8cf8938", "principal": "publisherServicePrincipal", "scope": "subscription", "actions": ["Microsoft.Authorization/roleAssignments/read", "Microsoft.Authorization/roleDefinitions/read"], "dataActions": []},
+    {"name": "publisherWebIdentityAudit", "definitionId": "0f2cd255-4c51-5408-a915-c766c27f3b24", "assignmentId": "3ecefabd-6676-50cc-b570-744f4a204e42", "principal": "publisherServicePrincipal", "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea", "actions": ["Microsoft.Web/sites/read"], "dataActions": []},
+    {"name": "publisherKeyPostureAudit", "definitionId": "15dac8d7-6bc4-573e-97e7-b7480297e8f8", "assignmentId": "998b4a29-6ebe-5ed8-8cfc-1a1f7b462410", "principal": "publisherServicePrincipal", "scope": "signingVault", "actions": ["Microsoft.KeyVault/vaults/read", "Microsoft.KeyVault/vaults/keys/read"], "dataActions": []},
+    {"name": "publisherUamiMetadataAudit", "definitionId": "3a12191a-26ef-564d-a096-fca7c00e89e8", "assignmentId": "bb2dcbac-a0af-56fc-b84b-58582b376369", "principal": "publisherServicePrincipal", "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea", "actions": ["Microsoft.ManagedIdentity/userAssignedIdentities/read"], "dataActions": []},
+    {"name": "publisherNetworkMetadataAudit", "definitionId": "a0f4409f-3582-58db-a537-a92059b858f5", "assignmentId": "66b64cce-aa94-5ebe-884b-ce2cc43eaa3d", "principal": "publisherServicePrincipal", "scope": "integrationVnet", "actions": ["Microsoft.Network/virtualNetworks/read", "Microsoft.Network/virtualNetworks/subnets/read"], "dataActions": []},
+    {"name": "publisherStorageMetadataAudit", "definitionId": "5b69a0f8-44c9-51a9-829d-0d0b99e34ee9", "assignmentId": "f553197d-58f6-57ec-ac6c-1ccfa31c37b3", "principal": "publisherServicePrincipal", "scope": "storageAccount", "actions": ["Microsoft.Storage/storageAccounts/read"], "dataActions": []},
+    {"name": "publisherProductionWebMetadataAudit", "definitionId": "a807e61d-5e2b-5218-8bf8-b038f57a64b5", "assignmentId": "ecb5b926-fb7f-5cef-b276-7cb576e97575", "principal": "publisherServicePrincipal", "scope": "productionSite", "actions": ["Microsoft.Web/sites/config/read"], "dataActions": []},
+    {"name": "bridgeMailboxResult", "definitionId": "574bc968-9e32-5542-a7b3-934cc266e548", "assignmentId": "0fdb9f64-f1c7-5936-ae9c-c3249a13626b", "principal": "bridgeIdentity", "scope": "mailboxResourceGroup", "actions": ["Microsoft.Resources/deployments/read", "Microsoft.Resources/deployments/write"], "dataActions": []},
+    {"name": "bridgeActivationFence", "definitionId": "906cb3b2-2061-5f5d-b168-515287d3165a", "assignmentId": "5e7ccc27-ff81-5cad-82de-3bc2e287d59f", "principal": "bridgeIdentity", "scope": "activationFenceContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]},
+    {"name": "bridgeKeyRead", "definitionId": "6aaa8d07-9f81-5447-b8c3-967540a7392c", "assignmentId": "e7429c1b-d80c-51f0-8d71-b76b9af90a26", "principal": "bridgeIdentity", "scope": "signingKey", "actions": [], "dataActions": ["Microsoft.KeyVault/vaults/keys/read"]},
+    {"name": "writerRegistryAdd", "definitionId": "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d", "assignmentId": "0151259f-6f5b-408e-a633-e927fa6773bc", "principal": "registryWriterIdentity", "scope": "acceptedContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]},
+    {"name": "writerPackageAdd", "definitionId": "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d", "assignmentId": "3bb19352-f72e-5a39-b6b1-6c1be4029c43", "principal": "registryWriterIdentity", "scope": "packageContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]},
+    {"name": "readerRegistryRead", "definitionId": "e005b62b-037b-4989-b492-932669ec0842", "assignmentId": "44d5161c-3104-4de2-8e9b-3d640f013cfb", "principal": "registryReaderIdentity", "scope": "acceptedContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]},
+    {"name": "readerPackageRead", "definitionId": "e005b62b-037b-4989-b492-932669ec0842", "assignmentId": "e76ee175-25d6-52c1-9cd8-9cd28c01e114", "principal": "registryReaderIdentity", "scope": "packageContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]},
+    {"name": "signerKeySign", "definitionId": "02b63fe1-da35-5ca3-8451-623bee486e1e", "assignmentId": "91b05676-34d3-58e0-aceb-cbe146acdf87", "principal": "signerIdentity", "scope": "signingKey", "actions": [], "dataActions": ["Microsoft.KeyVault/vaults/keys/sign/action"]},
+    {"name": "productionActivation", "definitionId": "e2d1852b-4d15-5193-a639-6c0d5716acce", "assignmentId": "f5d9b5c8-55d6-554b-8995-4d2feef0e920", "principal": "productionActivationIdentity", "scope": "productionSite", "actions": ["Microsoft.Web/sites/config/list/action", "Microsoft.Web/sites/config/write", "Microsoft.Web/sites/deployments/read", "Microsoft.Web/sites/restart/action"], "dataActions": []},
+    {"name": "productionSystemPackageRead", "definitionId": "c329630f-df64-5bf3-86dd-5e43852e4648", "assignmentId": "33b608d7-1bf5-5fe8-b752-54c5dfd70599", "principal": "productionSystemIdentity", "scope": "packageContainer", "actions": [], "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]},
+    {"name": "productionSystemAttachmentContributor", "definitionId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe", "definitionKind": "BuiltInRole", "assignmentId": "997c7c3c-ac72-4d56-8cc4-fdcfa5d7cee4", "principal": "productionSystemIdentity", "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Storage/storageAccounts/mdspaperdesksea9c4e/blobServices/default/containers/paperdesk-attachments", "roleDefinitionProjection": "fresh-full-canonical-preflight-projection-bound-by-observedPreflight.sha256"},
+    {"name": "productionSystemSecretsUser", "definitionId": "4633458b-17de-408a-b874-0445c86b69e6", "definitionKind": "BuiltInRole", "assignmentId": "c298e462-25d4-4f0f-812c-c7a3bbc68ef8", "principal": "productionSystemIdentity", "scope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d", "roleDefinitionProjection": "fresh-full-canonical-preflight-projection-bound-by-observedPreflight.sha256"}
+  ],
+  "mutations": [
+    {"id": "claimAzureSingleUseAuthorization", "kind": "azure-global-create-only-authorization-claim", "target": "azureSingleUseClaim", "temporary": false, "irreversible": false},
+    {"id": "createMailboxResourceGroup", "kind": "create-or-adopt-exact", "target": "mailboxResourceGroup", "temporary": false, "irreversible": false},
+    {"id": "createPublisherApplication", "kind": "create-or-adopt-unique-exact", "target": "publisherApplication", "temporary": false, "irreversible": false},
+    {"id": "createPublisherServicePrincipal", "kind": "create-or-adopt-unique-exact", "target": "publisherServicePrincipal", "temporary": false, "irreversible": false},
+    {"id": "grantPublisherGraphApplicationReadAll", "kind": "create-or-adopt-exact-material-tenant-read", "target": "publisherGraphPermission", "temporary": false, "irreversible": false},
+    {"id": "createBridgeIdentity", "kind": "create-or-adopt-exact", "target": "bridgeIdentity", "temporary": false, "irreversible": false},
+    {"id": "adoptExistingRegistryWriterIdentity", "kind": "adopt-existing-exact", "target": "registryWriterIdentity", "temporary": false, "irreversible": false},
+    {"id": "adoptExistingRegistryReaderIdentity", "kind": "adopt-existing-exact", "target": "registryReaderIdentity", "temporary": false, "irreversible": false},
+    {"id": "createSignerIdentity", "kind": "create-or-adopt-exact", "target": "signerIdentity", "temporary": false, "irreversible": false},
+    {"id": "createProductionActivationIdentity", "kind": "create-or-adopt-exact", "target": "productionActivationIdentity", "temporary": false, "irreversible": false},
+    {"id": "createPrivatePackageContainer", "kind": "create-or-adopt-private", "target": "packageContainer", "temporary": false, "irreversible": false},
+    {"id": "createPrivateControllerLockContainer", "kind": "create-or-adopt-private-empty", "target": "controllerLockContainer", "temporary": false, "irreversible": false},
+    {"id": "createPrivateActivationFenceContainer", "kind": "create-or-adopt-private", "target": "activationFenceContainer", "temporary": false, "irreversible": false},
+    {"id": "createSigningKeyVersion", "kind": "create-new-or-adopt-exact-rsa-3072-version", "target": "signingKey", "temporary": false, "irreversible": false},
+    {"id": "createCustomRoleDefinitions", "kind": "create-or-adopt-exact-role-matrix", "target": "subscription", "temporary": false, "irreversible": false},
+    {"id": "createStoppedPrivateBridge", "kind": "create-or-adopt-exact-stopped", "target": "bridgeSite", "temporary": false, "irreversible": false},
+    {"id": "createExactRoleAssignments", "kind": "create-or-adopt-exact-role-matrix", "target": "subscription", "temporary": false, "irreversible": false},
+    {"id": "attachFiveUamisOnlyToBridge", "kind": "replace-if-exact-prestate", "target": "bridgeSite", "temporary": false, "irreversible": false},
+    {"id": "addOwnedUploaderIpv4Rule", "kind": "temporary-add-exact", "target": "storageAccount", "temporary": true, "irreversible": false},
+    {"id": "addOwnedUploaderPackageRole", "kind": "temporary-add-exact", "target": "packageContainer", "temporary": true, "irreversible": false},
+    {"id": "addOwnedOperatorKeyReadRole", "kind": "temporary-add-exact", "target": "signingKey", "temporary": true, "irreversible": false},
+    {"id": "addOwnedOperatorFenceBootstrapRole", "kind": "temporary-add-exact", "target": "activationFenceContainer", "temporary": true, "irreversible": false},
+    {"id": "addOwnedOperatorControllerCanaryRole", "kind": "temporary-add-exact", "target": "controllerLockContainer", "temporary": true, "irreversible": false},
+    {"id": "uploadVersionedBridgePackage", "kind": "azure-ad-create-only-if-none-match", "target": "packageContainer", "temporary": false, "irreversible": false},
+    {"id": "readBackExactSigningPublicJwk", "kind": "azure-ad-read-exact-version", "target": "signingKey", "temporary": true, "irreversible": false},
+    {"id": "createInitialIdleActivationFence", "kind": "azure-ad-create-only-if-none-match", "target": "activationFenceBlob", "temporary": false, "irreversible": false},
+    {"id": "createControllerLeaseCanaryBlob", "kind": "temporary-azure-ad-create-only-if-none-match", "target": "controllerLockContainer", "temporary": true, "irreversible": false},
+    {"id": "exerciseControllerLeaseCanary", "kind": "temporary-finite-lease-acquire-renew-release", "target": "controllerLockContainer", "temporary": true, "irreversible": false},
+    {"id": "removeControllerLeaseCanaryBlob", "kind": "temporary-remove-owned-exact", "target": "controllerLockContainer", "temporary": true, "irreversible": false},
+    {"id": "removeOwnedOperatorControllerCanaryRole", "kind": "temporary-remove-owned-exact", "target": "controllerLockContainer", "temporary": true, "irreversible": false},
+    {"id": "removeOwnedOperatorFenceBootstrapRole", "kind": "temporary-remove-owned-exact", "target": "activationFenceContainer", "temporary": true, "irreversible": false},
+    {"id": "removeOwnedOperatorKeyReadRole", "kind": "temporary-remove-owned-exact", "target": "signingKey", "temporary": true, "irreversible": false},
+    {"id": "removeOwnedUploaderPackageRole", "kind": "temporary-remove-owned-exact", "target": "packageContainer", "temporary": true, "irreversible": false},
+    {"id": "removeOwnedUploaderIpv4Rule", "kind": "temporary-remove-owned-exact", "target": "storageAccount", "temporary": true, "irreversible": false},
+    {"id": "configureBridgeExactVersionedPackageAndCriticalSettings", "kind": "full-map-put-if-exact-old-state-only", "target": "bridgeSite", "temporary": false, "irreversible": false},
+    {"id": "lockPackageRetentionAt91Days", "kind": "lock-retention-exact", "target": "packageContainer", "temporary": false, "irreversible": true},
+    {"id": "startBridgeForBoundedCanary", "kind": "start-run-poll-terminal-success-stop-in-finally", "target": "bridgeSite", "temporary": true, "irreversible": false},
+    {"id": "extendAcceptedRetentionFrom30To91Days", "kind": "extend-locked-retention-exact", "target": "acceptedContainer", "temporary": false, "irreversible": true},
+    {"id": "extendResultRetentionFrom30To91Days", "kind": "extend-locked-retention-exact", "target": "resultContainer", "temporary": false, "irreversible": true},
+    {"id": "detachWriterAndReaderFromLegacyBridge", "kind": "remove-exact-two-uami-attachments-from-legacy-bridge", "target": "legacyBridgeSite", "temporary": false, "irreversible": false},
+    {"id": "removeLegacyWriterResultAssignment", "kind": "delete-one-exact-preflight-bound-assignment", "target": "resultContainer", "temporary": false, "irreversible": false},
+    {"id": "removeLegacyReaderResultAssignment", "kind": "delete-one-exact-preflight-bound-assignment", "target": "resultContainer", "temporary": false, "irreversible": false},
+    {"id": "retireLegacyPublisherFic", "kind": "delete-exact-preflight-bound-stale-fic", "target": "legacyPublisherBoundary", "temporary": false, "irreversible": false},
+    {"id": "retireLegacyPublisherMutatorAssignment", "kind": "delete-one-exact-preflight-bound-assignment", "target": "legacyPublisherBoundary", "temporary": false, "irreversible": false},
+    {"id": "retireLegacyPublisherSitesReadAssignment", "kind": "delete-one-exact-preflight-bound-assignment", "target": "legacyPublisherBoundary", "temporary": false, "irreversible": false},
+    {"id": "retireLegacyPublisherResultReadAssignment", "kind": "delete-one-exact-preflight-bound-assignment", "target": "legacyPublisherBoundary", "temporary": false, "irreversible": false},
+    {"id": "createSolePublisherFicToSignedBootstrapSource", "kind": "create-one-exact-after-global-legacy-control-absence", "target": "publisherFederatedCredential", "temporary": false, "irreversible": false},
+    {"id": "captureCanonicalBootstrapReceipts", "kind": "local-create-only-canonical-evidence", "target": "evidenceModel", "temporary": false, "irreversible": false}
+  ],
+  "sourcePreparation": {
+    "bridgePackageBuilder": "scripts/build_private_release_bridge_package.py",
+    "mode": "local-create-only-deterministic-before-authorization",
+    "requiredAuthorizationBindings": ["bridgePackageSourceSha", "bridgePackageSha256", "bridgePackageSize"],
+    "credentialConstructionForbidden": true
+  },
+  "orderingRules": [
+    "validate-canonical-authorization-source-executor-plan-package-account-and-fresh-preflight-before-exclusive-use-claim",
+    "exclusive-create-the-authorization-specific-use-receipt-before-any-Azure-mutation-and-never-unconsume-it",
+    "preflight-prove-the-authorization-specific-Azure-global-deployment-marker-absent-then-require-create-http-201-as-the-first-cloud-mutation-and-never-delete-it",
+    "establish-and-prove-the-complete-v2-path-before-retiring-the-exact-old-fic-and-exact-legacy-assignments",
+    "retire-the-exact-old-fic-and-exact-legacy-assignments-prove-global-control-absence-and-create-the-sole-new-fic-with-no-overlap",
+    "create-permanent-unreachable-resources-and-complete-temporary-access-cleanup-before-creating-the-new-fic",
+    "configure-the-stopped-bridge-only-after-create-only-package-version-readback-and-refuse-any-third-state",
+    "create-the-sole-new-source-sha-qualified-fic-as-the-final-Azure-mutation-then-prove-one-global-relevant-fic-and-control-inventory",
+    "capture-local-nonsecret-canonical-receipts-after-final-readback-without-writing-checked-in-evidence"
+  ],
+  "irreversibleMutationIds": [
+    "extendAcceptedRetentionFrom30To91Days",
+    "extendResultRetentionFrom30To91Days",
+    "lockPackageRetentionAt91Days"
+  ],
+  "temporaryAccess": {
+    "publicIpv4Input": "one-canonical-public-ipv4-slash-32",
+    "armIpRuleEncoding": "bare-ipv4",
+    "broadCidrForbidden": true,
+    "roleDefinitionId": "d3021f37-75b7-5dad-84ce-8bf84dd11e93",
+    "roleDefinitionProjection": "authorization-specific-custom-add-and-read-only-then-delete",
+    "temporaryPackageDataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"],
+    "roleAssignmentId": "39989cff-44ef-596e-8b46-0a433bb5c0e2",
+    "scope": "packageContainer",
+    "principal": "${authorization.azure.accountObjectId}",
+    "uploadAuth": "azure-ad",
+    "uploadCondition": "If-None-Match:*",
+    "temporaryKeyReadRoleDefinitionId": "dba37aa5-3824-5c68-91ac-5f1e24e7aa9c",
+    "temporaryKeyReadRoleAssignmentId": "9420cd85-94df-5156-99b7-9a011702c69e",
+    "temporaryKeyReadScope": "signingKey",
+    "temporaryKeyReadDataActions": ["Microsoft.KeyVault/vaults/keys/read"],
+    "temporaryFenceRoleDefinitionId": "1c425126-8044-52d8-b4f5-6dac8d60b1e1",
+    "temporaryFenceRoleAssignmentId": "bdfe78bb-909b-54df-86a0-1620898addf0",
+    "temporaryFenceScope": "activationFenceContainer",
+    "temporaryFenceDataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"],
+    "temporaryFenceBlob": "v2/production-activation-fence.json",
+    "temporaryControllerRoleDefinitionId": "fb109dbf-e475-5f97-8db3-3c1a94acf4b3",
+    "temporaryControllerRoleAssignmentId": "2d607095-edff-533c-a2c4-0e6e9d631715",
+    "temporaryControllerScope": "controllerLockContainer",
+    "temporaryControllerDataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete"],
+    "controllerCanaryBlobTemplate": "v2/bootstrap-canary/${authorization.authorizationId}.json",
+    "controllerLeaseId": "3c790643-01c0-59e3-aa6c-d0ece9085a90",
+    "controllerExpiryLeaseId": "fffd0c06-c801-56b5-ae31-44beb59853f9",
+    "activationFenceLeaseId": "c28f7730-431d-5c52-b885-8e43154d1ddb",
+    "leaseDurationSeconds": 60,
+    "leaseRenewals": 1,
+    "cleanup": "remove-only-exact-ip-rule-package-assignment-key-read-definition-assignment-fence-definition-assignment-controller-canary-blob-definition-and-assignment-created-by-this-authorization"
+  },
+  "legacyPublisherRetirement": {
+    "applicationObjectId": "f80b1856-f955-4c97-b63f-682c244da14d",
+    "applicationDisplayName": "mds-external-production-control-oidc",
+    "applicationClientId": "ecdb7a1b-8a57-4345-8a9e-b5e16ca0e20d",
+    "servicePrincipalObjectId": "915f5478-68d3-4382-bc37-faadabdc78d6",
+    "federatedCredential": "exact-sole-current-credential-bound-by-observedPreflight.sha256",
+    "roleAssignmentResourceIds": [
+      "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/58620e18-38d4-4978-8d5b-7150c8002015",
+      "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade",
+      "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/bbe31225-889b-457f-bd15-06d7cb05f0b6"
+    ],
+    "preservedUntilLaterActivationAssignmentResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/roleAssignments/b24a4ca5-de40-47c8-90d8-caf08759dfb2",
+    "legacyWriterResultAssignmentResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/a2ecf16a-05f8-48ab-8a7d-597386b79dbe",
+    "legacyReaderResultAssignmentResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/paperdesk-registry-webjob-results/providers/Microsoft.Authorization/roleAssignments/186e9f6c-f83f-4446-bf7e-31cfcd8aa802",
+    "preserveApplicationAndServicePrincipal": true,
+    "preserveCredentiallessState": true,
+    "cleanupPolicy": "delete-only-the-exact-observed-fic-and-three-exact-assignments-after-new-publisher-is-complete-and-read-back"
+  },
+  "postconditions": [
+    {"id": "azureSingleUseClaimPersists", "predicate": "the exact authorization-specific subscription deployment marker persists with the authorization source plan and package digests"},
+    {"id": "sourceContractRemainsNullDormant", "predicate": "committed activation values remain all null and status source-dormant"},
+    {"id": "oneSolePublisherFicPinsBootstrapSource", "predicate": "one credential named paperdesk-production-control-v2 binds the exact authorized source SHA and no stale or extra credential exists"},
+    {"id": "allAutomationIdentitiesDistinct", "predicate": "publisher plus five UAMIs plus production system client and principal IDs are pairwise distinct"},
+    {"id": "exactTwentyFiveRoleRecords", "predicate": "direct and effective inventories equal the exact 25-record role matrix with no inherited group conditional delegated or extra non-Owner assignment"},
+    {"id": "bridgePrivateStoppedAfterCanary", "predicate": "V2 bridge is private and Stopped after bounded canary with only the five planned UAMIs"},
+    {"id": "legacyBridgeRetired", "predicate": "legacy bridge remains Stopped private with no UAMI transient settings or publisher mutator"},
+    {"id": "storageFinalNetworkExact", "predicate": "public network enabled for service endpoint only, blob public access false, default Deny, bypass None, no ipRules, no resourceAccessRules, exactly the pinned subnet Allow Succeeded"},
+    {"id": "temporaryUploaderAccessAbsent", "predicate": "the exact uploader IPv4 rule and exact temporary role assignment are absent after fresh readback"},
+    {"id": "temporaryOperatorKeyReadAbsent", "predicate": "the exact temporary key-read assignment and role definition are absent after fresh readback"},
+    {"id": "temporaryOperatorFenceAccessAbsent", "predicate": "the exact temporary fence bootstrap assignment and role definition are absent after fresh readback"},
+    {"id": "temporaryControllerCanaryAccessAbsent", "predicate": "the exact temporary controller canary blob assignment and role definition are absent after fresh readback"},
+    {"id": "wormPoliciesLockedAtLeast91Days", "predicate": "accepted packages and results are private Locked for at least 91 days with append flags false"},
+    {"id": "vaultNotDowngraded", "predicate": "vault RBAC purge protection and 90-day soft delete remain and network posture is equal or stricter than preflight"},
+    {"id": "signingKeyExact", "predicate": "one enabled nonexportable RSA 3072 sign verify key version with no release policy and at least 30 days remaining is sealed"},
+    {"id": "packageExactVersionReadback", "predicate": "bridge package bytes SHA size quoted ETag and version ID match the deterministic package and versioned URL"},
+    {"id": "managedIdentityPackageFetchCanary", "predicate": "one fresh source-and-package-pinned WebJob invocation starts after the authorized history boundary, reaches terminal Success under the exact bootstrap control and settings, proves the bridge package-reader UAMI package fetch and activation-fence cleanup, and records only ARM invocation metadata plus a clearly source-derived expected-marker digest; HTTP health and literal stdout-marker observation are deferred"},
+    {"id": "finiteLeaseAndCleanupCanaries", "predicate": "the authorized operator controller-lock lease canary and the bridge-identity activation-fence lease plus cleanup fast-lane and expiry fallback canaries are separately identity-bound and digest-bound"},
+    {"id": "initialFenceIdleAvailable", "predicate": "initial fence blob is canonical idle versioned exact and lease state is Available after create readback and canary"},
+    {"id": "productionRoutingObservedNotMutated", "predicate": "production remains on the pinned subnet with applicationTraffic true and legacy vnetRouteAllEnabled true; allTraffic false is recorded as existing representation and no production routing write occurs before S2"},
+    {"id": "legacyPublisherRetired", "predicate": "legacy publisher app and service principal remain credentialless; its stale FIC and exact assignments 58620e18 784fb5eb bbe31225 are absent, while b24a4ca5 remains preserved for later activation"},
+    {"id": "noProductionReleaseMutation", "predicate": "no production app setting routing package activation deployment accepted-release persistence rollback mailbox request or reusable-workflow caller integration occurred"},
+    {"id": "canonicalEvidenceReadyForS2", "predicate": "all nonsecret source projections and the durable mutation journal are validated and ready for create-only local terminal assembly; the five S2 files and terminal bundle do not exist until the receipt builder validates and persists them after this postcondition"}
+  ],
+  "evidenceOutputs": {
+    "modelPath": "contracts/private_release_bootstrap_evidence_model.json",
+    "provisioningEvidencePath": "evidence/private-release-provisioning-evidence.json",
+    "bridgeRuntimeReceiptPath": "evidence/private-release-bridge-runtime-receipt.json",
+    "temporaryAccessCleanupReceiptPath": "evidence/private-release-bootstrap-temporary-access-cleanup-receipt.json",
+    "activationFenceReceiptPath": "evidence/private-release-activation-fence-bootstrap-receipt.json",
+    "bridgeCanaryReceiptPath": "evidence/private-release-bridge-canary-receipt.json",
+    "terminalBundlePath": "evidence/private-release-bootstrap-receipt-bundle.json",
+    "rule": "Execution writes receipts only to the externally authorized receipt directory; checked-in evidence remains source-dormant until separately reviewed S2."
+  },
+  "prohibitions": [
+    "azure-access-before-external-one-shot-authorization",
+    "legacy-v8-authorization-reuse",
+    "github-mutation",
+    "activation-contract-fill",
+    "reusable-workflow-activation",
+    "production-release-deployment-or-rollback",
+    "pre-s2-production-site-config-or-routing-write",
+    "accepted-release-persistence",
+    "sas",
+    "storage-account-key",
+    "shared-key",
+    "public-container",
+    "broad-cidr",
+    "full-acl-restore",
+    "key-vault-network-downgrade",
+    "storage-network-downgrade",
+    "delete-or-compensate-adopted-permanent-resource",
+    "compensate-anything-except-executor-owned-temporary-state"
+  ]
+}

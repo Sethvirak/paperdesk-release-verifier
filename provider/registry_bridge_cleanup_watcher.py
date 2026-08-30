@@ -1118,10 +1118,10 @@ def _validate_persistence_result(result: object, execution: Mapping[str, Any]) -
     if not isinstance(result, dict) or set(result) != expected_keys:
         fail("result-persistence-contract")
     created = result.get("createdBlobCount")
-    allowed_count = type(created) is int and 0 <= created <= 20
+    allowed_count = type(created) is int and 0 <= created <= 21
     allowed_overwrite = (
         (created == 0 and result.get("overwriteNegative") == "not-run-completed")
-        or (type(created) is int and 1 <= created <= 20 and result.get("overwriteNegative") == "passed")
+        or (type(created) is int and 1 <= created <= 21 and result.get("overwriteNegative") == "passed")
     )
     if any((
         result.get("status") != "complete",
@@ -1129,7 +1129,7 @@ def _validate_persistence_result(result: object, execution: Mapping[str, Any]) -
         result.get("artifactZipSha256") != execution.get("artifactZipSha256"),
         result.get("requestSha256") != execution.get("requestSha256"),
         not isinstance(result.get("manifestSha256"), str) or not SHA256_RE.fullmatch(result.get("manifestSha256", "")),
-        result.get("fileCount") != 19,
+        result.get("fileCount") != 20,
         not allowed_count,
         not allowed_overwrite,
         result.get("outOfPrefixNegative") != "passed",
@@ -1224,7 +1224,7 @@ def _validate_persistence_pair(
     second_count = second.get("createdBlobCount")
     first_overwrite = first.get("overwriteNegative")
     second_overwrite = second.get("overwriteNegative")
-    if 1 <= first_count <= 20 and first_overwrite == "passed" and second_count == 0 and second_overwrite == "not-run-completed":
+    if 1 <= first_count <= 21 and first_overwrite == "passed" and second_count == 0 and second_overwrite == "not-run-completed":
         return "created-or-recovered-then-idempotent"
     if first_count == 0 and second_count == 0 and first_overwrite == second_overwrite == "not-run-completed":
         return "already-complete-before-both-executions"

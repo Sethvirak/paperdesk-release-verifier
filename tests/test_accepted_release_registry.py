@@ -1,5 +1,6 @@
 import argparse
 import base64
+import copy
 import hashlib
 import importlib.util
 import io
@@ -25,6 +26,8 @@ SPEC.loader.exec_module(registry)
 SHA = "a" * 40
 SOURCE_RUN = "41001"
 SOURCE_ATTEMPT = "2"
+DEPLOYMENT_RUN = "41501"
+DEPLOYMENT_ATTEMPT = "4"
 ACCEPTANCE_RUN = "42001"
 ACCEPTANCE_ATTEMPT = "1"
 EVIDENCE_RUN = "42000"
@@ -34,6 +37,7 @@ ACCEPTANCE_WORKFLOW = (
     "Sethvirak/MasterDataStructure/.github/workflows/"
     f"main_master-data-structure-sea-9c4e0d0d.yml@{SHA}"
 )
+DEPLOYMENT_WORKFLOW = ACCEPTANCE_WORKFLOW
 VERIFIER_WORKFLOW = f"Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@{'b' * 40}"
 EVIDENCE_NAME = f"paperdesk-production-acceptance-evidence-post-deploy-{SHA}"
 
@@ -111,6 +115,9 @@ class RegistryFixture:
         }
         self.verification.write_text(json.dumps(verification), encoding="utf-8")
         self.acceptance = root / f"paperdesk-production-acceptance-receipt-{SHA}.json"
+        self.deployment_coordinate = (
+            root / f"paperdesk-deployment-coordinate-receipt-{SHA}.json"
+        )
         self.worm = {
             "resourceId": (
                 "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/"
@@ -134,7 +141,20 @@ class RegistryFixture:
         acceptance["evidenceContractSha256"] = registry.sha256_file(
             self.verified / f"paperdesk-azure-runtime-{SHA}.acceptance-contract.json"
         )
+        acceptance["candidateRunId"] = DEPLOYMENT_RUN
+        acceptance["candidateRunAttempt"] = DEPLOYMENT_ATTEMPT
         self.acceptance.write_text(json.dumps(acceptance), encoding="utf-8")
+        self.deployment_coordinate.write_text(json.dumps({
+            "candidateRuntimeSha256": verification["archiveSha256"],
+            "candidateSha": SHA,
+            "candidateSourceRunAttempt": SOURCE_ATTEMPT,
+            "candidateSourceRunId": SOURCE_RUN,
+            "deploymentRunAttempt": DEPLOYMENT_ATTEMPT,
+            "deploymentRunId": DEPLOYMENT_RUN,
+            "schema": registry.DEPLOYMENT_COORDINATE_RECEIPT_SCHEMA,
+            "schemaVersion": 1,
+            "verifiedArtifactName": f"paperdesk-azure-runtime-verified-{SHA}",
+        }), encoding="utf-8")
         (self.root / "worm-snapshot.json").write_text(json.dumps(self.worm), encoding="utf-8")
 
     def args(self, output: Path) -> argparse.Namespace:
@@ -142,6 +162,9 @@ class RegistryFixture:
             source_sha=SHA,
             source_run_id=SOURCE_RUN,
             source_run_attempt=SOURCE_ATTEMPT,
+            candidate_run_id=DEPLOYMENT_RUN,
+            candidate_run_attempt=DEPLOYMENT_ATTEMPT,
+            deployment_workflow_ref=DEPLOYMENT_WORKFLOW,
             acceptance_run_id=ACCEPTANCE_RUN,
             acceptance_run_attempt=ACCEPTANCE_ATTEMPT,
             acceptance_workflow_ref=ACCEPTANCE_WORKFLOW,
@@ -156,9 +179,15 @@ class RegistryFixture:
             verification_artifact_digest="c" * 64,
             acceptance_artifact_id="93004",
             acceptance_artifact_digest="d" * 64,
+            deployment_coordinate_artifact_id="93005",
+            deployment_coordinate_artifact_name=(
+                f"paperdesk-deployment-coordinate-receipt-{SHA}"
+            ),
+            deployment_coordinate_artifact_digest="e" * 64,
             verified_artifact_dir=str(self.verified),
             verification_receipt=str(self.verification),
             acceptance_receipt=str(self.acceptance),
+            deployment_coordinate_receipt=str(self.deployment_coordinate),
             worm_snapshot=str(self.root / "worm-snapshot.json"),
             output=str(output),
         )
@@ -400,41 +429,44 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         }
 
     @staticmethod
-    def persistence_result(created=20, overwrite="passed"):
+    def persistence_result(created=21, overwrite="passed"):
         return {
             "status": "complete",
             "prefix": f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/",
             "artifactZipSha256": "1" * 64,
             "requestSha256": "2" * 64,
             "manifestSha256": "3" * 64,
-            "fileCount": 19,
+            "fileCount": 20,
             "createdBlobCount": created,
             "overwriteNegative": overwrite,
             "outOfPrefixNegative": "passed",
         }
 
-    def test_request_is_deterministic_and_preserves_exact_nineteen_files(self):
+    def test_request_is_deterministic_and_preserves_exact_twenty_files(self):
         first, first_result = self.build("first.tar.gz")
         second, second_result = self.build("second.tar.gz")
         self.assertEqual(first.read_bytes(), second.read_bytes())
         self.assertEqual(first_result["requestSha256"], second_result["requestSha256"])
-        self.assertEqual(first_result["fileCount"], 19)
+        self.assertEqual(first_result["fileCount"], 20)
         extracted = self.root / "extracted"
         request, files = registry.extract_request(first, extracted)
-        self.assertEqual(len(files), 19)
+        self.assertEqual(len(files), 20)
         self.assertEqual(
             request["registry"]["prefix"],
             f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/",
         )
         self.assertEqual(request["wormSnapshot"]["state"], "Locked")
         self.assertEqual(request["artifacts"]["verified"]["id"], "93002")
+        self.assertEqual(
+            request["artifacts"]["deploymentCoordinateReceipt"]["id"], "93005"
+        )
 
     def test_manifest_is_uploaded_last_after_readback_and_negative_checks(self):
         request, _ = self.build()
         storage = FakeStorage()
         result = registry.persist_request(request, storage)
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["fileCount"], 19)
+        self.assertEqual(result["fileCount"], 20)
         self.assertEqual(result["overwriteNegative"], "passed")
         self.assertEqual(result["outOfPrefixNegative"], "passed")
         put_names = [name for operation, name in storage.events if operation == "put"]
@@ -442,7 +474,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         manifest = json.loads(storage.blobs[put_names[-1]])
         self.assertEqual(manifest["schema"], registry.MANIFEST_SCHEMA)
         self.assertEqual(manifest["status"], "complete")
-        self.assertEqual(len(manifest["files"]), 19)
+        self.assertEqual(len(manifest["files"]), 20)
         # A retry is read-only/idempotent and validates the same sole marker.
         event_count = len(storage.events)
         retried = registry.persist_request(request, storage)
@@ -783,7 +815,7 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         client_factory.assert_called_once_with("fixed-writer-token", "fixed-reader-token")
         self.assertNotEqual(registry.REGISTRY_WRITER_CLIENT_ID, registry.REGISTRY_READER_CLIENT_ID)
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["fileCount"], 19)
+        self.assertEqual(result["fileCount"], 20)
         serialized = registry.canonical_json(result)
         self.assertLessEqual(len(serialized), registry.MAX_ONE_SHOT_RESULT_BYTES)
         self.assertNotIn(b"secret", serialized)
@@ -1325,11 +1357,81 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         with self.assertRaises(registry.RegistryError):
             registry.build_request(self.fixture.args(self.root / "wrong-receipt.tar.gz"))
 
+    def test_source_deployment_acceptance_and_evidence_identities_are_separate(self):
+        output, _ = self.build("identity-separated.tar.gz")
+        request, files = registry.extract_request(output, self.root / "identity-separated")
+        self.assertEqual(request["schema"], "paperdesk-accepted-release-registry-request-v2")
+        self.assertEqual(set(request["source"]), {
+            "repository", "sha", "runId", "runAttempt", "workflowRef",
+        })
+        self.assertEqual(set(request["deployment"]), {"runId", "runAttempt", "workflowRef"})
+        self.assertEqual(
+            {
+                request["source"]["runId"], request["deployment"]["runId"],
+                request["acceptance"]["runId"], request["evidence"]["runId"],
+            },
+            {SOURCE_RUN, DEPLOYMENT_RUN, ACCEPTANCE_RUN, EVIDENCE_RUN},
+        )
+        self.assertEqual(
+            request["registry"]["prefix"],
+            f"v1/releases/{SHA}/{SOURCE_RUN}/{ACCEPTANCE_RUN}/",
+        )
+        coordinate_path = f"receipts/paperdesk-deployment-coordinate-receipt-{SHA}.json"
+        self.assertIn(coordinate_path, files)
+        self.assertEqual(
+            request["artifacts"]["deploymentCoordinateReceipt"]["fileSha256"],
+            registry.sha256_file(files[coordinate_path]),
+        )
+
+        swapped = self.fixture.args(self.root / "swapped-source-deployment.tar.gz")
+        swapped.candidate_run_id = SOURCE_RUN
+        with self.assertRaisesRegex(registry.RegistryError, "must be distinct"):
+            registry.build_request(swapped)
+
+    def test_deployment_coordinate_receipt_run_attempt_and_runtime_digest_are_exact(self):
+        base = json.loads(self.fixture.deployment_coordinate.read_text(encoding="utf-8"))
+        mutations = (
+            lambda value: value.__setitem__("candidateSourceRunId", DEPLOYMENT_RUN),
+            lambda value: value.__setitem__("candidateSourceRunAttempt", "99"),
+            lambda value: value.__setitem__("deploymentRunId", SOURCE_RUN),
+            lambda value: value.__setitem__("deploymentRunAttempt", "99"),
+            lambda value: value.__setitem__("candidateRuntimeSha256", "0" * 64),
+            lambda value: value.__setitem__("unexpected", True),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                document = copy.deepcopy(base)
+                mutate(document)
+                self.fixture.deployment_coordinate.write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                with self.assertRaises(registry.RegistryError):
+                    registry.build_request(
+                        self.fixture.args(self.root / f"bad-deployment-coordinate-{index}.tar.gz")
+                    )
+        self.fixture.deployment_coordinate.write_text(json.dumps(base), encoding="utf-8")
+
+        wrong_attempt = self.fixture.args(self.root / "wrong-deployment-attempt.tar.gz")
+        wrong_attempt.candidate_run_attempt = "99"
+        with self.assertRaises(registry.RegistryError):
+            registry.build_request(wrong_attempt)
+
+    def test_deployment_coordinate_receipt_inventory_digest_is_bound(self):
+        output, _ = self.build("deployment-coordinate-digest.tar.gz")
+        extracted = self.root / "deployment-coordinate-digest"
+        request, _ = registry.extract_request(output, extracted)
+        request["artifacts"]["deploymentCoordinateReceipt"]["fileSha256"] = "0" * 64
+        with self.assertRaisesRegex(registry.RegistryError, "deployment-coordinate"):
+            registry.validate_request(request, extracted)
+
     def test_source_provenance_uses_protected_main_ref_with_sha_bound_separately(self):
         output, _ = self.build("source-ref.tar.gz")
         request, _ = registry.extract_request(output, self.root / "source-ref")
-        self.assertEqual(request["candidate"]["workflowRef"], registry.PAPERDESK_SOURCE_WORKFLOW_REF)
-        self.assertEqual(request["candidate"]["sha"], SHA)
+        self.assertEqual(request["source"]["workflowRef"], registry.PAPERDESK_SOURCE_WORKFLOW_REF)
+        self.assertEqual(request["source"]["sha"], SHA)
+        self.assertEqual(request["source"]["runId"], SOURCE_RUN)
+        self.assertEqual(request["deployment"]["runId"], DEPLOYMENT_RUN)
+        self.assertEqual(request["deployment"]["workflowRef"], DEPLOYMENT_WORKFLOW)
 
     def test_overwrite_negative_rejects_unbounded_403_error_code(self):
         class WrongForbiddenStorage(FakeStorage):

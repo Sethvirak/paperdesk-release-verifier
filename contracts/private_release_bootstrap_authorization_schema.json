@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Sethvirak/paperdesk-release-verifier/contracts/private_release_bootstrap_authorization_schema.json",
+  "title": "PaperDesk private release V2 one-shot bootstrap authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "authorizationType",
+    "authorizationId",
+    "repository",
+    "source",
+    "executor",
+    "plan",
+    "azure",
+    "observedPreflight",
+    "validity",
+    "confirmation",
+    "singleUse"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "authorizationType": {"const": "paperdesk-private-release-v2-bootstrap-one-shot"},
+    "authorizationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "repository": {"const": "Sethvirak/paperdesk-release-verifier"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewedHead", "mergedMain"],
+      "properties": {
+        "reviewedHead": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "commitSha",
+            "treeSha",
+            "signatureVerified",
+            "signingPrincipal",
+            "signingKeyFingerprint",
+            "pullRequestNumber",
+            "pullRequestUrl",
+            "reviewDecision",
+            "requiredApprovals",
+            "pushedAt",
+            "reviews",
+            "requiredCheck"
+          ],
+          "properties": {
+            "commitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "treeSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "signatureVerified": {"const": true},
+            "signingPrincipal": {"const": "paperdesk-release-signing-2026-08-30"},
+            "signingKeyFingerprint": {"const": "SHA256:nOONZLlhHx9b03fmAPkCqfhYzp0CFZuHfLPc1T0rfA4"},
+            "pullRequestNumber": {"type": "integer", "minimum": 1},
+            "pullRequestUrl": {"type": "string", "pattern": "^https://github\\.com/Sethvirak/paperdesk-release-verifier/pull/[1-9][0-9]*$"},
+            "reviewDecision": {"const": "APPROVED"},
+            "requiredApprovals": {"const": 2},
+            "pushedAt": {"type": "string", "format": "date-time"},
+            "reviews": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["login", "userId", "reviewId", "state", "submittedAt", "commitSha"],
+                "properties": {
+                  "login": {"enum": ["jecebella168-cmyk", "jecebella169-cmyk"]},
+                  "userId": {"enum": [316989178, 322025901]},
+                  "reviewId": {"type": "integer", "minimum": 1},
+                  "state": {"const": "APPROVED"},
+                  "submittedAt": {"type": "string", "format": "date-time"},
+                  "commitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+                },
+                "oneOf": [
+                  {
+                    "properties": {
+                      "login": {"const": "jecebella168-cmyk"},
+                      "userId": {"const": 316989178}
+                    }
+                  },
+                  {
+                    "properties": {
+                      "login": {"const": "jecebella169-cmyk"},
+                      "userId": {"const": 322025901}
+                    }
+                  }
+                ]
+              }
+            },
+            "requiredCheck": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "runId", "headSha", "conclusion", "completedAt"],
+              "properties": {
+                "name": {"const": "test"},
+                "runId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+                "headSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                "conclusion": {"const": "success"},
+                "completedAt": {"type": "string", "format": "date-time"}
+              }
+            }
+          }
+        },
+        "mergedMain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "commitSha",
+            "treeSha",
+            "soleParentSha",
+            "treeEqualsReviewedHead",
+            "githubVerificationVerified",
+            "githubVerificationReason",
+            "mergedPullRequestNumber",
+            "mergedPullRequestUrl",
+            "mergedAt",
+            "verificationApiUrl",
+            "verificationRetrievedAt"
+          ],
+          "properties": {
+            "commitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "treeSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "soleParentSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "treeEqualsReviewedHead": {"const": true},
+            "githubVerificationVerified": {"const": true},
+            "githubVerificationReason": {"const": "valid"},
+            "mergedPullRequestNumber": {"type": "integer", "minimum": 1},
+            "mergedPullRequestUrl": {"type": "string", "pattern": "^https://github\\.com/Sethvirak/paperdesk-release-verifier/pull/[1-9][0-9]*$"},
+            "mergedAt": {"type": "string", "format": "date-time"},
+            "verificationApiUrl": {"type": "string", "pattern": "^https://api\\.github\\.com/repos/Sethvirak/paperdesk-release-verifier/commits/[0-9a-f]{40}$"},
+            "verificationRetrievedAt": {"type": "string", "format": "date-time"}
+          }
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"const": "scripts/private_release_v2_bootstrap.py"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "resourceIds",
+        "mutationIds",
+        "irreversibleMutationIds",
+        "postconditionIds",
+        "bridgePackageSourceSha",
+        "bridgePackageSha256",
+        "bridgePackageSize"
+      ],
+      "properties": {
+        "path": {"const": "contracts/private_release_bootstrap_plan.json"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resourceIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"}
+        },
+        "mutationIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"}
+        },
+        "irreversibleMutationIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"}
+        },
+        "postconditionIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"}
+        },
+        "bridgePackageSourceSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "bridgePackageSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bridgePackageSize": {"type": "integer", "minimum": 1, "maximum": 1073741824}
+      }
+    },
+    "azure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cloud", "subscriptionId", "tenantId", "accountId", "accountObjectId", "accountType"],
+      "properties": {
+        "cloud": {"const": "AzureCloud"},
+        "subscriptionId": {"const": "9c4e0d0d-602f-4cde-84bd-337250e5b64c"},
+        "tenantId": {"const": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"},
+        "accountId": {"type": "string", "minLength": 3, "maxLength": 256},
+        "accountObjectId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "accountType": {"enum": ["user", "servicePrincipal"]}
+      }
+    },
+    "observedPreflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "observedAt", "maximumAgeSeconds"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "observedAt": {"type": "string", "format": "date-time"},
+        "maximumAgeSeconds": {"const": 300}
+      }
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notBefore", "expiresAt", "maximumLifetimeSeconds"],
+      "properties": {
+        "notBefore": {"type": "string", "format": "date-time"},
+        "expiresAt": {"type": "string", "format": "date-time"},
+        "maximumLifetimeSeconds": {"const": 1800}
+      }
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["encoding", "phraseSha256"],
+      "properties": {
+        "encoding": {"const": "utf-8-exact-no-newline"},
+        "phraseSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "singleUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "receiptDirectory", "azureClaimResourceId"],
+      "properties": {
+        "required": {"const": true},
+        "receiptDirectory": {"type": "string", "minLength": 3, "maxLength": 1024},
+        "azureClaimResourceId": {"type": "string", "pattern": "^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft\\.Resources/deployments/paperdesk-v2-bootstrap-[0-9a-f-]{36}$"}
+      }
+    }
+  }
+}

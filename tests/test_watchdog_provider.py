@@ -509,8 +509,8 @@ class WatchdogProviderTransitionTests(unittest.TestCase):
         candidate = pending()
         candidate.update({
             "candidateSha": registry_fixture.SHA,
-            "candidateRunId": registry_fixture.SOURCE_RUN,
-            "candidateRunAttempt": registry_fixture.SOURCE_ATTEMPT,
+            "candidateRunId": registry_fixture.DEPLOYMENT_RUN,
+            "candidateRunAttempt": registry_fixture.DEPLOYMENT_ATTEMPT,
             "liveSha": registry_fixture.SHA,
         })
         storage.seed(

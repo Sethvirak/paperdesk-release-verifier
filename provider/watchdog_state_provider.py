@@ -997,6 +997,7 @@ class GithubAppDispatcher:
 
     def dispatch(self, attempt: Mapping[str, Any]) -> GithubDispatchResult:
         inputs = {
+            "operation": "rollback-accepted-release",
             "confirmation": "ROLLBACK PAPERDESK PRODUCTION",
             "expected_current_live_sha": str(attempt["expectedCurrentLiveSha"]),
             "rollback_source_sha": str(attempt["rollback"]["sourceSha"]),
@@ -1012,7 +1013,7 @@ class GithubAppDispatcher:
         installation_token = self._installation_token()
         path = (
             f"/repos/{SOURCE_REPOSITORY}/actions/workflows/"
-            "manual-azure-production-rollback.yml/dispatches"
+            "main_master-data-structure-sea-9c4e0d0d.yml/dispatches"
         )
         connection = self.connection_factory()
         try:

@@ -9,7 +9,7 @@
     "repositoryOwnerId": "202535166",
     "ref": "refs/heads/main",
     "productionWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
-    "rollbackWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+    "rollbackWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
     "persistenceWorkflow": ".github/workflows/persist-accepted-release.yml"
   },
   "provider": {
@@ -236,6 +236,8 @@
         "operation",
         "expectedStateSha256",
         "candidateSha",
+        "sourceRunId",
+        "sourceRunAttempt",
         "candidateRunId",
         "candidateRunAttempt",
         "acceptanceRunId",
@@ -263,12 +265,12 @@
         "the exact pending candidate is live and its deadline has not passed",
         "dispatchGuard is available and attemptReceiptSha256 is null",
         "OIDC workflow_ref is the exact persist-accepted-release.yml workflow_run consumer; its OIDC run is distinct from the source acceptanceRunId and is retained in transition WORM evidence",
-        "the accepted-release WORM manifest and production acceptance receipt bind the candidate, candidate run, acceptance run, registry ETag, and registry version ID",
+        "the accepted-release WORM manifest and production acceptance receipt independently bind the source run, candidate deployment run, acceptance run, registry ETag, and registry version ID",
         "the provider rereads the exact WORM manifest, promotes it to rollbackBaseline, and clears only the matching pending candidate"
       ]
     },
     "rollback-workflow-observed": {
-      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
       "requestFields": [
         "schemaVersion",
         "requestType",
@@ -303,7 +305,7 @@
       ]
     },
     "rollback-authorize": {
-      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
       "requestFields": [
         "schemaVersion",
         "requestType",
@@ -342,7 +344,7 @@
       ]
     },
     "rollback-completed": {
-      "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+      "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
       "requestFields": [
         "schemaVersion",
         "requestType",

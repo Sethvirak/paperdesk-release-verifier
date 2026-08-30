@@ -341,9 +341,11 @@ class ProvisioningVerifier:
         runtime=evidence["bridgeRuntime"]
         settings_doc=self._json(self.t("POST","https://management.azure.com"+bridge_resource+"/config/appsettings/list?api-version=2025-03-01",{"Accept":"application/json"},b""),"provisioning-bridge-settings")
         settings=settings_doc.get("properties")
-        if (not isinstance(settings,dict) or "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON" in settings
-                or any(settings.get(key)!=value for key,value in runtime["criticalAppSettings"].items())):core.fail("provisioning-bridge-settings")
-        critical={key:settings[key] for key in sorted(runtime["criticalAppSettings"])}
+        # This is the complete source-owned durable map, not a subset check.
+        # An unreviewed setting can change package execution just as surely as
+        # drift in one of the four known anchors.
+        if not isinstance(settings,dict) or settings!=runtime["criticalAppSettings"]:core.fail("provisioning-bridge-settings")
+        critical={key:settings[key] for key in sorted(settings)}
         if core.digest(core.canonical(critical))!=runtime["criticalAppSettingsSha256"]:core.fail("provisioning-bridge-settings")
         site_properties=bridge_document.get("properties") if isinstance(bridge_document,dict) else None
         web=self._json(self.t("GET","https://management.azure.com"+bridge_resource+"/config/web?api-version=2025-03-01",{"Accept":"application/json"},None),"provisioning-bridge-web-config")
@@ -400,10 +402,13 @@ class ProvisioningVerifier:
         legacy_doc=self._json(self.t("GET","https://management.azure.com"+legacy["siteResourceId"]+"?api-version=2025-03-01",{"Accept":"application/json"},None),"provisioning-legacy-bridge")
         legacy_properties=legacy_doc.get("properties") if isinstance(legacy_doc,dict) else None;legacy_identity=legacy_doc.get("identity") if isinstance(legacy_doc,dict) else None
         legacy_uamis=legacy_identity.get("userAssignedIdentities") if isinstance(legacy_identity,dict) else None
-        legacy_settings_doc=self._json(self.t("POST","https://management.azure.com"+legacy["siteResourceId"]+"/config/appsettings/list?api-version=2025-03-01",{"Accept":"application/json"},b""),"provisioning-legacy-settings")
-        legacy_settings=legacy_settings_doc.get("properties") if isinstance(legacy_settings_doc,dict) else None
-        if not isinstance(legacy_settings,dict):core.fail("provisioning-legacy-settings")
-        transient_names=sorted(name for name in BridgeLease.TRANSIENT if name in legacy_settings)
+        # The publisher deliberately has no permanent config/list authority on
+        # the legacy site because that endpoint discloses secret app settings.
+        # The exact empty transient-name projection is sealed by the immutable
+        # signed bootstrap evidence/receipt; live checks below cover every
+        # nonsecret site, identity, and RBAC property that can safely be read.
+        transient_names=legacy.get("transientAppSettingNamesPresent")
+        if transient_names!=[]:core.fail("provisioning-legacy-settings-sealed")
         legacy_assignments=self._pages(legacy["roleAssignmentsQuery"],"provisioning-legacy-role-assignments")
         publisher_mutators=[];legacy_definitions={}
         for document in legacy_assignments:
@@ -454,7 +459,10 @@ class ProvisioningVerifier:
                 projection={"id":resource_id,"type":resource_type,"publicNetworkAccess":properties.get("publicNetworkAccess"),"allowBlobPublicAccess":properties.get("allowBlobPublicAccess"),"defaultAction":acls.get("defaultAction"),"bypass":acls.get("bypass"),"ipRules":acls.get("ipRules",[]),"resourceAccessRules":acls.get("resourceAccessRules",[]),"virtualNetworkRules":vnet_rules}
             elif name=="productionSite":
                 routing=properties.get("outboundVnetRouting")
-                projection={"id":resource_id,"type":resource_type,"virtualNetworkSubnetId":properties.get("virtualNetworkSubnetId"),"outboundVnetRouting":{"allTraffic":routing.get("allTraffic"),"applicationTraffic":routing.get("applicationTraffic")} if isinstance(routing,dict) else None}
+                config_document=self._json(self.t("GET","https://management.azure.com"+resource["resourceId"]+"/config/web?api-version="+resource["apiVersion"],{"Accept":"application/json"},None),"provisioning-network-productionSite-config")
+                config_properties=config_document.get("properties") if isinstance(config_document,dict) else None
+                if not isinstance(config_properties,dict):core.fail("provisioning-network-productionSite-config")
+                projection={"id":resource_id,"type":resource_type,"virtualNetworkSubnetId":properties.get("virtualNetworkSubnetId"),"outboundVnetRouting":{"allTraffic":routing.get("allTraffic"),"applicationTraffic":routing.get("applicationTraffic")} if isinstance(routing,dict) else None,"legacyVnetRouteAllEnabled":config_properties.get("vnetRouteAllEnabled")}
             else:core.fail("provisioning-network-kind")
             expected={key:resource[key] for key in resource if key not in {"apiVersion","projectionSha256"}}
             expected={key:(value.lower() if key=="resourceId" else value) for key,value in expected.items()}
@@ -658,6 +666,14 @@ class BridgeLease:
     RECEIPT_SHA="PAPERDESK_PRIVATE_RELEASE_BRIDGE_RUNTIME_RECEIPT_SHA256"
     TRANSIENT={"PAPERDESK_PRIVATE_RELEASE_ACTIVATION_JSON","PAPERDESK_CONTROL_WORKFLOW_SHA","PAPERDESK_TRANSIENT_GITHUB_TOKEN",EVIDENCE,EVIDENCE_SHA,RECEIPT,RECEIPT_SHA,CONTROL}
     CONTROL_FIELDS=core.TRANSIENT_CONTROL_FIELDS
+    @staticmethod
+    def durable_settings(activation):
+        if not isinstance(activation,core.Activation):core.fail("bridge-durable-settings-contract")
+        runtime=activation.provisioning_evidence.get("bridgeRuntime")
+        values=runtime.get("criticalAppSettings") if isinstance(runtime,dict) else None
+        if (not isinstance(values,dict) or not all(isinstance(key,str) and isinstance(value,str) for key,value in values.items())
+                or core.digest(core.canonical(values))!=runtime.get("criticalAppSettingsSha256")):core.fail("bridge-durable-settings-contract")
+        return dict(values)
     def __init__(self,transport,activation,activation_json,bootstrap_receipt,github_token,request_name,request,controller_lease,sleep=time.sleep):
         if not isinstance(github_token,str) or len(github_token)<20 or any(c in github_token for c in "\r\n"):core.fail("bridge-github-token")
         self.t=transport;self.a=activation;self.activation_json=activation_json;self.bootstrap_receipt=core.validate_bridge_runtime_receipt(bootstrap_receipt,activation);self.github_token=github_token;self.request_name=request_name;self.request=request;self.controller_lease=controller_lease;self.original=None;self.updated=None;self.owns_transient=False;self.started_by_this=False;self.sleep=sleep
@@ -699,8 +715,8 @@ class BridgeLease:
         values,digest=self.settings.read()
         present={name for name in self.TRANSIENT if name in values}
         if present or "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON" in values:core.fail("bridge-transient-preexisting")
-        critical=self.a.provisioning_evidence["bridgeRuntime"]["criticalAppSettings"]
-        if any(values.get(key)!=value for key,value in critical.items()):core.fail("bridge-package-anchor")
+        durable=self.durable_settings(self.a)
+        if values!=durable:core.fail("bridge-durable-settings-drift")
         evidence_raw=core.canonical(self.a.provisioning_evidence).decode()
         receipt_raw=core.canonical(self.bootstrap_receipt).decode()
         control=self._control(digest);updated=dict(values);updated.update({"PAPERDESK_PRIVATE_RELEASE_ACTIVATION_JSON":self.activation_json,"PAPERDESK_CONTROL_WORKFLOW_SHA":self.a.workflow_sha,"PAPERDESK_TRANSIENT_GITHUB_TOKEN":self.github_token,self.EVIDENCE:evidence_raw,self.EVIDENCE_SHA:core.digest(evidence_raw.encode()),self.RECEIPT:receipt_raw,self.RECEIPT_SHA:core.digest(receipt_raw.encode()),self.CONTROL:core.canonical(control).decode()})
@@ -790,10 +806,12 @@ def cleanup_expired_transient(activation,transport,*,now=None,run_liveness=None,
     provisioning_verifier.verify()
     controller_lease.renew(force=True)
     now=now or dt.datetime.now(dt.timezone.utc);site=f"https://management.azure.com/subscriptions/{core.SUBSCRIPTION}/resourceGroups/{core.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/sites/{core.FIXED_COORDS['bridgeApp']}";settings=AppSettingsBoundary(transport,site)
-    current,current_digest=settings.read();present={name for name in BridgeLease.TRANSIENT if name in current}
+    current,current_digest=settings.read();present={name for name in BridgeLease.TRANSIENT if name in current};durable=BridgeLease.durable_settings(activation)
     if "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON" in current:core.fail("controller-cleanup-third-state")
-    if not present:return {"schemaVersion":1,"status":"clean","cleaned":False}
-    if present!=BridgeLease.TRANSIENT:core.fail("controller-cleanup-third-state")
+    if not present:
+        if current!=durable:core.fail("controller-cleanup-third-state")
+        return {"schemaVersion":1,"status":"clean","cleaned":False}
+    if present!=BridgeLease.TRANSIENT or set(current)!=(set(durable)|BridgeLease.TRANSIENT):core.fail("controller-cleanup-third-state")
     try:record=json.loads(current[BridgeLease.CONTROL])
     except Exception:core.fail("controller-cleanup-control-json")
     try:owner_policy=core.bridge_owner_policy(record.get("operation")) if isinstance(record,dict) else None
@@ -804,7 +822,7 @@ def cleanup_expired_transient(activation,transport,*,now=None,run_liveness=None,
             or record.get("workflowName")!=owner_policy.get("workflowName") or record.get("workflowPath")!=owner_policy.get("workflowPath")
             or record.get("workflowRef")!=owner_policy.get("workflowRef") or record.get("event") not in owner_policy.get("events",set()) or record.get("headBranch")!="main"
             or not core.POSITIVE.fullmatch(str(record.get("runId"))) or not core.POSITIVE.fullmatch(str(record.get("runAttempt")))
-            or record.get("operation") not in {"bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","persist-accepted-release","prepare-rollback","complete-rollback"}
+            or record.get("operation") not in {"registry-bridge-preflight","bootstrap-prepare","bootstrap-consume","prepare-candidate","consume-candidate","persist-accepted-release","prepare-rollback","complete-rollback"}
             or not core.SHA40.fullmatch(str(record.get("sourceSha"))) or not core.NAME.fullmatch(str(record.get("requestName")))
             or not core.SHA256.fullmatch(str(record.get("originalSettingsSha256"))) or not core.SHA256.fullmatch(str(record.get("githubTokenSha256")))
             or not core.SHA256.fullmatch(str(record.get("provisioningEvidenceSha256")))
@@ -840,7 +858,7 @@ def cleanup_expired_transient(activation,transport,*,now=None,run_liveness=None,
             or core.digest(current[BridgeLease.RECEIPT].encode())!=record["bridgeRuntimeReceiptSha256"]
             or core.digest(current["PAPERDESK_TRANSIENT_GITHUB_TOKEN"].encode())!=record["githubTokenSha256"]):core.fail("controller-cleanup-third-state")
     cleaned={key:value for key,value in current.items() if key not in BridgeLease.TRANSIENT}
-    if core.digest(core.canonical(cleaned))!=record["originalSettingsSha256"]:core.fail("controller-cleanup-third-state")
+    if cleaned!=durable or core.digest(core.canonical(cleaned))!=record["originalSettingsSha256"]:core.fail("controller-cleanup-third-state")
     controller_lease.renew(force=True)
     current_again,digest_again=settings.read()
     if current_again!=current or digest_again!=current_digest:core.fail("controller-cleanup-third-state")
@@ -873,7 +891,7 @@ def _stamp(now=None):
     value=now or dt.datetime.now(dt.timezone.utc);return value.strftime("%Y-%m-%dT%H:%M:%S.")+f"{value.microsecond//1000:03d}Z"
 
 def _followup(request,operation,*,accepted=None,pending=None,consumed=None,rollback=None,plan=None,now=None):
-    now=now or dt.datetime.now(dt.timezone.utc);result=dict(request);result.update({"operation":operation,"artifactId":"","artifactSha256":"","artifactMember":"","artifactMemberSha256":"","nonce":secrets.token_hex(16),"issuedAt":_stamp(now),"expiresAt":_stamp(now+dt.timedelta(minutes=15)),"acceptedBaseline":accepted,"pendingRelease":pending,"consumedMarker":consumed,"rollbackPreparation":rollback,"activationPlan":plan,"activationProof":None});return result
+    now=now or dt.datetime.now(dt.timezone.utc);result=dict(request);result.update({"operation":operation,"candidateRunId":None,"candidateRunAttempt":None,"artifactId":"","artifactSha256":"","artifactMember":"","artifactMemberSha256":"","nonce":secrets.token_hex(16),"issuedAt":_stamp(now),"expiresAt":_stamp(now+dt.timedelta(minutes=15)),"acceptedBaseline":accepted,"pendingRelease":pending,"consumedMarker":consumed,"rollbackPreparation":rollback,"activationPlan":plan,"activationProof":None});return result
 
 def _run_bridge(request,activation,activation_doc,github_token,transport,poll,provisioning_verifier):
     request,_,_=core.validate_request(request,now=dt.datetime.now(dt.timezone.utc));request_name=f"pdreq-{request['sourceRunId']}-{request['sourceRunAttempt']}-{request['nonce']}";result_name=f"pdres-{request['sourceRunId']}-{request['sourceRunAttempt']}-{request['nonce']}"
@@ -921,9 +939,10 @@ def _run_bridge(request,activation,activation_doc,github_token,transport,poll,pr
     if cleanup and not terminal:raise core.MailboxError("external-cleanup:"+",".join(label for label,_ in cleanup))
     return result,{"status":"complete" if not cleanup else "cleanup-pending","failures":[label for label,_ in cleanup]}
 
-def execute(request,activation_doc,*,runtime_workflow_sha,package_sha,provisioning_evidence,bridge_runtime_receipt,github_token,transport,poll=lambda _:time.sleep(5),activate=False,provisioning_verifier=None):
-    activation=core.load_activation_document(activation_doc,runtime_workflow_sha=runtime_workflow_sha,observed_bridge_package_sha256=package_sha,provisioning_evidence=provisioning_evidence);request,_,_=core.validate_request(request,now=dt.datetime.now(dt.timezone.utc))
+def execute(request,activation_doc,*,activation_raw,runtime_workflow_sha,package_sha,provisioning_evidence,bridge_runtime_receipt,github_token,transport,poll=lambda _:time.sleep(5),activate=False,provisioning_verifier=None):
+    activation=core.load_activation_document(activation_doc,runtime_workflow_sha=runtime_workflow_sha,observed_bridge_package_sha256=package_sha,provisioning_evidence=provisioning_evidence,raw_document=activation_raw);request,_,_=core.validate_request(request,now=dt.datetime.now(dt.timezone.utc))
     if request["controlWorkflowSha"]!=activation.workflow_sha:core.fail("external-request-workflow")
+    if request["operation"]=="registry-bridge-preflight" and activate:core.fail("external-read-only-operation")
     provisioning_verifier=provisioning_verifier or ProvisioningVerifier(transport,activation,bridge_runtime_receipt)
     housekeeping=[];prepared,prepared_cleanup=_run_bridge(request,activation,activation_doc,github_token,transport,poll,provisioning_verifier);housekeeping.append({"operation":request["operation"],**prepared_cleanup})
     if not activate:return {"bridgeResult":prepared,"activation":None,"housekeeping":housekeeping}
@@ -946,7 +965,7 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument("--request");parser.add_argument("--activation",required=True);parser.add_argument("--provisioning-evidence",required=True);parser.add_argument("--bridge-runtime-receipt",required=True);parser.add_argument("--workflow-sha",required=True);parser.add_argument("--package-sha",required=True);parser.add_argument("--output",required=True);parser.add_argument("--activate",action="store_true");parser.add_argument("--cleanup-stale",action="store_true");args=parser.parse_args()
     if args.cleanup_stale and (args.request is not None or args.activate):parser.error("--cleanup-stale is exclusive")
     if not args.cleanup_stale and args.request is None:parser.error("--request is required")
-    activation_doc=json.loads(Path(args.activation).read_text());provisioning_evidence=json.loads(Path(args.provisioning_evidence).read_text());bridge_runtime_receipt=json.loads(Path(args.bridge_runtime_receipt).read_text());activation=core.load_activation_document(activation_doc,runtime_workflow_sha=args.workflow_sha,observed_bridge_package_sha256=args.package_sha,provisioning_evidence=provisioning_evidence);core.validate_bridge_runtime_receipt(bridge_runtime_receipt,activation);tokens=CliTokens(activation);transport=Arm(tokens)
+    activation_raw=Path(args.activation).read_text(encoding="utf-8");activation_doc=json.loads(activation_raw);provisioning_evidence=json.loads(Path(args.provisioning_evidence).read_text());bridge_runtime_receipt=json.loads(Path(args.bridge_runtime_receipt).read_text());activation=core.load_activation_document(activation_doc,runtime_workflow_sha=args.workflow_sha,observed_bridge_package_sha256=args.package_sha,provisioning_evidence=provisioning_evidence,raw_document=activation_raw);core.validate_bridge_runtime_receipt(bridge_runtime_receipt,activation);tokens=CliTokens(activation);transport=Arm(tokens)
     if args.cleanup_stale:
         owner="cleanup|"+"|".join((os.environ.get("GITHUB_REPOSITORY",""),os.environ.get("GITHUB_RUN_ID",""),os.environ.get("GITHUB_RUN_ATTEMPT","")))
         verifier=ProvisioningVerifier(transport,activation,bridge_runtime_receipt);verifier.verify();controller_lease=acquire_cleanup_controller_lease(transport,owner)
@@ -956,7 +975,7 @@ def main():
             result=cleanup_expired_transient(activation,transport,run_liveness=GitHubRunLiveness(os.environ.get("GH_TOKEN","")),controller_lease=controller_lease,trigger=trigger,provisioning_verifier=verifier)
         finally:controller_lease.release()
     else:
-        request=json.loads(Path(args.request).read_text());result=execute(request,activation_doc,runtime_workflow_sha=args.workflow_sha,package_sha=args.package_sha,provisioning_evidence=provisioning_evidence,bridge_runtime_receipt=bridge_runtime_receipt,github_token=os.environ.get("GH_TOKEN",""),transport=transport,activate=args.activate)
+        request=json.loads(Path(args.request).read_text());result=execute(request,activation_doc,activation_raw=activation_raw,runtime_workflow_sha=args.workflow_sha,package_sha=args.package_sha,provisioning_evidence=provisioning_evidence,bridge_runtime_receipt=bridge_runtime_receipt,github_token=os.environ.get("GH_TOKEN",""),transport=transport,activate=args.activate)
     Path(args.output).write_bytes(core.canonical(result))
     if isinstance(result,dict) and any(item.get("status")!="complete" for item in result.get("housekeeping",[]) if isinstance(item,dict)):
         core.fail("external-cleanup-pending")

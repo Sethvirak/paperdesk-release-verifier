@@ -64,7 +64,7 @@ def persistence_result(created, overwrite):
         "artifactZipSha256": ARTIFACT_SHA,
         "requestSha256": REQUEST_SHA,
         "manifestSha256": MANIFEST_SHA,
-        "fileCount": 19,
+        "fileCount": 20,
         "createdBlobCount": created,
         "overwriteNegative": overwrite,
         "outOfPrefixNegative": "passed",
@@ -158,7 +158,7 @@ class RegistryWebJobResultValidatorTests(unittest.TestCase):
                 "persistence-result",
                 1,
                 "4" * 32,
-                persistence_result(20, "passed"),
+                persistence_result(21, "passed"),
             ),
             (
                 "persistence-result",
@@ -275,7 +275,7 @@ class RegistryWebJobResultValidatorTests(unittest.TestCase):
             "persistence-result",
             1,
             "4" * 32,
-            persistence_result(20, "passed"),
+            persistence_result(21, "passed"),
         )
         for key, value in (
             ("expected_prefix", f"v1/releases/{'2' * 40}/60001/70001/"),
@@ -346,7 +346,7 @@ class RegistryWebJobResultValidatorTests(unittest.TestCase):
         ]
 
     def test_both_allowed_persistence_idempotence_cases(self):
-        paths = self.persistence_proofs(20, "passed", 0, "not-run-completed")
+        paths = self.persistence_proofs(21, "passed", 0, "not-run-completed")
         result_set = validator.build_result_set("persistence", paths)
         self.assertEqual(
             result_set["persistenceCase"], "created-or-recovered-then-idempotent"

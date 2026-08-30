@@ -47,14 +47,15 @@ BRIDGE_APP = "paperdesk-release-registry-bridge-9c4e0d0d"
 BRIDGE_RESOURCE_GROUP = "rg-master-data-structure-sea"
 ENVIRONMENT = "production"
 BRIDGE_PATH = "/internal/v1/persist-accepted-release"
-SCHEMA = "paperdesk-accepted-release-registry-request-v1"
-MANIFEST_SCHEMA = "paperdesk-accepted-release-registry-manifest-v1"
+SCHEMA = "paperdesk-accepted-release-registry-request-v2"
+MANIFEST_SCHEMA = "paperdesk-accepted-release-registry-manifest-v2"
+DEPLOYMENT_COORDINATE_RECEIPT_SCHEMA = "paperdesk-deployment-coordinate-receipt-v1"
 RESULT_ATTESTATION_SCHEMA = "paperdesk-registry-webjob-result-attestation-v1"
 MAX_REQUEST_BYTES = 1280 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_OTHER_FILE_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_BYTES = 1200 * 1024 * 1024
-MAX_MEMBERS = 21
+MAX_MEMBERS = 22
 MAX_ACTIONS_ARTIFACT_BYTES = MAX_REQUEST_BYTES
 MAX_ACTIONS_ARTIFACT_URL_CHARS = 8192
 MAX_ACTIONS_ARTIFACT_QUERY_CHARS = 4096
@@ -154,6 +155,11 @@ ACCEPTANCE_RECEIPT_FIELDS = {
     "candidateSha", "environmentId", "evidenceArtifactId", "evidenceBundleSha256",
     "evidenceContractSha256", "evidenceRunId", "releaseScope", "schemaVersion", "status",
 }
+DEPLOYMENT_COORDINATE_RECEIPT_FIELDS = {
+    "candidateRuntimeSha256", "candidateSha", "candidateSourceRunAttempt",
+    "candidateSourceRunId", "deploymentRunAttempt", "deploymentRunId",
+    "schema", "schemaVersion", "verifiedArtifactName",
+}
 
 
 class RegistryError(RuntimeError):
@@ -234,6 +240,15 @@ def workflow_ref(value: str, label: str) -> str:
 def paperdesk_source_workflow_ref(value: str, label: str) -> str:
     if value != PAPERDESK_SOURCE_WORKFLOW_REF:
         fail(f"{label} must be the fixed protected-main workflow ref")
+    return value
+
+
+def paperdesk_deployment_workflow_ref(value: str, source_sha: str, label: str) -> str:
+    expected = PAPERDESK_SOURCE_WORKFLOW_REF.rsplit("@", 1)[0] + "@" + full_sha(
+        source_sha, "deployment workflow source SHA"
+    )
+    if workflow_ref(value, label) != expected:
+        fail(f"{label} must be the exact PaperDesk deployment workflow at the candidate SHA")
     return value
 
 
@@ -363,19 +378,52 @@ def validate_worm_snapshot(snapshot: Any) -> dict[str, Any]:
     return dict(snapshot)
 
 
-def validate_receipts(
-    verification: Any,
-    acceptance: Any,
+def validate_deployment_coordinate_receipt(
+    value: Any,
     *,
     source_sha: str,
     source_run_id: str,
     source_run_attempt: str,
+    deployment_run_id: str,
+    deployment_run_attempt: str,
+    verified_artifact_name: str,
+    runtime_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != DEPLOYMENT_COORDINATE_RECEIPT_FIELDS:
+        fail("deployment-coordinate receipt fields are not exact")
+    expected = {
+        "schema": DEPLOYMENT_COORDINATE_RECEIPT_SCHEMA,
+        "schemaVersion": 1,
+        "candidateSha": source_sha,
+        "candidateSourceRunId": source_run_id,
+        "candidateSourceRunAttempt": source_run_attempt,
+        "deploymentRunId": deployment_run_id,
+        "deploymentRunAttempt": deployment_run_attempt,
+        "verifiedArtifactName": verified_artifact_name,
+        "candidateRuntimeSha256": runtime_sha256,
+    }
+    if value != expected:
+        fail("deployment-coordinate receipt identity is not exact")
+    digest(str(value.get("candidateRuntimeSha256", "")), "deployment-coordinate runtime digest")
+    return dict(value)
+
+
+def validate_receipts(
+    verification: Any,
+    acceptance: Any,
+    deployment_coordinate: Any,
+    *,
+    source_sha: str,
+    source_run_id: str,
+    source_run_attempt: str,
+    deployment_run_id: str,
+    deployment_run_attempt: str,
     acceptance_run_id: str,
     evidence_run_id: str,
     evidence_artifact_id: str,
     evidence_bundle_sha256: str,
     evidence_contract_sha256: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if not isinstance(verification, dict):
         fail("candidate-verification receipt is invalid")
     required_verification = {
@@ -405,8 +453,8 @@ def validate_receipts(
         "schemaVersion": 1,
         "status": "fully-accepted",
         "candidateSha": source_sha,
-        "candidateRunId": source_run_id,
-        "candidateRunAttempt": source_run_attempt,
+        "candidateRunId": deployment_run_id,
+        "candidateRunAttempt": deployment_run_attempt,
         "candidateRuntimeSha256": verification.get("archiveSha256"),
         "acceptanceWorkflowHeadSha": source_sha,
         "acceptedByRunId": acceptance_run_id,
@@ -438,7 +486,17 @@ def validate_receipts(
         r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", acceptance["environmentId"]
     ):
         fail("production-acceptance receipt environment ID is invalid")
-    return dict(verification), dict(acceptance)
+    deployment_coordinate = validate_deployment_coordinate_receipt(
+        deployment_coordinate,
+        source_sha=source_sha,
+        source_run_id=source_run_id,
+        source_run_attempt=source_run_attempt,
+        deployment_run_id=deployment_run_id,
+        deployment_run_attempt=deployment_run_attempt,
+        verified_artifact_name=f"paperdesk-azure-runtime-verified-{source_sha}",
+        runtime_sha256=str(verification.get("archiveSha256", "")),
+    )
+    return dict(verification), dict(acceptance), deployment_coordinate
 
 
 def file_record(path: Path, relative: str) -> dict[str, Any]:
@@ -490,6 +548,11 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     source_sha = full_sha(args.source_sha, "source SHA")
     source_run_id = positive(args.source_run_id, "source run ID")
     source_run_attempt = positive(args.source_run_attempt, "source run attempt")
+    deployment_run_id = positive(args.candidate_run_id, "deployment run ID")
+    deployment_run_attempt = positive(args.candidate_run_attempt, "deployment run attempt")
+    deployment_ref = paperdesk_deployment_workflow_ref(
+        args.deployment_workflow_ref, source_sha, "deployment workflow"
+    )
     acceptance_run_id = positive(args.acceptance_run_id, "acceptance run ID")
     acceptance_run_attempt = positive(args.acceptance_run_attempt, "acceptance run attempt")
     acceptance_ref = workflow_ref(args.acceptance_workflow_ref, "acceptance workflow")
@@ -497,16 +560,21 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         fail("acceptance workflow is not pinned to the candidate SHA")
     evidence_run_id = positive(args.evidence_run_id, "evidence run ID")
     evidence_run_attempt = positive(args.evidence_run_attempt, "evidence run attempt")
-    if len({source_run_id, acceptance_run_id, evidence_run_id}) != 3:
-        fail("source, acceptance, and evidence runs must be distinct")
+    if len({source_run_id, deployment_run_id, acceptance_run_id, evidence_run_id}) != 4:
+        fail("source, deployment, acceptance, and evidence runs must be distinct")
     evidence_digest = digest(args.evidence_bundle_sha256, "evidence bundle digest")
     verified_artifact_digest = digest(args.verified_artifact_digest, "verified artifact digest")
     verification_artifact_digest = digest(args.verification_artifact_digest, "verification artifact digest")
     acceptance_artifact_digest = digest(args.acceptance_artifact_digest, "acceptance artifact digest")
+    deployment_coordinate_artifact_digest = digest(
+        args.deployment_coordinate_artifact_digest,
+        "deployment-coordinate artifact digest",
+    )
     for value, label in (
         (args.verified_artifact_id, "verified artifact ID"),
         (args.verification_artifact_id, "verification artifact ID"),
         (args.acceptance_artifact_id, "acceptance artifact ID"),
+        (args.deployment_coordinate_artifact_id, "deployment-coordinate artifact ID"),
         (args.evidence_artifact_id, "evidence artifact ID"),
     ):
         positive(value, label)
@@ -515,21 +583,35 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     source_files = verified_files(verified_root, source_sha)
     verification_path = Path(args.verification_receipt).resolve()
     acceptance_path = Path(args.acceptance_receipt).resolve()
+    deployment_coordinate_path = Path(args.deployment_coordinate_receipt).resolve()
     expected_verification_name = f"paperdesk-candidate-verification-receipt-{source_sha}.json"
     expected_acceptance_name = f"paperdesk-production-acceptance-receipt-{source_sha}.json"
-    if verification_path.name != expected_verification_name or acceptance_path.name != expected_acceptance_name:
+    expected_deployment_coordinate_name = f"paperdesk-deployment-coordinate-receipt-{source_sha}.json"
+    expected_deployment_coordinate_artifact_name = f"paperdesk-deployment-coordinate-receipt-{source_sha}"
+    if (
+        verification_path.name != expected_verification_name
+        or acceptance_path.name != expected_acceptance_name
+        or deployment_coordinate_path.name != expected_deployment_coordinate_name
+        or args.deployment_coordinate_artifact_name != expected_deployment_coordinate_artifact_name
+    ):
         fail("receipt file names are not exact")
     verification = read_json(verification_path, "candidate-verification receipt", 8192)
     acceptance = read_json(acceptance_path, "production-acceptance receipt", 65536)
+    deployment_coordinate = read_json(
+        deployment_coordinate_path, "deployment-coordinate receipt", 4096
+    )
     worm_snapshot = validate_worm_snapshot(read_json(Path(args.worm_snapshot).resolve(), "live WORM snapshot", 8192))
     acceptance_contract_name = f"paperdesk-azure-runtime-{source_sha}.acceptance-contract.json"
     evidence_contract_sha256 = sha256_file(source_files[acceptance_contract_name])
-    verification, acceptance = validate_receipts(
+    verification, acceptance, deployment_coordinate = validate_receipts(
         verification,
         acceptance,
+        deployment_coordinate,
         source_sha=source_sha,
         source_run_id=source_run_id,
         source_run_attempt=source_run_attempt,
+        deployment_run_id=deployment_run_id,
+        deployment_run_attempt=deployment_run_attempt,
         acceptance_run_id=acceptance_run_id,
         evidence_run_id=evidence_run_id,
         evidence_artifact_id=args.evidence_artifact_id,
@@ -550,9 +632,12 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Path] = {f"verified-artifact/{relative}": path for relative, path in source_files.items()}
     payload[f"receipts/{expected_verification_name}"] = regular_file(verification_path, "candidate-verification receipt", 8192)
     payload[f"receipts/{expected_acceptance_name}"] = regular_file(acceptance_path, "production-acceptance receipt", 65536)
+    payload[f"receipts/{expected_deployment_coordinate_name}"] = regular_file(
+        deployment_coordinate_path, "deployment-coordinate receipt", 4096
+    )
     records = [file_record(payload[relative], relative) for relative in sorted(payload)]
     total = sum(record["size"] for record in records)
-    if len(records) != 19 or total > MAX_EXPANDED_BYTES:
+    if len(records) != 20 or total > MAX_EXPANDED_BYTES:
         fail("accepted-release payload inventory or expanded size is invalid")
 
     request = {
@@ -565,12 +650,17 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             "bridgeResourceGroup": BRIDGE_RESOURCE_GROUP,
             "prefix": f"v1/releases/{source_sha}/{source_run_id}/{acceptance_run_id}/",
         },
-        "candidate": {
+        "source": {
             "repository": "Sethvirak/MasterDataStructure",
             "sha": source_sha,
             "runId": source_run_id,
             "runAttempt": source_run_attempt,
             "workflowRef": source_workflow_ref,
+        },
+        "deployment": {
+            "runId": deployment_run_id,
+            "runAttempt": deployment_run_attempt,
+            "workflowRef": deployment_ref,
         },
         "acceptance": {
             "runId": acceptance_run_id,
@@ -608,6 +698,12 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
                 "name": f"paperdesk-production-acceptance-receipt-{source_sha}",
                 "digest": acceptance_artifact_digest,
                 "fileSha256": sha256_file(acceptance_path),
+            },
+            "deploymentCoordinateReceipt": {
+                "id": args.deployment_coordinate_artifact_id,
+                "name": expected_deployment_coordinate_artifact_name,
+                "digest": deployment_coordinate_artifact_digest,
+                "fileSha256": sha256_file(deployment_coordinate_path),
             },
         },
         "verifier": {
@@ -1029,26 +1125,40 @@ def extract_request(archive_path: Path, output: Path) -> tuple[dict[str, Any], d
 
 
 def validate_request(request: Any, root: Path) -> dict[str, Path]:
-    keys = {"schema", "environment", "registry", "candidate", "acceptance", "evidence", "artifacts", "verifier", "wormSnapshot", "files"}
+    keys = {
+        "schema", "environment", "registry", "source", "deployment", "acceptance",
+        "evidence", "artifacts", "verifier", "wormSnapshot", "files",
+    }
     if not isinstance(request, dict) or set(request) != keys or request.get("schema") != SCHEMA:
         fail("registry request fields or schema are not exact")
     if request.get("environment") != ENVIRONMENT:
         fail("registry request environment is invalid")
-    candidate = request.get("candidate")
+    source = request.get("source")
+    deployment = request.get("deployment")
     acceptance = request.get("acceptance")
     registry = request.get("registry")
-    if not isinstance(candidate, dict) or not isinstance(acceptance, dict) or not isinstance(registry, dict):
+    if (
+        not isinstance(source, dict)
+        or not isinstance(deployment, dict)
+        or not isinstance(acceptance, dict)
+        or not isinstance(registry, dict)
+    ):
         fail("registry request coordinates are invalid")
-    if set(candidate) != {"repository", "sha", "runId", "runAttempt", "workflowRef"}:
-        fail("registry request candidate fields are not exact")
+    if set(source) != {"repository", "sha", "runId", "runAttempt", "workflowRef"}:
+        fail("registry request source fields are not exact")
+    if set(deployment) != {"runId", "runAttempt", "workflowRef"}:
+        fail("registry request deployment fields are not exact")
     if set(acceptance) != {
         "runId", "runAttempt", "workflowRef", "acceptedAt", "candidateCompletedAt",
         "candidateFinalizeDeadline", "candidateRuntimeSha256", "evidenceContractSha256",
         "releaseScope", "environmentId",
     }:
         fail("registry request acceptance fields are not exact")
-    source_sha = full_sha(str(candidate.get("sha", "")), "request source SHA")
-    source_run_id = positive(str(candidate.get("runId", "")), "request source run ID")
+    source_sha = full_sha(str(source.get("sha", "")), "request source SHA")
+    source_run_id = positive(str(source.get("runId", "")), "request source run ID")
+    deployment_run_id = positive(
+        str(deployment.get("runId", "")), "request deployment run ID"
+    )
     acceptance_run_id = positive(str(acceptance.get("runId", "")), "request acceptance run ID")
     expected_registry = {
         "storageAccount": ACCOUNT,
@@ -1059,10 +1169,16 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     }
     if registry != expected_registry:
         fail("registry request does not use the fixed registry resource and prefix")
-    if candidate.get("repository") != "Sethvirak/MasterDataStructure":
+    if source.get("repository") != "Sethvirak/MasterDataStructure":
         fail("registry request repository is invalid")
-    source_ref = paperdesk_source_workflow_ref(str(candidate.get("workflowRef", "")), "request source workflow")
-    source_run_attempt = positive(str(candidate.get("runAttempt", "")), "request source run attempt")
+    source_ref = paperdesk_source_workflow_ref(str(source.get("workflowRef", "")), "request source workflow")
+    source_run_attempt = positive(str(source.get("runAttempt", "")), "request source run attempt")
+    deployment_ref = paperdesk_deployment_workflow_ref(
+        str(deployment.get("workflowRef", "")), source_sha, "request deployment workflow"
+    )
+    deployment_run_attempt = positive(
+        str(deployment.get("runAttempt", "")), "request deployment run attempt"
+    )
     acceptance_ref = workflow_ref(str(acceptance.get("workflowRef", "")), "request acceptance workflow")
     acceptance_run_attempt = positive(str(acceptance.get("runAttempt", "")), "request acceptance run attempt")
     if acceptance_ref.split("@", 1)[1] != source_sha:
@@ -1080,16 +1196,20 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
         rf"paperdesk-production-acceptance-evidence-post-deploy-{source_sha}", evidence["artifactName"]
     ):
         fail("registry request evidence artifact name is not exact")
-    if len({source_run_id, acceptance_run_id, evidence_run_id}) != 3:
-        fail("registry request source, acceptance, and evidence runs must be distinct")
+    if len({source_run_id, deployment_run_id, acceptance_run_id, evidence_run_id}) != 4:
+        fail("registry request source, deployment, acceptance, and evidence runs must be distinct")
 
     artifacts = request.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != {"verified", "verificationReceipt", "productionAcceptanceReceipt"}:
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "verified", "verificationReceipt", "productionAcceptanceReceipt",
+        "deploymentCoordinateReceipt",
+    }:
         fail("registry request artifact fields are not exact")
     expected_artifact_names = {
         "verified": f"paperdesk-azure-runtime-verified-{source_sha}",
         "verificationReceipt": f"paperdesk-candidate-verification-receipt-{source_sha}",
         "productionAcceptanceReceipt": f"paperdesk-production-acceptance-receipt-{source_sha}",
+        "deploymentCoordinateReceipt": f"paperdesk-deployment-coordinate-receipt-{source_sha}",
     }
     for label, expected_name in expected_artifact_names.items():
         artifact = artifacts.get(label)
@@ -1112,7 +1232,7 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     positive(str(verifier.get("runId", "")), "request verifier run ID")
     positive(str(verifier.get("runAttempt", "")), "request verifier run attempt")
     records = request.get("files")
-    if not isinstance(records, list) or len(records) != 19:
+    if not isinstance(records, list) or len(records) != 20:
         fail("registry request file inventory count is invalid")
     files: dict[str, Path] = {}
     total = 0
@@ -1138,24 +1258,39 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     expected_payload |= {
         f"receipts/paperdesk-candidate-verification-receipt-{source_sha}.json",
         f"receipts/paperdesk-production-acceptance-receipt-{source_sha}.json",
+        f"receipts/paperdesk-deployment-coordinate-receipt-{source_sha}.json",
     }
     if set(files) != expected_payload:
         fail("registry request preserved-file inventory is not exact")
 
     verification_path = files[f"receipts/paperdesk-candidate-verification-receipt-{source_sha}.json"]
     acceptance_path = files[f"receipts/paperdesk-production-acceptance-receipt-{source_sha}.json"]
+    deployment_coordinate_path = files[
+        f"receipts/paperdesk-deployment-coordinate-receipt-{source_sha}.json"
+    ]
     if sha256_file(verification_path) != artifacts["verificationReceipt"]["fileSha256"]:
         fail("registry request verification-receipt digest binding is invalid")
     if sha256_file(acceptance_path) != artifacts["productionAcceptanceReceipt"]["fileSha256"]:
         fail("registry request acceptance-receipt digest binding is invalid")
+    if (
+        sha256_file(deployment_coordinate_path)
+        != artifacts["deploymentCoordinateReceipt"]["fileSha256"]
+    ):
+        fail("registry request deployment-coordinate receipt digest binding is invalid")
     verification = read_json(verification_path, "request candidate-verification receipt", 8192)
     production_acceptance = read_json(acceptance_path, "request production-acceptance receipt", 65536)
+    deployment_coordinate = read_json(
+        deployment_coordinate_path, "request deployment-coordinate receipt", 4096
+    )
     validate_receipts(
         verification,
         production_acceptance,
+        deployment_coordinate,
         source_sha=source_sha,
         source_run_id=source_run_id,
         source_run_attempt=source_run_attempt,
+        deployment_run_id=deployment_run_id,
+        deployment_run_attempt=deployment_run_attempt,
         acceptance_run_id=acceptance_run_id,
         evidence_run_id=evidence_run_id,
         evidence_artifact_id=evidence["artifactId"],
@@ -1190,7 +1325,7 @@ def validate_request(request: Any, root: Path) -> dict[str, Path]:
     provenance = read_json(provenance_path, "request candidate provenance")
     if not isinstance(provenance, dict) or any((
         provenance.get("commit") != source_sha,
-        provenance.get("repository") != candidate["repository"],
+        provenance.get("repository") != source["repository"],
         str(provenance.get("runId")) != source_run_id,
         str(provenance.get("runAttempt")) != source_run_attempt,
         provenance.get("workflow") != source_ref,
@@ -1649,7 +1784,7 @@ def persist_request(
 
         # A local prefix escape must be rejected before the sole completion marker.
         try:
-            blob_url(f"v1/releases/{request['candidate']['sha']}/outside", prefix)
+            blob_url(f"v1/releases/{request['source']['sha']}/outside", prefix)
         except RegistryError:
             pass
         else:
@@ -1696,16 +1831,16 @@ def bounded_one_shot_result(
         not isinstance(persisted, dict)
         or persisted.get("status") != "complete"
         or persisted.get("prefix") != expected_prefix
-        or persisted.get("fileCount") != 19
+        or persisted.get("fileCount") != 20
         or type(persisted.get("createdBlobCount")) is not int
-        or not 0 <= persisted["createdBlobCount"] <= 20
+        or not 0 <= persisted["createdBlobCount"] <= 21
         or not (
             (
                 persisted["createdBlobCount"] == 0
                 and persisted.get("overwriteNegative") == "not-run-completed"
             )
             or (
-                1 <= persisted["createdBlobCount"] <= 20
+                1 <= persisted["createdBlobCount"] <= 21
                 and persisted.get("overwriteNegative") == "passed"
             )
         )
@@ -1721,7 +1856,7 @@ def bounded_one_shot_result(
         "artifactZipSha256": digest(artifact_sha256, "Actions artifact ZIP digest"),
         "requestSha256": digest(request_sha256, "Actions registry request digest"),
         "manifestSha256": manifest_sha256,
-        "fileCount": 19,
+        "fileCount": 20,
         "createdBlobCount": persisted["createdBlobCount"],
         "overwriteNegative": persisted["overwriteNegative"],
         "outOfPrefixNegative": "passed",
@@ -1794,16 +1929,16 @@ def validate_attested_helper_result(
                 != result["requestSha256"]
             or digest(str(result.get("manifestSha256", "")), "manifest digest")
                 != result["manifestSha256"]
-            or result.get("fileCount") != 19
+            or result.get("fileCount") != 20
             or type(result.get("createdBlobCount")) is not int
-            or not 0 <= result["createdBlobCount"] <= 20
+            or not 0 <= result["createdBlobCount"] <= 21
             or not (
                 (
                     result["createdBlobCount"] == 0
                     and result.get("overwriteNegative") == "not-run-completed"
                 )
                 or (
-                    1 <= result["createdBlobCount"] <= 20
+                    1 <= result["createdBlobCount"] <= 21
                     and result.get("overwriteNegative") == "passed"
                 )
             )
@@ -2305,11 +2440,15 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--output", required=True)
     build = commands.add_parser("build")
     for name in (
-        "source-sha", "source-run-id", "source-run-attempt", "acceptance-run-id", "acceptance-run-attempt",
+        "source-sha", "source-run-id", "source-run-attempt", "candidate-run-id", "candidate-run-attempt",
+        "deployment-workflow-ref", "acceptance-run-id", "acceptance-run-attempt",
         "acceptance-workflow-ref", "evidence-run-id", "evidence-run-attempt", "evidence-artifact-id",
         "evidence-artifact-name", "evidence-bundle-sha256", "verified-artifact-id", "verified-artifact-digest",
         "verification-artifact-id", "verification-artifact-digest", "acceptance-artifact-id",
-        "acceptance-artifact-digest", "verified-artifact-dir", "verification-receipt", "acceptance-receipt",
+        "acceptance-artifact-digest", "deployment-coordinate-artifact-id",
+        "deployment-coordinate-artifact-name", "deployment-coordinate-artifact-digest",
+        "verified-artifact-dir", "verification-receipt", "acceptance-receipt",
+        "deployment-coordinate-receipt",
         "worm-snapshot", "output",
     ):
         build.add_argument(f"--{name}", required=True)

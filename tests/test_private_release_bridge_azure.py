@@ -1,4 +1,4 @@
-import base64, hashlib, io, json, time, unittest, zipfile
+import base64, hashlib, http.server, io, json, threading, time, unittest, zipfile
 from provider import private_release_bridge_azure as azure
 from scripts import private_release_mailbox as core
 from tests import private_release_v2_fixture as fixture
@@ -11,6 +11,31 @@ def jwt(**changes):
 class Tokens:
  def get(self,resource): return "token"
 class Tests(unittest.TestCase):
+ def assert_privileged_redirect_fails_closed(self,surface,headers):
+  redirect_requests=[];sink_requests=[]
+  class Handler(http.server.BaseHTTPRequestHandler):
+   def do_GET(self):
+    if self.path=="/redirect":
+     redirect_requests.append((surface,dict(self.headers)))
+     self.send_response(302);self.send_header("Location",f"http://127.0.0.1:{self.server.server_port}/sink");self.end_headers();return
+    sink_requests.append((surface,self.path,dict(self.headers)));self.send_response(200);self.end_headers()
+   def log_message(self,*args):pass
+  server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   response=azure.Http()("GET",f"http://127.0.0.1:{server.server_port}/redirect",headers,None)
+   self.assertEqual(response.status,302);self.assertEqual(len(redirect_requests),1);self.assertEqual(sink_requests,[])
+   observed_headers={name.lower():value for name,value in redirect_requests[0][1].items()}
+   for name,value in headers.items():self.assertEqual(observed_headers.get(name.lower()),value)
+  finally:
+   server.shutdown();server.server_close();thread.join(timeout=5)
+ def test_managed_identity_header_never_follows_redirect(self):
+  self.assert_privileged_redirect_fails_closed("managed-identity",{"X-IDENTITY-HEADER":"identity-secret"})
+ def test_arm_bearer_never_follows_redirect(self):
+  self.assert_privileged_redirect_fails_closed("arm",{"Authorization":"Bearer arm-secret"})
+ def test_storage_bearer_never_follows_redirect(self):
+  self.assert_privileged_redirect_fails_closed("storage",{"Authorization":"Bearer storage-secret"})
+ def test_vault_bearer_never_follows_redirect(self):
+  self.assert_privileged_redirect_fails_closed("vault",{"Authorization":"Bearer vault-secret"})
  def provider(self,token):
   return azure.ManagedIdentityTokens(client_id=CID,principal_id=PID,tenant_id=TID,endpoint="http://127.0.0.1:41741/MSI/token",identity_header="secret",clock=lambda:NOW,transport=lambda *args:core.Response(200,"",json.dumps({"access_token":token}).encode(),{}))
  def test_token_is_bound_to_audience_client_tenant_and_expiry(self):

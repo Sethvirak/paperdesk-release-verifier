@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       operation:
-        description: Registry bridge preflight, bootstrap, candidate deployment, live finalization, rollback, accepted-release persistence, or transient cleanup
+        description: Release-state read-only registry bridge preflight, bootstrap, candidate deployment, live finalization, rollback, accepted-release persistence, or transient cleanup
         required: true
         type: string
       source_repository:
@@ -24,6 +24,16 @@ on:
       source_run_attempt:
         required: true
         type: string
+      candidate_run_id:
+        description: Exact successful deploy-candidate workflow run; required only for accepted-release persistence
+        required: false
+        type: string
+        default: ''
+      candidate_run_attempt:
+        description: Exact successful deploy-candidate workflow run attempt; required only for accepted-release persistence
+        required: false
+        type: string
+        default: ''
       logical_operation_id:
         description: Stable SHA-256 authorization identifier; required only for rollback and reused across workflow reruns
         required: false
@@ -204,6 +214,8 @@ jobs:
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           ACCEPTED_MANIFEST_BLOB: ${{ inputs.accepted_manifest_blob }}
           ACCEPTED_MANIFEST_ETAG: ${{ inputs.accepted_manifest_etag }}
           ACCEPTED_MANIFEST_SIZE: ${{ inputs.accepted_manifest_size }}
@@ -241,7 +253,7 @@ jobs:
           SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@bbe3b1fdfe99d7afb8bf52a3b1981f24c74b7fda
+          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@${{ job.workflow_sha }}
           VERIFICATION_RECEIPT_NAME: ${{ inputs.verification_receipt_name }}
           VERIFICATION_RECEIPT_SHA256: ${{ inputs.verification_receipt_sha256 }}
           VERIFIED_ARTIFACT_NAME: ${{ inputs.verified_artifact_name }}
@@ -271,7 +283,7 @@ jobs:
           cleanup_workflow_name="PaperDesk external-control OIDC canary"
           cleanup_workflow_path=".github/workflows/production-oidc-canary.yml"
           case "${OPERATION}" in
-            bootstrap-current-production|deploy-candidate|rollback-accepted-release|finalize-live-release)
+            registry-bridge-preflight|bootstrap-current-production|deploy-candidate|rollback-accepted-release|finalize-live-release)
               expected_caller_workflow_id="306965591"
               expected_caller_workflow_name="${production_workflow_name}"
               expected_caller_workflow_path="${production_workflow_path}"
@@ -294,6 +306,13 @@ jobs:
           test "${CALLER_WORKFLOW_NAME}" = "${expected_caller_workflow_name}"
           test "${GITHUB_WORKFLOW_REF}" = "${expected_caller_workflow_ref}"
           case "${OPERATION}" in
+            registry-bridge-preflight)
+              test "${GITHUB_WORKFLOW_REF}" = "${production_workflow_ref}"
+              [[ "${GITHUB_EVENT_NAME}" =~ ^(push|workflow_dispatch)$ ]]
+              test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"
+              test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"
+              test -z "${VERIFIED_ARTIFACT_NAME}${VERIFICATION_RECEIPT_NAME}${VERIFICATION_RECEIPT_SHA256}${ACCEPTANCE_RUN_ID}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${EVIDENCE_RUN_ID}"
+              ;;
             bootstrap-current-production)
               test "${SOURCE_SHA}" = "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"
               test "${SOURCE_RUN_ID}" = "31665623339"
@@ -356,6 +375,8 @@ jobs:
               test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
               test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
               [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+              [[ "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+              [[ "${CANDIDATE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
               [[ "${ACCEPTANCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
               [[ "${ACCEPTANCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
               test "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" = "paperdesk-production-acceptance-receipt-${SOURCE_SHA}"
@@ -364,7 +385,10 @@ jobs:
               [[ "${EVIDENCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
               [[ "${EVIDENCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
               test "${ACCEPTANCE_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${CANDIDATE_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${CANDIDATE_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
               test "${EVIDENCE_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${EVIDENCE_RUN_ID}" != "${CANDIDATE_RUN_ID}"
               test "${EVIDENCE_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
               test "${EVIDENCE_ARTIFACT_NAME}" = "paperdesk-production-acceptance-evidence-post-deploy-${SOURCE_SHA}"
               [[ "${EVIDENCE_BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
@@ -372,6 +396,9 @@ jobs:
               test "${GITHUB_SHA}" = "${CALLER_SHA}"
               test "${GITHUB_REF}" = "refs/heads/main"
               test "${GITHUB_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"
+              test "${GITHUB_RUN_ID}" != "${SOURCE_RUN_ID}"
+              test "${GITHUB_RUN_ID}" != "${CANDIDATE_RUN_ID}"
+              test "${GITHUB_RUN_ID}" != "${EVIDENCE_RUN_ID}"
               test "${GITHUB_WORKFLOW_REF}" = "${persist_workflow_ref}"
               test "${GITHUB_EVENT_NAME}" = "workflow_run"
               test -z "${EXPECTED_APP_NAME}${EXPECTED_RESOURCE_GROUP}${EXPECTED_LIVE_URL}"
@@ -405,6 +432,7 @@ jobs:
             test -z "${ACCEPTED_MANIFEST_BLOB}${ACCEPTED_MANIFEST_VERSION_ID}${ACCEPTED_MANIFEST_SHA256}${ACCEPTED_MANIFEST_SIZE}${ACCEPTED_MANIFEST_ETAG}"
           fi
           if [ "${OPERATION}" != "persist-accepted-release" ]; then
+            test -z "${CANDIDATE_RUN_ID}${CANDIDATE_RUN_ATTEMPT}"
             test -z "${PENDING_RELEASE_BLOB}${PENDING_RELEASE_VERSION_ID}${PENDING_RELEASE_SHA256}${PENDING_RELEASE_SIZE}${PENDING_RELEASE_ETAG}${CONSUMED_MARKER_BLOB}${CONSUMED_MARKER_VERSION_ID}${CONSUMED_MARKER_SHA256}${CONSUMED_MARKER_SIZE}${CONSUMED_MARKER_ETAG}"
           fi
           case "${OPERATION}" in
@@ -585,7 +613,7 @@ jobs:
         if: inputs.operation == 'deploy-candidate' || inputs.operation == 'persist-accepted-release' || inputs.operation == 'finalize-live-release'
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
-          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@bbe3b1fdfe99d7afb8bf52a3b1981f24c74b7fda
+          VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@${{ job.workflow_sha }}
           VERIFICATION_RECEIPT_SHA256: ${{ inputs.verification_receipt_sha256 }}
         run: |
           set -euo pipefail
@@ -605,6 +633,8 @@ jobs:
         env:
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
           EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
           EVIDENCE_RUN_ATTEMPT: ${{ inputs.evidence_run_attempt }}
@@ -661,8 +691,21 @@ jobs:
           }
           resolve_artifact "${SOURCE_RUN_ID}" "${SOURCE_RUN_ATTEMPT}" "${VERIFIED_ARTIFACT_NAME}" verified "${source_workflow_path}" "${source_event}"
           resolve_artifact "${SOURCE_RUN_ID}" "${SOURCE_RUN_ATTEMPT}" "${VERIFICATION_RECEIPT_NAME}" verification "${source_workflow_path}" "${source_event}"
+          resolve_artifact "${CANDIDATE_RUN_ID}" "${CANDIDATE_RUN_ATTEMPT}" "paperdesk-deployment-coordinate-receipt-${SOURCE_SHA}" deployment "${source_workflow_path}" workflow_dispatch
           resolve_artifact "${ACCEPTANCE_RUN_ID}" "${ACCEPTANCE_RUN_ATTEMPT}" "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" acceptance ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml" workflow_dispatch
           resolve_artifact "${EVIDENCE_RUN_ID}" "${EVIDENCE_RUN_ATTEMPT}" "${EVIDENCE_ARTIFACT_NAME}" evidence ".github/workflows/production-evidence-intake.yml" workflow_dispatch
+          candidate_jobs_json="$(gh api "/repos/${SOURCE_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/jobs?per_page=100")"
+          test "$(jq '[.jobs[] | select(.name == "Deploy exact candidate pending final acceptance" and .conclusion == "success")] | length' <<< "${candidate_jobs_json}")" -eq 1
+
+      - name: Download exact deployment-coordinate receipt
+        if: inputs.operation == 'persist-accepted-release'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: paperdesk-deployment-coordinate-receipt-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/paperdesk-deployment-coordinate-receipt
+          repository: ${{ inputs.source_repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Download exact production-acceptance receipt
         if: inputs.operation == 'persist-accepted-release'
@@ -674,16 +717,47 @@ jobs:
           run-id: ${{ inputs.acceptance_run_id }}
           github-token: ${{ github.token }}
 
+      - name: Validate deployment-coordinate receipt before registry bridge activation
+        if: inputs.operation == 'persist-accepted-release'
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/paperdesk-deployment-coordinate-receipt"
+          receipt="${root}/paperdesk-deployment-coordinate-receipt-${SOURCE_SHA}.json"
+          verification_receipt="${RUNNER_TEMP}/paperdesk-verification-receipt/paperdesk-candidate-verification-receipt-${SOURCE_SHA}.json"
+          test "$(find "${root}" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+          test -f "${receipt}" && test ! -L "${receipt}" && test "$(stat --format=%s "${receipt}")" -le 4096
+          test "$(wc -l < "${receipt}")" -eq 1
+          candidate_runtime_sha256="$(jq -er '.archiveSha256 | select(test("^[0-9a-f]{64}$"))' "${verification_receipt}")"
+          expected="${RUNNER_TEMP}/paperdesk-expected-deployment-coordinate-receipt.json"
+          jq -cnS \
+            --arg candidateRuntimeSha256 "${candidate_runtime_sha256}" \
+            --arg candidateSha "${SOURCE_SHA}" \
+            --arg candidateSourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg candidateSourceRunId "${SOURCE_RUN_ID}" \
+            --arg deploymentRunAttempt "${CANDIDATE_RUN_ATTEMPT}" \
+            --arg deploymentRunId "${CANDIDATE_RUN_ID}" \
+            --arg schema "paperdesk-deployment-coordinate-receipt-v1" \
+            --arg verifiedArtifactName "paperdesk-azure-runtime-verified-${SOURCE_SHA}" \
+            '{candidateRuntimeSha256: $candidateRuntimeSha256, candidateSha: $candidateSha, candidateSourceRunAttempt: $candidateSourceRunAttempt, candidateSourceRunId: $candidateSourceRunId, deploymentRunAttempt: $deploymentRunAttempt, deploymentRunId: $deploymentRunId, schema: $schema, schemaVersion: 1, verifiedArtifactName: $verifiedArtifactName}' \
+            > "${expected}"
+          cmp --silent "${receipt}" "${expected}"
+
       - name: Validate production-acceptance receipt before registry bridge activation
         if: inputs.operation == 'persist-accepted-release'
         env:
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           EVIDENCE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.evidence_id }}
           EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
           EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
           PRODUCTION_ACCEPTANCE_RECEIPT_SHA256: ${{ inputs.production_acceptance_receipt_sha256 }}
-          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -700,8 +774,8 @@ jobs:
           [[ "${evidence_contract_sha256}" =~ ^[0-9a-f]{64}$ ]]
           jq --exit-status \
             --arg sha "${SOURCE_SHA}" \
-            --arg sourceRunId "${SOURCE_RUN_ID}" \
-            --arg sourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg candidateRunId "${CANDIDATE_RUN_ID}" \
+            --arg candidateRunAttempt "${CANDIDATE_RUN_ATTEMPT}" \
             --arg acceptanceRunId "${ACCEPTANCE_RUN_ID}" \
             --arg evidenceRunId "${EVIDENCE_RUN_ID}" \
             --arg evidenceArtifactId "${EVIDENCE_ARTIFACT_ID}" \
@@ -712,8 +786,8 @@ jobs:
             and .schemaVersion == 1
             and .status == "fully-accepted"
             and .candidateSha == $sha
-            and .candidateRunId == $sourceRunId
-            and .candidateRunAttempt == $sourceRunAttempt
+            and .candidateRunId == $candidateRunId
+            and .candidateRunAttempt == $candidateRunAttempt
             and .candidateRuntimeSha256 == $candidateRuntimeSha256
             and .acceptanceWorkflowHeadSha == $sha
             and .acceptedByRunId == $acceptanceRunId
@@ -777,7 +851,7 @@ jobs:
           test -f "${snapshot}" && test ! -L "${snapshot}" && test "$(stat --format=%s "${snapshot}")" -le 8192
 
       - name: Check out immutable registry control and bootstrap trust anchor
-        if: inputs.operation == 'bootstrap-current-production' || inputs.operation == 'deploy-candidate' || inputs.operation == 'persist-accepted-release' || inputs.operation == 'rollback-accepted-release' || inputs.operation == 'cleanup-transient'
+        if: inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'bootstrap-current-production' || inputs.operation == 'deploy-candidate' || inputs.operation == 'persist-accepted-release' || inputs.operation == 'rollback-accepted-release' || inputs.operation == 'cleanup-transient'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: Sethvirak/paperdesk-release-verifier
@@ -815,7 +889,7 @@ jobs:
           trigger="${RUNNER_TEMP}/paperdesk-private-release-transient-cleanup-trigger.json"
           evidence="evidence/private-release-provisioning-evidence.json"
           runtime_receipt="evidence/private-release-bridge-runtime-receipt.json"
-          printf '%s\n' "${PRIVATE_RELEASE_ACTIVATION_JSON}" > "${activation}"
+          printf '%s' "${PRIVATE_RELEASE_ACTIVATION_JSON}" > "${activation}"
           chmod 600 "${activation}"
           test -f "paperdesk-registry-control/${evidence}" && test ! -L "paperdesk-registry-control/${evidence}"
           test -f "paperdesk-registry-control/${runtime_receipt}" && test ! -L "paperdesk-registry-control/${runtime_receipt}"
@@ -908,6 +982,12 @@ jobs:
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          DEPLOYMENT_COORDINATE_ARTIFACT_DIGEST: ${{ steps.registry_artifacts.outputs.deployment_digest }}
+          DEPLOYMENT_COORDINATE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.deployment_id }}
+          DEPLOYMENT_COORDINATE_ARTIFACT_NAME: paperdesk-deployment-coordinate-receipt-${{ inputs.source_sha }}
+          DEPLOYMENT_WORKFLOW_REF: Sethvirak/MasterDataStructure/.github/workflows/main_master-data-structure-sea-9c4e0d0d.yml@${{ inputs.source_sha }}
           EVIDENCE_ARTIFACT_ID: ${{ steps.registry_artifacts.outputs.evidence_id }}
           EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
           EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
@@ -928,6 +1008,13 @@ jobs:
             --source-sha "${SOURCE_SHA}" \
             --source-run-id "${SOURCE_RUN_ID}" \
             --source-run-attempt "${SOURCE_RUN_ATTEMPT}" \
+            --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-run-attempt "${CANDIDATE_RUN_ATTEMPT}" \
+            --deployment-workflow-ref "${DEPLOYMENT_WORKFLOW_REF}" \
+            --deployment-coordinate-receipt "${RUNNER_TEMP}/paperdesk-deployment-coordinate-receipt/paperdesk-deployment-coordinate-receipt-${SOURCE_SHA}.json" \
+            --deployment-coordinate-artifact-id "${DEPLOYMENT_COORDINATE_ARTIFACT_ID}" \
+            --deployment-coordinate-artifact-name "${DEPLOYMENT_COORDINATE_ARTIFACT_NAME}" \
+            --deployment-coordinate-artifact-digest "${DEPLOYMENT_COORDINATE_ARTIFACT_DIGEST}" \
             --acceptance-run-id "${ACCEPTANCE_RUN_ID}" \
             --acceptance-run-attempt "${ACCEPTANCE_RUN_ATTEMPT}" \
             --acceptance-workflow-ref "${ACCEPTANCE_WORKFLOW_REF}" \
@@ -1058,10 +1145,12 @@ jobs:
 
       - name: Persist or recover release exclusively through the signed private mailbox
         id: private_release_mailbox
-        if: steps.azure_session.outputs.confirmed == 'true' && (inputs.operation == 'bootstrap-current-production' || inputs.operation == 'deploy-candidate' || inputs.operation == 'persist-accepted-release' || inputs.operation == 'rollback-accepted-release')
+        if: steps.azure_session.outputs.confirmed == 'true' && (inputs.operation == 'registry-bridge-preflight' || inputs.operation == 'bootstrap-current-production' || inputs.operation == 'deploy-candidate' || inputs.operation == 'persist-accepted-release' || inputs.operation == 'rollback-accepted-release')
         env:
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           ACCEPTED_MANIFEST_BLOB: ${{ inputs.accepted_manifest_blob }}
           ACCEPTED_MANIFEST_ETAG: ${{ inputs.accepted_manifest_etag }}
           ACCEPTED_MANIFEST_SHA256: ${{ inputs.accepted_manifest_sha256 }}
@@ -1097,7 +1186,7 @@ jobs:
           activation="${RUNNER_TEMP}/paperdesk-private-release-activation.json"
           request="${RUNNER_TEMP}/paperdesk-private-release-request.json"
           result="${RUNNER_TEMP}/paperdesk-private-release-result.json"
-          printf '%s\n' "${PRIVATE_RELEASE_ACTIVATION_JSON}" > "${activation}"
+          printf '%s' "${PRIVATE_RELEASE_ACTIVATION_JSON}" > "${activation}"
           chmod 600 "${activation}"
           if [ "${OPERATION}" = "deploy-candidate" ]; then
             artifact_json="$(gh api "/repos/${SOURCE_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" | jq --arg name "${VERIFIED_ARTIFACT_NAME}" '[.artifacts[] | select(.name == $name and .expired == false)] | if length == 1 then .[0] else error("artifact") end')"
@@ -1117,7 +1206,7 @@ jobs:
           PYTHONPATH="paperdesk-registry-control" REQUEST="${request}" python3 - <<'PY'
           import datetime as dt, json, os, secrets
           from scripts import private_release_mailbox as core
-          operation={"bootstrap-current-production":"bootstrap-prepare","deploy-candidate":"prepare-candidate","persist-accepted-release":"persist-accepted-release","rollback-accepted-release":"prepare-rollback"}[os.environ["OPERATION"]]
+          operation={"registry-bridge-preflight":"registry-bridge-preflight","bootstrap-current-production":"bootstrap-prepare","deploy-candidate":"prepare-candidate","persist-accepted-release":"persist-accepted-release","rollback-accepted-release":"prepare-rollback"}[os.environ["OPERATION"]]
           now=dt.datetime.now(dt.timezone.utc); stamp=lambda value:value.strftime("%Y-%m-%dT%H:%M:%S.")+f"{value.microsecond//1000:03d}Z"
           def descriptor(prefix):
               return {"blob":os.environ[prefix+"_BLOB"],"sha256":os.environ[prefix+"_SHA256"],"size":int(os.environ[prefix+"_SIZE"]),"etag":os.environ[prefix+"_ETAG"],"versionId":os.environ[prefix+"_VERSION_ID"]}
@@ -1127,7 +1216,7 @@ jobs:
           pending=descriptor("PENDING_RELEASE") if operation=="persist-accepted-release" else None
           consumed=descriptor("CONSUMED_MARKER") if operation=="persist-accepted-release" else None
           logical_operation_id=os.environ["LOGICAL_OPERATION_ID"] if operation=="prepare-rollback" else None
-          document={"schemaVersion":1,"requestType":"paperdesk-private-release-request","operation":operation,"repositoryId":base["repositoryId"] if bootstrap else os.environ["REPOSITORY_ID"],"ownerId":base["ownerId"] if bootstrap else os.environ["OWNER_ID"],"controlWorkflowSha":os.environ["CONTROL_WORKFLOW_SHA"],"sourceSha":base["sourceSha"] if bootstrap else os.environ["SOURCE_SHA"],"sourceRunId":base["sourceRunId"] if bootstrap else os.environ["SOURCE_RUN_ID"],"sourceRunAttempt":base["sourceRunAttempt"] if bootstrap else os.environ["SOURCE_RUN_ATTEMPT"],"artifactId":base["artifactId"] if bootstrap else (os.environ["ARTIFACT_ID"] if artifact_operation else ""),"artifactSha256":base["artifactSha256"] if bootstrap else (os.environ["ARTIFACT_SHA256"] if artifact_operation else ""),"artifactMember":base["artifactMember"] if bootstrap else (os.environ["ARTIFACT_MEMBER"] if artifact_operation else ""),"artifactMemberSha256":base["artifactMemberSha256"] if bootstrap else (os.environ["ARTIFACT_MEMBER_SHA256"] if artifact_operation else ""),"acceptanceRunId":os.environ["ACCEPTANCE_RUN_ID"] or os.environ["GITHUB_RUN_ID"],"acceptanceRunAttempt":os.environ["ACCEPTANCE_RUN_ATTEMPT"] or os.environ["GITHUB_RUN_ATTEMPT"],"logicalOperationId":logical_operation_id,"nonce":secrets.token_hex(16),"issuedAt":stamp(now),"expiresAt":stamp(now+dt.timedelta(minutes=15)),"acceptedBaseline":accepted,"pendingRelease":pending,"consumedMarker":consumed,"rollbackPreparation":None,"activationPlan":None,"activationProof":None}
+          document={"schemaVersion":2,"requestType":"paperdesk-private-release-request","operation":operation,"repositoryId":base["repositoryId"] if bootstrap else os.environ["REPOSITORY_ID"],"ownerId":base["ownerId"] if bootstrap else os.environ["OWNER_ID"],"controlWorkflowSha":os.environ["CONTROL_WORKFLOW_SHA"],"sourceSha":base["sourceSha"] if bootstrap else os.environ["SOURCE_SHA"],"sourceRunId":base["sourceRunId"] if bootstrap else os.environ["SOURCE_RUN_ID"],"sourceRunAttempt":base["sourceRunAttempt"] if bootstrap else os.environ["SOURCE_RUN_ATTEMPT"],"candidateRunId":os.environ["CANDIDATE_RUN_ID"] if operation=="persist-accepted-release" else None,"candidateRunAttempt":os.environ["CANDIDATE_RUN_ATTEMPT"] if operation=="persist-accepted-release" else None,"artifactId":base["artifactId"] if bootstrap else (os.environ["ARTIFACT_ID"] if artifact_operation else ""),"artifactSha256":base["artifactSha256"] if bootstrap else (os.environ["ARTIFACT_SHA256"] if artifact_operation else ""),"artifactMember":base["artifactMember"] if bootstrap else (os.environ["ARTIFACT_MEMBER"] if artifact_operation else ""),"artifactMemberSha256":base["artifactMemberSha256"] if bootstrap else (os.environ["ARTIFACT_MEMBER_SHA256"] if artifact_operation else ""),"acceptanceRunId":os.environ["ACCEPTANCE_RUN_ID"] or os.environ["GITHUB_RUN_ID"],"acceptanceRunAttempt":os.environ["ACCEPTANCE_RUN_ATTEMPT"] or os.environ["GITHUB_RUN_ATTEMPT"],"logicalOperationId":logical_operation_id,"nonce":secrets.token_hex(16),"issuedAt":stamp(now),"expiresAt":stamp(now+dt.timedelta(minutes=15)),"acceptedBaseline":accepted,"pendingRelease":pending,"consumedMarker":consumed,"rollbackPreparation":None,"activationPlan":None,"activationProof":None}
           core.validate_request(document,now=now)
           open(os.environ["REQUEST"],"w",encoding="utf-8",newline="\n").write(json.dumps(document,sort_keys=True,separators=(",",":"))+"\n")
           PY
@@ -1154,15 +1243,52 @@ jobs:
           test -s "${result}" && test ! -L "${result}"
           jq --exit-status '(.housekeeping | type == "array" and length > 0) and all(.housekeeping[]; .status == "complete" and .failures == [])' "${result}" >/dev/null
           echo "result_sha256=$(sha256sum "${result}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"
-          accepted_baseline=""; pending_release=""; consumed_marker=""
-          if [ "${OPERATION}" = "bootstrap-current-production" ]; then
-            accepted_baseline="$(jq --compact-output '.consumedBridgeResult.records.acceptedBaseline' "${result}")"
-          elif [ "${OPERATION}" = "deploy-candidate" ]; then
-            pending_release="$(jq --compact-output '.bridgeResult.records.pendingRelease' "${result}")"
-            consumed_marker="$(jq --compact-output '.consumedBridgeResult.records.consumedMarker' "${result}")"
-          elif [ "${OPERATION}" = "persist-accepted-release" ]; then
-            accepted_baseline="$(jq --compact-output '.bridgeResult.records.acceptedBaseline' "${result}")"
-          fi
+          case "${OPERATION}" in
+            registry-bridge-preflight)
+              records="$(jq --compact-output '.bridgeResult.records' "${result}")"
+              ;;
+            bootstrap-current-production)
+              records="$(jq --compact-output '.consumedBridgeResult.records' "${result}")"
+              ;;
+            deploy-candidate)
+              records="$(jq --compact-output '{acceptedBaseline:.bridgeResult.records.acceptedBaseline,pendingRelease:.bridgeResult.records.pendingRelease,consumedMarker:.consumedBridgeResult.records.consumedMarker}' "${result}")"
+              ;;
+            persist-accepted-release|rollback-accepted-release)
+              records="$(jq --compact-output '.bridgeResult.records' "${result}")"
+              ;;
+            *) exit 1 ;;
+          esac
+          accepted_baseline="$(jq --compact-output '.acceptedBaseline' <<< "${records}")"
+          pending_release="$(jq --compact-output '.pendingRelease' <<< "${records}")"
+          consumed_marker="$(jq --compact-output '.consumedMarker' <<< "${records}")"
+          jq --exit-status --argjson acceptedBaseline "${accepted_baseline}" --argjson pendingRelease "${pending_release}" --argjson consumedMarker "${consumed_marker}" '
+            def descriptor:
+              type == "object"
+              and (keys == ["blob","etag","sha256","size","versionId"])
+              and (.blob | type == "string")
+              and (.sha256 | test("^[0-9a-f]{64}$"))
+              and (.size | type == "number" and . >= 1 and floor == .)
+              and (.etag | type == "string" and test("^\"[^\"\\r\\n]+\"$"))
+              and (.versionId | type == "string" and test("^[A-Za-z0-9._=:+/-]{1,256}$"));
+            ($acceptedBaseline == null or ($acceptedBaseline | descriptor))
+            and ($pendingRelease == null or ($pendingRelease | descriptor))
+            and ($consumedMarker == null or ($consumedMarker | descriptor))
+          ' <<< '{}' >/dev/null
+          case "${OPERATION}" in
+            registry-bridge-preflight|rollback-accepted-release)
+              test "${accepted_baseline}" != "null"; test "${pending_release}" = "null"; test "${consumed_marker}" = "null"
+              ;;
+            bootstrap-current-production)
+              test "${accepted_baseline}" != "null"; test "${pending_release}" = "null"; test "${consumed_marker}" != "null"
+              ;;
+            deploy-candidate|persist-accepted-release)
+              test "${accepted_baseline}" != "null"; test "${pending_release}" != "null"; test "${consumed_marker}" != "null"
+              ;;
+            *) exit 1 ;;
+          esac
+          [ "${accepted_baseline}" = "null" ] && accepted_baseline=""
+          [ "${pending_release}" = "null" ] && pending_release=""
+          [ "${consumed_marker}" = "null" ] && consumed_marker=""
           echo "accepted_baseline_json=${accepted_baseline}" >> "${GITHUB_OUTPUT}"
           echo "pending_release_json=${pending_release}" >> "${GITHUB_OUTPUT}"
           echo "consumed_marker_json=${consumed_marker}" >> "${GITHUB_OUTPUT}"
@@ -1176,6 +1302,8 @@ jobs:
           ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
           ACCEPTANCE_WORKFLOW_REF: ${{ inputs.acceptance_workflow_ref }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           CONTROL_WORKFLOW_REF: ${{ inputs.control_workflow_ref }}
           EVIDENCE_ARTIFACT_NAME: ${{ inputs.evidence_artifact_name }}
           EVIDENCE_BUNDLE_SHA256: ${{ inputs.evidence_bundle_sha256 }}
@@ -1216,6 +1344,82 @@ jobs:
               registry_persistence='{"reason":"proof-not-produced","schemaVersion":0,"status":"unavailable"}'
             fi
           fi
+          accepted_baseline=null
+          pending_release=null
+          consumed_marker=null
+          descriptor_proof="${RUNNER_TEMP}/paperdesk-private-release-result.json"
+          descriptor_projection="${RUNNER_TEMP}/paperdesk-private-release-descriptors.json"
+          case "${OPERATION}" in
+            registry-bridge-preflight|bootstrap-current-production|deploy-candidate|persist-accepted-release|rollback-accepted-release)
+              projected=false
+              if [ -f "${descriptor_proof}" ] && [ ! -L "${descriptor_proof}" ] \
+                && [ "$(stat --format=%s "${descriptor_proof}")" -le 131072 ]; then
+                if (
+                  case "${OPERATION}" in
+                    registry-bridge-preflight)
+                      jq --compact-output '{acceptedBaseline:.bridgeResult.records.acceptedBaseline,pendingRelease:null,consumedMarker:null}' "${descriptor_proof}"
+                      ;;
+                    bootstrap-current-production)
+                      jq --compact-output '{acceptedBaseline:.consumedBridgeResult.records.acceptedBaseline,pendingRelease:null,consumedMarker:.consumedBridgeResult.records.consumedMarker}' "${descriptor_proof}"
+                      ;;
+                    deploy-candidate)
+                      jq --compact-output '{acceptedBaseline:.bridgeResult.records.acceptedBaseline,pendingRelease:.bridgeResult.records.pendingRelease,consumedMarker:.consumedBridgeResult.records.consumedMarker}' "${descriptor_proof}"
+                      ;;
+                    persist-accepted-release)
+                      jq --compact-output '{acceptedBaseline:.bridgeResult.records.acceptedBaseline,pendingRelease:.bridgeResult.records.pendingRelease,consumedMarker:.bridgeResult.records.consumedMarker}' "${descriptor_proof}"
+                      ;;
+                    rollback-accepted-release)
+                      jq --compact-output '{acceptedBaseline:.bridgeResult.records.acceptedBaseline,pendingRelease:null,consumedMarker:null}' "${descriptor_proof}"
+                      ;;
+                  esac
+                ) > "${descriptor_projection}" 2>/dev/null; then
+                  if jq --exit-status --arg operation "${OPERATION}" --arg sha "${SOURCE_SHA}" '
+                    def descriptor:
+                      type == "object"
+                      and (keys == ["blob","etag","sha256","size","versionId"])
+                      and (.blob | type == "string")
+                      and (.sha256 | test("^[0-9a-f]{64}$"))
+                      and (.size | type == "number" and . >= 1 and floor == .)
+                      and (.etag | type == "string" and test("^\"[^\"\\r\\n]+\"$"))
+                      and (.versionId | type == "string" and test("^[A-Za-z0-9._=:+/-]{1,256}$"));
+                    (keys == ["acceptedBaseline","consumedMarker","pendingRelease"])
+                    and (.acceptedBaseline | descriptor)
+                    and (.acceptedBaseline.blob | test("^v2/accepted/[0-9a-f]{40}/(bootstrap-consumed/)?manifest\\.json$"))
+                    and (.pendingRelease == null or (.pendingRelease | descriptor))
+                    and (.consumedMarker == null or (.consumedMarker | descriptor))
+                    and (if $operation == "registry-bridge-preflight" then
+                           (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/manifest.json")
+                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"))
+                           and .pendingRelease == null and .consumedMarker == null
+                         elif $operation == "bootstrap-current-production" then
+                           .acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json")
+                           and .pendingRelease == null
+                           and (.consumedMarker | descriptor)
+                           and .consumedMarker.blob == "v2/bootstrap/current-production/consumed.json"
+                         elif $operation == "deploy-candidate" or $operation == "persist-accepted-release" then
+                           (.pendingRelease | descriptor)
+                           and (.pendingRelease.blob | test("^v2/pending/"+$sha+"/[^/]+/manifest\\.json$"))
+                           and (.consumedMarker | descriptor)
+                           and (.consumedMarker.blob | test("^v2/pending/"+$sha+"/[^/]+/consumed\\.json$"))
+                         elif $operation == "rollback-accepted-release" then
+                           (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/manifest.json")
+                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"))
+                           and .pendingRelease == null and .consumedMarker == null
+                         else false end)
+                  ' "${descriptor_projection}" >/dev/null 2>&1; then
+                    accepted_baseline="$(jq --compact-output '.acceptedBaseline' "${descriptor_projection}")"
+                    pending_release="$(jq --compact-output '.pendingRelease' "${descriptor_projection}")"
+                    consumed_marker="$(jq --compact-output '.consumedMarker' "${descriptor_projection}")"
+                    projected=true
+                  fi
+                fi
+              fi
+              if [ "${projected}" != "true" ] && [ "${{ job.status }}" = "success" ]; then
+                echo "A successful registry operation must retain exact accepted/pending/consumed descriptors." >&2
+                exit 1
+              fi
+              ;;
+          esac
           deployment=null
           deployment_proof="${RUNNER_TEMP}/paperdesk-deployment-proof.json"
           if [ "${OPERATION}" = "deploy-candidate" ]; then
@@ -1284,7 +1488,7 @@ jobs:
             fi
           fi
           jq --null-input \
-            --arg schemaVersion '4' \
+            --arg schemaVersion '6' \
             --arg status "${{ job.status }}" \
             --arg operation "${OPERATION}" \
             --arg sourceRepository "${SOURCE_REPOSITORY}" \
@@ -1292,6 +1496,8 @@ jobs:
             --arg sourceSha "${SOURCE_SHA}" \
             --arg sourceRunId "${SOURCE_RUN_ID}" \
             --arg sourceRunAttempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg candidateRunId "${CANDIDATE_RUN_ID}" \
+            --arg candidateRunAttempt "${CANDIDATE_RUN_ATTEMPT}" \
             --arg controlWorkflowRef "${CONTROL_WORKFLOW_REF}" \
             --arg controlRunId "${GITHUB_RUN_ID}" \
             --arg controlRunAttempt "${GITHUB_RUN_ATTEMPT}" \
@@ -1306,13 +1512,16 @@ jobs:
             --arg verificationReceiptSha256 "${VERIFICATION_RECEIPT_SHA256}" \
             --arg productionAcceptanceReceiptName "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" \
             --arg productionAcceptanceReceiptSha256 "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" \
+            --argjson acceptedBaseline "${accepted_baseline}" \
+            --argjson pendingRelease "${pending_release}" \
+            --argjson consumedMarker "${consumed_marker}" \
             --argjson registryPersistence "${registry_persistence}" \
             --argjson deployment "${deployment}" \
             --argjson rollbackRegistryBinding "${rollback_registry_binding}" \
             --argjson liveFinalization "${live_finalization}" \
             --argjson transientCleanup "${transient_cleanup}" \
-            --arg registryPrefix "$(if [ "${OPERATION}" = "persist-accepted-release" ]; then printf 'v2/accepted/%s/' "${SOURCE_SHA}"; elif [ "${OPERATION}" = "rollback-accepted-release" ]; then printf 'v2/rollback/%s/' "${SOURCE_SHA}"; fi)" \
-            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, callerWorkflowRef: $callerWorkflowRef, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, registryPersistence: $registryPersistence, registryPrefix: $registryPrefix, deployment: $deployment, rollbackRegistryBinding: $rollbackRegistryBinding, liveFinalization: $liveFinalization, transientCleanup: $transientCleanup}' \
+            --arg registryPrefix "$(if [ "${OPERATION}" = "registry-bridge-preflight" ] || [ "${OPERATION}" = "persist-accepted-release" ]; then printf 'v2/accepted/%s/' "${SOURCE_SHA}"; elif [ "${OPERATION}" = "rollback-accepted-release" ]; then printf 'v2/rollback/%s/' "${SOURCE_SHA}"; fi)" \
+            '{schemaVersion: ($schemaVersion | tonumber), status: $status, operation: $operation, sourceRepository: $sourceRepository, callerWorkflowRef: $callerWorkflowRef, sourceSha: $sourceSha, sourceRunId: $sourceRunId, sourceRunAttempt: $sourceRunAttempt, candidateRunId: (if ($candidateRunId | test("^[1-9][0-9]*$")) then $candidateRunId else null end), candidateRunAttempt: (if ($candidateRunAttempt | test("^[1-9][0-9]*$")) then $candidateRunAttempt else null end), controlWorkflowRef: $controlWorkflowRef, controlRunId: $controlRunId, controlRunAttempt: $controlRunAttempt, acceptanceRunId: $acceptanceRunId, acceptanceRunAttempt: $acceptanceRunAttempt, acceptanceWorkflowRef: $acceptanceWorkflowRef, evidenceRunId: $evidenceRunId, evidenceRunAttempt: $evidenceRunAttempt, evidenceArtifactName: $evidenceArtifactName, evidenceBundleSha256: $evidenceBundleSha256, verificationReceiptName: $verificationReceiptName, verificationReceiptSha256: $verificationReceiptSha256, productionAcceptanceReceiptName: $productionAcceptanceReceiptName, productionAcceptanceReceiptSha256: $productionAcceptanceReceiptSha256, acceptedBaseline: $acceptedBaseline, pendingRelease: $pendingRelease, consumedMarker: $consumedMarker, registryPersistence: $registryPersistence, registryPrefix: $registryPrefix, deployment: $deployment, rollbackRegistryBinding: $rollbackRegistryBinding, liveFinalization: $liveFinalization, transientCleanup: $transientCleanup}' \
             > "${receipt_dir}/${receipt_name}"
           test -f "${receipt_dir}/${receipt_name}" && test ! -L "${receipt_dir}/${receipt_name}"
           test "$(stat --format=%s "${receipt_dir}/${receipt_name}")" -le 1048576

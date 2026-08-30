@@ -62,8 +62,9 @@ EXPECTED_TRANSITIONS = {
         "callerWorkflow": ".github/workflows/persist-accepted-release.yml",
         "requestFields": (
             "schemaVersion", "requestType", "operation", "expectedStateSha256",
-            "candidateSha", "candidateRunId", "candidateRunAttempt", "acceptanceRunId",
-            "acceptanceRunAttempt", "productionAcceptanceReceiptSha256",
+            "candidateSha", "sourceRunId", "sourceRunAttempt", "candidateRunId",
+            "candidateRunAttempt", "acceptanceRunId", "acceptanceRunAttempt",
+            "productionAcceptanceReceiptSha256",
             "acceptedReleaseManifestSha256", "acceptedReleasePrefix",
             "registryManifestETag", "registryManifestVersionId",
         ),
@@ -72,12 +73,12 @@ EXPECTED_TRANSITIONS = {
             "the exact pending candidate is live and its deadline has not passed",
             "dispatchGuard is available and attemptReceiptSha256 is null",
             "OIDC workflow_ref is the exact persist-accepted-release.yml workflow_run consumer; its OIDC run is distinct from the source acceptanceRunId and is retained in transition WORM evidence",
-            "the accepted-release WORM manifest and production acceptance receipt bind the candidate, candidate run, acceptance run, registry ETag, and registry version ID",
+            "the accepted-release WORM manifest and production acceptance receipt independently bind the source run, candidate deployment run, acceptance run, registry ETag, and registry version ID",
             "the provider rereads the exact WORM manifest, promotes it to rollbackBaseline, and clears only the matching pending candidate",
         ),
     },
     "rollback-workflow-observed": {
-        "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+        "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
         "requestFields": (
             "schemaVersion", "requestType", "operation", "expectedStateSha256",
             "decisionReceiptSha256", "decisionEvidenceETag", "claimId",
@@ -93,7 +94,7 @@ EXPECTED_TRANSITIONS = {
         ),
     },
     "rollback-authorize": {
-        "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+        "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
         "requestFields": (
             "schemaVersion", "requestType", "operation", "expectedStateSha256",
             "decisionReceiptSha256", "decisionEvidenceETag", "claimId",
@@ -110,7 +111,7 @@ EXPECTED_TRANSITIONS = {
         ),
     },
     "rollback-completed": {
-        "callerWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+        "callerWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
         "requestFields": (
             "schemaVersion", "requestType", "operation", "expectedStateSha256",
             "claimId", "dispatchGuardGeneration", "attemptReceiptSha256",
@@ -270,7 +271,7 @@ def validate_machine_contract(contract: object) -> Mapping[str, Any]:
         "repositoryOwnerId": "202535166",
         "ref": "refs/heads/main",
         "productionWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
-        "rollbackWorkflow": ".github/workflows/manual-azure-production-rollback.yml",
+        "rollbackWorkflow": ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
         "persistenceWorkflow": ".github/workflows/persist-accepted-release.yml",
     }
     if source != expected_source:
@@ -391,7 +392,8 @@ def validate_transition_request(
         fail("transition operation is unsupported")
     expected = EXPECTED_TRANSITIONS[str(operation)]
     _exact(document, expected["requestFields"], f"{operation} request")
-    if document.get("schemaVersion") != 2 or document.get("requestType") != "watchdog-state-transition":
+    expected_schema_version = 3 if operation == "accept-candidate" else 2
+    if document.get("schemaVersion") != expected_schema_version or document.get("requestType") != "watchdog-state-transition":
         fail("schemaVersion or requestType is invalid")
     _string(document.get("expectedStateSha256"), SHA256, "expectedStateSha256")
     for name in (
@@ -406,7 +408,10 @@ def validate_transition_request(
     for name in ("candidateSha", "liveSha", "expectedCurrentLiveSha", "kuduObservedLiveSha", "rolledBackLiveSha"):
         if name in document:
             _string(document[name], SHA40, name)
-    for name in ("candidateRunId", "candidateRunAttempt", "acceptanceRunId", "acceptanceRunAttempt", "workflowRunId"):
+    for name in (
+        "sourceRunId", "sourceRunAttempt", "candidateRunId", "candidateRunAttempt",
+        "acceptanceRunId", "acceptanceRunAttempt", "workflowRunId",
+    ):
         if name in document:
             _string(document[name], POSITIVE, name)
     if "dispatchGuardGeneration" in document and (
@@ -431,11 +436,11 @@ def validate_transition_request(
         if document["candidateSha"] != document["liveSha"]:
             fail("published candidateSha must equal liveSha")
     elif operation == "accept-candidate":
-        prefix = f'v1/releases/{document["candidateSha"]}/{document["candidateRunId"]}/{document["acceptanceRunId"]}/'
+        if len({document["sourceRunId"], document["candidateRunId"], document["acceptanceRunId"]}) != 3:
+            fail("source, candidate deployment, and acceptance runs must be distinct")
+        prefix = f'v1/releases/{document["candidateSha"]}/{document["sourceRunId"]}/{document["acceptanceRunId"]}/'
         if document["acceptedReleasePrefix"] != prefix:
-            fail("acceptedReleasePrefix is not bound to candidate and acceptance runs")
-        if document["acceptanceRunId"] == document["candidateRunId"]:
-            fail("acceptance run must differ from candidate run")
+            fail("acceptedReleasePrefix is not bound to source and acceptance runs")
     elif operation == "rollback-authorize":
         _timestamp(document["kuduObservedAt"], "kuduObservedAt")
         if document["kuduObservedLiveSha"] != document["expectedCurrentLiveSha"]:

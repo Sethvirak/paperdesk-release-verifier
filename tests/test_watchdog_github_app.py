@@ -131,19 +131,21 @@ class GithubAppDispatchTests(unittest.TestCase):
         self.assertEqual(
             path,
             "/repos/Sethvirak/MasterDataStructure/actions/workflows/"
-            "manual-azure-production-rollback.yml/dispatches",
+            "main_master-data-structure-sea-9c4e0d0d.yml/dispatches",
         )
         document = json.loads(body)
         self.assertEqual(set(document), {"ref", "inputs"})
         self.assertEqual(document["ref"], "main")
         self.assertNotIn("return_run_details", document)
         self.assertEqual(set(document["inputs"]), {
+            "operation",
             "confirmation", "expected_current_live_sha", "rollback_source_sha",
             "rollback_source_run_id", "rollback_source_run_attempt",
             "rollback_acceptance_run_id", "rollback_acceptance_run_attempt",
             "rollback_baseline_receipt_sha256", "watchdog_claim_id",
             "watchdog_attempt_receipt_sha256",
         })
+        self.assertEqual(document["inputs"]["operation"], "rollback-accepted-release")
         self.assertEqual(document["inputs"]["watchdog_claim_id"], CLAIM_ID)
         self.assertEqual(headers["X-GitHub-Api-Version"], "2026-03-10")
         self.assertTrue(token_connection.closed)

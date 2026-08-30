@@ -34,6 +34,7 @@
     "signingKeyId": null,
     "signingKeyVersion": null,
     "signingPublicJwk": null,
+    "bridgePackageSourceSha": null,
     "bridgePackageSha256": null,
     "productionActivationManagedIdentityClientId": null,
     "productionActivationManagedIdentityPrincipalId": null,
