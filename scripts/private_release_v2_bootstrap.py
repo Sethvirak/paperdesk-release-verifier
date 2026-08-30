@@ -8303,6 +8303,89 @@ def _key_vault_preflight_error_projection(
     }
 
 
+def _arm_storage_absence_error_projection(
+    method: str, url: str, response: _RestResponse
+) -> dict[str, str] | None:
+    """Bind stable fields from exact ARM storage-absence responses.
+
+    Azure Storage management 404 bodies append a fresh RequestId and Time to
+    every otherwise identical response.  The status and exact URL are already
+    separate preflight fields, so retain the validated stable code/message and
+    reject every other host, path, query, shape, or error.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    base_path = (
+        f"/subscriptions/{SUBSCRIPTION}/resourceGroups/"
+        "rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/"
+        "storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/"
+    )
+    expected_codes = {
+        base_path + "paperdesk-deployment-packages": "ContainerNotFound",
+        base_path + "paperdesk-release-controller-lock": "ContainerNotFound",
+        base_path + "paperdesk-release-activation-control": "ContainerNotFound",
+        (
+            base_path
+            + "paperdesk-deployment-packages/immutabilityPolicies/default"
+        ): "ContainerOperationFailure",
+    }
+    expected_code = expected_codes.get(parsed.path)
+    if (
+        method != "GET"
+        or parsed.scheme != "https"
+        or parsed.netloc.lower() != "management.azure.com"
+        or parsed.query != "api-version=2025-06-01"
+        or parsed.fragment
+        or response.status != 404
+        or expected_code is None
+    ):
+        return None
+    content_type = next(
+        (
+            value
+            for key, value in response.headers.items()
+            if key.lower() == "content-type"
+        ),
+        "",
+    )
+    if "json" not in content_type.lower():
+        fail("ARM storage absence response is not exact JSON")
+    try:
+        document = json.loads(
+            response.body.decode("utf-8"),
+            object_pairs_hook=_duplicate_safe_pairs,
+            parse_constant=lambda value: fail(
+                f"invalid JSON constant in ARM storage absence error: {value}"
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError("ARM storage absence response is not exact JSON") from exc
+    if not isinstance(document, Mapping) or set(document) != {"error"}:
+        fail("ARM storage absence error envelope drifted")
+    error = document["error"]
+    if not isinstance(error, Mapping) or set(error) != {"code", "message"}:
+        fail("ARM storage absence error fields drifted")
+    stable_message = "The specified container does not exist."
+    message = error.get("message")
+    if (
+        error.get("code") != expected_code
+        or not isinstance(message, str)
+        or re.fullmatch(
+            re.escape(stable_message)
+            + r"\nRequestId:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}\nTime:[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{1,7}Z",
+            message,
+        )
+        is None
+    ):
+        fail("ARM storage absence error is not exact")
+    return {
+        "armStorageErrorCode": expected_code,
+        "armStorageErrorMessage": stable_message,
+    }
+
+
 def _preflight_response_sha256(
     method: str, url: str, response: _RestResponse
 ) -> str:
@@ -8312,6 +8395,9 @@ def _preflight_response_sha256(
         # Bind the exact stable error code while status and URL remain separate
         # preflight fields.
         return sha256_bytes(canonical_json_bytes(storage_error))
+    arm_storage_error = _arm_storage_absence_error_projection(method, url, response)
+    if arm_storage_error is not None:
+        return sha256_bytes(canonical_json_bytes(arm_storage_error))
     key_vault_error = _key_vault_preflight_error_projection(method, url, response)
     if key_vault_error is not None:
         return sha256_bytes(canonical_json_bytes(key_vault_error))
@@ -8737,11 +8823,52 @@ class AzureCliBootstrapTransport:
             self.sleep(min(0.25 * (2 ** (attempts - 1)), 2.0))
         fail(f"bridge did not reach {expected_state} within bounded attempts")
 
+    def _read_request_with_transport_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None = None,
+    ) -> _RestResponse:
+        """Retry only exact read-only transport failures before mutation.
+
+        Mutation requests continue to call the underlying session directly, so
+        an ambiguous PUT/PATCH/DELETE is never replayed.  The sole allowed POST
+        is ARM's fixed app-settings list operation, which is read-only.
+        """
+
+        allowed_posts = {
+            request["url"]
+            for request in _production_boundary_requests(self.plan)
+            if request["method"] == "POST"
+        }
+        allowed_posts.add(
+            _operation_readback_url(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                self.plan,
+                self.authorization,
+            )
+        )
+        if not (
+            (method == "GET" and body is None)
+            or (method == "POST" and url in allowed_posts and body == b"")
+        ):
+            fail("read-only retry helper received a mutation-capable request")
+        delays: tuple[float | None, ...] = (0.5, 1.0, None)
+        for delay in delays:
+            try:
+                return self.session.request(method, url, body=body)
+            except BootstrapError as error:
+                if str(error) != "Azure REST transport failed closed" or delay is None:
+                    raise
+                self.sleep(delay)
+        raise AssertionError("unreachable read-only retry loop")
+
     def account(self) -> Mapping[str, Any]:
         return self.session.account()
 
     def _execute_probe(self, probe: Mapping[str, Any]) -> dict[str, Any]:
-        response = self.session.request(
+        response = self._read_request_with_transport_retry(
             probe["method"],
             probe["url"],
             body=b"" if probe["method"] == "POST" else None,
@@ -9723,7 +9850,7 @@ class AzureCliBootstrapTransport:
         documents: dict[str, Any] = {}
         observed_probes: dict[str, dict[str, Any]] = {}
         for request in _production_boundary_requests(self.plan):
-            response = self.session.request(
+            response = self._read_request_with_transport_retry(
                 request["method"],
                 request["url"],
                 body=b"" if request["method"] == "POST" else None,

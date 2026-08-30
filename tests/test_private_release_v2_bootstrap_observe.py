@@ -1131,6 +1131,163 @@ class ObserveTests(unittest.TestCase):
             session.read(observe.ReadRequest("GET", url))
         self.assertEqual(sleeps, [0.5, 1.0])
 
+    def test_executor_preflight_retries_only_read_transport_failures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        url = (
+            "https://management.azure.com/subscriptions/"
+            f"{bootstrap.SUBSCRIPTION}?api-version=2022-09-01"
+        )
+
+        class FlakySession:
+            def __init__(
+                self,
+                error="Azure REST transport failed closed",
+                failures_before_success=2,
+            ):
+                self.calls = 0
+                self.error = error
+                self.failures_before_success = failures_before_success
+
+            def request(self, _method, _url, *, body=None, headers=None):
+                self.calls += 1
+                if self.calls <= self.failures_before_success:
+                    raise bootstrap.BootstrapError(self.error)
+                return bootstrap._RestResponse(
+                    status=200,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+
+        sleeps = []
+        flaky = FlakySession()
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            sleep=sleeps.append,
+            session=flaky,
+        )
+        response = transport._read_request_with_transport_retry("GET", url)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(flaky.calls, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+        permanent = FlakySession("permanent read failure")
+        sleeps = []
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            sleep=sleeps.append,
+            session=permanent,
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "permanent read failure"
+        ):
+            transport._read_request_with_transport_retry("GET", url)
+        self.assertEqual(permanent.calls, 1)
+        self.assertEqual(sleeps, [])
+
+        exhausted = FlakySession(failures_before_success=3)
+        sleeps = []
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            sleep=sleeps.append,
+            session=exhausted,
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "Azure REST transport failed closed"
+        ):
+            transport._read_request_with_transport_retry("GET", url)
+        self.assertEqual(exhausted.calls, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+        app_settings_urls = [
+            next(
+                request["url"]
+                for request in bootstrap._production_boundary_requests(self.plan)
+                if request["method"] == "POST"
+            ),
+            bootstrap._operation_readback_url(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                self.plan,
+                authorization,
+            ),
+        ]
+        for app_settings_url in app_settings_urls:
+            allowed_post = FlakySession()
+            post_sleeps = []
+            transport = bootstrap.AzureCliBootstrapTransport(
+                authorization=authorization,
+                plan=self.plan,
+                package=bootstrap.build_package_descriptor(),
+                preflight=preflight,
+                sleep=post_sleeps.append,
+                session=allowed_post,
+            )
+            self.assertEqual(
+                transport._read_request_with_transport_retry(
+                    "POST", app_settings_url, body=b""
+                ).status,
+                200,
+            )
+            self.assertEqual(allowed_post.calls, 3)
+            self.assertEqual(post_sleeps, [0.5, 1.0])
+
+        http_failure = FlakySession(failures_before_success=0)
+        http_failure.request = lambda _method, _url, *, body=None, headers=None: (
+            setattr(http_failure, "calls", http_failure.calls + 1)
+            or bootstrap._RestResponse(
+                status=503,
+                body=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            sleep=lambda _delay: self.fail("HTTP responses must not be retried"),
+            session=http_failure,
+        )
+        self.assertEqual(
+            transport._read_request_with_transport_retry("GET", url).status,
+            503,
+        )
+        self.assertEqual(http_failure.calls, 1)
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "mutation-capable"
+        ):
+            transport._read_request_with_transport_retry(
+                "PATCH", url, body=b"{}"
+            )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "mutation-capable"
+        ):
+            transport._read_request_with_transport_retry("GET", url, body=b"")
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "mutation-capable"
+        ):
+            transport._read_request_with_transport_retry(
+                "POST", url, body=b""
+            )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "mutation-capable"
+        ):
+            transport._read_request_with_transport_retry(
+                "POST", app_settings_urls[0], body=b"{}"
+            )
+        self.assertEqual(http_failure.calls, 1)
+
     def test_worm_admission_accepts_only_supported_exact_prestates(self):
         with tempfile.TemporaryDirectory() as folder:
             _session, _preflight, template = self.build(folder)
@@ -1387,6 +1544,193 @@ class ObserveTests(unittest.TestCase):
                     "https://management.azure.com/subscriptions/"
                     f"{bootstrap.SUBSCRIPTION}?api-version=2022-09-01",
                 )
+            )
+
+    def test_arm_storage_absence_digest_excludes_request_id_and_time(self):
+        base_url = (
+            "https://management.azure.com/subscriptions/"
+            f"{bootstrap.SUBSCRIPTION}/resourceGroups/"
+            "rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/"
+            "storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/"
+        )
+        container_urls = [
+            base_url + name + "?api-version=2025-06-01"
+            for name in (
+                "paperdesk-deployment-packages",
+                "paperdesk-release-controller-lock",
+                "paperdesk-release-activation-control",
+            )
+        ]
+        container_url = container_urls[0]
+        policy_url = (
+            base_url
+            + "paperdesk-deployment-packages/immutabilityPolicies/default"
+            + "?api-version=2025-06-01"
+        )
+
+        def response(code, request_id, observed_at, *, extra=None):
+            error = {
+                "code": code,
+                "message": (
+                    "The specified container does not exist.\n"
+                    f"RequestId:{request_id}\nTime:{observed_at}"
+                ),
+            }
+            if extra is not None:
+                error["extra"] = extra
+            return bootstrap._RestResponse(
+                status=404,
+                body=bootstrap.canonical_json_bytes({"error": error}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        first = response(
+            "ContainerNotFound",
+            "3a8d9ee8-501e-0044-2ead-38837b000000",
+            "2026-08-30T18:28:25.2401069Z",
+        )
+        second = response(
+            "ContainerNotFound",
+            "4b9eaff9-612f-1155-3fbe-49948c111111",
+            "2026-08-30T18:29:26.1Z",
+        )
+        first_digest = bootstrap._preflight_response_sha256(
+            "GET", container_url, first
+        )
+        self.assertEqual(
+            first_digest,
+            bootstrap._preflight_response_sha256("GET", container_url, second),
+        )
+        for exact_container_url in container_urls[1:]:
+            self.assertEqual(
+                first_digest,
+                bootstrap._preflight_response_sha256(
+                    "GET", exact_container_url, second
+                ),
+            )
+        self.assertEqual(
+            first_digest,
+            bootstrap.sha256_bytes(
+                bootstrap.canonical_json_bytes(
+                    {
+                        "armStorageErrorCode": "ContainerNotFound",
+                        "armStorageErrorMessage": (
+                            "The specified container does not exist."
+                        ),
+                    }
+                )
+            ),
+        )
+        policy_digest = bootstrap._preflight_response_sha256(
+            "GET",
+            policy_url,
+            response(
+                "ContainerOperationFailure",
+                "5caeb00a-7230-2266-40cf-5aa59d222222",
+                "2026-08-30T18:30:27.123Z",
+            ),
+        )
+        self.assertNotEqual(first_digest, policy_digest)
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "not exact"
+        ):
+            bootstrap._preflight_response_sha256(
+                "GET",
+                container_url,
+                response(
+                    "ContainerOperationFailure",
+                    "3a8d9ee8-501e-0044-2ead-38837b000000",
+                    "2026-08-30T18:28:25.2401069Z",
+                ),
+            )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "fields drifted"
+        ):
+            bootstrap._preflight_response_sha256(
+                "GET",
+                container_url,
+                response(
+                    "ContainerNotFound",
+                    "3a8d9ee8-501e-0044-2ead-38837b000000",
+                    "2026-08-30T18:28:25.2401069Z",
+                    extra="unexpected",
+                ),
+            )
+
+        class ArmStorageAbsenceSession:
+            def request(self, method, url):
+                self.requested = (method, url)
+                return first
+
+        session = observe.AzureCliReadOnlySession()
+        session._session = ArmStorageAbsenceSession()
+        observed = session.read(observe.ReadRequest("GET", container_url))
+        self.assertEqual(observed.body["error"]["code"], "ContainerNotFound")
+        self.assertEqual(observed.response_sha256, first_digest)
+        envelope = observe._normalize_response(
+            observe.ReadRequest("GET", container_url), observed
+        )
+        self.assertEqual(observe.response_digest(envelope), first_digest)
+
+        for invalid_url in (
+            container_url.replace("https://", "http://", 1),
+            container_url.replace(
+                "management.azure.com", "user@management.azure.com", 1
+            ),
+            container_url.replace(
+                "management.azure.com", "management.azure.com:443", 1
+            ),
+            container_url.replace(
+                "management.azure.com", "management.example.com", 1
+            ),
+            container_url.replace(
+                "paperdesk-deployment-packages", "unreviewed-container", 1
+            ),
+            container_url.replace("api-version=2025-06-01", "api-version=2024-01-01"),
+        ):
+            self.assertIsNone(
+                bootstrap._arm_storage_absence_error_projection(
+                    "GET", invalid_url, first
+                )
+            )
+
+        non_absence = bootstrap._RestResponse(
+            status=503,
+            body=first.body,
+            headers=first.headers,
+        )
+        self.assertIsNone(
+            bootstrap._arm_storage_absence_error_projection(
+                "GET", container_url, non_absence
+            )
+        )
+        non_json = bootstrap._RestResponse(
+            status=404,
+            body=first.body,
+            headers={"Content-Type": "text/plain"},
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "not exact JSON"
+        ):
+            bootstrap._preflight_response_sha256("GET", container_url, non_json)
+        wrong_message = bootstrap._RestResponse(
+            status=404,
+            body=bootstrap.canonical_json_bytes(
+                {
+                    "error": {
+                        "code": "ContainerNotFound",
+                        "message": "A different container error",
+                    }
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "not exact"
+        ):
+            bootstrap._preflight_response_sha256(
+                "GET", container_url, wrong_message
             )
 
     def test_key_vault_forbidden_preflight_digest_excludes_volatile_message(self):
