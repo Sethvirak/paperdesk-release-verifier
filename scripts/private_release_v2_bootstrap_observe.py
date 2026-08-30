@@ -26,11 +26,36 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
+import urllib.parse
+
+_SCRIPT_DIRECTORY = str(Path(__file__).resolve().parent)
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parent.parent)
+if _SCRIPT_DIRECTORY not in sys.path:
+    # Azure CLI's embedded Windows Python runs with an isolated search path and
+    # does not add the invoked script directory.  Add only this fixed local
+    # directory so the documented direct invocation resolves its sibling.
+    sys.path.insert(0, _SCRIPT_DIRECTORY)
+if _REPOSITORY_ROOT not in sys.path:
+    sys.path.insert(0, _REPOSITORY_ROOT)
+_loaded_scripts = sys.modules.get("scripts")
+_loaded_locations = {
+    str(Path(item).resolve()).lower()
+    for item in getattr(_loaded_scripts, "__path__", [])
+}
+if (
+    _loaded_scripts is not None
+    and _SCRIPT_DIRECTORY.lower() not in _loaded_locations
+):
+    # The Azure CLI runtime imports an unrelated win32 ``scripts`` namespace
+    # during startup.  Remove only that foreign namespace before resolving the
+    # repository's fixed local package boundary.
+    sys.modules.pop("scripts", None)
 
 try:
     from scripts import private_release_v2_bootstrap as bootstrap
-except ModuleNotFoundError:
+except ImportError:
     # Support the documented direct invocation from the repository root:
     # ``python -B scripts/private_release_v2_bootstrap_observe.py ...``.
     import private_release_v2_bootstrap as bootstrap
@@ -46,7 +71,7 @@ SENSITIVE_TEXT = re.compile(
     r"(?:bearer\s+|password\s*=|client[_-]?secret\s*=|[?&]sig=)", re.IGNORECASE
 )
 SENSITIVE_KEYS = re.compile(
-    r"(?:^|[_-])(?:access[-_]?token|refresh[-_]?token|client[-_]?secret|password|sas|connection[-_]?string)(?:$|[_-])",
+    r"(?:^|[_-])(?:access[-_]?token|refresh[-_]?token|client[-_]?secret|password|sas|connection[-_]?string|api[-_]?key|service[-_]?token|signing[-_]?key|private[-_]?secret)(?:$|[_-])",
     re.IGNORECASE,
 )
 OBSERVED_HEADERS = {
@@ -160,6 +185,7 @@ class ReadResponse:
     status: int
     headers: Mapping[str, str]
     body: Any
+    response_sha256: str | None = None
 
 
 class ReadOnlySession(Protocol):
@@ -174,9 +200,13 @@ class AzureCliReadOnlySession:
     """Concrete Azure CLI credential boundary exposing only reviewed reads."""
 
     def __init__(
-        self, *, clock: Callable[[], dt.datetime] | None = None
+        self,
+        *,
+        clock: Callable[[], dt.datetime] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
+        self.sleep = sleeper or time.sleep
         self._account: dict[str, Any] | None = None
         self._session: bootstrap.AzureCliRestSession | None = None
 
@@ -200,20 +230,59 @@ class AzureCliReadOnlySession:
         if self._session is None:
             self.account()
         assert self._session is not None
-        response = self._session.request(request.method, request.url)
-        if response.body:
+        response = None
+        for attempt in range(3):
             try:
-                body = json.loads(
-                    response.body.decode("utf-8"),
-                    object_pairs_hook=_duplicate_safe_pairs,
-                    parse_constant=lambda value: fail(
-                        f"invalid JSON constant in read-only response: {value}"
-                    ),
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ObserveError(
-                    "Azure read-only response is not bounded JSON"
-                ) from exc
+                response = self._session.request(request.method, request.url)
+                break
+            except bootstrap.BootstrapError as exc:
+                if (
+                    str(exc) != "Azure REST transport failed closed"
+                    or attempt == 2
+                ):
+                    raise
+                # This class exposes only bounded read operations.  Retrying a
+                # transient transport failure here cannot duplicate a mutation;
+                # the mutation-capable executor deliberately has no such retry.
+                self.sleep(0.5 * (2**attempt))
+        if response is None:
+            fail("read-only Azure retry boundary produced no response")
+        response_sha256 = bootstrap._preflight_response_sha256(
+            request.method, request.url, response
+        )
+        storage_error = bootstrap._package_blob_error_projection(
+            request.method, request.url, response
+        )
+        if response.body:
+            content_type = next(
+                (
+                    value
+                    for key, value in response.headers.items()
+                    if key.lower() == "content-type"
+                ),
+                "",
+            )
+            if "json" in content_type.lower() or response.body[:1] in {b"{", b"["}:
+                try:
+                    body = json.loads(
+                        response.body.decode("utf-8"),
+                        object_pairs_hook=_duplicate_safe_pairs,
+                        parse_constant=lambda value: fail(
+                            f"invalid JSON constant in read-only response: {value}"
+                        ),
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ObserveError(
+                        "Azure read-only response is not bounded JSON"
+                    ) from exc
+            else:
+                host = (urllib.parse.urlsplit(request.url).hostname or "").lower()
+                if host != "mdspdbak2608089c4e.blob.core.windows.net":
+                    fail("non-JSON read-only response is outside the package blob boundary")
+                # Blob absence is XML and an existing package is binary.  The
+                # observer retains only the exact raw-body digest; operation
+                # admission is determined by status and safe response headers.
+                body = storage_error or {}
         else:
             body = {}
         return ReadResponse(
@@ -222,6 +291,7 @@ class AzureCliReadOnlySession:
             status=response.status,
             headers=dict(response.headers),
             body=body,
+            response_sha256=response_sha256,
         )
 
 
@@ -268,13 +338,18 @@ def _normalize_response(request: ReadRequest, response: ReadResponse) -> dict[st
             fail("read-only session returned duplicate conflicting headers")
         headers[lowered] = value
     body = _safe_json(response.body, "read-only response body")
-    return {
+    envelope = {
         "method": request.method,
         "url": request.url,
         "status": response.status,
         "headers": dict(sorted(headers.items())),
         "body": body,
     }
+    if response.response_sha256 is not None:
+        if not bootstrap.SHA256.fullmatch(response.response_sha256):
+            fail("read-only session returned an invalid response digest")
+        envelope["responseSha256"] = response.response_sha256
+    return envelope
 
 
 def response_digest(envelope: Mapping[str, Any]) -> str:
@@ -312,26 +387,16 @@ def _normalize_production_boundary_response(
     if response.status != 200 or not isinstance(response.headers, Mapping):
         fail("production boundary read did not return one exact HTTP 200 response")
     if request.method == "POST":
-        if not isinstance(response.body, Mapping) or set(response.body) != {"properties"}:
-            fail("production app-settings response fields are not exact")
-        settings = response.body.get("properties")
-        if (
-            not isinstance(settings, Mapping)
-            or any(
-                not isinstance(key, str) or not isinstance(value, str)
-                for key, value in settings.items()
-            )
-        ):
-            fail("production app settings are not one exact string map")
-        canonical_body = bootstrap.canonical_json_bytes(
-            {"properties": dict(settings)}
+        digest_document = bootstrap._production_boundary_digest_document(
+            request.method, request.url, response.body
         )
+        canonical_body = bootstrap.canonical_json_bytes(digest_document)
         return {
             "method": request.method,
             "url": request.url,
             "status": 200,
             "headers": {},
-            "body": {"properties": dict(settings)},
+            "body": digest_document,
             "responseSha256": bootstrap.sha256_bytes(canonical_body),
         }
     envelope = _normalize_response(request, response)
@@ -461,8 +526,11 @@ def _etag(envelope: Mapping[str, Any], label: str) -> str:
     headers = envelope["headers"]
     body = envelope["body"] if isinstance(envelope["body"], dict) else {}
     value = headers.get("etag") or body.get("etag")
-    if not isinstance(value, str) or re.fullmatch(r'"[^"\r\n]{1,256}"', value) is None:
-        fail(f"{label} has no exact quoted ETag")
+    if not isinstance(value, str) or not (
+        re.fullmatch(r'"[^"\r\n]{1,256}"', value) is not None
+        or re.fullmatch(r"[0-9A-Fa-f]{8,64}", value) is not None
+    ):
+        fail(f"{label} has no exact strong ETag token")
     return value
 
 
@@ -474,10 +542,17 @@ def _properties(envelope: Mapping[str, Any], label: str) -> Mapping[str, Any]:
     return properties
 
 
+def _graph_collection(
+    envelope: Mapping[str, Any], label: str
+) -> list[Mapping[str, Any]]:
+    return bootstrap._unpaginated_graph_collection(
+        _body_mapping(envelope, label), label
+    )
+
+
 def _graph_one(envelope: Mapping[str, Any], label: str) -> Mapping[str, Any]:
-    body = _body_mapping(envelope, label)
-    values = body.get("value")
-    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+    values = _graph_collection(envelope, label)
+    if len(values) != 1:
         fail(f"{label} must resolve to exactly one Graph object")
     return values[0]
 
@@ -503,14 +578,7 @@ def _storage_acl(envelope: Mapping[str, Any]) -> dict[str, Any]:
     acls = properties.get("networkAcls")
     if not isinstance(acls, dict):
         fail("storage account response has no network ACL object")
-    expected = {
-        "defaultAction",
-        "bypass",
-        "ipRules",
-        "resourceAccessRules",
-        "virtualNetworkRules",
-    }
-    return dict(_exact_keys(acls, expected, "storage network ACL"))
+    return bootstrap._normalize_storage_acl_prestate(acls)
 
 
 def _app_settings(envelope: Mapping[str, Any]) -> dict[str, str]:
@@ -522,6 +590,70 @@ def _app_settings(envelope: Mapping[str, Any]) -> dict[str, str]:
     ):
         fail("bridge app settings response is not one exact string map")
     return dict(properties)
+
+
+def _worm_policy_admission(
+    operation_id: str,
+    envelope: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    status = envelope["status"]
+    if status == 404:
+        if operation_id != "lockPackageRetentionAt91Days":
+            fail(f"{operation_id} required existing WORM policy is absent")
+        return "absent", _policy_checked_context(
+            operation_id,
+            policy,
+            {"executionDecision": "apply-exact", "etag": None},
+        )
+    if status != 200:
+        fail(f"{operation_id} WORM preflight returned unsupported status")
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    target = {
+        "lockPackageRetentionAt91Days": "packageContainer",
+        "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
+        "extendResultRetentionFrom30To91Days": "resultContainer",
+    }[operation_id]
+    body = _body_mapping(envelope, operation_id)
+    properties = body.get("properties")
+    expected_id = resources[target]["resourceId"] + "/immutabilityPolicies/default"
+    if (
+        str(body.get("id", "")).lower() != expected_id.lower()
+        or body.get("name") != "default"
+        or body.get("type")
+        != "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
+        or not isinstance(properties, Mapping)
+        or set(properties)
+        != {
+            "allowProtectedAppendWrites",
+            "allowProtectedAppendWritesAll",
+            "immutabilityPeriodSinceCreationInDays",
+            "state",
+        }
+        or properties["allowProtectedAppendWrites"] is not False
+        or properties["allowProtectedAppendWritesAll"] is not False
+        or type(properties["immutabilityPeriodSinceCreationInDays"]) is not int
+    ):
+        fail(f"{operation_id} WORM policy prestate drifted")
+    days = properties["immutabilityPeriodSinceCreationInDays"]
+    state = properties["state"]
+    if state == "Locked" and days >= 91:
+        return "exact", _policy_checked_context(
+            operation_id,
+            policy,
+            {"executionDecision": "adopt-exact", "adopted": {}},
+        )
+    if operation_id == "lockPackageRetentionAt91Days":
+        if state not in {"Locked", "Unlocked"} or not 1 <= days <= 91:
+            fail("package WORM policy is outside the supported resumable prestate")
+    elif state != "Locked" or days != 30:
+        fail(f"{operation_id} is not an exact locked 30-day policy")
+    return "exact", _policy_checked_context(
+        operation_id,
+        policy,
+        {"executionDecision": "apply-exact", "etag": _etag(envelope, operation_id)},
+    )
 
 
 def _adopted_projection(
@@ -652,7 +784,131 @@ def _operation_admission(
     kind = str(operation["kind"])
     status = envelope["status"]
     if status not in {200, 404}:
+        if operation_id == "uploadVersionedBridgePackage" and status == 403:
+            error = _exact_keys(
+                _body_mapping(envelope, operation_id),
+                {"storageErrorCode"},
+                "package blob pre-network error",
+            )
+            if error["storageErrorCode"] not in {
+                "AuthenticationFailed",
+                "AuthorizationFailure",
+                "AuthorizationPermissionMismatch",
+            }:
+                fail("package blob preflight is not blocked by temporary access")
+            return "network-inaccessible", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "apply-exact"},
+            )
+        if operation_id == "readBackExactSigningPublicJwk" and status == 403:
+            body = _body_mapping(envelope, operation_id)
+            error = body.get("error")
+            inner = error.get("innererror") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(error, Mapping)
+                or error.get("code") != "Forbidden"
+                or not isinstance(inner, Mapping)
+                or inner.get("code") != "ForbiddenByRbac"
+            ):
+                fail("signing JWK preflight is not blocked by temporary RBAC")
+            return "temporary-access-inaccessible", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "apply-exact"},
+            )
+        if (
+            operation_id
+            in bootstrap.TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS
+            and status == 403
+        ):
+            error = _exact_keys(
+                _body_mapping(envelope, operation_id),
+                {"storageErrorCode"},
+                f"{operation_id} temporary storage-access error",
+            )
+            if error["storageErrorCode"] not in {
+                "AuthenticationFailed",
+                "AuthorizationFailure",
+                "AuthorizationPermissionMismatch",
+            }:
+                fail(
+                    f"{operation_id} preflight is not blocked by temporary RBAC"
+                )
+            return "temporary-access-inaccessible", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "apply-exact"},
+            )
         fail(f"{operation_id} preflight returned unsupported status {status}")
+
+    # Microsoft Graph collection queries return HTTP 200 with ``value: []``
+    # when the source-named application or service principal is absent.  Treat
+    # that exact, unpaginated empty collection as logical absence for the three
+    # create-or-adopt operations; HTTP status alone cannot express this state.
+    graph_create_or_adopt = {
+        "createPublisherApplication",
+        "createPublisherServicePrincipal",
+        "grantPublisherGraphApplicationReadAll",
+    }
+    if status == 200 and operation_id in graph_create_or_adopt:
+        values = _graph_collection(envelope, operation_id)
+        if not values:
+            status = 404
+        elif len(values) != 1:
+            fail(f"{operation_id} must resolve to at most one Graph object")
+        elif (
+            operation_id == "grantPublisherGraphApplicationReadAll"
+            and values[0].get("appRoleAssignments@odata.nextLink")
+            not in {None, ""}
+        ):
+            fail("publisher Graph assignment inventory is partial or paginated")
+
+    if operation_id in {
+        "lockPackageRetentionAt91Days",
+        "extendAcceptedRetentionFrom30To91Days",
+        "extendResultRetentionFrom30To91Days",
+    }:
+        return _worm_policy_admission(operation_id, envelope, plan, policy)
+
+    if operation_id == "createSolePublisherFicToSignedBootstrapSource":
+        if status != 200:
+            fail("publisher FIC inventory must use one Graph collection response")
+        application, credentials = bootstrap._publisher_fic_inventory(
+            _body_mapping(envelope, operation_id),
+            plan,
+            authorization,
+            operation_id,
+        )
+        adopted_application = dependency_facts.get("createPublisherApplication")
+        if adopted_application is None:
+            if application is not None:
+                fail("publisher application appeared after its absence observation")
+            return "absent", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "apply-exact"},
+            )
+        if (
+            application is None
+            or application.get("id") != adopted_application.get("objectId")
+            or application.get("appId") != adopted_application.get("appId")
+        ):
+            fail("publisher FIC inventory is not bound to the adopted application")
+        if not credentials:
+            return "absent", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "apply-exact"},
+            )
+        bootstrap._validate_exact_publisher_fic(
+            credentials[0], plan, authorization, operation_id
+        )
+        return "exact", _policy_checked_context(
+            operation_id,
+            policy,
+            {"executionDecision": "adopt-exact", "adopted": {}},
+        )
 
     if operation_id == "claimAzureSingleUseAuthorization":
         if status != 404:
@@ -692,7 +948,6 @@ def _operation_admission(
             fail("temporary uploader IPv4 access is already present")
         return "absent", _policy_checked_context(operation_id, policy, {
             "executionDecision": "apply-exact",
-            "etag": _etag(envelope, operation_id),
             "uploaderIpv4": uploader_ipv4,
             "preNetworkAcls": acl,
         })
@@ -764,6 +1019,10 @@ def _operation_admission(
         )
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
         settings = {} if status == 404 else _app_settings(envelope)
+        if settings:
+            fail(
+                "bridge app-settings prestate must be empty so the canonical preflight remains secret-free"
+            )
         context.update(
             {
                 "preAppSettings": settings,
@@ -865,14 +1124,6 @@ def _operation_admission(
             admission_status = "exact"
         else:
             admission_status = "owned-present"
-    # Existing resource ETags may be bound.  ETags for resources created by
-    # earlier operations are deliberately left for executor-derived state.
-    elif operation_id in {
-        "lockPackageRetentionAt91Days",
-        "extendAcceptedRetentionFrom30To91Days",
-        "extendResultRetentionFrom30To91Days",
-    } and status == 200:
-        context["etag"] = _etag(envelope, operation_id)
     return admission_status, _policy_checked_context(operation_id, policy, context)
 
 
@@ -974,6 +1225,36 @@ def build_read_only_observation(
         envelope = cache[key]
         built_in_role_definitions: dict[str, Mapping[str, Any]] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
+        temporary_definition_url = (
+            bootstrap._temporary_role_definition_readback_url(
+                operation["id"], plan
+            )
+        )
+        if temporary_definition_url is not None:
+            definition_request = ReadRequest(
+                method="GET", url=temporary_definition_url
+            )
+            definition_key = (
+                definition_request.method,
+                definition_request.url,
+            )
+            if definition_key not in cache:
+                cache[definition_key] = _normalize_response(
+                    definition_request, session.read(definition_request)
+                )
+            definition_envelope = cache[definition_key]
+            if definition_envelope["status"] != 404:
+                fail(
+                    "temporary role definition is already present before bootstrap: "
+                    + operation["id"]
+                )
+            extra_preflight_probes.append(
+                _preflight_probe(
+                    f"preflight-{index:02d}-temporary-definition",
+                    definition_request,
+                    definition_envelope,
+                )
+            )
         if operation["id"] == "createCustomRoleDefinitions":
             built_in_role_definitions = {}
             definition_ids = sorted(
@@ -1122,11 +1403,18 @@ def build_read_only_observation(
         },
         "proposedValidity": kernel["proposedValidity"],
         "singleUse": kernel["singleUse"],
+        "requiredResidualRiskAcceptance": {
+            "id": "temporary-storage-ip-rules-and-recovery-residuals",
+            "exactConfirmationText": (
+                bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+            ),
+        },
         "ceremonyRequirements": [
             "independently-review-canonical-preflight",
             "obtain-fresh-explicit-user-authorization",
             "promote-proposedValidity-to-validity-within-freshness-window",
             "add-exact-confirmation-phrase-sha256",
+            "include-exact-storage-acl-concurrency-residual-acceptance-in-confirmation",
             "emit-separate-canonical-executable-authorization",
         ],
     }

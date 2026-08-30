@@ -48,7 +48,15 @@
             "required": ["operationId", "status", "probeIds", "desiredProbeIds", "context"],
             "properties": {
               "operationId": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9-]{1,95}$"},
-              "status": {"enum": ["absent", "exact", "owned-present"]},
+              "status": {
+                "enum": [
+                  "absent",
+                  "exact",
+                  "owned-present",
+                  "network-inaccessible",
+                  "temporary-access-inaccessible"
+                ]
+              },
               "probeIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
               "desiredProbeIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
               "context": {"type": "object"}

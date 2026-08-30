@@ -24,7 +24,19 @@ TREE = "3" * 40
 PARENT = "4" * 40
 ACCOUNT_OBJECT = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 AUTH_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-PHRASE = "Authorize the exact one-shot PaperDesk V2 bootstrap plan."
+EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
+    "I accept that Azure Storage exposes no ETag for this account update, so the "
+    "temporary uploader ipRules PATCH cannot atomically exclude an unrelated "
+    "concurrent administrator change during its bounded pre-read/PATCH/post-read window. "
+    "I also accept that process death after the PATCH, an ambiguous successful transport, "
+    "or a local result-journal/fsync failure can leave the exact uploader /32 in place; "
+    "execution and any later release must stop until a fresh live read proves the /32 and "
+    "all related temporary roles absent, and manual cleanup may be required."
+)
+PHRASE = (
+    "Authorize the exact one-shot PaperDesk V2 bootstrap plan. "
+    + EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+)
 
 
 def stamp(value):
@@ -161,6 +173,7 @@ def build_projection(plan, package, *, adopt_operations=()):
         "bypass": "None",
         "ipRules": [],
         "resourceAccessRules": [],
+        "ipv6Rules": [],
         "virtualNetworkRules": [{"id": subnet, "action": "Allow", "state": "Succeeded"}],
     }
 
@@ -210,7 +223,7 @@ def build_projection(plan, package, *, adopt_operations=()):
         elif operation_id == "createSigningKeyVersion":
             value["expiresAt"] = stamp(NOW + dt.timedelta(days=60))
         elif operation_id == "addOwnedUploaderIpv4Rule":
-            value.update({"etag": '"storage-etag"', "uploaderIpv4": "203.0.113.10/32", "preNetworkAcls": copy.deepcopy(base_acl)})
+            value.update({"uploaderIpv4": "203.0.113.10/32", "preNetworkAcls": copy.deepcopy(base_acl)})
         elif operation_id == "removeOwnedUploaderIpv4Rule":
             value.update({"uploaderIpv4": "203.0.113.10/32", "restoreNetworkAcls": copy.deepcopy(base_acl)})
         elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
@@ -243,6 +256,8 @@ def build_projection(plan, package, *, adopt_operations=()):
         return value
 
     def operation_status(operation):
+        if operation["id"] == "readBackExactSigningPublicJwk":
+            return "temporary-access-inaccessible"
         kind = operation["kind"]
         if kind.startswith(("azure-global-create-only", "azure-ad-create-only", "temporary-add", "create-or-adopt")):
             return "absent"
@@ -253,6 +268,7 @@ def build_projection(plan, package, *, adopt_operations=()):
             continue
         pre_id = f"pre-{index}-{operation['id']}"
         post_id = f"post-{index}-{operation['id']}"
+        preflight_probe_ids = [pre_id]
         operation_contract = bootstrap._validator_contract(
             f"operation:{operation['id']}", plan, context_authorization
         )
@@ -290,11 +306,36 @@ def build_projection(plan, package, *, adopt_operations=()):
                 },
             ]
         )
+        temporary_definition_url = (
+            bootstrap._temporary_role_definition_readback_url(
+                operation["id"], plan
+            )
+        )
+        if temporary_definition_url is not None:
+            temporary_definition_probe_id = (
+                f"pre-{index}-{operation['id']}-temporary-definition"
+            )
+            probes.append(
+                {
+                    "id": temporary_definition_probe_id,
+                    "phase": "preflight",
+                    "method": "GET",
+                    "url": temporary_definition_url,
+                    "requestBodySha256": None,
+                    "status": 404,
+                    "responseSha256": bootstrap.sha256_bytes(
+                        f"pre-temporary-definition-{index}".encode()
+                    ),
+                    "validatorId": None,
+                    "validatorContract": None,
+                }
+            )
+            preflight_probe_ids.append(temporary_definition_probe_id)
         admissions.append(
             {
                 "operationId": operation["id"],
                 "status": operation_status(operation),
-                "probeIds": [pre_id],
+                "probeIds": preflight_probe_ids,
                 "desiredProbeIds": [post_id],
                 "context": operation_context(operation["id"]),
             }
@@ -2581,6 +2622,189 @@ class BootstrapTests(unittest.TestCase):
         cls.plan, cls.plan_sha = bootstrap.load_plan()
         cls.package = bootstrap.build_package_descriptor()
 
+    def test_existing_registry_role_metadata_is_canonical_without_authority_drift(self):
+        definitions = bootstrap._custom_role_definition_specs(self.plan)
+        cases = {
+            "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d": {
+                "roleName": "PaperDesk Accepted Release Blob Append Writer",
+                "description": (
+                    "PaperDesk accepted-release registry: create-only blob "
+                    "data-plane permission at an exact container assignment scope."
+                ),
+                "dataAction": (
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                    "blobs/add/action"
+                ),
+            },
+            "e005b62b-037b-4989-b492-932669ec0842": {
+                "roleName": "PaperDesk Accepted Release Blob Reader",
+                "description": (
+                    "PaperDesk accepted-release registry: read-only blob "
+                    "data-plane permission at an exact container assignment scope."
+                ),
+                "dataAction": (
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                    "blobs/read"
+                ),
+            },
+        }
+        for definition_id, expected in cases.items():
+            with self.subTest(definition_id=definition_id):
+                projection = definitions[definition_id]
+                properties = projection["properties"]
+                self.assertEqual(properties["roleName"], expected["roleName"])
+                self.assertEqual(properties["description"], expected["description"])
+                self.assertEqual(properties["type"], "CustomRole")
+                self.assertEqual(
+                    properties["permissions"],
+                    [
+                        {
+                            "actions": [],
+                            "notActions": [],
+                            "dataActions": [expected["dataAction"]],
+                            "notDataActions": [],
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    properties["assignableScopes"],
+                    [f"/subscriptions/{bootstrap.SUBSCRIPTION}"],
+                )
+
+    def test_role_assignment_inventory_uses_supported_unfiltered_collection(self):
+        url = bootstrap._operation_readback_url(
+            "createExactRoleAssignments", self.plan, {}
+        )
+        self.assertEqual(
+            url,
+            "https://management.azure.com/subscriptions/"
+            f"{bootstrap.SUBSCRIPTION}/providers/Microsoft.Authorization/"
+            "roleAssignments?api-version=2022-04-01",
+        )
+        self.assertNotIn("atScopeAndBelow", url)
+
+    def test_storage_acl_normalization_preserves_supported_optional_boundaries(self):
+        subnet = (
+            f"/subscriptions/{bootstrap.SUBSCRIPTION}/resourceGroups/"
+            "rg-master-data-structure-sea/providers/Microsoft.Network/"
+            "virtualNetworks/vnet-master-data-structure-sea/subnets/"
+            "snet-appservice-integration"
+        )
+        live_shape = {
+            "defaultAction": "Deny",
+            "bypass": "None",
+            "ipRules": [],
+            "ipv6Rules": [],
+            "virtualNetworkRules": [
+                {"id": subnet, "action": "Allow", "state": "Succeeded"}
+            ],
+        }
+        normalized = bootstrap._normalize_storage_acl_prestate(live_shape)
+        self.assertEqual(normalized["resourceAccessRules"], [])
+        self.assertEqual(normalized["ipv6Rules"], [])
+        self.assertEqual(
+            bootstrap._validate_storage_acl_prestate(
+                live_shape, adding=True, uploader="203.0.113.10/32"
+            ),
+            normalized,
+        )
+        nonempty_ipv6 = copy.deepcopy(live_shape)
+        nonempty_ipv6["ipv6Rules"] = [
+            {"value": "2001:db8::/64", "action": "Allow"}
+        ]
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "exact reviewed topology"
+        ):
+            bootstrap._validate_storage_acl_prestate(
+                nonempty_ipv6, adding=True, uploader="203.0.113.10/32"
+            )
+        unknown = copy.deepcopy(live_shape)
+        unknown["futureAclFamily"] = []
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "fields are not exact"
+        ):
+            bootstrap._normalize_storage_acl_prestate(unknown)
+
+    def test_operation_context_rejects_any_nonempty_bridge_app_settings(self):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        context = copy.deepcopy(
+            next(
+                item["context"]
+                for item in projection["operationAdmissions"]
+                if item["operationId"]
+                == "configureBridgeExactVersionedPackageAndCriticalSettings"
+            )
+        )
+        context["preAppSettings"] = {"VISIBLE_NONSECRET_SETTING": "value"}
+        context["preAppSettingsSha256"] = bootstrap.sha256_bytes(
+            bootstrap.canonical_json_bytes(context["preAppSettings"])
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "app-settings prestate"
+        ):
+            bootstrap._validate_operation_context(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                context,
+                authorization,
+            )
+
+    def test_preflight_requires_fresh_temporary_role_definition_absence(self):
+        projection = build_projection(self.plan, self.package)
+        operation_id = "addOwnedUploaderPackageRole"
+        definition_url = bootstrap._temporary_role_definition_readback_url(
+            operation_id, self.plan
+        )
+        self.assertIsNotNone(definition_url)
+        admission = next(
+            item
+            for item in projection["operationAdmissions"]
+            if item["operationId"] == operation_id
+        )
+        definition_probe_id = next(
+            probe_id
+            for probe_id in admission["probeIds"]
+            if next(
+                probe
+                for probe in projection["probes"]
+                if probe["id"] == probe_id
+            )["url"]
+            == definition_url
+        )
+        admission["probeIds"].remove(definition_probe_id)
+        projection["probes"] = [
+            probe
+            for probe in projection["probes"]
+            if probe["id"] != definition_probe_id
+        ]
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan,
+            self.plan_sha,
+            self.package,
+            projection,
+            receipt,
+        )
+        preflight = {
+            "schemaVersion": 1,
+            "status": "observed-read-only",
+            "observedAt": authorization["observedPreflight"]["observedAt"],
+            "projection": projection,
+            "projectionSha256": authorization["observedPreflight"]["sha256"],
+        }
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "temporary role definition absence",
+        ):
+            bootstrap.validate_preflight_evidence(
+                preflight, authorization, self.plan
+            )
+
     def fixture(self, folder):
         projection = build_projection(self.plan, self.package)
         receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
@@ -2608,6 +2832,63 @@ class BootstrapTests(unittest.TestCase):
             preflight_path, validated.document, self.plan
         )
         return auth, validated, validated_preflight, projection, receipt
+
+    def test_authorization_requires_explicit_storage_acl_residual_acceptance(self):
+        self.assertEqual(
+            bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE,
+            EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            projection = build_projection(self.plan, self.package)
+            receipt = (
+                Path(folder)
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            )
+            authorization = build_authorization(
+                self.plan, self.plan_sha, self.package, projection, receipt
+            )
+            incomplete_phrase = "Authorize the exact one-shot PaperDesk V2 bootstrap plan."
+            authorization["confirmation"]["phraseSha256"] = bootstrap.sha256_bytes(
+                incomplete_phrase.encode("utf-8")
+            )
+            path = Path(folder) / "authorization-without-residual-acceptance.json"
+            canonical_file(path, authorization)
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError, "does not explicitly accept"
+            ):
+                bootstrap.validate_authorization(
+                    path,
+                    plan=self.plan,
+                    plan_sha256=self.plan_sha,
+                    package=self.package,
+                    confirmation_phrase=incomplete_phrase,
+                    now=NOW,
+                )
+
+    def test_residual_acceptance_does_not_bypass_whole_phrase_hash(self):
+        with tempfile.TemporaryDirectory() as folder:
+            projection = build_projection(self.plan, self.package)
+            receipt = (
+                Path(folder)
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            )
+            authorization = build_authorization(
+                self.plan, self.plan_sha, self.package, projection, receipt
+            )
+            path = Path(folder) / "authorization-exact-phrase-hash.json"
+            canonical_file(path, authorization)
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "confirmation phrase does not match",
+            ):
+                bootstrap.validate_authorization(
+                    path,
+                    plan=self.plan,
+                    plan_sha256=self.plan_sha,
+                    package=self.package,
+                    confirmation_phrase=PHRASE + " ",
+                    now=NOW,
+                )
 
     def terminal_fixture(self, folder):
         return build_valid_terminal_source_evidence_fixture(
@@ -3219,6 +3500,286 @@ class BootstrapTests(unittest.TestCase):
             method = bootstrap.AzureCliBootstrapTransport.__dict__.get(name)
             self.assertIsNotNone(method, name)
             self.assertIn(required, inspect.getsource(method))
+
+    def test_storage_acl_post_read_failure_records_owned_cleanup_obligation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            projection = build_projection(self.plan, self.package)
+            receipt = (
+                Path(folder)
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            )
+            authorization = build_authorization(
+                self.plan,
+                self.plan_sha,
+                self.package,
+                projection,
+                receipt,
+            )
+            operation = next(
+                item
+                for item in self.plan["mutations"]
+                if item["id"] == "addOwnedUploaderIpv4Rule"
+            )
+            context = next(
+                item["context"]
+                for item in projection["operationAdmissions"]
+                if item["operationId"] == operation["id"]
+            )
+            before = copy.deepcopy(context["preNetworkAcls"])
+            after = copy.deepcopy(before)
+            after["ipRules"] = [
+                {"value": "203.0.113.10", "action": "Allow"}
+            ]
+
+            class Session:
+                def __init__(self):
+                    self.requests = []
+                    self.get_count = 0
+
+                def request(self, method, url, *, body=None, headers=None):
+                    self.requests.append(
+                        (method, url, body, dict(headers or {}))
+                    )
+                    if method == "PATCH":
+                        return bootstrap._RestResponse(
+                            200, bootstrap.canonical_json_bytes({}), {}
+                        )
+                    self.get_count += 1
+                    if self.get_count == 1:
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {"properties": {"networkAcls": before}}
+                            ),
+                            {},
+                        )
+                    return bootstrap._RestResponse(
+                        503, bootstrap.canonical_json_bytes({}), {}
+                    )
+
+            ledger = bootstrap.UseLedger(
+                directory=receipt,
+                authorization_id=AUTH_ID,
+                authorization_sha256=bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(authorization)
+                ),
+                source_sha=MERGE,
+                plan_sha256=self.plan_sha,
+                claimed_at=stamp(NOW),
+            )
+            ledger.claim()
+            session = Session()
+            transport = bootstrap.AzureCliBootstrapTransport(
+                authorization=authorization,
+                plan=self.plan,
+                package=self.package,
+                preflight={"projection": projection},
+                clock=lambda: NOW,
+                session=session,
+            )
+            transport.bind_journal(ledger)
+            transport._active_operation_id = operation["id"]
+            with self.assertRaisesRegex(
+                bootstrap.OwnedTemporaryMutationError,
+                "exact post-readback failed",
+            ) as raised:
+                transport._mutate(operation, {})
+
+            patch_request = next(
+                item for item in session.requests if item[0] == "PATCH"
+            )
+            self.assertEqual(
+                json.loads(patch_request[2]),
+                {
+                    "properties": {
+                        "networkAcls": {"ipRules": after["ipRules"]}
+                    }
+                },
+            )
+            self.assertEqual(
+                patch_request[3], {"Content-Type": "application/json"}
+            )
+            self.assertNotIn("If-Match", patch_request[3])
+            proof = raised.exception.proof
+            self.assertTrue(proof["owned"])
+            self.assertEqual(proof["cleanupKey"], "uploader-ipv4-rule")
+            self.assertEqual(
+                proof["details"]["addedNetworkAclsSha256"],
+                bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(after)
+                ),
+            )
+            journal = ledger.read_cloud_mutations()
+            self.assertEqual([item["phase"] for item in journal], ["intent", "result"])
+            self.assertEqual(ledger.unresolved_intents(), [])
+            self.assertEqual(journal[0]["operationId"], operation["id"])
+            self.assertEqual(
+                journal[0]["requestBodySha256"],
+                bootstrap.sha256_bytes(patch_request[2]),
+            )
+
+    def test_storage_acl_cleanup_refuses_digest_drift_without_patch(self):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan,
+            self.plan_sha,
+            self.package,
+            projection,
+            receipt,
+        )
+        operation = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "removeOwnedUploaderIpv4Rule"
+        )
+        context = next(
+            item["context"]
+            for item in projection["operationAdmissions"]
+            if item["operationId"] == operation["id"]
+        )
+        added = copy.deepcopy(context["restoreNetworkAcls"])
+        added["ipRules"] = [
+            {"value": "203.0.113.10", "action": "Allow"}
+        ]
+        drifted = copy.deepcopy(added)
+        drifted["ipRules"].append(
+            {"value": "198.51.100.40", "action": "Allow"}
+        )
+
+        class Session:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, url, *, body=None, headers=None):
+                self.requests.append((method, url, body, dict(headers or {})))
+                return bootstrap._RestResponse(
+                    200,
+                    bootstrap.canonical_json_bytes(
+                        {"properties": {"networkAcls": drifted}}
+                    ),
+                    {},
+                )
+
+        session = Session()
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            clock=lambda: NOW,
+            session=session,
+        )
+        state = {
+            "proofs": {
+                "addOwnedUploaderIpv4Rule": {
+                    "details": {
+                        "cleanupKey": "uploader-ipv4-rule",
+                        "addedNetworkAclsSha256": bootstrap.sha256_bytes(
+                            bootstrap.canonical_json_bytes(added)
+                        ),
+                    }
+                }
+            }
+        }
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "concurrent drift; manual cleanup is required",
+        ):
+            transport._mutate(operation, state)
+        self.assertEqual([item[0] for item in session.requests], ["GET"])
+
+    def test_storage_acl_result_journal_failure_leaves_bound_unresolved_intent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            projection = build_projection(self.plan, self.package)
+            receipt = (
+                Path(folder)
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            )
+            authorization = build_authorization(
+                self.plan,
+                self.plan_sha,
+                self.package,
+                projection,
+                receipt,
+            )
+            operation = next(
+                item
+                for item in self.plan["mutations"]
+                if item["id"] == "addOwnedUploaderIpv4Rule"
+            )
+            context = next(
+                item["context"]
+                for item in projection["operationAdmissions"]
+                if item["operationId"] == operation["id"]
+            )
+            before = copy.deepcopy(context["preNetworkAcls"])
+
+            class Session:
+                def __init__(self):
+                    self.requests = []
+
+                def request(self, method, url, *, body=None, headers=None):
+                    self.requests.append((method, url, body, dict(headers or {})))
+                    if method == "GET":
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {"properties": {"networkAcls": before}}
+                            ),
+                            {},
+                        )
+                    return bootstrap._RestResponse(
+                        200, bootstrap.canonical_json_bytes({}), {}
+                    )
+
+            ledger = bootstrap.UseLedger(
+                directory=receipt,
+                authorization_id=AUTH_ID,
+                authorization_sha256=bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(authorization)
+                ),
+                source_sha=MERGE,
+                plan_sha256=self.plan_sha,
+                claimed_at=stamp(NOW),
+            )
+            ledger.claim()
+            session = Session()
+            transport = bootstrap.AzureCliBootstrapTransport(
+                authorization=authorization,
+                plan=self.plan,
+                package=self.package,
+                preflight={"projection": projection},
+                clock=lambda: NOW,
+                session=session,
+            )
+            transport.bind_journal(ledger)
+            transport._active_operation_id = operation["id"]
+            with mock.patch.object(
+                transport,
+                "_record_mutation",
+                side_effect=OSError("simulated result fsync failure"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated result fsync failure"
+                ):
+                    transport._mutate(operation, {})
+            unresolved = ledger.unresolved_intents()
+            self.assertEqual(len(unresolved), 1)
+            self.assertEqual(unresolved[0]["operationId"], operation["id"])
+            self.assertEqual(unresolved[0]["method"], "PATCH")
+            self.assertEqual(
+                unresolved[0]["targetUrl"],
+                next(item[1] for item in session.requests if item[0] == "PATCH"),
+            )
+            self.assertEqual(
+                unresolved[0]["requestBodySha256"],
+                bootstrap.sha256_bytes(
+                    next(item[2] for item in session.requests if item[0] == "PATCH")
+                ),
+            )
 
     def test_expiry_mid_run_blocks_next_mutation_but_allows_owned_cleanup(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -4135,6 +4696,172 @@ class BootstrapTests(unittest.TestCase):
     def test_preflight_rejects_sas_and_mutating_probe(self):
         self.assertFalse(bootstrap._preflight_url_allowed("GET", "https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-deployment-packages/x?sig=secret"))
         self.assertFalse(bootstrap._preflight_url_allowed("PUT", f"https://management.azure.com/subscriptions/{bootstrap.SUBSCRIPTION}/resourceGroups/x?api-version=2022-09-01"))
+
+    def test_synthetic_inaccessible_statuses_are_operation_specific(self):
+        base_projection = build_projection(self.plan, self.package)
+        receipt = Path(
+            "C:/fixture/"
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        base_authorization = build_authorization(
+            self.plan,
+            self.plan_sha,
+            self.package,
+            base_projection,
+            receipt,
+        )
+        for status in (
+            "network-inaccessible",
+            "temporary-access-inaccessible",
+        ):
+            with self.subTest(status=status):
+                projection = copy.deepcopy(base_projection)
+                admission = next(
+                    item
+                    for item in projection["operationAdmissions"]
+                    if item["operationId"] == "createPublisherApplication"
+                )
+                admission["status"] = status
+                digest = bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(projection)
+                )
+                authorization = copy.deepcopy(base_authorization)
+                authorization["observedPreflight"]["sha256"] = digest
+                preflight = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"]["observedAt"],
+                    "projection": projection,
+                    "projectionSha256": digest,
+                }
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError, "outside .* boundary"
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, authorization, self.plan
+                    )
+
+    def test_graph_and_key_inventory_readbacks_reject_partial_or_malformed_pages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _auth, validated, preflight, _projection, _receipt = self.fixture(folder)
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=validated.document,
+            plan=self.plan,
+            package=self.package,
+            preflight=preflight,
+            session=object(),
+        )
+
+        def expected(operation_id):
+            return next(
+                item
+                for item in preflight["projection"]["probes"]
+                if item.get("validatorId") == f"operation:{operation_id}"
+            )
+
+        publisher_id = "11111111-1111-4111-8111-111111111111"
+        assignment_id = "22222222-2222-4222-8222-222222222222"
+        resource_id = "33333333-3333-4333-8333-333333333333"
+        service = {
+            "id": publisher_id,
+            "appId": "44444444-4444-4444-8444-444444444444",
+            "displayName": "paperdesk-release-publisher-v2-9c4e0d0d",
+            "accountEnabled": True,
+            "servicePrincipalType": "Application",
+            "passwordCredentials": [],
+            "keyCredentials": [],
+            "appRoleAssignments": [
+                {
+                    "id": assignment_id,
+                    "principalId": publisher_id,
+                    "resourceId": resource_id,
+                    "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+                }
+            ],
+            "appRoleAssignments@odata.nextLink": (
+                "https://graph.microsoft.com/v1.0/next"
+            ),
+        }
+        graph_response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes({"value": [service]}),
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "assignment is not sole and exact"
+        ):
+            transport._validate_readback_response(
+                expected("grantPublisherGraphApplicationReadAll"),
+                graph_response,
+                {
+                    "assignmentId": assignment_id,
+                    "resourceId": resource_id,
+                },
+            )
+
+        kid = (
+            "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/"
+            "paperdesk-release-result-signing/" + "c" * 32
+        )
+        attributes = {
+            "enabled": True,
+            "nbf": int(NOW.timestamp()),
+            "exp": int((NOW + dt.timedelta(days=60)).timestamp()),
+            "created": int(NOW.timestamp()),
+            "updated": int((NOW + dt.timedelta(seconds=1)).timestamp()),
+            "recoveryLevel": "Recoverable+Purgeable",
+            "recoverableDays": 90,
+            "exportable": False,
+        }
+        modulus = base64.urlsafe_b64encode(
+            b"\x80" + b"\x00" * 383
+        ).decode().rstrip("=")
+        facts = {
+            "kid": kid,
+            "kty": "RSA",
+            "n": modulus,
+            "e": "AQAB",
+            "key_ops": ["sign", "verify"],
+            "attributes": attributes,
+        }
+        transport._validated_source_projections["createSigningKeyVersion"] = {
+            "projection": {
+                "keyUriWithVersion": kid,
+                "expiresAt": attributes["exp"],
+            }
+        }
+
+        def key_response(values, next_link=None):
+            return bootstrap._RestResponse(
+                status=200,
+                body=bootstrap.canonical_json_bytes(
+                    {"value": values, "nextLink": next_link}
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+
+        valid_version = {"kid": kid, "attributes": attributes}
+        transport._validate_readback_response(
+            expected("readBackExactSigningPublicJwk"),
+            key_response([valid_version]),
+            facts,
+        )
+        variants = (
+            key_response(
+                [valid_version],
+                "https://kv-mds-sea-9c4e0d0d.vault.azure.net/next",
+            ),
+            key_response([valid_version, copy.deepcopy(valid_version)]),
+            key_response([valid_version, "junk"]),
+        )
+        for response in variants:
+            with self.subTest(body=response.body):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    transport._validate_readback_response(
+                        expected("readBackExactSigningPublicJwk"),
+                        response,
+                        facts,
+                    )
 
     def test_terminal_secret_scan_rejects_percent_encoded_sas_and_jose(self):
         values = [

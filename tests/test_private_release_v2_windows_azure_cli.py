@@ -125,6 +125,54 @@ class AzureCliExecutableTests(unittest.TestCase):
         )
         self.assertNotIn("--tenant", runner.call_args.args[0])
 
+    def test_key_vault_public_cloud_application_audience_is_exactly_allowed(self):
+        observed_at = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+        account_object_id = "b97bfa13-b375-4b27-93d7-141029dbc05b"
+
+        def token_for(audience):
+            claims = {
+                "aud": audience,
+                "exp": int(observed_at.timestamp()) + 3600,
+                "nbf": int(observed_at.timestamp()) - 30,
+                "oid": account_object_id,
+                "tid": bootstrap.TENANT,
+            }
+            payload = base64.urlsafe_b64encode(
+                json.dumps(claims, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            return f"header.{payload}.signature"
+
+        session = bootstrap.AzureCliRestSession(
+            {"azure": {"accountObjectId": account_object_id}},
+            clock=lambda: observed_at,
+        )
+        accepted = token_for("cfa8b339-82a2-471a-a3c9-0fc0be7a4093")
+        with mock.patch.object(
+            session, "_run_az_json", return_value={"accessToken": accepted}
+        ):
+            self.assertEqual(session._token("https://vault.azure.net"), accepted)
+
+        rejected_session = bootstrap.AzureCliRestSession(
+            {"azure": {"accountObjectId": account_object_id}},
+            clock=lambda: observed_at,
+        )
+        with (
+            mock.patch.object(
+                rejected_session,
+                "_run_az_json",
+                return_value={
+                    "accessToken": token_for(
+                        "11111111-1111-4111-8111-111111111111"
+                    )
+                },
+            ),
+            self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "access token is not bound",
+            ),
+        ):
+            rejected_session._token("https://vault.azure.net")
+
 
 if __name__ == "__main__":
     unittest.main()
