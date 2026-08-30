@@ -7789,8 +7789,6 @@ class AzureCliRestSession:
                 "get-access-token",
                 "--resource",
                 resource,
-                "--tenant",
-                TENANT,
                 "--subscription",
                 SUBSCRIPTION,
             ],

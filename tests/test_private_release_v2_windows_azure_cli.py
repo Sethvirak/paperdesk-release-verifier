@@ -1,3 +1,6 @@
+import base64
+import datetime as dt
+import json
 import subprocess
 import unittest
 from unittest import mock
@@ -79,6 +82,48 @@ class AzureCliExecutableTests(unittest.TestCase):
             bootstrap.AzureCliRestSession._run_az_json(
                 ["account", "get-access-token"], "token acquisition"
             )
+
+    def test_token_request_selects_exact_subscription_without_redundant_tenant(self):
+        observed_at = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+        account_object_id = "b97bfa13-b375-4b27-93d7-141029dbc05b"
+        claims = {
+            "aud": "https://management.azure.com/",
+            "exp": int(observed_at.timestamp()) + 3600,
+            "nbf": int(observed_at.timestamp()) - 30,
+            "oid": account_object_id,
+            "tid": bootstrap.TENANT,
+        }
+        payload = base64.urlsafe_b64encode(
+            json.dumps(claims, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        token = f"header.{payload}.signature"
+        session = bootstrap.AzureCliRestSession(
+            {"azure": {"accountObjectId": account_object_id}},
+            clock=lambda: observed_at,
+        )
+
+        with mock.patch.object(
+            session,
+            "_run_az_json",
+            return_value={"accessToken": token},
+        ) as runner:
+            self.assertEqual(
+                session._token("https://management.azure.com/"),
+                token,
+            )
+
+        runner.assert_called_once_with(
+            [
+                "account",
+                "get-access-token",
+                "--resource",
+                "https://management.azure.com/",
+                "--subscription",
+                bootstrap.SUBSCRIPTION,
+            ],
+            "access token request",
+        )
+        self.assertNotIn("--tenant", runner.call_args.args[0])
 
 
 if __name__ == "__main__":
