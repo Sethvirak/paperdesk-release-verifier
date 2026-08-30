@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Dormant, fail-closed runner-loss cleanup core for the registry bridge.
 
-The module deliberately supplies no HTTP server, timer trigger, Azure SDK
-adapter, credential loader, or executable live entry point.  Its only cloud
-surface is the narrow ``CleanupBoundary`` protocol.  A later independently
-reviewed activation must implement that protocol with fixed-resource managed
-identity calls, pin the merged mutating commit in the adjacent contract, and
-prove the package through live runner-loss canaries.
+The adjacent Azure adapter and independently scheduled entry implement only
+the narrow ``CleanupBoundary`` protocol.  They return before credential
+construction while this module's merged mutating commit remains null.  A later
+independently reviewed activation must pin that commit and seven fixed managed
+identities in the adjacent contract, then prove the package through live
+runner-loss canaries.
 
 The state machine is still concrete enough to review and test now: it uses an
 authenticated server timestamp, ETag compare-and-swap, monotonically increasing
@@ -26,7 +26,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 
 CONTRACT_ID = "paperdesk-registry-bridge-cleanup-watcher-v1"
-CONTRACT_SHA256 = "2042a420c8da9ab30f5a71bd50c75fb023118fa4bba3709c5913024ea8334f90"
+CONTRACT_SHA256 = "3b7da11ea2677a5128fd0cc3a4a1dcc25a8f1e10957d6c00fd9ccccecb8ee4fc"
 SESSION_SCHEMA = "paperdesk-registry-bridge-cleanup-session-v1"
 RECEIPT_SCHEMA = "paperdesk-registry-bridge-cleanup-receipt-v1"
 CLOSURE_SCHEMA = "paperdesk-registry-bridge-cleanup-closure-v1"
@@ -66,8 +66,8 @@ MAX_SESSION_BYTES = 65536
 MAX_RESULT_BYTES = 8192
 MAX_RECEIPT_BYTES = 65536
 
-PACKAGE_SHA256 = "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8"
-HELPER_SHA256 = "889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050"
+PACKAGE_SHA256 = "832036fa78557573de5c4349c05fa5cde56af12a279867b2a74a5edfc9b44026"
+HELPER_SHA256 = "9971449d479adc0c549d8b761c98cf576e559f13005bc6b365be308995b9a075"
 RUNNER_SHA256 = "47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b"
 SETTINGS_SHA256 = "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e"
 
@@ -1320,6 +1320,13 @@ def _assess_results(
 
 
 def assess_cleanup(boundary: CleanupBoundary, session: Mapping[str, Any]) -> dict[str, Any]:
+    # No Azure cleanup mutation is permitted until the immutable authority-fence
+    # evidence has been durably CAS-bound into this exact claimed generation.
+    # This guard also protects direct callers and later freshness re-assessment.
+    authority_fence = session.get("authorityFence")
+    if authority_fence is None:
+        fail("cleanup-authority-fence-unbound")
+    validate_authority_fence_reference(authority_fence, session)
     issues: set[str] = set()
     actions: dict[str, str] = {}
     for name, action in (
@@ -1745,6 +1752,9 @@ def reconcile_claim(
         fail("claim-status")
     if session["controlWorkflowSha"] != reviewed_mutating_sha:
         fail("reviewed-mutating-sha-mismatch")
+    if session.get("authorityFence") is None:
+        claim = bind_authority_fence(boundary, claim)
+        session = claim.session
     if session["assessment"] is None:
         claim = stage_assessment(boundary, claim)
         session = claim.session

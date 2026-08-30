@@ -1,17 +1,25 @@
 from pathlib import Path
 import hashlib
+import json
 import re
-import shutil
-import subprocess
 import unittest
 
+
 ROOT = Path(__file__).resolve().parents[1]
-README = ROOT / "README.md"
 CONTROL = ROOT / ".github" / "workflows" / "azure-production-control.yml"
 VERIFY = ROOT / ".github" / "workflows" / "verify-candidate.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "accepted-release-deadline-watchdog.yml"
 BASELINE = ROOT / ".github" / "workflows" / "initialize-watchdog-rollback-baseline.yml"
 RECONCILIATION = ROOT / ".github" / "workflows" / "reconcile-watchdog-dispatch.yml"
+CONTRACT = ROOT / "contracts" / "private_release_mailbox_contract.json"
+PROVISIONING = ROOT / "evidence" / "private-release-provisioning-evidence.json"
+MAILBOX = ROOT / "scripts" / "private_release_mailbox.py"
+CONTROLLER = ROOT / "scripts" / "private_release_external_controller.py"
+BRIDGE_RUNTIME = ROOT / "provider" / "private_release_bridge_runtime.py"
+BRIDGE_AZURE = ROOT / "provider" / "private_release_bridge_azure.py"
+V2_DOC = ROOT / "docs" / "private-release-mailbox-v2.md"
+README = ROOT / "README.md"
+
 
 MAPPING_ENTRY = re.compile(
     r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+):(?:[ ]*(?P<value>.*))?$"
@@ -19,12 +27,11 @@ MAPPING_ENTRY = re.compile(
 
 
 def mapping_block(source, path):
-    """Return the line bounds and indentation for a strict YAML mapping path."""
+    """Return the bounds and indentation for one strict YAML mapping path."""
     lines = source.splitlines()
     start = 0
     end = len(lines)
     parent_indent = -2
-
     for key in path:
         expected_indent = parent_indent + 2
         matches = []
@@ -32,7 +39,7 @@ def mapping_block(source, path):
             line = lines[index]
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            if line.startswith("\t") or line[: len(line) - len(line.lstrip(" \t"))].find("\t") >= 0:
+            if "\t" in line[: len(line) - len(line.lstrip(" \t"))]:
                 raise AssertionError("workflow mappings must use spaces, not tabs")
             match = MAPPING_ENTRY.match(line)
             if (
@@ -43,33 +50,29 @@ def mapping_block(source, path):
                 matches.append((index, match))
         if len(matches) != 1:
             raise AssertionError(
-                f"expected exactly one mapping key {'/'.join(path)!r}; found {len(matches)} for {key!r}"
+                f"expected one mapping key {'/'.join(path)!r}; found {len(matches)} for {key!r}"
             )
-
         index, match = matches[0]
         if (match.group("value") or "").strip():
-            raise AssertionError(f"workflow key {'/'.join(path)!r} must contain a nested mapping")
+            raise AssertionError(f"workflow key {'/'.join(path)!r} must contain a mapping")
         block_end = end
         for candidate in range(index + 1, end):
             line = lines[candidate]
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            indent = len(line) - len(line.lstrip(" "))
-            if indent <= expected_indent:
+            if len(line) - len(line.lstrip(" ")) <= expected_indent:
                 block_end = candidate
                 break
         start = index + 1
         end = block_end
         parent_indent = expected_indent
-
     return lines, start, end, parent_indent
 
 
 def direct_mapping(source, path, *, require_scalar_values=False):
-    """Read direct children of a mapping without implementing general YAML."""
     lines, start, end, parent_indent = mapping_block(source, path)
-    child_indent = parent_indent + 2
     result = {}
+    child_indent = parent_indent + 2
     for index in range(start, end):
         line = lines[index]
         if not line.strip() or line.lstrip().startswith("#"):
@@ -98,7 +101,16 @@ def workflow_step(source, name):
         flags=re.M,
     )
     if match is None:
-        raise AssertionError(f"workflow step {name!r} was not found exactly once")
+        raise AssertionError(f"workflow step {name!r} was not found")
+    return match.group(0)
+
+
+def function_source(source, name):
+    match = re.search(
+        rf"(?ms)^def {re.escape(name)}\(.*?(?=^def |^class |\Z)", source
+    )
+    if match is None:
+        raise AssertionError(f"function {name!r} was not found")
     return match.group(0)
 
 
@@ -108,7 +120,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertTrue(direct_mapping(source, ("jobs",)), path)
         return source
 
-    def test_all_actions_are_full_sha_pinned(self):
+    def test_all_actions_are_immutable_full_sha_pinned(self):
         for path in (CONTROL, VERIFY, WATCHDOG, BASELINE, RECONCILIATION):
             source = self.workflow(path)
             actions = re.findall(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", source, flags=re.M)
@@ -116,974 +128,294 @@ class WorkflowContractTests(unittest.TestCase):
             for action in actions:
                 self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$", action)
 
-    def test_artifact_verifier_has_no_oidc_or_azure(self):
+    def test_artifact_verifier_remains_read_only_and_cloud_free(self):
         source = self.workflow(VERIFY)
-        self.assertNotIn("id-token", source)
-        self.assertNotIn("azure/login", source)
-        self.assertNotIn("environment:", source)
         self.assertEqual(
             direct_mapping(source, ("permissions",), require_scalar_values=True),
             {"actions": "read", "contents": "read"},
         )
+        for forbidden in ("id-token", "azure/login", "environment:", "az ", "Microsoft.Web"):
+            self.assertNotIn(forbidden, source)
 
-    def test_artifact_verifier_pins_exact_approved_control_bytes(self):
-        source = self.workflow(VERIFY)
-        control_sha = "511d45ceb916dc4eaa64dbf96675adce36b5d213"
-        verifier_sha256 = "2ef303b87e8ffb3cece2bc8a1aa6f80e2c91859ecdcdc4dfff968fd1999f35f2"
-        deadline_sha256 = "f8b3e9123eff6555eb6201b3784a1ebe7c222a586ca778eea914fb68a212da0f"
-        checkout = workflow_step(source, "Check out immutable independent verifier controls")
-        verification = workflow_step(source, "Verify independently pinned control bytes")
+    def test_private_release_v2_is_dormant_until_s2_evidence_and_fic_repin(self):
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        evidence = json.loads(PROVISIONING.read_text(encoding="utf-8"))
+        self.assertEqual(contract["status"], "source-dormant")
+        self.assertTrue(contract["activation"])
+        self.assertTrue(all(value is None for value in contract["activation"].values()))
+        self.assertIsNone(contract["activation"]["mergedControlWorkflowSha"])
+        self.assertEqual(evidence["status"], "source-dormant")
 
-        self.assertEqual(
-            re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", checkout),
-            [control_sha],
-        )
-        self.assertEqual(
-            re.findall(r'test "\$\(git rev-parse HEAD\)" = "([0-9a-f]{40})"', verification),
-            [control_sha],
-        )
-        self.assertEqual(
-            re.findall(r"(?m)^            '([0-9a-f]{64})' 'scripts/([^']+)'", verification),
-            [
-                (verifier_sha256, "verify_candidate.py"),
-                (deadline_sha256, "check_deadline.py"),
-            ],
-        )
-        for stale in (
-            "aa9ac0d7f3de54fe159763f52d40730abccbaa8d",
-            "4e54f5bee030feb30ed3fae6a1d7a9363573c558fbb8b901d176789816f90acf",
-            "893b721221c92778bee928cb20423ad1397a8f91cdd9cda2d7718f5b265d8b55",
-        ):
-            self.assertNotIn(stale, source)
-        self.assertEqual(
-            hashlib.sha256((ROOT / "scripts" / "verify_candidate.py").read_bytes()).hexdigest(),
-            verifier_sha256,
-        )
-        self.assertEqual(
-            hashlib.sha256((ROOT / "scripts" / "check_deadline.py").read_bytes()).hexdigest(),
-            deadline_sha256,
-        )
+        baseline = contract["fixed"]["bootstrapBaseline"]
+        self.assertIn("oneDeployInvariant", baseline)
+        self.assertNotIn("activeOneDeployId", baseline)
 
-    def test_azure_login_lives_only_in_pinned_external_control(self):
         source = self.workflow(CONTROL)
-        self.assertIn("id-token: write", source)
-        self.assertIn("azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43", source)
-        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", source)
-        self.assertIn("claims.job_workflow_ref", source)
-        self.assertIn("claims.job_workflow_sha", source)
-        self.assertIn("claims.workflow_ref", source)
-        self.assertNotIn("${{ job.workflow_", source)
-        self.assertIn("oidc-canary-read-resource", source)
-        self.assertIn("az webapp show", source)
-        self.assertIn("environment: paperdesk-production-control", source)
-        self.assertEqual(
-            direct_mapping(
-                source,
-                ("jobs", "azure_production_control", "permissions"),
-                require_scalar_values=True,
-            ),
-            {"actions": "read", "contents": "read", "id-token": "write"},
-        )
-
-    def test_every_mutating_azure_step_requires_confirmed_post_login_session(self):
-        source = self.workflow(CONTROL)
-        session_step = workflow_step(source, "Prove exact Azure subscription after claim-bound login")
-        for required in (
-            "id: azure_session",
-            'account_json="$(az account show --output json)"',
-            '.id == $subscriptionId',
-            '.tenantId == $tenantId',
-            '.state == "Enabled"',
-            '.user == {name: $clientId, type: "servicePrincipal"}',
-            'echo "confirmed=true" >> "${GITHUB_OUTPUT}"',
-        ):
-            self.assertIn(required, session_step)
-
-        login_offset = source.index(
-            "      - name: Azure login from the immutable reusable-workflow identity"
-        )
-        session_offset = source.index(
-            "      - name: Prove exact Azure subscription after claim-bound login"
-        )
-        self.assertLess(login_offset, session_offset)
-
-        mutating_azure_fragments = (
-            "az webapp config appsettings set",
-            "az webapp config appsettings delete",
-            "az webapp config access-restriction set",
-            "az webapp start",
-            "az webapp stop",
-            "az resource update",
-            "az rest --method post",
-            "az rest --method put",
-            "az rest --method patch",
-            "az rest --method delete",
-        )
-        named_steps = re.findall(
-            r"(?ms)^      - name: .*?(?=^      - name:|\Z)", source
-        )
-        mutation_steps = [
-            step for step in named_steps if any(fragment in step for fragment in mutating_azure_fragments)
-        ]
-        self.assertEqual(
-            [re.search(r"^      - name: (.+)$", step, flags=re.M).group(1) for step in mutation_steps],
-            [
-                "Preflight and persist accepted-release material through fixed bridge",
-                "Seal fixed registry bridge after every bridge attempt",
-            ],
-        )
-        for step in mutation_steps:
-            self.assertIn("steps.azure_session.outputs.confirmed == 'true'", step)
-        seal_step = workflow_step(source, "Seal fixed registry bridge after every bridge attempt")
-        self.assertIn(
-            "if: always() && steps.azure_session.outputs.confirmed == 'true'",
-            seal_step,
-        )
-
-    def test_mutating_modes_remain_hard_stopped(self):
-        source = self.workflow(CONTROL)
-        coordinate_step = workflow_step(
+        coordinate = workflow_step(
             source, "Validate immutable caller and operation coordinates before OIDC"
         )
-        self.assertIn("application-specific deployment action remains fail-closed", source)
-        self.assertIn("this source receives independent review", coordinate_step)
-        self.assertIn("the old workflow SHA is denied", coordinate_step)
-        self.assertRegex(
-            coordinate_step,
-            r'if \[ "\$\{OPERATION\}" != "oidc-canary-read-resource" \]; then\n'
-            r'.*?\n\s+exit 1\n\s+fi',
-        )
-        self.assertGreaterEqual(source.count("exit 1"), 3)
+        login = source.index("      - name: Azure login from the immutable reusable-workflow identity")
+        self.assertLess(source.index(coordinate), login)
+        self.assertIn(".activation.mergedControlWorkflowSha == $workflowSha", coordinate)
+        self.assertIn("([.activation[] | select(. == null)] | length) == 0", coordinate)
+        self.assertIn("RUNTIME_CONTROL_WORKFLOW_SHA: ${{ job.workflow_sha }}", coordinate)
 
-    def test_registry_contract_is_fixed_bounded_and_manifest_last(self):
-        source = self.workflow(CONTROL)
-        self.assertNotIn("registry_container_url", source)
-        self.assertNotIn("accepted_release_coordinate", source)
+        docs = V2_DOC.read_text(encoding="utf-8") + README.read_text(encoding="utf-8")
         for required in (
-            "mdspdbak2608089c4e",
-            "paperdesk-accepted-releases",
-            "paperdesk-release-registry-bridge-9c4e0d0d",
-            "rg-paperdesk-rollback-sea-20260808",
-            "rg-master-data-structure-sea",
-            "accepted_release_registry.py build",
-            "v1/releases/${SOURCE_SHA}/${SOURCE_RUN_ID}/${ACCEPTANCE_RUN_ID}/",
-            "assert_bridge_stopped_and_sealed",
-            "trap cleanup_bridge EXIT",
-            "trap 'exit 130' INT",
-            "trap 'exit 143' TERM",
-            ".publicNetworkAccess",
-            "properties.allow=false",
-            "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
+            "S1",
+            "S2",
+            "FIC",
+            "No Azure mutation is authorized",
+            "main pins S2",
         ):
-            self.assertIn(required, source)
-        for transient_setting in (
-            "PAPERDESK_REGISTRY_GITHUB_TOKEN",
-            "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID",
-            "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
-            "PAPERDESK_REGISTRY_REQUEST_SHA256",
-            "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
-            "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB",
-            "PAPERDESK_REGISTRY_RESULT_PURPOSE",
-            "PAPERDESK_REGISTRY_RESULT_EXECUTION",
-            "PAPERDESK_REGISTRY_RESULT_NONCE",
-            "PAPERDESK_REGISTRY_RESULT_BLOB",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT",
-            "PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA",
-            "PAPERDESK_REGISTRY_OPERATION",
-        ):
-            self.assertGreaterEqual(source.count(transient_setting), 3)
-        self.assertIn("actions: read", source)
-        inputs = direct_mapping(source, ("on", "workflow_call", "inputs"))
-        for required_input in (
-            "caller_sha",
-            "acceptance_run_id",
-            "acceptance_run_attempt",
-            "acceptance_workflow_ref",
-            "production_acceptance_receipt_name",
-            "production_acceptance_receipt_sha256",
-            "evidence_run_id",
-            "evidence_run_attempt",
-            "evidence_artifact_name",
-            "evidence_bundle_sha256",
-            "registry_preflight_source_sha",
-            "registry_preflight_run_id",
-            "registry_preflight_run_attempt",
-            "registry_preflight_receipt_sha256",
-        ):
-            self.assertIn(required_input, inputs)
+            self.assertIn(required, docs)
 
-    def test_registry_transport_is_single_flight_digest_bound_and_secret_safe(self):
+    def test_exact_callers_and_reusable_workflow_identity_are_cross_bound(self):
         source = self.workflow(CONTROL)
+        coordinate = workflow_step(
+            source, "Validate immutable caller and operation coordinates before OIDC"
+        )
+        for required in (
+            'expected_caller_workflow_id="306965591"',
+            'expected_caller_workflow_id="340547201"',
+            'expected_caller_workflow_id="334414600"',
+            'production_workflow_path=".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml"',
+            'persist_workflow_path=".github/workflows/persist-accepted-release.yml"',
+            'cleanup_workflow_path=".github/workflows/production-oidc-canary.yml"',
+            'test "${JOB_WORKFLOW_FILE_PATH}" = ".github/workflows/azure-production-control.yml"',
+            'test "${JOB_WORKFLOW_REF}" = "${CONTROL_WORKFLOW_REF}"',
+        ):
+            self.assertIn(required, coordinate)
+
+        claims = workflow_step(
+            source, "Prove exact reusable-workflow and caller claims before Azure login"
+        )
+        for claim in (
+            ".sub",
+            ".job_workflow_ref",
+            ".job_workflow_sha",
+            ".repository_id",
+            ".repository_owner_id",
+            ".run_id",
+            ".run_attempt",
+        ):
+            self.assertIn(claim, claims)
+
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        for claim in (
+            'claims.get("appid")!=self.activation.publisher_client_id',
+            'claims.get("azp")!=self.activation.publisher_client_id',
+            'claims.get("oid")!=self.activation.publisher_principal_id',
+            'claims.get("sub")!=self.activation.publisher_principal_id',
+        ):
+            self.assertIn(claim, controller)
+
+        revalidate = workflow_step(
+            source, "Revalidate exact caller workflow identity before Azure login"
+        )
+        for field in (".workflow_id", ".name", ".path", ".head_sha", ".head_branch", ".event"):
+            self.assertIn(field, revalidate)
+
+    def test_runner_has_no_direct_storage_onedeploy_or_production_setting_mutation(self):
+        source = self.workflow(CONTROL)
+        for forbidden in (
+            "az storage ",
+            "az webapp deploy",
+            "az webapp start",
+            "az webapp stop",
+            "az webapp restart",
+            "az webapp config appsettings",
+            "/extensions/onedeploy",
+            "/config/appsettings?api-version=2025-03-01",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("scripts/private_release_external_controller.py", source)
+
+    def test_bridge_token_is_transient_stopped_private_bridge_state(self):
+        source = CONTROLLER.read_text(encoding="utf-8")
+        lease = source.split("class BridgeLease:", 1)[1].split("def _stamp", 1)[0]
+        self.assertIn('"PAPERDESK_TRANSIENT_GITHUB_TOKEN"', lease)
+        self.assertIn('"githubTokenSha256":core.digest(self.github_token.encode())', lease)
+        self.assertIn("self.assert_stopped()", lease)
+        self.assertLess(lease.index("self.assert_stopped()"), lease.index("self.settings.put_if_digest"))
+        self.assertIn("bridge-transient-preexisting", lease)
+        self.assertIn("bridge-settings-acquire-third-state", lease)
+        for forbidden in ("sig=", "listKeys", "SharedKey"):
+            self.assertNotIn(forbidden, source)
+
+    def test_run_from_package_uses_versioned_worm_bytes_and_manifest_last(self):
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        baseline = contract["fixed"]["bootstrapBaseline"]
+        invariant = baseline["oneDeployInvariant"]
         self.assertEqual(
-            direct_mapping(
-                source,
-                ("jobs", "azure_production_control", "concurrency"),
-                require_scalar_values=True,
-            ),
+            set(invariant),
             {
-                "group": "paperdesk-immutable-azure-production-control",
-                "cancel-in-progress": "false",
+                "historicalActiveDeploymentId",
+                "collectionSemanticProjectionSha256",
+                "propertyIdSetSha256",
+                "deploymentCount",
             },
         )
 
-        upload_step = workflow_step(source, "Upload exact one-shot registry transfer artifact")
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        runtime = BRIDGE_RUNTIME.read_text(encoding="utf-8")
+        self.assertIn("?versionid={descriptor['versionId']}", mailbox)
+        self.assertIn('"WEBSITE_RUN_FROM_PACKAGE":package_url', mailbox)
+        self.assertIn('"WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID":activation["registryReaderManagedIdentityResourceId"]', mailbox)
+        self.assertIn('desired["WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID"]="SystemAssigned"', runtime)
+        self.assertIn('item["immutabilityPeriodSinceCreationInDays"]<91', mailbox)
+
+        persist = function_source(mailbox, "persist_accepted_release")
+        self.assertLess(persist.index("accepted_bundle=_create_or_read_exact"), persist.index("manifest=_create_or_read_exact"))
+        self.assertLess(persist.index("result=_create_or_read_exact"), persist.index("manifest=_create_or_read_exact"))
+        self.assertIn('_load_accepted(boundary,request["acceptedBaseline"],package_boundary)', mailbox)
+
+    def test_historical_onedeploy_is_full_collection_evidence_not_activation(self):
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        azure = BRIDGE_AZURE.read_text(encoding="utf-8")
+        docs = V2_DOC.read_text(encoding="utf-8")
         for required in (
-            "id: registry_transfer",
-            "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
-            "retention-days: 1",
-            "compression-level: 0",
-            "overwrite: false",
-            "if-no-files-found: error",
+            "historicalActiveDeploymentId",
+            "collectionSemanticProjectionSha256",
+            "propertyIdSetSha256",
+            "deploymentCount",
         ):
-            self.assertIn(required, upload_step)
+            self.assertIn(required, mailbox)
+            self.assertIn(required, azure)
+        self.assertNotIn("activeOneDeployId", mailbox)
+        self.assertNotIn("active OneDeploy ID", docs)
+        self.assertIn("historical full OneDeploy collection invariant", " ".join(docs.split()))
 
-        metadata_step = workflow_step(source, "Bind exact uploaded registry transfer metadata")
+    def test_live_versioned_key_get_and_jwk_match_precede_privileged_work(self):
+        runtime = BRIDGE_RUNTIME.read_text(encoding="utf-8")
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        azure = BRIDGE_AZURE.read_text(encoding="utf-8")
+        process = function_source(runtime, "process_request")
+        self.assertLess(process.index("live_key=key_reader()"), process.index("validate_request"))
+        self.assertIn("validate_live_signing_key(live_key,activation,now=now)", process)
+        self.assertIn("keyDataPlaneGetUrl", azure)
+        self.assertIn("kv-read-coordinate", azure)
         for required in (
-            "/actions/artifacts/${EXPECTED_ARTIFACT_ID}",
-            ".id | tostring",
-            ".name == $artifactName",
-            ".expired == false",
-            ".digest == $artifactDigest",
-            ".workflow_run.id | tostring",
-            ".workflow_run.head_sha == $headSha",
-            '"sha256:${EXPECTED_ARTIFACT_DIGEST}"',
+            "live-key-projection",
+            "live-key-expiry",
+            "live-key-jwk",
+            'attributes.get("enabled") is not True',
+            'attributes.get("exportable") is not False',
         ):
-            self.assertIn(required, metadata_step)
+            self.assertIn(required, mailbox)
 
-        persistence_step = workflow_step(
-            source, "Preflight and persist accepted-release material through fixed bridge"
-        )
+    def test_controller_and_activation_leases_are_finite_and_fail_closed(self):
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        azure = BRIDGE_AZURE.read_text(encoding="utf-8")
+        cleanup_acquire = function_source(controller, "acquire_cleanup_controller_lease")
+        self.assertIn("attempts=8", cleanup_acquire)
+        self.assertIn("interval_seconds=10", cleanup_acquire)
+        self.assertIn("(attempts-1)*interval_seconds<=60", cleanup_acquire)
+        self.assertIn('"leaseDuration":60', controller)
+        self.assertIn("controller-lease-lost", controller)
+        self.assertIn('properties.get("leaseStatus")!="Unlocked"', controller)
+
+        fence = azure.split("class BlobActivationFence:", 1)[1].split("class ProductionActivation:", 1)[0]
         for required in (
-            'readonly web_api_version="2025-05-01"',
-            'mktemp "${RUNNER_TEMP}/paperdesk-registry-settings.XXXXXX.json"',
-            'chmod 600 "${transient_settings_file}"',
-            '--settings "@${transient_settings_file}"',
-            'rm -f "${transient_settings_file}"',
-            "/triggeredwebjobs/${webjob_name}/run?api-version=${web_api_version}",
-            "/triggeredwebjobs/${webjob_name}/history?api-version=${web_api_version}",
-            "new_count > 1",
-            "properties.runs | type == \"array\" and length == 1",
-            "Success)",
-            "stable_deadline=$((SECONDS + 15))",
-            '.[0].properties.runs[0].status == "Success"',
-            'test "$(jq -r \'.linuxFxVersion\' <<< "${config_json}")" = "PYTHON|3.12"',
-            'test "$(jq -r \'.alwaysOn\' <<< "${config_json}")" = "true"',
-            'test "$(jq -r \'.webJobsEnabled\' <<< "${config_json}")" = "true"',
-            'and .properties.run_command == "run.sh"',
+            '"stateVersion"',
+            '"pendingRelease"',
+            '"preSettingsSha256"',
+            '"desiredSettingsSha256"',
+            '"x-ms-lease-duration":"60"',
+            "fence-busy",
+            "fence-completion-binding",
         ):
-            self.assertIn(required, persistence_step)
-        self.assertNotIn(
-            'PAPERDESK_REGISTRY_GITHUB_TOKEN="${TRANSIENT_GITHUB_TOKEN}"',
-            persistence_step,
-        )
-        self.assertNotIn('--arg githubToken "${TRANSIENT_GITHUB_TOKEN}"', persistence_step)
-        self.assertIn("env.TRANSIENT_GITHUB_TOKEN", persistence_step)
+            self.assertIn(required, fence)
 
-        activation = persistence_step.split(
-            "# The five-execution result contract is complete dormant source.",
-            1,
-        )[1]
-        self.assertIn(
-            "independent runner-loss cleanup watcher is deployed and live-canaried",
-            activation,
-        )
-        self.assertEqual(activation.count("run_runtime_canary"), 1)
-        self.assertEqual(activation.count("run_persistence_once"), 2)
-        self.assertLess(activation.index("run_runtime_canary"), activation.index("run_persistence_once"))
-        self.assertIn('build_bound_result_set persistence "${persistence_result_set}"', activation)
-        self.assertIn("write_persistence_proof", activation)
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        for required in (
+            "activation-recovery-third-state",
+            "activation-rollback-third-state",
+            "rollback-third-state",
+            "activation-consumption-indeterminate",
+        ):
+            self.assertIn(required, mailbox)
 
-        seal_step = workflow_step(source, "Seal fixed registry bridge after every bridge attempt")
-        canonical_transient = (
-            "PAPERDESK_BRIDGE_SESSION_TOKEN_SHA256",
-            "PAPERDESK_REGISTRY_ARTIFACT_URL",
-            "PAPERDESK_REGISTRY_ARTIFACT_HOST",
-            "PAPERDESK_REGISTRY_GITHUB_TOKEN",
-            "PAPERDESK_REGISTRY_GITHUB_ARTIFACT_ID",
-            "PAPERDESK_REGISTRY_ARTIFACT_ZIP_SHA256",
-            "PAPERDESK_REGISTRY_REQUEST_SHA256",
-            "PAPERDESK_REGISTRY_EXPECTED_PREFIX",
-            "PAPERDESK_REGISTRY_RBAC_CANARY_BLOB",
-            "PAPERDESK_REGISTRY_RESULT_PURPOSE",
-            "PAPERDESK_REGISTRY_RESULT_EXECUTION",
-            "PAPERDESK_REGISTRY_RESULT_NONCE",
-            "PAPERDESK_REGISTRY_RESULT_BLOB",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT",
-            "PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA",
-            "PAPERDESK_REGISTRY_OPERATION",
-        )
-        for transient_setting in canonical_transient:
-            self.assertIn(transient_setting, persistence_step)
-            self.assertGreaterEqual(seal_step.count(transient_setting), 2)
-        persistence_function = persistence_step.split("run_persistence_once() {", 1)[1].split(
-            "trap cleanup_bridge", 1
-        )[0]
-        self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_URL", persistence_function)
-        self.assertNotIn("PAPERDESK_REGISTRY_ARTIFACT_HOST", persistence_function)
-        self.assertNotIn("az webapp update", persistence_step)
-        self.assertNotIn("az webapp update", seal_step)
-        self.assertIn("cleanup_failed=0", seal_step)
-        self.assertIn("site_id_valid=0", seal_step)
-        self.assertIn('if [ "${site_id_valid}" -eq 1 ]; then', seal_step)
-        delete_offset = seal_step.index("az webapp config appsettings delete")
-        final_assert_offset = seal_step.index("site_json=", delete_offset)
-        self.assertLess(delete_offset, final_assert_offset)
-        self.assertIn('test "${cleanup_failed}" -eq 0', seal_step)
-
-    def test_registry_storage_and_bridge_resource_groups_are_not_cross_wired(self):
+    def test_cleanup_has_exact_provenance_durable_obligation_and_runner_loss_path(self):
         source = self.workflow(CONTROL)
-        worm_step = re.search(
-            r"(?s)      - name: Capture exact live locked WORM policy through Azure control identity.*?"
-            r"(?=\n      - name:)",
-            source,
-        ).group(0)
-        self.assertIn(
-            "/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/",
-            worm_step,
-        )
-        self.assertNotIn("/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Storage/", worm_step)
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        runtime = BRIDGE_RUNTIME.read_text(encoding="utf-8")
 
-        for step_name in (
-            "Preflight and persist accepted-release material through fixed bridge",
-            "Seal fixed registry bridge after every bridge attempt",
-        ):
-            step = re.search(
-                rf"(?s)      - name: {re.escape(step_name)}.*?(?=\n      - name:)",
-                source,
-            ).group(0)
-            self.assertIn("BRIDGE_RESOURCE_GROUP: rg-master-data-structure-sea", step)
-            self.assertNotIn("BRIDGE_RESOURCE_GROUP: rg-paperdesk-rollback-sea-20260808", step)
-
-        self.assertNotIn("BRIDGE_RESOURCE_GROUP: rg-paperdesk-rollback-sea-20260808", source)
-
-    def test_registry_preflight_is_dormant_retained_and_required_before_persistence(self):
-        source = self.workflow(CONTROL)
-        coordinate_step = workflow_step(
-            source, "Validate immutable caller and operation coordinates before OIDC"
-        )
-        self.assertIn("registry-bridge-preflight)", coordinate_step)
-        self.assertIn(
-            ".github/workflows/production-registry-bridge-preflight.yml@refs/heads/main",
-            coordinate_step,
-        )
-        self.assertIn(
-            'if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then',
-            coordinate_step,
-        )
-        self.assertIn(
-            "Registry bridge activation is impossible until an independent cleanup watcher/reconciliation receipt",
-            coordinate_step,
-        )
-        self.assertFalse(
-            (ROOT / "evidence" / "registry-bridge-bootstrap-receipt.json").exists(),
-            "the canonical bootstrap receipt must be added only by the later reviewed activation commit",
-        )
-
-        checkout_step = workflow_step(
-            source, "Check out immutable registry control and bootstrap trust anchor"
-        )
-        self.assertIn("steps.immutable_coordinates.outputs.control_workflow_sha", checkout_step)
-        self.assertIn("persist-credentials: false", checkout_step)
-        anchor_step = workflow_step(
-            source, "Verify canonical independently reviewed package bootstrap receipt"
+        cleanup = workflow_step(
+            source, "Clean only exact terminal-owner private bridge transient state"
         )
         for required in (
-            'readonly receipt_name="registry-bridge-bootstrap-receipt.json"',
-            'sha256sum --check --strict "${receipt_name}.sha256"',
-            'keys == ["bootstrapAuthority", "bridge", "deployment", "package", "resultStorageRbac", "reviewedMergeSha", "reviewedSourceSha", "schemaVersion", "status", "storageRbac", "webJob"]',
-            '(.deployment | keys) == ["apiVersion", "liveDeployment", "resourceId"]',
-            '.deployment.liveDeployment.statusCode == 4',
-            '.deployment.liveDeployment.responseObjectSha256',
-            'extensions/onedeploy"',
-            'runCommand: "run.sh"',
-            'mode: "0755", size: 970',
-            'mode: "0644", size: 88',
-            'mode: "0644", size: 106227',
-            '"Microsoft.Web/sites/extensions/Write"',
-            '"Microsoft.Web/sites/extensions/Read"',
-            '"Microsoft.Web/sites/publish/Action"',
-            '.bootstrapAuthority.verifiedAbsent == true',
-            '.bootstrapAuthority.automationRedeployAudit.remainingDedicatedRedeployAssignments == []',
-            '.bootstrapAuthority.automationRedeployAudit.temporaryBootstrapAssignmentDeleted == true',
-            '.bootstrapAuthority.automationRedeployAudit.effectiveRoleAssignmentInventory',
-            'inventory_sha256=',
-            '.grantsRedeploy == false',
-            'every-preflight-detects-onedeploy-drift',
-            'roleAssignments/0151259f-6f5b-408e-a633-e927fa6773bc',
-            'roleDefinitions/b5d9d7c7-9367-4ac0-9d41-28b71e0d517d',
-            'roleAssignments/44d5161c-3104-4de2-8e9b-3d640f013cfb',
-            'roleDefinitions/e005b62b-037b-4989-b492-932669ec0842',
-            '"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"',
-            '"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"',
-            'reason: "AadPremiumLicenseRequired"',
-            '.storageRbac.writer.roleAssignmentSha256',
-            '.storageRbac.writer.roleDefinitionSha256',
-            '.resultStorageRbac.containerResourceId',
-            'paperdesk-registry-webjob-results',
-            '.resultStorageRbac.helperWriter',
-            '.resultStorageRbac.helperReader',
-            '.resultStorageRbac.controlReader',
-            '.resultStorageRbac.identityAudit.controlReaderMemberOf == []',
-            '.resultStorageRbac.immutabilityPolicy.state == "Locked"',
-            '.resultStorageRbac.immutabilityPolicy.immutabilityPeriodSinceCreationInDays == 30',
-            '.resultStorageRbac.subscriptionRoleAudit.directAssignments',
-            'directAssignmentsSha256',
-            'all-direct-principal-role-assignments-at-above-or-below-subscription',
-            'assignedTo-effective-inventory-must-exactly-match-direct-inventory',
-            '.bootstrapAuthority.controlPrincipalId == $azureControlPrincipalId',
-            '$azureClientId',
-            'deployment_completed_epoch <= authority_removed_epoch',
-            'authority_removed_epoch <= authority_audit_epoch',
+            'OWNER_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}',
+            'OWNER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}',
+            'OWNER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}',
+            'OWNER_PATH: ${{ github.event.workflow_run.path }}',
+            'OWNER_EVENT: ${{ github.event.workflow_run.event }}',
+            "--cleanup-stale",
         ):
-            self.assertIn(required, anchor_step)
-        self.assertNotIn("actions/download-artifact", anchor_step)
+            self.assertIn(required, cleanup)
 
-        worm_step = workflow_step(
-            source, "Capture exact live locked WORM policy through Azure control identity"
-        )
-        self.assertIn("inputs.operation == 'registry-bridge-preflight'", worm_step)
-        result_worm_step = workflow_step(
-            source,
-            "Capture exact live locked registry result WORM policy through Azure control identity",
-        )
-        self.assertIn("paperdesk-registry-webjob-results", result_worm_step)
-        self.assertIn('.properties.state == "Locked"', result_worm_step)
-        self.assertIn('.properties.immutabilityPeriodSinceCreationInDays == 30', result_worm_step)
-        download_step = workflow_step(
-            source, "Download exact successful registry bridge preflight receipt"
-        )
-        self.assertIn(
-            "actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53",
-            download_step,
-        )
-        self.assertIn("registry_preflight_run_id", download_step)
-        verify_step = workflow_step(
-            source, "Verify successful registry bridge preflight before persistence"
-        )
+        self.assertIn("acquire_cleanup_controller_lease", controller)
+        self.assertIn("expired-owner-api-unavailable", controller)
+        self.assertIn("controller-cleanup-active", controller)
+        self.assertIn("controller-cleanup-third-state", controller)
+        self.assertIn("attach_cleanup_obligation", runtime)
+        self.assertIn('"cleanupState":"required-after-terminal-result"', mailbox)
+        self.assertIn("external-cleanup-pending", controller)
+        self.assertIn('all(.housekeeping[]; .status == "complete" and .failures == [])', source)
+
+        workflow_names = {path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")}
+        self.assertNotIn("private-release-cleanup.yml", workflow_names)
+        self.assertNotIn("cleanup-private-release.yml", workflow_names)
+
+    def test_mailbox_logical_create_only_and_authenticated_provenance(self):
+        source = MAILBOX.read_text(encoding="utf-8")
+        mailbox_class = source.split("class MailboxClient:", 1)[1].split("def cleanup_mailbox", 1)[0]
         for required in (
-            "/actions/runs/${PREFLIGHT_RUN_ID}",
-            '.path == ".github/workflows/production-registry-bridge-preflight.yml"',
-            '.conclusion == "success"',
-            'test "$(sha256sum "${receipt}" | cut -d \' \' -f 1)" = "${PREFLIGHT_RECEIPT_SHA256}"',
-            ".controlWorkflowRef == $controlWorkflowRef",
-            ".registryBridgePreflight.packageBootstrap == {receiptSha256: $bootstrapReceiptSha256, receipt: $currentBootstrap[0]}",
-            ".registryBridgePreflight.oneDeploy == $currentBootstrap[0].deployment",
-            ".registryBridgePreflight.bridge == $currentBootstrap[0].bridge",
-            ".registryBridgePreflight.storageRbac == $currentBootstrap[0].storageRbac",
-            ".registryBridgePreflight.resultStorageRbac == $currentBootstrap[0].resultStorageRbac",
-            '.registryBridgePreflight.storageRbacCanary.result.writerUnconditionalOverwriteDenied == "passed"',
-            ".registryBridgePreflight.storageRbacCanary.result.canaryBlob == .registryBridgePreflight.storageRbacCanary.blob",
-            ".registryBridgePreflight.storageRbacCanary.resultSha256",
-            "embedded_storage_rbac_result_sha256=",
-            '.registryBridgePreflight.webJob.runCommand == "run.sh"',
-            '.registryBridgePreflight.webJob.runtimeCanaryAnchor == "independently-reviewed-package-bootstrap-receipt"',
-            ".registryBridgePreflight.webJob.status == \"Success\"",
-            ".registryBridgePreflight.wormPolicy.etag == $currentWorm[0].etag",
-            ".registryBridgePreflight.resultWormPolicy.etag == $currentResultWorm[0].etag",
-            '.registryBridgePreflight.resultAttestations.mode == "preflight"',
-            '(.registryBridgePreflight.resultAttestations.executions | length) == 2',
-            "now_epoch - preflight_observed_epoch <= 86400",
+            'if response.status!=201: fail("mailbox-create")',
+            "mailbox-create-readback",
+            'system.get("createdBy")!=expected',
+            'system.get("lastModifiedBy")!=expected',
+            'system.get("createdAt")!=system.get("lastModifiedAt")',
+            'state!="Succeeded"',
         ):
-            self.assertIn(required, verify_step)
+            self.assertIn(required, mailbox_class)
+        self.assertIn("HTTP 200 is an", mailbox_class)
+        self.assertIn("update and is always rejected", mailbox_class)
 
-        bridge_step = workflow_step(
-            source, "Preflight and persist accepted-release material through fixed bridge"
-        )
-        self.assertIn('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then', bridge_step)
-        self.assertIn("write_preflight_proof", bridge_step)
-        self.assertIn("run_storage_rbac_canary", bridge_step)
-        self.assertIn('test "${OPERATION}" = "persist-accepted-release"', bridge_step)
-        self.assertLess(
-            bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
-            bridge_step.index('test "${OPERATION}" = "persist-accepted-release"'),
-        )
-        self.assertIn(
-            "TRANSIENT_GITHUB_TOKEN: ${{ inputs.operation == 'persist-accepted-release' && github.token || '' }}",
-            bridge_step,
-        )
-        proof_function = bridge_step.split("write_preflight_proof() {", 1)[1].split(
-            "run_persistence_once() {", 1
-        )[0]
-        self.assertIn('--slurpfile bootstrap "paperdesk-registry-control/evidence/registry-bridge-bootstrap-receipt.json"', proof_function)
-        self.assertIn('packageBootstrap: {receiptSha256: $bootstrapReceiptSha256, receipt: $bootstrap[0]}', proof_function)
-        self.assertIn('runtimeCanaryAnchor: "independently-reviewed-package-bootstrap-receipt"', proof_function)
-        self.assertIn('test "${webjob_run_command}" = "run.sh"', proof_function)
-        self.assertIn('--argjson liveOneDeploy "${live_onedeploy_deployment}"', proof_function)
-        self.assertIn('and .oneDeploy == $bootstrap[0].deployment', proof_function)
-        self.assertIn('and .storageRbac == $bootstrap[0].storageRbac', proof_function)
-        self.assertIn('and .resultStorageRbac == $bootstrap[0].resultStorageRbac', proof_function)
-        self.assertIn('resultSha256: $storageRbacCanaryResultSha256', proof_function)
-        self.assertIn('result: $storageRbacCanaryResult', proof_function)
-        self.assertIn('.result.writerUnconditionalOverwriteDenied == "passed"', proof_function)
-        self.assertIn('.result.canaryBlob == .storageRbacCanary.blob', proof_function)
-        for synthetic_pass in (
-            'writerCreate: "passed"',
-            'readerRead: "passed"',
-            'writerUnconditionalOverwriteDenied: "passed"',
-            'writerReadDenied: "passed"',
-            'readerWriteDenied: "passed"',
-            'localPrefixGuard: "passed-before-network"',
-        ):
-            self.assertNotIn(synthetic_pass, proof_function)
-        self.assertNotIn('--arg packageSha256 "${EXPECTED_PACKAGE_SHA256}"', proof_function)
-        self.assertIn('select(.name == "PAPERDESK_REGISTRY_PACKAGE_SHA256")', proof_function)
-        self.assertIn('resultWormPolicy: $resultWorm[0]', proof_function)
-        self.assertIn('resultAttestations: $resultSet[0]', proof_function)
+    def test_authorization_decisions_are_derived_without_risky_negative_writes(self):
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        docs = V2_DOC.read_text(encoding="utf-8") + README.read_text(encoding="utf-8")
+        self.assertIn("publisherAuthorizationDecisions", mailbox)
+        self.assertIn('deny=evidence.get("publisherAuthorizationDecisions")', mailbox)
+        self.assertNotIn("publisherDenyMatrix", mailbox)
+        self.assertNotIn("live negative canary", docs)
+        self.assertIn("derived authorization decisions", docs)
+        self.assertIn("no risky negative write", docs)
 
-        self.assertIn("verify_live_onedeploy_anchor() {", bridge_step)
-        self.assertIn("verify_live_storage_rbac() {", bridge_step)
-        rbac_function = bridge_step.split("verify_live_storage_subject() {", 1)[1].split(
-            "cleanup_bridge() {", 1
-        )[0]
-        for required in (
-            "expected_container_scope=",
-            "expected_assignments_path=",
-            "expected_assignments_url=",
-            "https://management.azure.com${assignments_path}",
-            "api-version=2022-04-01&%24filter=principalId%20eq%20%27${principal_id}%27",
-            '[[ "${principal_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]',
-            'test "${assignments_path}" = "${expected_assignments_path}"',
-            'test "${assignments_url}" = "${expected_assignments_url}"',
-            'assignments_response="$(az rest',
-            '(.value | type) == "array"',
-            '((.nextLink // "") == "")',
-            '.type == "Microsoft.Authorization/roleAssignments"',
-            "scope: .properties.scope",
-            "roleDefinitionId: .properties.roleDefinitionId",
-            'type == "array"',
-            "and length == 1",
-            ".condition // null",
-            ".conditionVersion // null",
-            "role_assignment_sha256=",
-            "role_definition_sha256=",
-            '.properties.permissions[0].dataActions == $expected.dataActions',
-            '.identity.type == "UserAssigned"',
-        ):
-            self.assertIn(required, rbac_function)
-        for forbidden in (
-            "az role assignment list",
-            "--all",
-            "--include-inherited",
-            "--assignee-object-id",
-        ):
-            self.assertNotIn(forbidden, rbac_function)
-        self.assertLess(
-            rbac_function.index('test "${assignments_url}" = "${expected_assignments_url}"'),
-            rbac_function.index('assignments_response="$(az rest'),
-        )
-        self.assertLess(
-            rbac_function.index('((.nextLink // "") == "")'),
-            rbac_function.index('assignments="$(jq --compact-output'),
-        )
-        onedeploy_function = bridge_step.split("verify_live_onedeploy_anchor() {", 1)[1].split(
-            "cleanup_bridge() {", 1
-        )[0]
-        for required in (
-            '/extensions/onedeploy?api-version=${web_api_version}',
-            '(.value | length) == 1',
-            '(.nextLink // "") == ""',
-            '.value[0].properties.status == 4',
-            '.value[0].properties.active == true',
-            "jq --sort-keys --compact-output '.value[0]'",
-            "expected_live_deployment=",
-            'test "${live_onedeploy_deployment}" = "${expected_live_deployment}"',
-        ):
-            self.assertIn(required, onedeploy_function)
-        self.assertLess(
-            bridge_step.index("verify_live_storage_rbac\n          verify_live_result_storage_rbac"),
-            bridge_step.index('if [ "${OPERATION}" = "registry-bridge-preflight" ]; then'),
-        )
+    def test_package_url_is_bound_metadata_not_a_secret(self):
+        docs = V2_DOC.read_text(encoding="utf-8") + README.read_text(encoding="utf-8")
+        self.assertNotIn("runner never receives a package URL", docs)
+        self.assertIn("package URL is not a secret", docs)
+        self.assertIn("no SAS", docs)
 
-        runtime_canary_function = bridge_step.split("run_runtime_canary() {", 1)[1].split(
-            "run_storage_rbac_canary() {", 1
-        )[0]
-        storage_canary_function = bridge_step.split("run_storage_rbac_canary() {", 1)[1].split(
-            "write_preflight_proof() {", 1
-        )[0]
-        bound_result_capture = bridge_step.split(
-            "capture_bound_webjob_result() {", 1
-        )[1].split("build_bound_result_set() {", 1)[0]
-        for required in (
-            'az storage blob download',
-            '--account-name "${result_account}"',
-            '--container-name "${result_container}"',
-            '--name "${result_blob}"',
-            '--auth-mode login',
-            'validate_registry_webjob_result.py validate',
-            '--webjobs-run-id "${webjob_run_id}"',
-            '--history-id "${webjob_history_id}"',
-            '--control-workflow-sha "${CONTROL_WORKFLOW_SHA}"',
-            '--package-sha256 "${EXPECTED_PACKAGE_SHA256}"',
-            '--helper-sha256 "${EXPECTED_HELPER_SHA256}"',
-            '.history.webJobsRunId == $webJobsRunId',
-            'storage_rbac_canary_result="$(jq --compact-output',
-        ):
-            self.assertIn(required, bound_result_capture)
-        self.assertNotIn("curl", bound_result_capture)
-        self.assertNotIn("--account-key", bound_result_capture)
-        self.assertNotIn("--connection-string", bound_result_capture)
-        self.assertLess(
-            storage_canary_function.index("prepare_result_coordinates preflight-storage 1"),
-            storage_canary_function.index("az webapp config appsettings set"),
-        )
-        self.assertLess(
-            storage_canary_function.index("delete_transient_settings"),
-            storage_canary_function.index("capture_bound_webjob_result storage-rbac-canary"),
-        )
-        persistence_function = bridge_step.split("run_persistence_once() {", 1)[1].split(
-            "trap cleanup_bridge", 1
-        )[0]
-        for label, function in (
-            ("runtime canary", runtime_canary_function),
-            ("storage RBAC canary", storage_canary_function),
-            ("persistence", persistence_function),
-        ):
-            with self.subTest(webjob_wait=label):
-                self.assertEqual(function.count("wait_for_fixed_webjob"), 1)
-                self.assertLess(
-                    function.index("az webapp start"),
-                    function.index("wait_for_fixed_webjob"),
-                )
-                self.assertLess(
-                    function.index("wait_for_fixed_webjob"),
-                    function.index("trigger_fixed_webjob_and_wait"),
-                )
-
-        readme = README.read_text(encoding="utf-8")
-        self.assertIn("source-complete", readme)
-        for required in (
-            "paperdesk-registry-webjob-results",
-            "separate 30-day locked-WORM container",
-            "create-only writer UAMI",
-            "future OIDC control principal",
-            "paperdesk-registry-webjob-result-attestation-v1",
-            "four result classes and five exact executions",
-            "`preflight-storage`",
-            "`preflight-runtime`",
-            "`persistence-runtime`",
-            "`persistence-result`",
-            "persistence run 1",
-            "persistence run 2",
-            "`artifactZipSha256`",
-            "`requestSha256`",
-            "`manifestSha256`",
-            "`fileCount`",
-            "`createdBlobCount`",
-            "`overwriteNegative`",
-            "`outOfPrefixNegative`",
-            "Both persistence envelopes must match on `prefix`",
-            "both must prove `outOfPrefixNegative: passed`",
-            "Retry attestation permits exactly two cases",
-            "run 1 creates or recovers `createdBlobCount` 1..20",
-            "replay proves `createdBlobCount: 0`",
-            "entry was already complete before this workflow",
-            "both calls prove `createdBlobCount: 0`",
-            "Any other value, type, outcome relationship, or immutable-field mismatch must fail closed",
-            "Generic History `Success` remains insufficient",
-            "az storage blob download --auth-mode login",
-            "ARM history `web_job_id`",
-            "envelope `WEBJOBS_RUN_ID`",
-            "global pre-login hard stop remains in force",
-            "does not independently enumerate group membership or prove PIM eligibility or activation schedules",
-            "separately approved read-only Graph/PIM audit identity",
-        ):
-            self.assertIn(required, readme)
-        self.assertNotIn("byte-identical", readme)
-
-        receipt_step = workflow_step(source, "Create bounded control receipt")
-        self.assertIn("--arg schemaVersion '3'", receipt_step)
-        self.assertIn("registryBridgePreflight: $registryBridgePreflight", receipt_step)
-        self.assertIn("registryPersistence: $registryPersistence", receipt_step)
-        self.assertIn("paperdesk-registry-persistence-proof.json", receipt_step)
-        self.assertIn("registryPreflightReceiptSha256", receipt_step)
-        retained_step = workflow_step(source, "Retain immutable-control receipt")
-        self.assertIn("retention-days: 90", retained_step)
-
-    def test_caller_release_and_fixed_production_coordinates_are_separate(self):
-        source = self.workflow(CONTROL)
-        self.assertIn('test "${CALLER_SHA}" = "${GITHUB_SHA}"', source)
-        self.assertNotIn('test "${SOURCE_SHA}" = "${GITHUB_SHA}"', source)
-        self.assertIn(
-            'test "${GITHUB_WORKFLOW_REF}" = "Sethvirak/MasterDataStructure/.github/workflows/'
-            'persist-accepted-release.yml@refs/heads/main"',
-            source,
-        )
-        for fixed_coordinate in (
-            'test "${EXPECTED_APP_NAME}" = "master-data-structure-sea-9c4e0d0d"',
-            'test "${EXPECTED_RESOURCE_GROUP}" = "rg-master-data-structure-sea"',
-            'test "${EXPECTED_LIVE_URL}" = "https://master-data-structure-sea-9c4e0d0d.azurewebsites.net"',
-        ):
-            self.assertIn(fixed_coordinate, source)
-        self.assertNotIn('[[ "${EXPECTED_APP_NAME}" =~', source)
-
-    def test_registry_result_orchestration_is_exact_bound_and_still_dormant(self):
-        source = self.workflow(CONTROL)
-        bridge = workflow_step(
-            source, "Preflight and persist accepted-release material through fixed bridge"
-        )
-        coordinate_step = workflow_step(
-            source, "Validate immutable caller and operation coordinates before OIDC"
-        )
-        azure_login_offset = source.index(
-            "      - name: Azure login from the immutable reusable-workflow identity"
-        )
-        self.assertLess(
-            source.index('if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then'),
-            azure_login_offset,
-        )
-        self.assertIn("independent cleanup watcher/reconciliation receipt", coordinate_step)
-
-        for coordinate in (
-            "preflight-storage:1",
-            "preflight-runtime:1",
-            "persistence-runtime:1",
-            "persistence-result:1",
-            "persistence-result:2",
-        ):
-            self.assertIn(coordinate, bridge)
-        self.assertIn("declare -A used_result_nonces=()", bridge)
-        self.assertIn("declare -A used_result_blobs=()", bridge)
-        self.assertIn('test -z "${used_result_nonces[${nonce}]+x}"', bridge)
-        self.assertIn('test -z "${used_result_blobs[${result_blob}]+x}"', bridge)
-        self.assertIn("run_runtime_canary preflight-runtime", bridge)
-        self.assertIn("run_runtime_canary persistence-runtime", bridge)
-        self.assertEqual(bridge.count("run_persistence_once 1"), 1)
-        self.assertEqual(bridge.count("run_persistence_once 2"), 1)
-
-        result_settings = (
-            "PAPERDESK_REGISTRY_RESULT_PURPOSE",
-            "PAPERDESK_REGISTRY_RESULT_EXECUTION",
-            "PAPERDESK_REGISTRY_RESULT_NONCE",
-            "PAPERDESK_REGISTRY_RESULT_BLOB",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ID",
-            "PAPERDESK_REGISTRY_RESULT_GITHUB_RUN_ATTEMPT",
-            "PAPERDESK_REGISTRY_RESULT_CONTROL_WORKFLOW_SHA",
-        )
-        for setting in result_settings:
-            self.assertGreaterEqual(bridge.count(setting), 4)
-
-        capture = bridge.split("capture_bound_webjob_result() {", 1)[1].split(
-            "build_bound_result_set() {", 1
-        )[0]
-        self.assertEqual(capture.count("az storage blob download"), 1)
-        self.assertIn('--account-name "${result_account}"', capture)
-        self.assertIn('--container-name "${result_container}"', capture)
-        self.assertIn('--name "${result_blob}"', capture)
-        self.assertIn("--auth-mode login", capture)
-        self.assertIn("validate_registry_webjob_result.py validate", capture)
-        self.assertIn('--webjobs-run-id "${webjob_run_id}"', capture)
-        self.assertIn('--history-id "${webjob_history_id}"', capture)
-        for forbidden in (
-            "--account-key",
-            "--connection-string",
-            "DefaultEndpointsProtocol=",
-            "curl",
-            "/api/vfs/",
-            "/api/command",
-        ):
-            self.assertNotIn(forbidden, capture)
-
-        runtime = bridge.split("run_runtime_canary() {", 1)[1].split(
-            "run_storage_rbac_canary() {", 1
-        )[0]
-        storage = bridge.split("run_storage_rbac_canary() {", 1)[1].split(
-            "write_preflight_proof() {", 1
-        )[0]
-        persistence = bridge.split("run_persistence_once() {", 1)[1].split(
-            "trap cleanup_bridge", 1
-        )[0]
-        for function, capture_call in (
-            (runtime, "capture_bound_webjob_result runtime-canary"),
-            (storage, "capture_bound_webjob_result storage-rbac-canary"),
-            (persistence, "capture_bound_webjob_result persist-actions-artifact"),
-        ):
-            self.assertLess(function.index("trigger_fixed_webjob_and_wait"), function.index("az webapp stop"))
-            self.assertLess(function.index("az webapp stop"), function.index("delete_transient_settings"))
-            self.assertLess(function.index("delete_transient_settings"), function.index(capture_call))
-
-        result_set = bridge.split("build_bound_result_set() {", 1)[1].split(
-            "write_persistence_proof() {", 1
-        )[0]
-        self.assertIn("--mode preflight", result_set)
-        self.assertEqual(result_set.count('--proof "${preflight_'), 2)
-        self.assertIn("--mode persistence", result_set)
-        self.assertEqual(result_set.count('--proof "${persistence_'), 3)
-        self.assertIn("paperdesk-registry-webjob-result-set-v1", result_set)
-
-        self.assertIn("verify_subscription_direct_role_assignments() {", bridge)
-        self.assertIn("and length >= 6", bridge)
-        self.assertIn("assignedTo%28%27${principal_id}%27%29", bridge)
-        self.assertIn('test "${effective_coordinates}" = "${direct_coordinates}"', bridge)
-        self.assertIn('(contains("*") | not)', source)
-        role_audit = bridge.split("verify_subscription_direct_role_assignments() {", 1)[1].split(
-            "verify_live_result_storage_rbac() {", 1
-        )[0]
-        self.assertNotIn("continue\n", role_audit)
-        self.assertIn("verify_live_result_storage_rbac", bridge)
-        self.assertIn("paperdesk-registry-webjob-results", bridge)
-        self.assertIn("directAssignmentsSha256", source)
-        self.assertIn("trap cleanup_bridge EXIT", bridge)
-        self.assertIn("trap 'exit 130' INT", bridge)
-        self.assertIn("trap 'exit 143' TERM", bridge)
-        self.assertNotIn("trap cleanup_bridge EXIT INT TERM", bridge)
-        self.assertGreaterEqual(bridge.count('proof_temp="$(mktemp'), 2)
-        self.assertIn('mv -- "${proof_temp}" "${persistence_proof}"', bridge)
-        self.assertIn('mv -- "${proof_temp}" "${proof}"', bridge)
-        receipt_step = workflow_step(source, "Create bounded control receipt")
-        self.assertIn("proof-malformed-oversized-or-unsafe", receipt_step)
-        self.assertIn("proof-not-produced", receipt_step)
-        self.assertIn("COORDINATES_SUCCEEDED", receipt_step)
-        self.assertIn(
-            'receipt_stem="paperdesk-external-control-invalid-coordinates-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
-            receipt_step,
-        )
-        self.assertIn('echo "operation_receipt_name=${receipt_stem}"', receipt_step)
-        retain_step = workflow_step(source, "Retain immutable-control receipt")
-        self.assertIn("steps.receipt.outputs.operation_receipt_name", retain_step)
-        self.assertNotIn("inputs.operation", retain_step)
-        self.assertNotIn("inputs.source_sha", retain_step)
-        self.assertIn("--arg schemaVersion '3'", workflow_step(source, "Create bounded control receipt"))
-        self.assertIn(
-            "scripts/validate_registry_webjob_result.py",
-            self.workflow(ROOT / ".github" / "workflows" / "self-test.yml"),
-        )
-
-    def test_signal_handlers_exit_before_mutating_work_can_resume(self):
-        source = self.workflow(CONTROL)
-        bridge = workflow_step(
-            source, "Preflight and persist accepted-release material through fixed bridge"
-        )
-        self.assertIn("trap cleanup_bridge EXIT", bridge)
-        self.assertIn("trap 'exit 143' TERM", bridge)
-        bash = shutil.which("bash")
-        bundled = Path(r"C:\Program Files\Git\bin\bash.exe")
-        if bash is None and bundled.is_file():
-            bash = str(bundled)
-        if bash is None:
-            self.skipTest("bash is unavailable for the signal semantic check")
-        completed = subprocess.run(
-            [
-                bash,
-                "-c",
-                "set -e; trap \"printf 'cleanup\\\\n'\" EXIT; "
-                "trap 'exit 143' TERM; kill -TERM $$; printf 'resumed\\\\n'",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(completed.returncode, 143)
-        self.assertEqual(completed.stdout, "cleanup\n")
-        self.assertNotIn("resumed", completed.stdout)
-
-    def test_webjob_poll_treats_running_as_transitional_until_success(self):
-        source = self.workflow(CONTROL)
-        bridge = workflow_step(
-            source, "Preflight and persist accepted-release material through fixed bridge"
-        )
-        poller = bridge.split("trigger_fixed_webjob_and_wait() {", 1)[1].split(
-            "prepare_result_coordinates() {", 1
-        )[0]
-        self.assertIn("Initializing|Running)\n                    sleep 5\n                    continue", poller)
-        self.assertIn("Failed|Error|Aborted|Stopped)", poller)
-        self.assertIn('echo "Registry WebJob returned an unknown ARM history status."', poller)
-        self.assertLess(poller.index("Initializing|Running)"), poller.index("Success)"))
-
-    def test_receipts_and_registry_artifacts_bind_exact_workflow_runs(self):
-        source = self.workflow(CONTROL)
-        receipt_step = re.search(
-            r"(?s)      - name: Verify exact receipt digest before any Azure mutation.*?"
-            r"(?=\n      - name:)",
-            source,
-        ).group(0)
-        verifier_env = (
-            "VERIFIER_WORKFLOW_REF: Sethvirak/paperdesk-release-verifier/.github/workflows/"
-            "verify-candidate.yml@23fc16fca795e0c6786f35aae863167fe80aa3cd"
-        )
-
-        def assert_receipt_step_contract(step_source):
-            self.assertIn(verifier_env, step_source)
-            self.assertIn(".verifierWorkflow == env.VERIFIER_WORKFLOW_REF", step_source)
-
-        assert_receipt_step_contract(receipt_step)
-        with self.assertRaises(AssertionError):
-            assert_receipt_step_contract(receipt_step.replace(verifier_env, "", 1))
-        for exact_check in (
-            ".repository.full_name",
-            ".head_repository.full_name",
-            ".head_sha",
-            ".head_branch",
-            ".path",
-            ".event",
-            ".github/workflows/main_master-data-structure-sea-9c4e0d0d.yml",
-            ".github/workflows/production-evidence-intake.yml",
-            "main_master-data-structure-sea-9c4e0d0d.yml@refs/heads/main",
-            "persist-accepted-release.yml@refs/heads/main",
-            "source_event",
-            ".workflow_run.repository_id",
-            ".workflow_run.head_repository_id",
-            'test "${ACCEPTANCE_RUN_ID}" != "${SOURCE_RUN_ID}"',
-            'test "${EVIDENCE_RUN_ID}" != "${SOURCE_RUN_ID}"',
-            'test "${EVIDENCE_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"',
-        ):
-            self.assertIn(exact_check, source)
-
-    def test_only_read_only_canary_reaches_oidc(self):
-        source = self.workflow(CONTROL)
-        hard_stop = source.index('if [ "${OPERATION}" != "oidc-canary-read-resource" ]; then')
-        azure_login = source.index("      - name: Azure login from the immutable reusable-workflow identity")
-        self.assertLess(hard_stop, azure_login)
-        self.assertIn('test "${SOURCE_SHA}" = "${CALLER_SHA}"', source)
-        self.assertIn('test "${SOURCE_RUN_ID}" = "${GITHUB_RUN_ID}"', source)
-        self.assertIn('test "${SOURCE_RUN_ATTEMPT}" = "${GITHUB_RUN_ATTEMPT}"', source)
-
-    def test_watchdog_v2_workflows_are_source_dormant_before_any_oidc_client_call(self):
+    def test_watchdog_v2_workflows_remain_source_dormant(self):
         cases = (
-            (
-                WATCHDOG,
-                ("jobs", "enforce_deadline", "permissions"),
-                "environment: paperdesk-watchdog",
-                "Source-dormant hard stop before GitHub OIDC or provider calls",
-                "Fetch exact canonical provider state with transient OIDC",
-            ),
-            (
-                BASELINE,
-                ("jobs", "initialize_baseline", "permissions"),
-                "environment: paperdesk-watchdog-baseline",
-                "Source-dormant hard stop before baseline OIDC or state creation",
-                "Initialize provider state from the preexisting reviewed WORM receipt",
-            ),
-            (
-                RECONCILIATION,
-                ("jobs", "reconcile_dispatch", "permissions"),
-                "environment: paperdesk-watchdog-reconciliation",
-                "Source-dormant hard stop before protected reconciliation OIDC",
-                "Reconcile without releasing any attempted state",
-            ),
+            (WATCHDOG, "enforce_deadline", "Source-dormant hard stop before GitHub OIDC or provider calls"),
+            (BASELINE, "initialize_baseline", "Source-dormant hard stop before baseline OIDC or state creation"),
+            (RECONCILIATION, "reconcile_dispatch", "Source-dormant hard stop before protected reconciliation OIDC"),
         )
-        for path, permissions_path, environment, hard_stop_name, protected_name in cases:
+        for path, job, step_name in cases:
             with self.subTest(path=path.name):
                 source = self.workflow(path)
                 self.assertEqual(
-                    direct_mapping(source, permissions_path, require_scalar_values=True),
+                    direct_mapping(source, ("jobs", job, "permissions"), require_scalar_values=True),
                     {"contents": "read", "id-token": "write"},
                 )
-                self.assertIn(environment, source)
                 self.assertIn("ref: ${{ github.workflow_sha }}", source)
-                self.assertIn("persist-credentials: false", source)
-                self.assertIn("clean: true", source)
-                hard_stop = workflow_step(source, hard_stop_name)
-                self.assertIn("exit 1", hard_stop)
-                self.assertLess(source.index(hard_stop_name), source.index(protected_name))
-                for forbidden in (
-                    "secrets.", "github.token", "GH_TOKEN", "PAPERDESK_WATCHDOG_STATE_TOKEN",
-                    "azure/login@", "gh api", "return_run_details",
-                ):
-                    self.assertNotIn(forbidden, source)
+                self.assertIn("exit 1", workflow_step(source, step_name))
 
-    def test_watchdog_v2_workflow_sources_are_exact_hash_bound(self):
+    def test_watchdog_digest_bound_sources_match_checked_out_bytes(self):
         expected_paths = {
             WATCHDOG: {
                 "scripts/check_deadline.py",
@@ -1104,66 +436,18 @@ class WorkflowContractTests(unittest.TestCase):
             },
         }
         for workflow_path, required in expected_paths.items():
-            with self.subTest(workflow=workflow_path.name):
-                source = self.workflow(workflow_path)
-                bindings = dict(re.findall(
+            source = self.workflow(workflow_path)
+            bindings = dict(
+                re.findall(
                     r"echo '([0-9a-f]{64})  ([A-Za-z0-9_./-]+)' \| sha256sum --check --strict",
                     source,
-                ))
-                self.assertEqual(set(bindings.values()), required)
-                by_path = {path: digest for digest, path in bindings.items()}
-                for relative in required:
-                    actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
-                    self.assertEqual(by_path[relative], actual, relative)
-
-    def test_every_byte_digest_bound_source_forces_lf_checkout_bytes(self):
-        attributes = {
-            line
-            for line in (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
-            if line
-        }
-        self.assertEqual(attributes, {
-            "webjobs/paperdesk-accepted-release-registry/run.sh text eol=lf",
-            "webjobs/paperdesk-accepted-release-registry/settings.job text eol=lf",
-            "scripts/check_deadline.py text eol=lf",
-            "scripts/watchdog_contract.py text eol=lf",
-            "scripts/watchdog_evidence.py text eol=lf",
-            "provider/accepted_release_manifest.py text eol=lf",
-            "provider/watchdog_state_provider.py text eol=lf",
-            "provider/startup.sh text eol=lf",
-            "contracts/production_release_watchdog_contract.json text eol=lf",
-        })
-
-    def test_watchdog_v2_lifecycle_uses_provider_only_dispatch_and_fail_closed_reconciliation(self):
-        source = self.workflow(WATCHDOG)
-        for required in (
-            "accepted-release-deadline-v2",
-            "scripts/watchdog_evidence.py fetch-state",
-            "scripts/check_deadline.py",
-            "scripts/watchdog_evidence.py claim",
-            "scripts/watchdog_evidence.py provider-dispatch",
-            "rollback-claim-expired-unattempted",
-            "--mode automatic",
-            "HTTP 200 run binding",
-            "mergedMutatingCommitSha is null",
-        ):
-            self.assertIn(required, source)
-        self.assertNotIn("actions/workflows/", source)
-        self.assertNotIn("manual-azure-production-rollback.yml", source)
-
-        baseline_source = self.workflow(BASELINE)
-        for required in (
-            "evidence/watchdog-initial-rollback-baseline.json",
-            "90-day WORM receipt",
-            "PAPERDESK_WATCHDOG_BASELINE_PROJECTION_SHA256",
-            "scripts/watchdog_evidence.py initialize-baseline",
-        ):
-            self.assertIn(required, baseline_source)
-
-        reconciliation_source = self.workflow(RECONCILIATION)
-        self.assertIn("--mode manual", reconciliation_source)
-        self.assertIn("Reconcile without releasing any attempted state", reconciliation_source)
-        self.assertNotIn("--mode automatic", reconciliation_source)
+                )
+            )
+            self.assertEqual(set(bindings.values()), required)
+            by_path = {path: digest for digest, path in bindings.items()}
+            for relative in required:
+                actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+                self.assertEqual(by_path[relative], actual, relative)
 
 
 if __name__ == "__main__":

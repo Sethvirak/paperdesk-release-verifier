@@ -37,6 +37,7 @@ PROVENANCE_MATERIALS = (
 RUNTIME_INPUT = "server/internal-manifests/package-input-manifest.json"
 RUNTIME_MANIFEST = "server/internal-manifests/runtime-file-manifest.json"
 RELEASE_SHA = "server/paperdesk-release-sha.txt"
+EXECUTABLE_PACKAGE_SOURCE = "App_Data/jobs/triggered/paperdesk-defender-malware-canary/run.sh"
 
 
 def fail(message: str) -> None:
@@ -81,12 +82,30 @@ def safe_relative(value: str, label: str) -> str:
     return "/".join(parts)
 
 
-def validate_records(records: Any, label: str, allow_empty: bool = False) -> list[dict[str, Any]]:
+def authorized_file_mode(path: str) -> str:
+    return "0755" if path == EXECUTABLE_PACKAGE_SOURCE else "0644"
+
+
+def validate_records(
+    records: Any,
+    label: str,
+    allow_empty: bool = False,
+    *,
+    require_mode: bool = False,
+    allow_generated_owner: bool = False,
+) -> list[dict[str, Any]]:
     if not isinstance(records, list) or (not allow_empty and not records):
         fail(f"{label} must be a {'possibly empty ' if allow_empty else 'non-empty '}array")
+    required_keys = {"path", "size", "sha256"}
+    if require_mode:
+        required_keys.add("mode")
+    allowed_keys = set(required_keys)
+    if allow_generated_owner:
+        allowed_keys.add("generatedOwner")
     prior = ""
     for record in records:
-        if not isinstance(record, dict) or set(record) - {"path", "size", "sha256", "generatedOwner"}:
+        keys = set(record) if isinstance(record, dict) else set()
+        if not isinstance(record, dict) or not required_keys.issubset(keys) or not keys.issubset(allowed_keys):
             fail(f"{label} contains an invalid record")
         path = safe_relative(str(record.get("path", "")), label)
         if prior and prior >= path:
@@ -96,9 +115,25 @@ def validate_records(records: Any, label: str, allow_empty: bool = False) -> lis
             fail(f"{label} contains an invalid size: {path}")
         if not SHA256.fullmatch(str(record.get("sha256", ""))):
             fail(f"{label} contains an invalid digest: {path}")
+        if require_mode and record.get("mode") != authorized_file_mode(path):
+            fail(f"{label} contains an unauthorized mode: {path}")
         if "generatedOwner" in record and not isinstance(record["generatedOwner"], str):
             fail(f"{label} contains an invalid generated owner: {path}")
     return records
+
+
+def verify_package_source_modes(root: Path, records: list[dict[str, Any]]) -> None:
+    if os.name == "nt":
+        return
+    for record in records:
+        candidate = root.joinpath(*PurePosixPath(record["path"]).parts)
+        metadata = candidate.lstat()
+        actual_mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+        if not stat.S_ISREG(metadata.st_mode) or candidate.is_symlink() or actual_mode != record["mode"]:
+            fail(
+                "reconstructed package source mode differs from its authorized manifest mode: "
+                f"{record['path']} (expected {record['mode']}, found {actual_mode})"
+            )
 
 
 def tree_records(root: Path, excluded: set[str] | None = None) -> list[dict[str, Any]]:
@@ -221,8 +256,17 @@ def verify_manifest_boundaries(input_document: Any, runtime_document: Any, sourc
         fail("package input manifest schema is invalid")
     if input_document.get("repositoryCommit") != source_sha:
         fail("package input manifest does not bind the source SHA")
-    validate_records(input_document.get("files"), "package input files")
-    release_records = validate_records(input_document.get("releaseMaterials"), "release materials")
+    input_records = validate_records(
+        input_document.get("files"),
+        "package input files",
+        require_mode=True,
+        allow_generated_owner=True,
+    )
+    release_records = validate_records(
+        input_document.get("releaseMaterials"),
+        "release materials",
+        require_mode=True,
+    )
     if tuple(record["path"] for record in release_records) != RELEASE_MATERIALS:
         fail("package input release-material paths are invalid")
     validate_records(input_document.get("productionDependencies"), "production dependencies", allow_empty=True)
@@ -237,10 +281,15 @@ def verify_manifest_boundaries(input_document: Any, runtime_document: Any, sourc
     embedded_input = expected_runtime / RUNTIME_INPUT
     if not isinstance(input_boundary, dict) or input_boundary != {"path": RUNTIME_INPUT, "sha256": sha256_file(embedded_input)}:
         fail("runtime manifest input-manifest boundary is invalid")
-    records = validate_records(runtime_document.get("files"), "runtime files")
+    records = validate_records(runtime_document.get("files"), "runtime files", require_mode=True)
     actual_records = tree_records(expected_runtime, {RUNTIME_MANIFEST})
-    if records != actual_records:
+    runtime_evidence = [
+        {"path": record["path"], "size": record["size"], "sha256": record["sha256"]}
+        for record in records
+    ]
+    if runtime_evidence != actual_records:
         fail("runtime manifest does not exactly reconcile to expected runtime files")
+    verify_package_source_modes(expected_runtime, input_records)
     if (expected_runtime / RELEASE_SHA).read_text(encoding="utf-8") != f"{source_sha}\n":
         fail("runtime release marker does not exactly bind the source SHA")
 

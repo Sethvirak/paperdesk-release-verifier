@@ -45,7 +45,7 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           [[ "${CLAIM_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
           echo '2c94ef28d3b9f2cd565fb899c8e1c5a4ea5bd84d6a28b390c48ce2639b3d638d  scripts/watchdog_evidence.py' | sha256sum --check --strict
-          echo '1c0eb3305d014118cbe3fa55ba4896efdd9ee88479e6816a751cf25a9a6f06ea  provider/watchdog_state_provider.py' | sha256sum --check --strict
+          echo 'dc29237eaee6e1a521d4e4658f038bf8b647c068168812668200753080e98a06  provider/watchdog_state_provider.py' | sha256sum --check --strict
           python3 scripts/watchdog_evidence.py validate-config
 
       - name: Source-dormant hard stop before protected reconciliation OIDC

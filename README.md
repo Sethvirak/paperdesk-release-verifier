@@ -1,6 +1,22 @@
 # PaperDesk release verifier
 
-This public repository is an independent workflow/control root for PaperDesk release verification. It contains no PaperDesk application source, runtime artifact, production evidence, credential, or customer data.
+This public repository is an independent workflow and control root for PaperDesk
+release verification. It contains no PaperDesk application source, production
+artifact, customer record, persistent cloud credential, or production secret.
+
+## Current status
+
+| Surface | Status | Consequence |
+| --- | --- | --- |
+| Candidate verifier | Independently pinned, read-only | May verify a hostile producer artifact without cloud identity |
+| Private release mailbox V2 | Source-dormant | Every activation field is null; every mutating operation stops before Azure login |
+| Watchdog V2 | Source-dormant | Baseline, reconciliation, and deadline workflows stop before OIDC/provider calls |
+
+Merging dormant source is not deployment authorization. No Azure mutation is
+authorized until the exact S2 evidence, FIC repin, activation contract, and main
+caller integration described below have been separately reviewed and approved.
+
+## Candidate verifier
 
 The reusable verifier:
 
@@ -8,68 +24,184 @@ The reusable verifier:
 - checks out the caller's exact release commit without persisted credentials;
 - reconstructs the expected package before downloading the producer artifact;
 - treats the downloaded artifact as hostile input;
-- runs an independently versioned standard-library verifier over the archive, manifests, release materials, SBOMs, and provenance;
-- publishes only a verified artifact and digest-bound JSON receipt into the caller's workflow run.
+- runs an independently versioned standard-library verifier over archives,
+  manifests, release materials, SBOMs, and provenance;
+- publishes only a verified artifact and digest-bound receipt into the caller's
+  workflow run.
 
-The watchdog v2 implementation is implemented for independent source review but remains source-dormant and not activation-grade. Each of its three workflows exits before the first GitHub OIDC request or provider call. The reviewed design reads one canonical provider-owned state record, evaluates the exact 1,440-minute acceptance deadline, WORM-records a decision before a claim CAS, and delegates the only rollback dispatch to a fixed external provider. No workflow receives an Azure credential, GitHub App private key, installation token, state token, dispatch PAT, or caller-selectable cloud coordinate.
+Actions and reusable workflows must always use full immutable commit SHAs. Never
+call a production control from a branch or tag.
 
-The `azure-production-control.yml` read-only canary is the only currently exercisable GitHub OIDC path; every mutating Azure operation is rejected before Azure login. The three watchdog workflows declare protected-environment OIDC permissions but are also stopped before requesting a token. The canary validates the exact reusable `job.workflow_ref`, `job.workflow_sha`, caller commit, repository, subscription, and fixed production App Service resource. The accepted-release implementation is source-complete for independent review of its five-execution result orchestration: it binds release, caller, candidate-run, acceptance-run, evidence-run, artifact-ID/digest, receipt, verifier-workflow/job, environment, ARM WebJob history, and both live locked-WORM coordinates. This is still dormant source, not activation-grade infrastructure. The result container, its exact roles and immutable bootstrap receipt, and the independently hosted cleanup watcher's live adapter, scheduler, deployment, canaries, and receipt do not exist yet. The cleanup state machine and deterministic source-review package exist only as dormant local source. The global pre-login hard stop still makes the path non-operational and must not be treated as permission to start the bridge or write Azure Storage.
+## Private release mailbox V2
 
-## Pinning model
+The authoritative operator and security contract is
+[`docs/private-release-mailbox-v2.md`](docs/private-release-mailbox-v2.md). The
+single reusable entry is `.github/workflows/azure-production-control.yml`,
+including `cleanup-transient`; no standalone cleanup workflow is trusted.
 
-Verifier scripts are pinned inside reusable workflows to an earlier immutable full commit SHA. PaperDesk callers pin the reusable workflow itself to a later full commit SHA. This two-commit update process avoids a circular self-reference:
+### Exact callers and OIDC
 
-1. merge and test verifier script changes;
-2. update the workflow's internal script checkout to that full SHA and merge;
-3. update the PaperDesk caller to the new workflow full SHA;
-4. update the Azure federated-identity subject only after review so it requires the exact `azure-production-control.yml` `job_workflow_ref` and the protected `paperdesk-production-control` environment;
-5. run the read-only canary and prove the old PaperDesk workflow can no longer obtain a token before enabling any mutating operation.
+The workflow accepts only these source identities:
 
-Never call a branch or tag from a production workflow. Never place application bytes or evidence in this public repository.
+- production workflow ID `306965591` at
+  `.github/workflows/main_master-data-structure-sea-9c4e0d0d.yml`;
+- persistence workflow ID `340547201` at
+  `.github/workflows/persist-accepted-release.yml`;
+- cleanup workflow ID `334414600` at
+  `.github/workflows/production-oidc-canary.yml`.
+
+Name, path, repository/owner IDs, protected-main ref, event, head SHA, run ID,
+attempt, source SHA, `job.workflow_ref`, and `job.workflow_sha` are all exact.
+The Azure token must also bind exact `appid`, `azp`, `oid`, `sub`,
+`job_workflow_ref`, and `job_workflow_sha` claims. The workflow refetches caller
+run metadata before Azure login rather than trusting only event text.
+
+### Runner boundary
+
+The GitHub-hosted runner may use the publisher control identity only to validate
+fixed control-plane evidence, publish/read the nonce-bound ARM mailbox, serialize
+the private bridge, and recover its exact owned transient state. It has no
+Storage blob DataActions, OneDeploy authority, production App Settings
+write/restart authority, Key Vault sign authority, SAS, account key, or Shared
+Key credential. It never directly runs `az storage`, OneDeploy, or a production
+App Settings mutation.
+
+The short-lived GitHub token is injected only into a proven-Stopped private V2
+bridge, together with its digest-bound control record. The token is removed
+during exact full-map cleanup and is never placed in process arguments or durable
+receipts.
+
+### Versioned run-from-package chain
+
+The V2 bridge is a separately provisioned private App Service anchored from
+creation to a private, content-addressed, versioned WORM package URL and exact
+package-reader UAMI. Candidate and rollback deployment packages are create-only,
+read back by exact version, and activated using App Service run-from-package.
+Production uses its system identity with exact package-container read access.
+
+The package URL is not a secret; it is source-pinned metadata. The runner may
+validate it, but receives no SAS, Storage bearer token, account key, or package
+write permission. Package, accepted-release, and result containers must be
+private and Locked for at least 91 days. Accepted package promotion is complete
+only after exact byte readback and a manifest-last commit.
+
+The historical full OneDeploy collection invariant is evidence only. It binds
+the historical deployment ID, canonical full-collection semantic digest,
+property-ID-set digest, and deployment count. OneDeploy is not the V2 activation
+mechanism.
+
+### Production activation and recovery
+
+A finite activation-fence blob lease binds the exact operation, source, release
+descriptor, pre-settings digest, desired-settings digest, lease ID, and state
+version. Every full-map read/write, restart, and probe renews that fence. State is
+classified as old, desired, or third-state; third-state is never overwritten.
+After lease expiry, only the exact same plan may rebind under a fresh random
+lease and incremented state version. Desired-state recovery repeats only the
+durable consume/complete action rather than restoring production because result
+delivery was lost.
+
+Before mailbox, Storage, production, or signing work, the bridge performs a live
+versioned Key Vault `Get Key` and proves the exact JWK, attributes, version,
+digest, and remaining lifetime. The bridge key identity is read-only; a distinct
+signer UAMI has only sign permission.
+
+### Cleanup and runner loss
+
+The controller uses a finite 60-second Storage resource-provider container lease
+with no blob DataActions. Cleanup retries eight times at ten-second intervals,
+so its 70-second busy window exceeds a whole abandoned lease term.
+
+Every terminal result includes a create-only/readback cleanup obligation. A
+workflow is not successful while any housekeeping record is pending. Exact
+completed-owner proof permits immediate cleanup. If the Actions API is
+unavailable, fallback waits at least 120 minutes, beyond the 90-minute owner job
+timeout, and still requires exact owner, nonce, run attempt/SHA, transient map,
+self-deadline, and lease proof. Active owner, partial map, or third-state means no
+mutation.
+
+The main repository must route production, persistence, and cleanup callers
+through one literal `paperdesk-production` concurrency group with
+`cancel-in-progress: false`. The completed `workflow_run` path and schedule/manual
+expiry fallback call the same exact-SHA reusable workflow.
+
+### Authorization evidence
+
+Action-time authorization proof uses the subscription-scope ARM 2022-04-01 List For Scope endpoint with the exact `principalId eq '<principalId>'` filter and the effective `assignedTo(...)` filter. The proof covers direct role assignments at, above, and below the fixed approved subscription only; it cannot inventory unrelated sibling subscriptions, Entra group or transitive grants, or PIM eligibility or activation. Where broader proof is required, use a separate Entra/PIM audit identity and P2/Identity Governance coverage; activation remains blocked until that proof is reviewed. The action-time checks exhaustively inventory both projections for every
+automation principal, follows pagination, and canonical-hashes every referenced
+role definition. Both inventories must equal the source-pinned allowlist.
+Unexpected inherited, conditional, delegated, group-effective, overlapping, or
+extra non-Owner access fails closed.
+
+`publisherAuthorizationDecisions` are derived authorization decisions from that
+complete inventory. They are not claimed 403 probes, and the system performs no
+risky negative write, delete, restart, OneDeploy, listKeys, blob write, or Key
+Vault sign merely to manufacture denial evidence. Subscription/resource-group
+Owners remain an explicit out-of-band governance boundary.
+
+## Activation trust DAG
+
+The activation sequence is finite:
+
+1. Merge dormant exact-SHA source **S1** with null activation.
+2. Provision exact resources and temporarily bind the sole publisher FIC to S1.
+3. Commit SHA-independent concrete evidence and the bootstrap receipt in **S2**.
+4. Explicitly repin that sole FIC from S1 to S2 and prove no stale/extra FIC.
+5. Only after independent review, main pins S2 and receives its exact caller
+   integration.
+
+No Azure mutation is authorized before S2 evidence acceptance and FIC repin, and
+main pins S2 only after those gates. No impossible S3 self-reference is needed.
+Any later drift requires fresh evidence and a new reviewed pin.
+
+## Bootstrap boundary
+
+The local bootstrap provisioner is a separate, explicitly authorized operator
+action, not a GitHub runner shortcut. It may temporarily add only:
+
+- the current host's exact public IPv4 `/32` Storage firewall rule; and
+- Blob Data Contributor on the exact package container for the local uploader.
+
+It uses Azure AD create-only upload, verifies exact SHA-256/size/ETag/version ID,
+then removes only its owned `/32` rule and exact temporary assignment. Fresh
+readback must prove both are absent before the V2 site starts. It may not use a
+SAS, account key, Shared Key, broad CIDR, stale full-ACL restore, or public
+container. Managed-identity package fetch must succeed through the reviewed
+service-endpoint topology before WORM locking/activation is accepted.
 
 ## Local verification
 
+Use a Python runtime with bytecode generation disabled when validating a shared
+review checkout:
+
 ```bash
-python -m unittest discover -s tests -v
-python -m py_compile scripts/verify_candidate.py scripts/check_deadline.py scripts/accepted_release_registry.py scripts/validate_registry_webjob_result.py scripts/build_registry_webjob.py provider/registry_bridge_cleanup_watcher.py scripts/build_registry_cleanup_watcher_package.py
-python scripts/build_registry_webjob.py --output /tmp/paperdesk-accepted-release-registry-webjob.zip
-python scripts/build_registry_cleanup_watcher_package.py --output /tmp/paperdesk-registry-cleanup-watcher.zip
+PYTHONDONTWRITEBYTECODE=1 python -B tests/test_workflow_contract.py
+PYTHONDONTWRITEBYTECODE=1 python -B -m unittest \
+  tests.test_private_release_bridge_package \
+  tests.test_private_release_bridge_runtime \
+  tests.test_private_release_bridge_azure \
+  tests.test_private_release_external_controller
+python -m py_compile \
+  scripts/private_release_mailbox.py \
+  scripts/private_release_external_controller.py \
+  provider/private_release_bridge_runtime.py \
+  provider/private_release_bridge_azure.py
 ```
 
-## Accepted-release registry contract
+`scripts/build_private_release_bridge_package.py` creates the deterministic V2
+bridge package for byte-level review. Building the package is not permission to
+upload it or mutate Azure.
 
-The registry helper preserves the exact 12 verified-artifact top-level files, all five exact files under `paperdesk-prebuild-release-materials/`, the external candidate-verification receipt, and the production-acceptance receipt. It builds a deterministic, bounded request and permits only this fixed destination:
+## Watchdog V2
 
-`https://mdspdbak2608089c4e.blob.core.windows.net/paperdesk-accepted-releases/v1/releases/<candidate-sha>/<candidate-run-id>/<acceptance-run-id>/`
+Watchdog V2 is a separate dormant system. Its deadline, baseline, and
+reconciliation workflows stop before OIDC/provider calls. It binds immutable
+source bytes, exact provider state, 1,440-minute acceptance deadline, WORM
+decision-before-claim ordering, provider-owned rollback dispatch, and fail-closed
+reconciliation. The watchdog evidence store's 90-day policy is separate from
+the V2 package/accepted/result containers' minimum 91-day Locked policies.
 
-The request binds candidate and acceptance run attempts inside the manifest rather than weakening the stable path. Each of the 19 preserved files has an exact relative path, byte size, SHA-256, and Content-MD5. It binds PaperDesk's actual protected-main source workflow ref (`@refs/heads/main`) while independently binding immutable execution through the fetched run ID, path, head SHA, branch, event, and attempt. It also binds exact GitHub artifact IDs and immutable artifact digests, the `post-deploy` evidence name and bundle digest, the source-compatible `fully-accepted` 17-field receipt, the external verifier workflow full SHA/job/run, `production` environment, and a separately observed locked 30-day WORM policy snapshot. The dormant bridge helper is designed to upload each payload blob with `If-None-Match: *`, read it back through the distinct read-only managed identity, accept only bounded create-only overwrite error codes, prove overwrite and out-of-prefix negatives, and upload `registry-manifest.json` last as the sole completeness marker. A retry may only validate an identical completed entry.
-
-The selected dormant transport is a fixed triggered WebJob, not public or SCM ingress. `python scripts/build_registry_webjob.py --output <unused-path>.zip` creates a deterministic three-file deployment package under `App_Data/jobs/triggered/paperdesk-accepted-release-registry/`: the fixed runner, singleton `settings.job`, and standard-library helper. The runner accepts only the persistent reviewed helper and package digests, verifies the deployed helper before execution, passes the verified helper digest under a non-caller result-binding name, and invokes `python3 -I accepted_release_registry.py` only for `runtime-canary`, `storage-rbac-canary`, or `persist-actions-artifact`. The isolated member checker invoked by that exact runner verifies the deployed `run.sh` and `settings.job` digests, Python 3.12, the absence of a GitHub credential, and both fixed distinct managed-identity client IDs. Inside the helper, the storage-RBAC canary accepts only a workflow-generated unique path under `v1/canaries/storage-rbac/<run>/<attempt>/<nonce>.json` and checks writer create, reader exact-byte readback, unconditional writer overwrite denial without `If-None-Match`, writer-read denial, reader-create denial, and local out-of-prefix rejection before network access. Generic ARM WebJob History `Success` remains insufficient: the dormant workflow now downloads the exact fixed-container blob through Entra login and the independent control-side validator binds the envelope's `WEBJOBS_RUN_ID` to the exact ARM `web_job_id`. Container scope is bound by the immutable RBAC receipt and action-time ARM 2022-04-01 List For Scope queries filtered to each exact principal. The result-channel check inventories every direct role assignment for the two helper identities and OIDC control principal, then requires each principal's `assignedTo(...)` effective assignment set to equal its direct set; active group-derived grants therefore fail closed. It rejects pagination, unexpected data actions, mutating control management actions, and unbound read-only control management roles. It does not enumerate Entra group membership or prove PIM eligibility or activation schedules. Azure RBAC does not make an in-container blob prefix a role-assignment scope. The one-shot persistence command accepts only a transient GitHub Actions token plus exact artifact ID and digests. It makes one authenticated request to the fixed GitHub artifact endpoint, requires exactly one 302 to a tightly constrained short-lived read-only HTTPS Blob URL, strips authorization before the Blob request, disables environment proxies, and rejects any additional redirect. It verifies the downloaded ZIP and inner request digests, requires exactly one `paperdesk-accepted-release-request.tar.gz`, and checks the expected release prefix before any Storage call. Its distinct writer and reader managed-identity client IDs are compiled into the reviewed helper rather than selected by the caller. The older HTTP `serve` mode remains dormant and is not part of this transport.
-
-The reviewed target runtime is App Service `PYTHON|3.12` with Always On and WebJobs enabled. A future activated `registry-bridge-preflight` may create only the one small unique 30-day-WORM RBAC canary described above after the result orchestration, result-container bootstrap receipt, and independent runner-loss cleanup control are separately reviewed. From the immutable verifier checkout it first verifies the fixed `evidence/registry-bridge-bootstrap-receipt.json` and adjacent strict SHA-256 file. That canonical non-secret receipt must bind the independently reviewed source and merge SHAs, deterministic package/member hashes, exact App Service/UAMI coordinates, OneDeploy object, WebJob command, sealed bridge configuration, removed bootstrap authority, and both exact Storage RBAC contracts. The accepted-release contract fixes writer assignment `0151259f-6f5b-408e-a633-e927fa6773bc` to custom role `b5d9d7c7-9367-4ac0-9d41-28b71e0d517d` with sole `blobs/add/action`, and reader assignment `44d5161c-3104-4de2-8e9b-3d640f013cfb` to custom role `e005b62b-037b-4989-b492-932669ec0842` with sole `blobs/read`. The result contract requires separate exact-container custom roles for helper add-only, helper read-only, and OIDC control read-only access. Its direct inventory contains exactly the accepted-release and result roles for each helper, the result-read role and fixed permanent bridge role for control, and only receipt-bound read-only management roles beyond those. Every `assignedTo(...)` effective coordinate must exactly match the corresponding direct inventory. All accepted assignments are unconditional, non-delegated, and subscription-only assignable. The receipt also records canonical assignment/definition digests, a separately captured snapshot of empty direct Entra `memberOf` results for all three result principals, and the honest boundary that PIM schedule enumeration returned `AadPremiumLicenseRequired` because the tenant lacks the required P2/Identity Governance license. The workflow's action-time ARM query rejects active group-derived assignments but does not independently enumerate group membership or prove PIM eligibility or activation schedules. The current control principal intentionally has no Graph/PIM enumeration authority. Any action-time Entra membership or PIM proof requires a separately approved read-only Graph/PIM audit identity, the applicable tenant consent, and the required P2/Identity Governance licensing, followed by a refreshed immutable receipt; this source does not silently widen the control role. Before every canary or persistence run, the workflow re-reads and binds the live OneDeploy object. A later persistence call must bind a successful preflight receipt from the same immutable workflow SHA no more than 24 hours earlier, including both strictly validated canonical preflight envelopes, repeats the isolated runtime canary, and performs persistence twice for create-only completion and idempotent readback. The transient GitHub token is passed through a mode-600 JSON settings file rather than process arguments. Workflow-local trap plus `always()` cleanup stop/reseal the bridge and delete all transient settings only after the post-login step has emitted an exact subscription/tenant/service-principal session sentinel; a pre-login hard stop cannot fall through to ambient Azure CLI credentials.
-
-The source-only helper result channel uses the dedicated fixed `paperdesk-registry-webjob-results` container in storage account `mdspdbak2608089c4e`; it must be provisioned later as a separate 30-day locked-WORM container and bound by a new immutable bootstrap receipt. Its create-only writer UAMI may have only `blobs/add/action`, its helper reader UAMI may have only `blobs/read`, and the future OIDC control principal may have only exact-container read access. The receipt and live checks must reject inherited, conditional, group-derived, or overlapping unconditional assignments rather than assuming an in-container prefix is an RBAC scope. Before an operation can create any durable registry or canary state, the helper validates and consumes the complete result-coordinate envelope. It then writes the result with `If-None-Match: *`, reads back the exact canonical bytes and required Content-MD5 through the distinct reader, and fails unless unconditional writer overwrite is denied, writer read is denied, and reader create is denied.
-
-The envelope schema `paperdesk-registry-webjob-result-attestation-v1` binds a fresh 32-hex nonce and exact blob, GitHub run ID/attempt, immutable control workflow SHA, reviewed package/helper digests, fixed operation/purpose/execution, and `WEBJOBS_NAME`, `WEBJOBS_TYPE`, and `WEBJOBS_RUN_ID`, plus the canonical helper-result digest and result. The storage-RBAC canary must use that same GitHub run ID, attempt, and nonce, while a runtime result's nested helper digest must equal the envelope's verified executing-helper digest. There are four result classes and five exact executions: `preflight-storage` once for `storage-rbac-canary`, `preflight-runtime` once for `runtime-canary`, `persistence-runtime` once for the repeated pre-persistence runtime canary, and `persistence-result` twice for persistence run 1 and persistence run 2. Each persistence output must strictly validate `status: complete` plus the exact `prefix`, `artifactZipSha256`, `requestSha256`, `manifestSha256`, `fileCount`, integer `createdBlobCount`, `overwriteNegative`, and `outOfPrefixNegative` fields. Both persistence envelopes must match on `prefix`, `artifactZipSha256`, `requestSha256`, `manifestSha256`, and `fileCount`, and both must prove `outOfPrefixNegative: passed`. Retry attestation permits exactly two cases: (A) run 1 creates or recovers `createdBlobCount` 1..20 with `overwriteNegative: passed`, then replay proves `createdBlobCount: 0` and `overwriteNegative: not-run-completed`; or (B) the entry was already complete before this workflow, so both calls prove `createdBlobCount: 0` and `overwriteNegative: not-run-completed`. Any other value, type, outcome relationship, or immutable-field mismatch must fail closed.
-
-The dormant workflow now generates five unique coordinate sets, passes each set only to its intended execution, downloads only that exact result blob with `az storage blob download --auth-mode login`, binds the ARM history `web_job_id` to the envelope `WEBJOBS_RUN_ID`, recomputes the helper-result digest, strictly validates all five envelopes, and applies the persistence idempotence rule above. It retains a canonical two-execution preflight result set and a canonical three-execution persistence proof. This makes the result orchestration source-complete for review; it does not make the system activation-grade. The fixed result container, its locked policy, exact UAMI/control assignments, and immutable bootstrap receipt still do not exist. The runner-loss cleanup core is present as dormant, dependency-free source plus an exact-contract deterministic review package; it has no Azure adapter, credential loader, timer/HTTP entry point, live scheduler deployment, or retained canary/receipt. Its state machine uses authenticated server time, ETag CAS fencing, exact fixed-resource ARM histories, and read-only result reconciliation. Before it can write any cleanup receipt, it must bind an independently produced locked-WORM authority fence proving that the exact runner federation and mutating role generation are revoked and every prior token has expired, then rerun stop, reseal, transient-setting deletion, and the final snapshot. Every receipt is read back byte-for-byte and receives a separate immutable closure marker binding the closed-state digest, authority fence, and receipt, so later singleton sessions do not erase its authority. The authority-fence container, independent producer, live canaries, and retained receipts do not exist yet. Generic History `Success` remains insufficient, and the global pre-login hard stop remains in force.
-
-The fixed bridge is `paperdesk-release-registry-bridge-9c4e0d0d` in `rg-master-data-structure-sea`, while the fixed registry storage account and container remain in `rg-paperdesk-rollback-sea-20260808`; resource names and prefixes are not caller inputs. The bridge must be stopped, public access disabled, main and SCM defaults denied, FTPS disabled, and FTP/SCM basic publishing disabled before and after every attempt. The writer user-assigned identity is create/add only; the separate reader identity is read only. Workflow-local cleanup is not an independent runner-loss control: GitHub host loss can prevent both the trap and `always()` step from running. This dormant source therefore has a second unconditional activation stop that may not be removed until an external independently authorized watcher can stop/reseal the bridge, delete every transient setting, reconcile retained evidence, and provide an immutable reviewed receipt. That watcher may not delete accepted-release blobs.
-
-Current status: this dormant implementation is approved for inclusion in main as source only; merging it does not approve mutation. The deterministic WebJob package and one-shot helper have not been deployed or live-canaried, the canonical bootstrap receipt/checksum intentionally do not yet exist, and the global workflow hard stop still rejects both `registry-bridge-preflight` and every other non-read-only operation before Azure login. Activation requires a later separately reviewed commit to add those exact canonical receipt bytes and checksum and to alter that exact gate only after independent approval of the final package bytes, immutable package bootstrap on the Python 3.12 bridge, both locked 30-day containers, the four persistent package/member digest settings (`PAPERDESK_REGISTRY_PACKAGE_SHA256`, `PAPERDESK_REGISTRY_HELPER_SHA256`, `PAPERDESK_REGISTRY_RUNNER_SHA256`, and `PAPERDESK_REGISTRY_SETTINGS_SHA256`), removal of `Microsoft.Web/sites/extensions/Write` and `Microsoft.Web/sites/publish/Action` from permanent bridge authority while retaining only the required `Microsoft.Web/sites/extensions/Read` status action, deletion and audit of all dedicated bootstrap redeploy authority, narrow WORM-policy and WebJob run/history authorization, exact-workflow federated-credential rotation plus old-SHA denial proof, `scmIpSecurityRestrictionsUseMain=true`, a successful retained preflight while public access stays disabled, live create/overwrite-denial canaries with retained 30-day registry evidence, an independently deployed and live-canaried runner-loss cleanup watcher with its own immutable receipt, and a separately reviewed PaperDesk caller pinned to the activated workflow SHA. The activation commit should permit the preflight first and must not make persistence callable without its exact retained receipt. Until those gates pass, every mutating mode exits before Azure login. Do not add a persistent secret, branch/tag workflow reference, caller-controlled Azure resource, public bridge ingress, SCM exception, Shared Key, or broad Storage role as a shortcut. The separately approved 90-day watchdog evidence store is a different container and must not change either registry container's locked 30-day policy.
-
-## Watchdog v2 source contract and activation gates
-
-The fixed provider origin is `https://paperdesk-watchdog-state-9c4e0d0d.azurewebsites.net`. Canonical state transitions use `POST /api/watchdog-state/v2/transitions` and exactly these operations, in lifecycle order: `publish-candidate`, `accept-candidate`, `rollback-workflow-observed`, `rollback-authorize`, and `rollback-completed`. A newly committed transition returns HTTP 201. Only a byte-exact idempotent replay whose current state metadata names that exact WORM transition receipt returns HTTP 200. Malformed input, missing authentication, forbidden identity, lifecycle conflict, stale CAS, and unavailable provider evidence remain distinct fail-closed 400, 401, 403, 409, 412, and 503 boundaries.
-
-Every state caller is bound by GitHub OIDC to the exact repository ID and owner ID, protected `main` ref, environment, workflow ref, workflow SHA, source SHA, event, run, attempt, subject, audience, and pinned immutable external-control `job_workflow_ref` and `job_workflow_sha`. `accept-candidate` keeps the prior finalized release coordinates in its request while the distinct `persist-accepted-release.yml` `workflow_run` caller coordinates are retained in its WORM receipt. The provider runtime requires five distinct user-assigned managed identities: state read/write, evidence create-only, evidence read-only, accepted-release registry read-only, and ARM immutability-policy read-only. Duplicate or partial identity configuration fails startup.
-
-For each managed-identity principal, the provider uses the subscription-scope ARM 2022-04-01 List For Scope endpoint with the exact `principalId eq '<principalId>'` filter, rejects any `nextLink`, and requires one assignment with the exact principal, assignment, custom-role definition, intended scope, and unconditional non-delegated shape. The proof covers direct role assignments at, above, and below the fixed approved subscription only; it cannot inventory unrelated sibling subscriptions, Entra group or transitive grants, or PIM eligibility or activation. Consequently, activation remains blocked pending a separate Entra/PIM audit identity and P2/Identity Governance coverage where applicable; this source does not claim that broader identity proof.
-
-Rollback dispatch is provider-owned. It mints a short-lived GitHub App installation token for numeric repository ID `1287744543` only, with exactly `actions: write` and `metadata: read`. The GitHub REST `2026-03-10` request body contains only fixed `ref` plus fixed `inputs`; success requires HTTP 200 with the exact workflow run ID, API URL, HTML URL, and GitHub request ID. Any non-200 or inexact response is indeterminate and remains held. The token is never returned to a workflow and is discarded after the bounded request.
-
-The durable lifecycle is: decision WORM -> claim CAS -> attempt WORM -> `dispatching` CAS -> provider GitHub dispatch -> outcome WORM -> state run binding. Mutable state metadata binds the exact body digest, schema, initial baseline receipt, and last durable transition receipt, so identical JSON written by another caller cannot become a false replay. Automatic reconciliation may release only an expired `claimed` guard with no durable attempt. Once an attempt exists, automatic release is forbidden; protected manual reconciliation can only bind a known durable run and keep the rollback held for workflow observation. Both reconciliation modes persist prior and next states before CAS and recover only the same receipt after a lost CAS.
-
-The watchdog evidence container is a separate locked 90-day WORM boundary. The accepted-release registry remains the separately locked 30-day WORM boundary described above. Initial state creation requires an exact preexisting `watchdog-initial-rollback-baseline` WORM receipt bound to its storage account/container/path, reviewed source and acceptance coordinates, baseline workflow SHA/run/attempt/environment, and authenticated OIDC caller. Later `accept-candidate` promotion instead derives its baseline from the real locked accepted-release manifest and production acceptance receipt; those two provenance models are deliberately distinct.
-
-All three watchdog workflows are currently source-dormant. The scheduled job is additionally gated on `PAPERDESK_WATCHDOG_MODE=accepted-release-deadline-v2`, while baseline and reconciliation are manual protected-environment workflows. Activation remains blocked because the machine contract's `mergedMutatingCommitSha` is null; the provider package has not been deployed or live-canaried; the five identities, narrow RBAC assignments, and 90-day policy proof have not been live proven; the single-repository GitHub App has not been configured or canaried; the independently reviewed initial WORM receipt and `evidence/watchdog-initial-rollback-baseline.json` are intentionally absent; and the corresponding PaperDesk callers remain dormant. No placeholder activation SHA, fake baseline, cloud mutation, secret, PAT bridge, or production authorization is included in this source slice. A later independently reviewed activation commit must refresh exact workflow/package hashes, protected environment rules, federated credentials, old-SHA denial evidence, initial baseline bytes, live canaries, and retained rollback-drill receipts before removing any hard stop.
+Do not activate watchdog or private release control by filling a placeholder
+SHA, weakening a test, broadening a role, adding a public bridge ingress, or
+inserting a persistent secret. Activation requires its own exact evidence,
+canaries, caller pin, and explicit review.

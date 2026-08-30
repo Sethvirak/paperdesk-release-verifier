@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "status": "source-dormant",
+  "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+  "observedAt": null,
+  "publisherIdentity": null,
+  "roles": null,
+  "principalInventories": null,
+  "controllerLockContainer": null,
+  "bridgeRuntime": null,
+  "keyVaultBoundary": null,
+  "wormPolicies": null,
+  "publisherAuthorizationDecisions": null,
+  "rule": "Activation remains fail-closed until an independently reviewed canonical provisioning inventory is committed at this exact source path and its SHA-256 is sealed in the activation document."
+}

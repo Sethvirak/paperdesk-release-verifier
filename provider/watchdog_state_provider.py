@@ -1502,11 +1502,12 @@ def validate_registry_manifest_from_storage(
     if (
         not isinstance(policy, dict)
         or policy.get("state") != "Locked"
-        or policy.get("immutabilityPeriodSinceCreationInDays") != 30
+        or type(policy.get("immutabilityPeriodSinceCreationInDays")) is not int
+        or policy.get("immutabilityPeriodSinceCreationInDays") < 91
         or policy.get("allowProtectedAppendWrites") is not False
         or policy.get("allowProtectedAppendWritesAll") is not False
     ):
-        fail("accepted-release registry is not locked for exactly 30 days", 503, "registry-policy-invalid")
+        fail("accepted-release registry is not locked for at least 91 days", 503, "registry-policy-invalid")
     return baseline
 
 

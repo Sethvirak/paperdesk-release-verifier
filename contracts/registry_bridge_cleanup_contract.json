@@ -7,18 +7,28 @@
     "repositoryId": "1333353701",
     "workflowPath": ".github/workflows/azure-production-control.yml",
     "mergedMutatingCommitSha": null,
-    "activationRule": "The watcher package has no live entry point while mergedMutatingCommitSha is null. Activation requires an independently reviewed merged commit, fixed managed identities and exact roles, a deployed independent scheduler, retained runner-loss canaries for every phase, and an immutable bootstrap receipt."
+    "activationRule": "The independently scheduled entry returns before credential construction while mergedMutatingCommitSha or any reviewed managed-identity client ID is null. Activation requires an independently reviewed merged commit, seven fixed managed identities and exact roles, a deployed independent scheduler, retained runner-loss canaries for every phase, and an immutable bootstrap receipt."
   },
   "watcher": {
     "appName": "paperdesk-registry-cleanup-watcher-9c4e0d0d",
     "independence": "The watcher is not hosted by the registry bridge and does not depend on a GitHub-hosted runner surviving.",
+    "entryPoint": "independent singleton continuous WebJob; maximum 60-second timer interval; no public HTTP ingress",
     "scheduleMaximumSeconds": 60,
     "sessionLeaseSeconds": 600,
     "cleanupLeaseSeconds": 600,
     "canonicalJsonRequired": true,
     "maximumSessionBytes": 65536,
     "maximumResultEnvelopeBytes": 8192,
-    "maximumReceiptBytes": 65536
+    "maximumReceiptBytes": 65536,
+    "managedIdentityClientIds": {
+      "state-read-write": null,
+      "bridge-control": null,
+      "result-read-only": null,
+      "evidence-policy-read-only": null,
+      "authority-fence-read-only": null,
+      "evidence-create-only": null,
+      "evidence-read-only": null
+    }
   },
   "bridge": {
     "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
@@ -41,8 +51,8 @@
       "scmBasicPublishingAllowed": false
     },
     "persistentSettings": {
-      "PAPERDESK_REGISTRY_HELPER_SHA256": "889603801a301cb31d33c6d7515f74d601f2637ff40a2b0a49139927f3e25050",
-      "PAPERDESK_REGISTRY_PACKAGE_SHA256": "76c9c8c51a07852e2aaa5139c5e544b672fec600bee30eb56633ec3df6b859c8",
+      "PAPERDESK_REGISTRY_HELPER_SHA256": "9971449d479adc0c549d8b761c98cf576e559f13005bc6b365be308995b9a075",
+      "PAPERDESK_REGISTRY_PACKAGE_SHA256": "832036fa78557573de5c4349c05fa5cde56af12a279867b2a74a5edfc9b44026",
       "PAPERDESK_REGISTRY_RUNNER_SHA256": "47369cdedfc874b28e850a8b3639413c1afddaf33f722edd80fb99684d68128b",
       "PAPERDESK_REGISTRY_SETTINGS_SHA256": "cd75a1d6bcd7fdca484962635d8bfb84b170de2ef78aac84de339f8c00180e1e",
       "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false"
@@ -131,7 +141,7 @@
         ["persist-actions-artifact", "persistence-result", 2]
       ]
     },
-    "runnerLossRule": "After the server-timestamped lease expires, the watcher increments the fence before any cleanup. Before any receipt it must bind an independently produced locked-WORM fence for the exact runner-authority generation and rerun stop, reseal, transient-setting deletion, and the final snapshot only after that authority is revoked and every prior token is expired. Every non-null ARM history ID and web_job_id is unique, each history ID is under the fixed bridge and WebJob resource, and each ARM start time must not follow its end time. Missing authority fence, history binding, result, a partial matrix, a non-success history, an envelope mismatch, or an ARM web_job_id mismatch can never produce a receipt."
+    "runnerLossRule": "After the server-timestamped lease expires, the watcher increments the fence, validates an independently produced locked-WORM fence proving the exact runner role assignments and federated credential are revoked and every prior token is expired, and durably CAS-binds that fence before the first stop, reseal, transient-setting deletion, or assessment read. Every later cleanup reassessment revalidates the bound generation. Every non-null ARM history ID and web_job_id is unique, each history ID is under the fixed bridge and WebJob resource, and each ARM start time must not follow its end time. Missing authority fence, history binding, result, a partial matrix, a non-success history, an envelope mismatch, or an ARM web_job_id mismatch can never mutate cleanup state or produce a receipt."
   },
   "authority": {
     "allowedControlOperations": [

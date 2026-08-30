@@ -61,6 +61,7 @@ MAX_ACTIONS_ARTIFACT_QUERY_CHARS = 4096
 MAX_GITHUB_TOKEN_CHARS = 4096
 MIN_ACTIONS_ARTIFACT_REMAINING_SECONDS = 10
 MAX_ACTIONS_ARTIFACT_REMAINING_SECONDS = 300
+MIN_ACCEPTED_RELEASE_RETENTION_DAYS = 91
 MAX_ONE_SHOT_RESULT_BYTES = 4096
 MAX_RESULT_ATTESTATION_BYTES = 8192
 STORAGE_API_VERSION = "2023-11-03"
@@ -344,13 +345,18 @@ def validate_worm_snapshot(snapshot: Any) -> dict[str, Any]:
         "storageAccount": ACCOUNT,
         "container": CONTAINER,
         "state": "Locked",
-        "immutabilityPeriodSinceCreationInDays": 30,
+        "immutabilityPeriodSinceCreationInDays": snapshot.get(
+            "immutabilityPeriodSinceCreationInDays"
+        ),
         "allowProtectedAppendWrites": False,
         "allowProtectedAppendWritesAll": False,
     }
     for key, value in expected.items():
         if snapshot.get(key) != value:
             fail("WORM snapshot does not prove the fixed locked policy")
+    retention = snapshot.get("immutabilityPeriodSinceCreationInDays")
+    if type(retention) is not int or retention < MIN_ACCEPTED_RELEASE_RETENTION_DAYS:
+        fail("WORM snapshot does not prove at least 91 days of accepted-release custody")
     if not isinstance(snapshot.get("etag"), str) or not ETAG.fullmatch(snapshot["etag"]):
         fail("WORM snapshot ETag is invalid")
     utc_timestamp(snapshot.get("observedAt"), "WORM observation")

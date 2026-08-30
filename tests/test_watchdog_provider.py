@@ -491,10 +491,12 @@ class WatchdogProviderTransitionTests(unittest.TestCase):
 
     def test_accept_with_real_locked_registry_validator_promotes_acceptance_provenance(self):
         class RegistryPolicyStorage(MemoryStorage):
+            registry_retention = 91
+
             def policy(self, container):
                 value = super().policy(container)
                 if container == provider.REGISTRY_CONTAINER:
-                    value["immutabilityPeriodSinceCreationInDays"] = 30
+                    value["immutabilityPeriodSinceCreationInDays"] = self.registry_retention
                 return value
 
         storage = RegistryPolicyStorage()
@@ -568,6 +570,16 @@ class WatchdogProviderTransitionTests(unittest.TestCase):
         self.assertEqual(promoted["reviewEnvironment"], "production")
         self.assertEqual(promoted["preparedAt"], "2026-08-14T02:03:04.000Z")
         self.assertEqual(promoted["evidencePath"], request["acceptedReleasePrefix"] + receipt_path)
+
+        storage.registry_retention = 90
+        with self.assertRaises(provider.ProviderError) as caught:
+            provider.validate_registry_manifest_from_storage(
+                storage,
+                request,
+                candidate,
+                {},
+            )
+        self.assertEqual(caught.exception.code, "registry-policy-invalid")
 
     def test_three_rollback_transitions_bind_same_claim_attempt_run_and_authorization(self):
         dispatching = pending(

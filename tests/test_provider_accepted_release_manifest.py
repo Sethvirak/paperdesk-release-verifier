@@ -121,7 +121,7 @@ def manifest_document():
             "storageAccount": producer.ACCOUNT,
             "container": producer.CONTAINER,
             "state": "Locked",
-            "immutabilityPeriodSinceCreationInDays": 30,
+            "immutabilityPeriodSinceCreationInDays": 91,
             "allowProtectedAppendWrites": False,
             "allowProtectedAppendWritesAll": False,
             "etag": '"fixed-policy-etag"',

@@ -120,7 +120,7 @@ class RegistryFixture:
             "storageAccount": registry.ACCOUNT,
             "container": registry.CONTAINER,
             "state": "Locked",
-            "immutabilityPeriodSinceCreationInDays": 30,
+            "immutabilityPeriodSinceCreationInDays": 91,
             "allowProtectedAppendWrites": False,
             "allowProtectedAppendWritesAll": False,
             "etag": '"fixed-policy-etag"',
@@ -1276,6 +1276,24 @@ class AcceptedReleaseRegistryTests(unittest.TestCase):
         snapshot.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(registry.RegistryError):
             registry.build_request(self.fixture.args(self.root / "rejected.tar.gz"))
+
+    def test_accepted_release_worm_requires_at_least_ninety_one_days(self):
+        snapshot = self.root / "worm-snapshot.json"
+        document = json.loads(snapshot.read_text(encoding="utf-8"))
+        document["immutabilityPeriodSinceCreationInDays"] = 90
+        snapshot.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(registry.RegistryError, "at least 91 days"):
+            registry.build_request(self.fixture.args(self.root / "retention-too-short.tar.gz"))
+
+        document["immutabilityPeriodSinceCreationInDays"] = 365
+        snapshot.write_text(json.dumps(document), encoding="utf-8")
+        output = self.root / "retention-long-enough.tar.gz"
+        registry.build_request(self.fixture.args(output))
+        request, _ = registry.extract_request(output, self.root / "retention-long-enough")
+        self.assertEqual(
+            request["wormSnapshot"]["immutabilityPeriodSinceCreationInDays"],
+            365,
+        )
 
     def test_storage_and_bridge_resource_groups_are_fixed_and_not_interchangeable(self):
         self.assertEqual(registry.STORAGE_RESOURCE_GROUP, "rg-paperdesk-rollback-sea-20260808")
