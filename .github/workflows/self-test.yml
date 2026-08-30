@@ -28,7 +28,13 @@ jobs:
           set -euo pipefail
           test -z "$(find . -type f -size +1M -not -path './.git/*' -print -quit)"
           test -z "$(git ls-files | grep --extended-regexp --ignore-case '\.(sqlite|sqlite3|db|zip|tar|tgz|gz|7z|pem|pfx|key|env)$' || true)"
-          test -z "$(git grep --line-number --extended-regexp '-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{40,}|AccountKey=' -- . ':!tests/*' || true)"
+          if git grep --quiet --extended-regexp -e '-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{40,}|AccountKey=[A-Za-z0-9+/]{40,}={0,2}' -- . ':!tests/*'; then
+            echo 'credential material detected' >&2
+            exit 1
+          else
+            grep_status="$?"
+            test "${grep_status}" -eq 1
+          fi
 
       - name: Compile and run dependency-free tests
         run: |

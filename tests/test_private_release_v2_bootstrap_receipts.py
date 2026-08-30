@@ -12,10 +12,10 @@ from tests.test_private_release_v2_bootstrap import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RECEIPT_DIRECTORY = Path(
-    "C:/operator/paperdesk-private-release-v2-bootstrap-"
-    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-)
+RECEIPT_DIRECTORY = (
+    ROOT.parent
+    / "paperdesk-private-release-v2-bootstrap-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+).resolve()
 H = lambda value: receipts.sha256_hex(str(value).encode("utf-8"))
 
 
@@ -79,6 +79,17 @@ def reviewed_authorization(plan, plan_sha256):
         "maximumLifetimeSeconds": 1800,
     }
     return value
+
+
+class ReceiptDirectoryFixturePortabilityTests(unittest.TestCase):
+    def test_fixture_path_is_absolute_external_and_authorization_specific(self):
+        self.assertTrue(RECEIPT_DIRECTORY.is_absolute())
+        self.assertEqual(
+            RECEIPT_DIRECTORY.name,
+            "paperdesk-private-release-v2-bootstrap-"
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        self.assertNotIn(ROOT, RECEIPT_DIRECTORY.parents)
 
 
 class CompleteReceiptBundleTests(unittest.TestCase):

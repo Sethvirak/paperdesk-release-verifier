@@ -6,6 +6,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SELF_TEST = ROOT / ".github" / "workflows" / "self-test.yml"
 CONTROL = ROOT / ".github" / "workflows" / "azure-production-control.yml"
 VERIFY = ROOT / ".github" / "workflows" / "verify-candidate.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "accepted-release-deadline-watchdog.yml"
@@ -127,6 +128,19 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertTrue(actions, path)
             for action in actions:
                 self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$", action)
+
+    def test_self_test_credential_scan_is_fail_closed(self):
+        source = self.workflow(SELF_TEST)
+        step = workflow_step(source, "Reject application/data/credential material")
+        self.assertIn(
+            "git grep --quiet --extended-regexp -e '-----BEGIN",
+            step,
+        )
+        self.assertNotRegex(step, r"git grep[^\n]*\|\| true")
+        self.assertNotIn("credential_matches", step)
+        self.assertNotIn("printf '%s", step)
+        self.assertIn("echo 'credential material detected' >&2", step)
+        self.assertIn('test "${grep_status}" -eq 1', step)
 
     def test_artifact_verifier_remains_read_only_and_cloud_free(self):
         source = self.workflow(VERIFY)
