@@ -85,7 +85,7 @@ def persistence_result(execution, created):
         "artifactZipSha256": execution["artifactZipSha256"],
         "requestSha256": execution["requestSha256"],
         "manifestSha256": "c" * 64,
-        "fileCount": 19,
+        "fileCount": 20,
         "createdBlobCount": created,
         "overwriteNegative": "passed" if created else "not-run-completed",
         "outOfPrefixNegative": "passed",

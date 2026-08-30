@@ -22,8 +22,9 @@ ROLLBACK_BASELINE_FIELDS = frozenset({
     "preparedAt",
 })
 MANIFEST_FIELDS = frozenset({
-    "schema", "status", "persistedAt", "environment", "registry", "candidate",
-    "acceptance", "evidence", "artifacts", "verifier", "wormSnapshot", "files",
+    "schema", "status", "persistedAt", "environment", "registry", "source",
+    "deployment", "acceptance", "evidence", "artifacts", "verifier", "wormSnapshot",
+    "files",
 })
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 POSITIVE = re.compile(r"^[1-9][0-9]*$")
@@ -168,19 +169,23 @@ def _validate_evidence(value: Any, candidate_sha: str, excluded_runs: set[str]) 
     if evidence.get("artifactName") != f"paperdesk-production-acceptance-evidence-post-deploy-{candidate_sha}":
         fail("accepted-release manifest evidence artifact name is not exact")
     if evidence_run_id in excluded_runs:
-        fail("accepted-release source, acceptance, and evidence runs must be distinct")
+        fail("accepted-release source, deployment, acceptance, and evidence runs must be distinct")
 
 
 def _validate_artifacts(value: Any, candidate_sha: str, receipt_sha256: str) -> Mapping[str, Any]:
     artifacts = _exact_object(
         value,
-        {"verified", "verificationReceipt", "productionAcceptanceReceipt"},
+        {
+            "verified", "verificationReceipt", "productionAcceptanceReceipt",
+            "deploymentCoordinateReceipt",
+        },
         "accepted-release manifest artifacts",
     )
     expected_names = {
         "verified": f"paperdesk-azure-runtime-verified-{candidate_sha}",
         "verificationReceipt": f"paperdesk-candidate-verification-receipt-{candidate_sha}",
         "productionAcceptanceReceipt": f"paperdesk-production-acceptance-receipt-{candidate_sha}",
+        "deploymentCoordinateReceipt": f"paperdesk-deployment-coordinate-receipt-{candidate_sha}",
     }
     for label, expected_name in expected_names.items():
         fields = {"id", "name", "digest"} | ({"fileSha256"} if label != "verified" else set())
@@ -229,7 +234,7 @@ def _validate_file_inventory(
     artifacts: Mapping[str, Any],
     production_receipt_sha256: str,
 ) -> str:
-    if not isinstance(value, list) or len(value) != 19:
+    if not isinstance(value, list) or len(value) != 20:
         fail("accepted-release manifest file inventory count is invalid")
     expected_maximums = {
         f"verified-artifact/{relative}": maximum
@@ -237,8 +242,12 @@ def _validate_file_inventory(
     }
     verification_path = f"receipts/paperdesk-candidate-verification-receipt-{candidate_sha}.json"
     production_path = f"receipts/paperdesk-production-acceptance-receipt-{candidate_sha}.json"
+    deployment_coordinate_path = (
+        f"receipts/paperdesk-deployment-coordinate-receipt-{candidate_sha}.json"
+    )
     expected_maximums[verification_path] = 8192
     expected_maximums[production_path] = 65536
+    expected_maximums[deployment_coordinate_path] = 4096
     records: dict[str, Mapping[str, Any]] = {}
     ordered_paths: list[str] = []
     total = 0
@@ -282,6 +291,11 @@ def _validate_file_inventory(
         fail("accepted-release verification-receipt inventory digest is invalid")
     if records[production_path]["sha256"] != production_receipt_sha256:
         fail("accepted-release production-acceptance receipt inventory digest is invalid")
+    if (
+        records[deployment_coordinate_path]["sha256"]
+        != artifacts["deploymentCoordinateReceipt"]["fileSha256"]
+    ):
+        fail("accepted-release deployment-coordinate receipt inventory digest is invalid")
     return production_path
 
 
@@ -340,19 +354,46 @@ def validate_accept_candidate_manifest(
     }:
         fail("accepted-release manifest registry coordinates are not exact")
 
-    candidate = _exact_object(
-        manifest.get("candidate"),
+    source = _exact_object(
+        manifest.get("source"),
         {"repository", "sha", "runId", "runAttempt", "workflowRef"},
-        "accepted-release manifest candidate",
+        "accepted-release manifest source",
     )
-    if candidate != {
+    if source != {
         "repository": producer.PAPERDESK_REPOSITORY,
         "sha": transition["candidateSha"],
-        "runId": transition["candidateRunId"],
-        "runAttempt": transition["candidateRunAttempt"],
+        "runId": transition["sourceRunId"],
+        "runAttempt": transition["sourceRunAttempt"],
         "workflowRef": producer.PAPERDESK_SOURCE_WORKFLOW_REF,
     }:
-        fail("accepted-release manifest candidate coordinates are not exact")
+        fail("accepted-release manifest source coordinates are not exact")
+
+    deployment = _exact_object(
+        manifest.get("deployment"),
+        {"runId", "runAttempt", "workflowRef"},
+        "accepted-release manifest deployment",
+    )
+    expected_deployment_ref = (
+        producer.PAPERDESK_SOURCE_WORKFLOW_REF.rsplit("@", 1)[0]
+        + "@"
+        + transition["candidateSha"]
+    )
+    if deployment != {
+        "runId": transition["candidateRunId"],
+        "runAttempt": transition["candidateRunAttempt"],
+        "workflowRef": expected_deployment_ref,
+    }:
+        fail("accepted-release manifest deployment coordinates are not exact")
+    if len({
+        transition["sourceRunId"], transition["candidateRunId"],
+        transition["acceptanceRunId"],
+    }) != 3:
+        fail("accepted-release source, deployment, and acceptance runs must be distinct")
+    if prefix != (
+        f"v1/releases/{transition['candidateSha']}/{transition['sourceRunId']}/"
+        f"{transition['acceptanceRunId']}/"
+    ):
+        fail("accepted-release manifest prefix does not bind source and acceptance runs")
 
     _, review_workflow_ref, review_workflow_sha = _validate_acceptance(
         manifest.get("acceptance"),
@@ -361,7 +402,10 @@ def validate_accept_candidate_manifest(
     _validate_evidence(
         manifest.get("evidence"),
         transition["candidateSha"],
-        {transition["candidateRunId"], transition["acceptanceRunId"]},
+        {
+            transition["sourceRunId"], transition["candidateRunId"],
+            transition["acceptanceRunId"],
+        },
     )
     receipt_sha256 = transition["productionAcceptanceReceiptSha256"]
     artifacts = _validate_artifacts(manifest.get("artifacts"), transition["candidateSha"], receipt_sha256)
@@ -382,8 +426,8 @@ def validate_accept_candidate_manifest(
         "receiptSha256": receipt_sha256,
         "evidencePath": prefix + production_receipt_path,
         "sourceSha": transition["candidateSha"],
-        "sourceRunId": transition["candidateRunId"],
-        "sourceRunAttempt": transition["candidateRunAttempt"],
+        "sourceRunId": transition["sourceRunId"],
+        "sourceRunAttempt": transition["sourceRunAttempt"],
         "acceptanceRunId": transition["acceptanceRunId"],
         "acceptanceRunAttempt": transition["acceptanceRunAttempt"],
         "acceptedReleaseManifestSha256": manifest_sha256,

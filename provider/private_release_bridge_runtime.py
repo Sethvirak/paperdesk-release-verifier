@@ -67,7 +67,9 @@ def process_request(
     if operation in {"bootstrap-prepare","prepare-candidate","persist-accepted-release"}:
         tar_gz=artifact_reader(request)
         if not isinstance(tar_gz,bytes) or mailbox.digest(tar_gz)!=request["artifactMemberSha256"]: mailbox.fail("bridge-artifact")
-    if operation=="bootstrap-prepare": durable=mailbox.prepare_bootstrap(registry_worm,request,tar_gz,now=now,package_boundary=package_worm)
+    if operation=="registry-bridge-preflight":
+        durable=mailbox.registry_bridge_preflight(registry_worm,request,now=now,package_boundary=package_worm,production_observe=production_activation.observe)
+    elif operation=="bootstrap-prepare": durable=mailbox.prepare_bootstrap(registry_worm,request,tar_gz,now=now,package_boundary=package_worm)
     elif operation=="bootstrap-consume":
         accepted,baseline=mailbox._read_json(registry_worm,request["acceptedBaseline"],"bootstrap-finalize-baseline")
         profile={"sourceSha":baseline["sourceSha"],"baselineMode":"bootstrap","servedIndexSha256":baseline["servedIndexSha256"],"oneDeployInvariant":baseline["oneDeployInvariant"],"deploymentBundle":baseline["deploymentBundle"]}
@@ -227,6 +229,24 @@ def process_pending(*,arm_mailbox: Any, limit: int = 20, **boundaries: Any) -> l
     return outcomes
 
 
+class _AuthorizedMailbox:
+    """Bind the single mailbox read to the transient control in-line.
+
+    ``process_request`` retains ownership of the Key Vault-first ordering.  The
+    proxy checks the control binding on that same subsequent ARM read and
+    forwards the result write, avoiding the former pre-key duplicate read.
+    """
+    def __init__(self,delegate: Any,control: dict[str,Any]):
+        self.delegate=delegate;self.control=control
+    def get(self,name: str) -> dict[str,Any]:
+        request=self.delegate.get(name)
+        if (not isinstance(request,dict) or request.get("operation")!=self.control.get("operation")
+                or request.get("sourceSha")!=self.control.get("sourceSha")):mailbox.fail("bridge-authorized-request-binding")
+        return request
+    def put_create_or_read_exact(self,name: str,envelope: dict[str,Any]):
+        return self.delegate.put_create_or_read_exact(name,envelope)
+
+
 def process_authorized(control: dict[str, Any], *, arm_mailbox: Any, **boundaries: Any) -> dict[str, Any]:
     """Process only the request named by the exact transient control record.
 
@@ -236,8 +256,5 @@ def process_authorized(control: dict[str, Any], *, arm_mailbox: Any, **boundarie
     """
     name=control.get("requestName") if isinstance(control,dict) else None
     if not isinstance(name,str) or not mailbox.NAME.fullmatch(name) or not name.startswith("pdreq-"):mailbox.fail("bridge-authorized-request")
-    request=arm_mailbox.get(name)
-    if (not isinstance(request,dict) or request.get("operation")!=control.get("operation")
-            or request.get("sourceSha")!=control.get("sourceSha")):mailbox.fail("bridge-authorized-request-binding")
-    envelope=process_request(name,arm_mailbox=arm_mailbox,transient_control=control,**boundaries)
+    envelope=process_request(name,arm_mailbox=_AuthorizedMailbox(arm_mailbox,control),transient_control=control,**boundaries)
     return {"status":"complete","requestNameSha256":mailbox.digest(name.encode()),"envelope":envelope}

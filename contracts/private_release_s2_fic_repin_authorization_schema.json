@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperdesk.invalid/contracts/private-release-s2-fic-repin-authorization-v1.schema.json",
+  "title": "PaperDesk private release V2 one-shot S2 FIC repin authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "authorizationType",
+    "authorizationId",
+    "repository",
+    "source",
+    "executor",
+    "bootstrap",
+    "azure",
+    "observedPreflight",
+    "validity",
+    "confirmation",
+    "singleUse"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "authorizationType": {"const": "paperdesk-private-release-v2-s2-fic-repin-one-shot"},
+    "authorizationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "repository": {"const": "Sethvirak/paperdesk-release-verifier"},
+    "source": {"type": "object"},
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"const": "scripts/private_release_v2_fic_repin.py"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "bootstrap": {"$ref": "#/$defs/bootstrapBinding"},
+    "azure": {"$ref": "#/$defs/azureAccount"},
+    "observedPreflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "observedAt", "maximumAgeSeconds"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "observedAt": {"type": "string", "format": "date-time"},
+        "maximumAgeSeconds": {"const": 300}
+      }
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notBefore", "expiresAt", "maximumLifetimeSeconds"],
+      "properties": {
+        "notBefore": {"type": "string", "format": "date-time"},
+        "expiresAt": {"type": "string", "format": "date-time"},
+        "maximumLifetimeSeconds": {"const": 1800}
+      }
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["encoding", "phraseSha256"],
+      "properties": {
+        "encoding": {"const": "utf-8-exact-no-newline"},
+        "phraseSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "singleUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "receiptDirectory", "azureClaimResourceId"],
+      "properties": {
+        "required": {"const": true},
+        "receiptDirectory": {"type": "string", "minLength": 8, "maxLength": 2048},
+        "azureClaimResourceId": {"type": "string", "pattern": "^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft\\.Resources/deployments/paperdesk-v2-s2-fic-repin-[0-9a-f-]+$"}
+      }
+    }
+  },
+  "$defs": {
+    "guid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "azureAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cloud", "subscriptionId", "tenantId", "accountId", "accountObjectId", "accountType"],
+      "properties": {
+        "cloud": {"const": "AzureCloud"},
+        "subscriptionId": {"const": "9c4e0d0d-602f-4cde-84bd-337250e5b64c"},
+        "tenantId": {"const": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"},
+        "accountId": {"type": "string", "minLength": 3, "maxLength": 256},
+        "accountObjectId": {"$ref": "#/$defs/guid"},
+        "accountType": {"enum": ["user", "servicePrincipal"]}
+      }
+    },
+    "bootstrapBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originalAuthorization", "originalPreflight", "package", "terminalBundle"],
+      "properties": {
+        "originalAuthorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "authorizationId"],
+          "properties": {
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "authorizationId": {"$ref": "#/$defs/guid"}
+          }
+        },
+        "originalPreflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256"],
+          "properties": {"sha256": {"$ref": "#/$defs/sha256"}}
+        },
+        "package": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceSha", "sha256", "size"],
+          "properties": {
+            "sourceSha": {"$ref": "#/$defs/sha40"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 1, "maximum": 1073741824}
+          }
+        },
+        "terminalBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "minLength": 3, "maxLength": 512},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    }
+  }
+}

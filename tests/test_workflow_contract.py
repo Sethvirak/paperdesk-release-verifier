@@ -137,6 +137,175 @@ class WorkflowContractTests(unittest.TestCase):
         for forbidden in ("id-token", "azure/login", "environment:", "az ", "Microsoft.Web"):
             self.assertNotIn(forbidden, source)
 
+    def test_candidate_receipt_verifier_ref_tracks_the_exact_control_workflow_sha(self):
+        source = self.workflow(CONTROL)
+        dynamic_ref = (
+            "Sethvirak/paperdesk-release-verifier/.github/workflows/"
+            "verify-candidate.yml@${{ job.workflow_sha }}"
+        )
+        self.assertEqual(source.count(dynamic_ref), 2)
+        self.assertIsNone(
+            re.search(
+                r"verify-candidate\.yml@[0-9a-f]{40}",
+                source,
+            )
+        )
+
+    def test_registry_preflight_reuses_production_caller_and_exact_path_resolution(self):
+        source = self.workflow(CONTROL)
+        self.assertIn(
+            "Release-state read-only registry bridge preflight", source
+        )
+        self.assertNotIn("description: Read-only registry bridge preflight", source)
+        coordinate = workflow_step(
+            source, "Validate immutable caller and operation coordinates before OIDC"
+        )
+        self.assertIn("registry-bridge-preflight)", coordinate)
+        self.assertIn('test "${GITHUB_WORKFLOW_REF}" = "${production_workflow_ref}"', coordinate)
+        self.assertEqual(
+            set(re.findall(r'expected_caller_workflow_id="([0-9]+)"', coordinate)),
+            {"306965591", "340547201", "334414600"},
+        )
+
+        mailbox = MAILBOX.read_text(encoding="utf-8")
+        resolver = function_source(mailbox, "resolve_current_accepted")
+        self.assertIn('strict_blob=f"v2/accepted/{source_sha}/manifest.json"', resolver)
+        self.assertIn(
+            'bootstrap_blob=f"v2/accepted/{source_sha}/bootstrap-consumed/manifest.json"',
+            resolver,
+        )
+        self.assertEqual(resolver.count("_read_current("), 2)
+        for forbidden in ("list_blobs", ".list(", "walk_blobs", "iter_blobs"):
+            self.assertNotIn(forbidden, resolver.lower())
+        self.assertIn("accepted-current-ambiguous", resolver)
+        self.assertIn("accepted-current-absent", resolver)
+
+        external = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn(
+            'request["operation"]=="registry-bridge-preflight" and activate', external
+        )
+        runtime = BRIDGE_RUNTIME.read_text(encoding="utf-8")
+        preflight_branch = runtime.split(
+            'if operation=="registry-bridge-preflight":', 1
+        )[1].split('elif operation=="bootstrap-prepare":', 1)[0]
+        self.assertIn("production_activation.observe", preflight_branch)
+        self.assertNotIn("activation_fence", preflight_branch)
+
+        for document in (
+            README.read_text(encoding="utf-8"),
+            V2_DOC.read_text(encoding="utf-8"),
+        ):
+            normalized_document = " ".join(document.split())
+            self.assertIn("release-state read-only", normalized_document)
+            for transient in (
+                "controller lease",
+                "mailbox request/result",
+                "temporary bridge App Settings",
+                "starts and stops the exact WebJob",
+            ):
+                self.assertIn(transient, normalized_document)
+
+    def test_activation_variable_preserves_exact_canonical_bytes(self):
+        source = self.workflow(CONTROL)
+        exact_write = (
+            "printf '%s' \"${PRIVATE_RELEASE_ACTIVATION_JSON}\" > \"${activation}\""
+        )
+        newline_write = (
+            "printf '%s\\n' \"${PRIVATE_RELEASE_ACTIVATION_JSON}\" > \"${activation}\""
+        )
+        self.assertEqual(source.count(exact_write), 2)
+        self.assertNotIn(newline_write, source)
+
+        external = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn(
+            'activation_raw=Path(args.activation).read_text(encoding="utf-8")',
+            external,
+        )
+        self.assertGreaterEqual(external.count("raw_document=activation_raw"), 2)
+
+    def test_public_receipt_retains_exact_release_descriptors(self):
+        source = self.workflow(CONTROL)
+        receipt = workflow_step(source, "Create bounded control receipt")
+        self.assertIn("--arg schemaVersion '6'", receipt)
+        self.assertIn('--arg candidateRunId "${CANDIDATE_RUN_ID}"', receipt)
+        self.assertIn('--arg candidateRunAttempt "${CANDIDATE_RUN_ATTEMPT}"', receipt)
+        for field in ("acceptedBaseline", "pendingRelease", "consumedMarker"):
+            self.assertIn(f"--argjson {field}", receipt)
+            self.assertIn(field, receipt)
+        self.assertIn('keys == ["acceptedBaseline","consumedMarker","pendingRelease"]', receipt)
+        self.assertIn('keys == ["blob","etag","sha256","size","versionId"]', receipt)
+        self.assertIn(
+            "A successful registry operation must retain exact accepted/pending/consumed descriptors.",
+            receipt,
+        )
+        self.assertIn("registry-bridge-preflight", receipt)
+        self.assertIn("bootstrap-consumed/manifest.json", receipt)
+
+    def test_persistence_keeps_source_deployment_acceptance_and_evidence_runs_distinct(self):
+        source = self.workflow(CONTROL)
+        inputs = direct_mapping(source, ("on", "workflow_call", "inputs"))
+        self.assertIn("candidate_run_id", inputs)
+        self.assertIn("candidate_run_attempt", inputs)
+
+        coordinate = workflow_step(
+            source, "Validate immutable caller and operation coordinates before OIDC"
+        )
+        for marker in (
+            '[[ "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]',
+            '[[ "${CANDIDATE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]',
+            'test "${CANDIDATE_RUN_ID}" != "${SOURCE_RUN_ID}"',
+            'test "${CANDIDATE_RUN_ID}" != "${ACCEPTANCE_RUN_ID}"',
+            'test "${EVIDENCE_RUN_ID}" != "${CANDIDATE_RUN_ID}"',
+            'test "${GITHUB_RUN_ID}" != "${CANDIDATE_RUN_ID}"',
+            'test -z "${CANDIDATE_RUN_ID}${CANDIDATE_RUN_ATTEMPT}"',
+        ):
+            self.assertIn(marker, coordinate)
+
+        resolver = workflow_step(
+            source, "Resolve exact accepted-release artifact identities and digests"
+        )
+        self.assertIn(
+            'resolve_artifact "${CANDIDATE_RUN_ID}" "${CANDIDATE_RUN_ATTEMPT}" "paperdesk-deployment-coordinate-receipt-${SOURCE_SHA}" deployment',
+            resolver,
+        )
+        self.assertIn("Deploy exact candidate pending final acceptance", resolver)
+
+        deployment_download = workflow_step(
+            source, "Download exact deployment-coordinate receipt"
+        )
+        self.assertIn("run-id: ${{ inputs.candidate_run_id }}", deployment_download)
+        deployment_validation = workflow_step(
+            source, "Validate deployment-coordinate receipt before registry bridge activation"
+        )
+        for field in (
+            "candidateSourceRunId", "candidateSourceRunAttempt",
+            "deploymentRunId", "deploymentRunAttempt", "candidateRuntimeSha256",
+        ):
+            self.assertIn(field, deployment_validation)
+        self.assertIn('cmp --silent "${receipt}" "${expected}"', deployment_validation)
+
+        acceptance_validation = workflow_step(
+            source, "Validate production-acceptance receipt before registry bridge activation"
+        )
+        self.assertIn('and .candidateRunId == $candidateRunId', acceptance_validation)
+        self.assertIn('and .candidateRunAttempt == $candidateRunAttempt', acceptance_validation)
+        self.assertNotIn('and .candidateRunId == $sourceRunId', acceptance_validation)
+
+        builder = workflow_step(source, "Build deterministic bounded registry transfer request")
+        for flag in (
+            "--candidate-run-id", "--candidate-run-attempt", "--deployment-workflow-ref",
+            "--deployment-coordinate-receipt", "--deployment-coordinate-artifact-id",
+            "--deployment-coordinate-artifact-name", "--deployment-coordinate-artifact-digest",
+        ):
+            self.assertIn(flag, builder)
+
+        mailbox = workflow_step(
+            source, "Persist or recover release exclusively through the signed private mailbox"
+        )
+        self.assertIn('"schemaVersion":2', mailbox)
+        self.assertIn('"candidateRunId":os.environ["CANDIDATE_RUN_ID"] if operation=="persist-accepted-release" else None', mailbox)
+        self.assertIn('"candidateRunAttempt":os.environ["CANDIDATE_RUN_ATTEMPT"] if operation=="persist-accepted-release" else None', mailbox)
+
     def test_private_release_v2_is_dormant_until_s2_evidence_and_fic_repin(self):
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         evidence = json.loads(PROVISIONING.read_text(encoding="utf-8"))
@@ -144,6 +313,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertTrue(contract["activation"])
         self.assertTrue(all(value is None for value in contract["activation"].values()))
         self.assertIsNone(contract["activation"]["mergedControlWorkflowSha"])
+        self.assertIsNone(contract["activation"]["bridgePackageSourceSha"])
         self.assertEqual(evidence["status"], "source-dormant")
 
         baseline = contract["fixed"]["bootstrapBaseline"]
@@ -160,15 +330,122 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("([.activation[] | select(. == null)] | length) == 0", coordinate)
         self.assertIn("RUNTIME_CONTROL_WORKFLOW_SHA: ${{ job.workflow_sha }}", coordinate)
 
-        docs = V2_DOC.read_text(encoding="utf-8") + README.read_text(encoding="utf-8")
-        for required in (
-            "S1",
-            "S2",
-            "FIC",
-            "No Azure mutation is authorized",
-            "main pins S2",
+        readme = README.read_text(encoding="utf-8")
+        operator = V2_DOC.read_text(encoding="utf-8")
+        for document, heading in (
+            (readme, "## Activation trust DAG"),
+            (operator, "## Trust DAG and activation sequence"),
         ):
-            self.assertIn(required, docs)
+            for required in (
+                "S1-prime",
+                "S2",
+                "sole pre-S2 Azure-mutation exception",
+                "external single-use authorization",
+                "reusable workflow",
+                "mailbox",
+                "production activation",
+                "accepted-release",
+                "caller integration",
+            ):
+                self.assertIn(required, document)
+            sequence = document[document.index(heading):]
+            self.assertLess(sequence.index("S1-prime"), sequence.index("S2"))
+            self.assertLess(
+                sequence.index("external single-use authorization"),
+                sequence.index("S2"),
+            )
+            self.assertLess(sequence.index("S2"), sequence.index("repin"))
+
+        contradictory = (
+            "No Azure mutation is authorized before S2 evidence acceptance",
+            "every mutating mode must stop before Azure login",
+        )
+        for phrase in contradictory:
+            self.assertNotIn(phrase, readme)
+            self.assertNotIn(phrase, operator)
+
+    def test_public_evidence_exception_is_narrow_and_secret_material_is_forbidden(self):
+        security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("narrow exception", security)
+        self.assertIn("canonical, non-secret", security)
+        for forbidden_material in (
+            "raw IP addresses",
+            "bearer or refresh tokens",
+            "SAS query strings",
+            "Shared Key/account keys",
+            "GitHub/OIDC claim tokens",
+            "customer records",
+        ):
+            self.assertIn(forbidden_material, security)
+        for receipt_boundary in (
+            "operator-controlled, access-restricted real directory",
+            "Same-privilege replacement",
+            "file and directory durability barriers",
+            "requires manual reconciliation",
+        ):
+            self.assertIn(receipt_boundary, security)
+
+    def test_bootstrap_observe_apply_and_local_resume_are_real_fail_closed_paths(self):
+        readme = README.read_text(encoding="utf-8")
+        operator = V2_DOC.read_text(encoding="utf-8")
+        executor = (ROOT / "scripts/private_release_v2_bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+        observer = (
+            ROOT / "scripts/private_release_v2_bootstrap_observe.py"
+        ).read_text(encoding="utf-8")
+        for document in (readme, operator):
+            for required in (
+                "private_release_v2_bootstrap.py describe",
+                "private_release_v2_bootstrap.py apply",
+                "private_release_v2_bootstrap.py resume-finalization",
+                "private_release_v2_bootstrap_observe.py",
+                "deliberately non-executable authorization template",
+                "original authorized preflight",
+                "terminal bundle last",
+                "zero Azure requests or mutations",
+            ):
+                self.assertIn(required, document)
+        self.assertIn(
+            'choices=("describe", "apply", "resume-finalization")', executor
+        )
+        self.assertIn("resume_local_finalization_from_snapshot(", executor)
+        self.assertIn("receipts.validate_receipt_bundle(", executor)
+        self.assertIn('READ_METHODS = {"GET", "POST"}', observer)
+        self.assertIn("class AzureCliReadOnlySession:", observer)
+        self.assertIn('if __name__ == "__main__":', observer)
+        self.assertNotIn("Future apply", readme)
+        self.assertNotIn("Future apply", operator)
+
+    def test_s2_repin_and_offline_activation_are_documented_as_separate_gates(self):
+        readme = README.read_text(encoding="utf-8")
+        operator = V2_DOC.read_text(encoding="utf-8")
+        for required in (
+            "private_release_v2_fic_repin.py describe",
+            "private_release_v2_fic_repin.py observe",
+            "private_release_v2_fic_repin.py apply",
+            "private_release_v2_fic_repin.py validate-receipt",
+            "private_release_v2_activation.py",
+            "deliberately non-executable",
+            "empty intermediate",
+            "mergedControlWorkflowSha",
+            "bridgePackageSourceSha",
+            "separately authorized caller-integration",
+        ):
+            self.assertIn(required, readme)
+        for required in (
+            "S2 repin and activation ceremony",
+            "authorization-specific empty ARM deployment claim",
+            "exact sole S2 credential",
+            "06-terminal-receipt.json",
+            "offline-only, create-only builder",
+            "separate exact ledger",
+            "caller-integration mutations require",
+            "authorization after the activation output",
+        ):
+            self.assertIn(required, operator)
+        self.assertNotIn("S1-prime and S2 credentials overlap", readme)
+        self.assertNotIn("publishes the activation document", operator)
 
     def test_exact_callers_and_reusable_workflow_identity_are_cross_bound(self):
         source = self.workflow(CONTROL)

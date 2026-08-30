@@ -14,6 +14,7 @@ from scripts import private_release_mailbox as box
 
 STAMP = "2026-08-29T00:00:00.000Z"
 WORKFLOW_SHA = "a" * 40
+BOOTSTRAP_SOURCE_SHA = "b" * 40
 PACKAGE_SHA = "b" * 64
 KEY_VERSION = "c" * 32
 JWK_N = "A" * 384
@@ -37,6 +38,8 @@ def _ids():
              f"/providers/Microsoft.KeyVault/vaults/{box.FIXED_COORDS['signingVault']}")
     return {
         "subscription": subscription, "storage": storage, "bridge": bridge,
+        "masterRg": f"{subscription}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}",
+        "vnet": f"{subscription}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea",
         "production": production, "mailbox": f"{subscription}/resourceGroups/mailbox-rg",
         "vault": vault, "key": f"{vault}/keys/{box.FIXED_COORDS['signingKeyName']}",
         "registry": f"{containers}/{box.FIXED_COORDS['registryContainer']}",
@@ -90,7 +93,7 @@ def activated_bundle():
         "signerRoleDefinitionDataActions": ["Microsoft.KeyVault/vaults/keys/sign/action"], "signerForbiddenRoleAssignments": [],
         "signingKeyId": key_id, "signingKeyVersion": KEY_VERSION,
         "signingPublicJwk": {"kid": f"{key_id}/{KEY_VERSION}", "kty": "RSA", "n": JWK_N, "e": "AQAB", "key_ops": ["sign", "verify"]},
-        "bridgePackageSha256": PACKAGE_SHA,
+        "bridgePackageSourceSha": BOOTSTRAP_SOURCE_SHA, "bridgePackageSha256": PACKAGE_SHA,
         "productionActivationManagedIdentityClientId": clients["productionActivation"], "productionActivationManagedIdentityPrincipalId": principals["productionActivation"], "productionActivationManagedIdentityResourceId": uami["productionActivation"],
         "productionActivationRoleDefinitionId": gid(104), "productionActivationRoleAssignmentId": gid(204), "productionActivationRoleAssignmentScope": rid["production"],
         "productionActivationRoleDefinitionActions": ["Microsoft.Web/sites/config/list/action", "Microsoft.Web/sites/config/write", "Microsoft.Web/sites/deployments/read", "Microsoft.Web/sites/restart/action"],
@@ -110,10 +113,14 @@ def activated_bundle():
         "publisherPackageCustodyAudit": (gid(116), gid(211), "publisher", None, rid["packages"], custody, []),
         "publisherResultCustodyAudit": (gid(117), gid(212), "publisher", None, rid["results"], custody, []),
         "publisherAudit": (gid(107), gid(213), "publisher", None, rid["subscription"], ["Microsoft.Authorization/roleAssignments/read", "Microsoft.Authorization/roleDefinitions/read"], []),
-        "publisherWebIdentityAudit": (gid(113), gid(217), "publisher", None, rid["subscription"], ["Microsoft.Web/sites/read"], []),
-        "publisherKeyPostureAudit": (gid(114), gid(218), "publisher", None, rid["key"], ["Microsoft.KeyVault/vaults/read", "Microsoft.KeyVault/vaults/keys/read"], []),
+        "publisherWebIdentityAudit": (gid(113), gid(217), "publisher", None, rid["masterRg"], ["Microsoft.Web/sites/read"], []),
+        "publisherKeyPostureAudit": (gid(114), gid(218), "publisher", None, rid["vault"], ["Microsoft.KeyVault/vaults/read", "Microsoft.KeyVault/vaults/keys/read"], []),
+        "publisherUamiMetadataAudit": (gid(120), gid(222), "publisher", None, rid["masterRg"], ["Microsoft.ManagedIdentity/userAssignedIdentities/read"], []),
+        "publisherNetworkMetadataAudit": (gid(121), gid(223), "publisher", None, rid["vnet"], ["Microsoft.Network/virtualNetworks/read", "Microsoft.Network/virtualNetworks/subnets/read"], []),
+        "publisherStorageMetadataAudit": (gid(122), gid(224), "publisher", None, rid["storage"], ["Microsoft.Storage/storageAccounts/read"], []),
+        "publisherProductionWebMetadataAudit": (gid(123), gid(225), "publisher", None, rid["production"], ["Microsoft.Web/sites/config/read"], []),
         "bridgeMailboxResult": (gid(108), gid(214), "bridge", uami["bridge"], rid["mailbox"], ["Microsoft.Resources/deployments/read", "Microsoft.Resources/deployments/write"], []),
-        "bridgeActivationFence": (gid(109), gid(208), "bridge", uami["bridge"], rid["fence"], [], ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/lease/action"]),
+        "bridgeActivationFence": (gid(109), gid(208), "bridge", uami["bridge"], rid["fence"], [], ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]),
         "bridgeKeyRead": (gid(115), gid(219), "bridge", uami["bridge"], rid["key"], [], ["Microsoft.KeyVault/vaults/keys/read"]),
         "writerRegistryAdd": (gid(110), gid(220), "writer", uami["writer"], rid["registry"], [], ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]),
         "writerPackageAdd": (gid(118), gid(206), "writer", uami["writer"], rid["packages"], [], ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]),
@@ -149,14 +156,15 @@ def activated_bundle():
         policy_projection = {"id": policy_id.lower(), "name": "default", "type": "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies", "etag": f'"policy-{name}"', "properties": {"state": "Locked", "immutabilityPeriodSinceCreationInDays": 91, "allowProtectedAppendWrites": False, "allowProtectedAppendWritesAll": False}}
         worm[name] = {"scope": scope, "policyResourceId": policy_id, "publicAccess": "None", "containerResourceSha256": box.digest(box.canonical(container_projection)), "state": "Locked", "immutabilityPeriodSinceCreationInDays": 91, "allowProtectedAppendWrites": False, "allowProtectedAppendWritesAll": False, "etag": f'"policy-{name}"', "resourceSha256": box.digest(box.canonical(policy_projection)), "observedAt": STAMP}
 
-    package_blob = f"v2/control/{PACKAGE_SHA}/paperdesk-private-release-bridge.zip"
+    package_blob = f"v2/control/{BOOTSTRAP_SOURCE_SHA}/paperdesk-private-release-bridge.zip"
     package_version = "2026-08-29T00:00:00.0000000Z"
     package_url = f"https://{box.FIXED_COORDS['packageAccount']}.blob.core.windows.net/{box.FIXED_COORDS['packageContainer']}/{package_blob}?versionid={package_version}"
     critical = {"WEBSITE_RUN_FROM_PACKAGE": package_url, "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": uami["reader"], "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false", "PAPERDESK_BRIDGE_PACKAGE_SHA256": PACKAGE_SHA}
-    subnet = f"{rid['subscription']}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Network/virtualNetworks/paperdesk-vnet/subnets/snet-appservice-integration".lower()
+    subnet = f"{rid['subscription']}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea/subnets/snet-appservice-integration".lower()
     vnet = subnet.rsplit("/subnets/", 1)[0]
-    routing = {"allTraffic": True, "applicationTraffic": True}
-    posture = {"siteResourceId": rid["bridge"], "name": box.FIXED_COORDS["bridgeApp"], "type": "Microsoft.Web/sites", "kind": "app,linux", "serverFarmId": f"{rid['subscription']}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/serverfarms/paperdesk-b1", "httpsOnly": True, "publicNetworkAccess": "Disabled", "virtualNetworkSubnetId": subnet, "outboundVnetRouting": routing, "webConfig": {"alwaysOn": True, "linuxFxVersion": "PYTHON|3.12", "ftpsState": "Disabled", "minTlsVersion": "1.2", "scmMinTlsVersion": "1.2", "scmType": "None", "http20Enabled": True, "vnetRouteAllEnabled": True}, "ftpBasicAuthAllowed": False, "scmBasicAuthAllowed": False, "sourceControl": {"status": 404}}
+    bridge_routing = {"allTraffic": True, "applicationTraffic": True}
+    production_routing = {"allTraffic": False, "applicationTraffic": True}
+    posture = {"siteResourceId": rid["bridge"], "name": box.FIXED_COORDS["bridgeApp"], "type": "Microsoft.Web/sites", "kind": "app,linux", "serverFarmId": f"{rid['subscription']}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/serverfarms/asp-master-data-structure-b1-sea", "httpsOnly": True, "publicNetworkAccess": "Disabled", "virtualNetworkSubnetId": subnet, "outboundVnetRouting": bridge_routing, "webConfig": {"alwaysOn": True, "linuxFxVersion": "PYTHON|3.12", "ftpsState": "Disabled", "minTlsVersion": "1.2", "scmMinTlsVersion": "1.2", "scmType": "None", "http20Enabled": True, "vnetRouteAllEnabled": True}, "ftpBasicAuthAllowed": False, "scmBasicAuthAllowed": False, "sourceControl": {"status": 404}}
     sensitive = sorted(value.lower() for value in uami.values())
     graph_attachments = {identity: [rid["bridge"].lower()] for identity in sensitive}
     owner_role = f"{rid['subscription']}/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
@@ -166,15 +174,15 @@ def activated_bundle():
     legacy_site = f"{rid['subscription']}/resourceGroups/{box.FIXED_COORDS['bridgeResourceGroup']}/providers/Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d"
     legacy_projection = {"siteResourceId": legacy_site, "state": "Stopped", "publicNetworkAccess": "Disabled", "userAssignedIdentityResourceIds": [], "transientAppSettingNamesPresent": [], "publisherMutatorAssignmentIds": []}
     legacy = {**legacy_projection, "roleAssignmentsQuery": f"https://management.azure.com{legacy_site}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01", "projectionSha256": box.digest(box.canonical(legacy_projection)), "observedAt": STAMP}
-    vnet_projection = {"id": vnet, "type": "Microsoft.Network/virtualNetworks", "addressSpacePrefixes": ["10.42.0.0/16"]}
+    vnet_projection = {"id": vnet, "type": "Microsoft.Network/virtualNetworks", "addressSpacePrefixes": ["10.41.0.0/16"]}
     subnet_projection = {"id": subnet, "type": "Microsoft.Network/virtualNetworks/subnets", "virtualNetworkResourceId": vnet.lower(), "delegations": ["Microsoft.Web/serverFarms"], "serviceEndpoints": [{"service": "Microsoft.Storage", "provisioningState": "Succeeded"}], "routeTableResourceId": None, "networkSecurityGroupResourceId": None}
     storage_projection = {"id": rid["storage"].lower(), "type": "Microsoft.Storage/storageAccounts", "publicNetworkAccess": "Enabled", "allowBlobPublicAccess": False, "defaultAction": "Deny", "bypass": "None", "ipRules": [], "resourceAccessRules": [], "virtualNetworkRules": [{"id": subnet, "action": "Allow", "state": "Succeeded"}]}
-    production_projection = {"id": rid["production"].lower(), "type": "Microsoft.Web/sites", "virtualNetworkSubnetId": subnet, "outboundVnetRouting": routing}
+    production_projection = {"id": rid["production"].lower(), "type": "Microsoft.Web/sites", "virtualNetworkSubnetId": subnet, "outboundVnetRouting": production_routing, "legacyVnetRouteAllEnabled": True}
     topology = {"mode": "service-endpoint-firewall-v1",
                 "virtualNetwork": {"resourceId": vnet, "apiVersion": "2025-01-01", "projectionSha256": box.digest(box.canonical(vnet_projection)), "addressSpacePrefixes": vnet_projection["addressSpacePrefixes"]},
                 "integrationSubnet": {"resourceId": subnet, "apiVersion": "2025-01-01", "projectionSha256": box.digest(box.canonical(subnet_projection)), **{key: subnet_projection[key] for key in ("virtualNetworkResourceId", "delegations", "serviceEndpoints", "routeTableResourceId", "networkSecurityGroupResourceId")}},
                 "packageStorageAccount": {"resourceId": rid["storage"], "apiVersion": "2025-06-01", "projectionSha256": box.digest(box.canonical(storage_projection)), **{key: storage_projection[key] for key in ("publicNetworkAccess", "allowBlobPublicAccess", "defaultAction", "bypass", "ipRules", "resourceAccessRules", "virtualNetworkRules")}},
-                "productionSite": {"resourceId": rid["production"], "apiVersion": "2025-03-01", "projectionSha256": box.digest(box.canonical(production_projection)), "virtualNetworkSubnetId": subnet, "outboundVnetRouting": routing}}
+                "productionSite": {"resourceId": rid["production"], "apiVersion": "2025-03-01", "projectionSha256": box.digest(box.canonical(production_projection)), "virtualNetworkSubnetId": subnet, "outboundVnetRouting": production_routing, "legacyVnetRouteAllEnabled": True}}
     graph_inventory = {"query": "Resources | where isnotnull(identity.userAssignedIdentities) | mv-expand uamiResourceId=bag_keys(identity.userAssignedIdentities) | project resourceId=tolower(id), uamiResourceId=tolower(tostring(uamiResourceId)) | order by uamiResourceId asc, resourceId asc", "sensitiveIdentityAttachments": graph_attachments, "projectionSha256": box.digest(box.canonical(graph_attachments)), "evidenceMethod": "authorized-bootstrap-azure-resource-graph", "observedAt": STAMP}
     bridge_runtime = {"siteResourceId": rid["bridge"], "packageBlob": package_blob, "packageSha256": PACKAGE_SHA, "packageSize": 4096, "packageEtag": '"package"', "packageVersionId": package_version, "packageUrl": package_url, "packageReaderIdentityResourceId": uami["reader"], "criticalAppSettings": critical, "criticalAppSettingsSha256": box.digest(box.canonical(critical)), "sitePosture": posture, "sitePostureSha256": box.digest(box.canonical(posture)), "siteInventoryQuery": f"https://management.azure.com/subscriptions/{box.SUBSCRIPTION}/providers/Microsoft.Web/sites?api-version=2025-03-01", "sensitiveIdentityResourceIds": sensitive, "sensitiveIdentityAttachmentSha256": box.digest(box.canonical({rid['bridge'].lower(): sensitive})), "resourceGraphAttachmentInventory": graph_inventory, "identityAssignmentBoundaries": identity_boundaries, "bridgeMutationBoundary": mutation, "legacyBridgeRetirement": legacy, "networkTopology": topology, "bootstrapReceiptPath": "evidence/private-release-bridge-runtime-receipt.json", "bootstrapReceiptSha256": "0" * 64, "observedAt": STAMP}
 

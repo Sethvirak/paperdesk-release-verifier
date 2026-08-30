@@ -36,18 +36,20 @@ def request_fixtures():
             "rollbackBaselineReceiptSha256": DIGESTS["d"],
         },
         "accept-candidate": {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "requestType": "watchdog-state-transition",
             "operation": "accept-candidate",
             "expectedStateSha256": DIGESTS["a"],
             "candidateSha": SHA_A,
+            "sourceRunId": "88",
+            "sourceRunAttempt": "1",
             "candidateRunId": "101",
             "candidateRunAttempt": "2",
             "acceptanceRunId": "202",
             "acceptanceRunAttempt": "1",
             "productionAcceptanceReceiptSha256": DIGESTS["b"],
             "acceptedReleaseManifestSha256": DIGESTS["c"],
-            "acceptedReleasePrefix": f"v1/releases/{SHA_A}/101/202/",
+            "acceptedReleasePrefix": f"v1/releases/{SHA_A}/88/202/",
             "registryManifestETag": '"0x8DABC123"',
             "registryManifestVersionId": "2026-08-23T00:00:00.0000000Z",
         },
@@ -249,6 +251,24 @@ class WatchdogContractTests(unittest.TestCase):
         claims["run_id"] = request["acceptanceRunId"]
         with self.assertRaisesRegex(ValueError, "distinct persistence workflow run"):
             contract.validate_oidc_binding(self.machine, request, claims)
+
+    def test_accept_keeps_source_deployment_and_acceptance_runs_distinct(self):
+        request = self.requests["accept-candidate"]
+        self.assertEqual(contract.validate_transition_request(self.machine, request), request)
+        for field, value in (
+            ("sourceRunId", request["candidateRunId"]),
+            ("sourceRunId", request["acceptanceRunId"]),
+            ("candidateRunId", request["acceptanceRunId"]),
+        ):
+            changed = {**request, field: value}
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "must be distinct"):
+                contract.validate_transition_request(self.machine, changed)
+        changed = {**request, "acceptedReleasePrefix": f"v1/releases/{SHA_A}/101/202/"}
+        with self.assertRaisesRegex(ValueError, "source and acceptance"):
+            contract.validate_transition_request(self.machine, changed)
+        changed = {**request, "schemaVersion": 2}
+        with self.assertRaisesRegex(ValueError, "schemaVersion"):
+            contract.validate_transition_request(self.machine, changed)
 
     def test_oidc_expiration_must_be_strictly_after_iat_and_nbf(self):
         request = self.requests["publish-candidate"]

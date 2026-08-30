@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "modelId": "paperdesk-private-release-v2-bootstrap-evidence-v1",
+  "status": "source-dormant-model-only",
+  "canonicalEncoding": "utf-8-json-sort-keys-compact-newline",
+  "bundleType": "paperdesk-private-release-v2-bootstrap-receipt-bundle",
+  "requiredBundleComponents": [
+    "executionReceipt",
+    "permanentMutationLedger",
+    "temporaryAccessCleanup",
+    "activationFenceBootstrap",
+    "packageReadback",
+    "managedIdentityFetchSelfTest",
+    "bridgeEvidence",
+    "leaseCanaryEvidence",
+    "wormProjections",
+    "s2OutputMetadata"
+  ],
+  "publicEvidenceBoundary": {
+    "allowed": [
+      "nonsecret Azure resource and object identifiers required to verify least authority",
+      "canonical SHA-256 projection digests",
+      "quoted ETags and immutable version IDs",
+      "role-definition and role-assignment identifiers",
+      "HTTP status codes and response-body SHA-256 digests",
+      "timestamps and the one-shot authorization identifier"
+    ],
+    "forbidden": [
+      "access or refresh token",
+      "GitHub token",
+      "SAS or SAS query parameter",
+      "storage account or Shared Key credential",
+      "private key",
+      "raw public operator IPv4 address or CIDR",
+      "raw OIDC token or unredacted claims",
+      "customer data",
+      "PaperDesk source or deployment-package bytes"
+    ]
+  },
+  "constants": {
+    "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+    "packageBlobTemplate": "v2/control/{mergedSourceSha}/paperdesk-private-release-bridge.zip",
+    "activationFenceBlob": "v2/production-activation-fence.json",
+    "temporaryPackageRoleDefinitionId": "d3021f37-75b7-5dad-84ce-8bf84dd11e93",
+    "temporaryPackageRoleAssignmentId": "39989cff-44ef-596e-8b46-0a433bb5c0e2",
+    "temporaryKeyReadRoleDefinitionId": "dba37aa5-3824-5c68-91ac-5f1e24e7aa9c",
+    "temporaryKeyReadRoleAssignmentId": "9420cd85-94df-5156-99b7-9a011702c69e",
+    "temporaryFenceRoleDefinitionId": "1c425126-8044-52d8-b4f5-6dac8d60b1e1",
+    "temporaryFenceRoleAssignmentId": "bdfe78bb-909b-54df-86a0-1620898addf0",
+    "wormRetentionDays": 91,
+    "finiteLeaseSeconds": 60,
+    "finiteLeaseRenewalCount": 1,
+    "cleanupFallbackMinimumOwnerAgeMinutes": 120,
+    "ownerJobTimeoutMinutes": 90,
+    "maximumEvidenceLagSeconds": 300
+  },
+  "initialActivationFenceDocument": {
+    "schemaVersion": 1,
+    "state": "idle",
+    "stateVersion": 0,
+    "operation": "",
+    "sourceSha": "",
+    "pendingRelease": null,
+    "preSettingsSha256": "",
+    "desiredSettingsSha256": "",
+    "leaseId": "",
+    "lastStatus": "bootstrap",
+    "lastProofSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "receiptTypes": {
+    "executionReceipt": "paperdesk-private-release-v2-bootstrap-terminal-receipt",
+    "permanentMutationLedger": "paperdesk-private-release-v2-permanent-mutation-ledger",
+    "temporaryAccessCleanup": "paperdesk-private-release-v2-temporary-access-cleanup",
+    "activationFenceBootstrap": "paperdesk-private-release-v2-activation-fence-bootstrap",
+    "packageReadback": "paperdesk-private-release-v2-package-readback",
+    "managedIdentityFetchSelfTest": "paperdesk-private-release-v2-managed-identity-fetch-self-test",
+    "bridgeEvidence": "paperdesk-private-release-v2-bridge-canary-evidence",
+    "leaseCanaryEvidence": "paperdesk-private-release-v2-lease-cleanup-canaries",
+    "wormProjections": "paperdesk-private-release-v2-worm-projections",
+    "s2OutputMetadata": "paperdesk-private-release-v2-s2-output-metadata"
+  },
+  "requiredS2EvidencePaths": [
+    "evidence/private-release-provisioning-evidence.json",
+    "evidence/private-release-bridge-runtime-receipt.json",
+    "evidence/private-release-bootstrap-temporary-access-cleanup-receipt.json",
+    "evidence/private-release-activation-fence-bootstrap-receipt.json",
+    "evidence/private-release-bridge-canary-receipt.json"
+  ],
+  "requiredS2TerminalBundlePath": "evidence/private-release-bootstrap-receipt-bundle.json",
+  "rules": [
+    "Every object has an exact field set; missing and additional fields fail closed.",
+    "Every hash is lowercase SHA-256 over canonical newline-terminated JSON or exact response bytes as labelled.",
+    "The terminal receipt binds the canonical authorization, reviewed head, merged main, common tree, executor, plan, deterministic package, Azure account object, full mutation universe, component digests and S2 evidence-file digests.",
+    "The terminal receipt is successful only when failures and pendingHousekeeping are both empty and no production release mutation occurred.",
+    "Permanent mutation IDs occur exactly once and equal the non-temporary provider mutation universe in the reviewed plan.",
+    "Temporary package IPv4 and each authorization-specific custom package, key-read, activation-fence and controller-canary role definition and assignment are executor-owned, removed, freshly reread and absent before bridge start.",
+    "Activation-fence evidence distinguishes a current-authorization If-None-Match:* HTTP 201 create from exact immutable adoption with no current write; either path leaves the canonical idle fence Available and Unlocked.",
+    "Package evidence distinguishes a current-authorization If-None-Match:* HTTP 201 upload from exact immutable version adoption with no current write, and binds deterministic versioned Azure AD readback; SAS, account keys and package bytes are never retained.",
+    "Bootstrap managed-identity proof is one fresh exact source-and-package-pinned WebJob invocation reaching terminal Success under the exact control and settings, with ARM invocation metadata, pre-run history boundary, fence cleanup, and a source-derived expected-marker digest; it does not claim HTTP index/live/ready/app-health/security or literal stdout-marker observation.",
+    "Controller and activation leases are finite; fast-lane and expiry-fallback cleanup canaries both complete and leave no lease or housekeeping obligation.",
+    "Accepted-release, result and package containers are private Locked WORM projections at no less than 91 days with append-write flags false; an already stricter retention is never downgraded.",
+    "The separate required S2 terminal bundle retains the full canonical component and proof bodies plus the five evidence-file descriptors and terminal receipt, never a digest of itself; the S2 Git commit seals it.",
+    "Generated outputs remain local until one independently reviewed evidence-only S2 commit; source logic and resource policy cannot be changed by that commit."
+  ]
+}

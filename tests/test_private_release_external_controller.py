@@ -1,4 +1,5 @@
 import base64
+import datetime as dt
 import json
 import types
 import unittest
@@ -53,6 +54,7 @@ class LiveProvisioning:
         self.calls = []
         self.drift_worm = False
         self.extra_effective_assignment = False
+        self.extra_bridge_setting = False
 
     @staticmethod
     def response(value, status=200):
@@ -122,7 +124,10 @@ class LiveProvisioning:
         if url == base + bridge_id + "?api-version=2025-03-01":
             return self.response(bridge_document)
         if url == base + bridge_id + "/config/appsettings/list?api-version=2025-03-01":
-            return self.response({"properties": dict(runtime["criticalAppSettings"])})
+            settings = dict(runtime["criticalAppSettings"])
+            if self.extra_bridge_setting:
+                settings["PAPERDESK_UNREVIEWED_EXECUTION_MODE"] = "enabled"
+            return self.response({"properties": settings})
         if url == base + bridge_id + "/config/web?api-version=2025-03-01":
             return self.response({"properties": posture["webConfig"]})
         if url == base + bridge_id + "/basicPublishingCredentialsPolicies/ftp?api-version=2025-03-01":
@@ -143,6 +148,8 @@ class LiveProvisioning:
         topology = runtime["networkTopology"]
         if url == base + production_id + "?api-version=2025-03-01":
             return self.response({"id": production_id, "type": "Microsoft.Web/sites", "identity": {"type": "SystemAssigned", "tenantId": production_role["tenantId"], "principalId": production_role["principalId"], "userAssignedIdentities": {}}, "properties": {"virtualNetworkSubnetId": topology["productionSite"]["virtualNetworkSubnetId"], "outboundVnetRouting": topology["productionSite"]["outboundVnetRouting"]}})
+        if url == base + production_id + "/config/web?api-version=2025-03-01":
+            return self.response({"properties": {"vnetRouteAllEnabled": topology["productionSite"]["legacyVnetRouteAllEnabled"]}})
         for name, item in topology.items():
             if name == "mode" or url != base + item["resourceId"] + "?api-version=" + item["apiVersion"]:
                 continue
@@ -175,6 +182,56 @@ class LiveProvisioning:
 
 
 class Tests(unittest.TestCase):
+    def test_registry_preflight_cannot_enter_activation_path(self):
+        document, evidence, receipt = fixture.activated_bundle()
+        now = dt.datetime.now(dt.timezone.utc)
+        request = {
+            "schemaVersion": 2, "requestType": "paperdesk-private-release-request",
+            "operation": "registry-bridge-preflight", "repositoryId": core.OWNER_REPOSITORY_ID,
+            "ownerId": core.OWNER_ID, "controlWorkflowSha": fixture.WORKFLOW_SHA,
+            "sourceSha": "9" * 40, "sourceRunId": "44", "sourceRunAttempt": "1",
+            "candidateRunId": None, "candidateRunAttempt": None,
+            "artifactId": "", "artifactSha256": "", "artifactMember": "",
+            "artifactMemberSha256": "", "acceptanceRunId": "44",
+            "acceptanceRunAttempt": "1", "logicalOperationId": None, "nonce": "e" * 32,
+            "issuedAt": controller._stamp(now),
+            "expiresAt": controller._stamp(now + dt.timedelta(minutes=15)),
+            "acceptedBaseline": None, "pendingRelease": None, "consumedMarker": None,
+            "rollbackPreparation": None, "activationPlan": None, "activationProof": None,
+        }
+        with mock.patch.object(controller, "_run_bridge") as run_bridge:
+            with self.assertRaisesRegex(core.MailboxError, "external-read-only-operation"):
+                controller.execute(
+                    request, document,
+                    activation_raw=core.canonical(document).decode(),
+                    runtime_workflow_sha=fixture.WORKFLOW_SHA,
+                    package_sha=fixture.PACKAGE_SHA, provisioning_evidence=evidence,
+                    bridge_runtime_receipt=receipt, github_token="g" * 20,
+                    transport=lambda *args: None, activate=True,
+                )
+        run_bridge.assert_not_called()
+
+        carried = dict(request)
+        carried.update({"candidateRunId": "45", "candidateRunAttempt": "2"})
+        followed = controller._followup(
+            carried, "registry-bridge-preflight", now=now
+        )
+        self.assertIsNone(followed["candidateRunId"])
+        self.assertIsNone(followed["candidateRunAttempt"])
+        self.assertEqual(core.validate_request(followed, now=now)[0], followed)
+
+        with mock.patch.object(controller, "_run_bridge") as run_bridge:
+            with self.assertRaisesRegex(core.MailboxError, "activation-document-canonical"):
+                controller.execute(
+                    request, document,
+                    activation_raw=json.dumps(document, indent=2),
+                    runtime_workflow_sha=fixture.WORKFLOW_SHA,
+                    package_sha=fixture.PACKAGE_SHA, provisioning_evidence=evidence,
+                    bridge_runtime_receipt=receipt, github_token="g" * 20,
+                    transport=lambda *args: None,
+                )
+        run_bridge.assert_not_called()
+
     def test_live_provisioning_inventory_succeeds_and_worm_drift_fails_closed(self):
         document, evidence, receipt = fixture.activated_bundle()
         activation = fixture.activation()
@@ -194,6 +251,48 @@ class Tests(unittest.TestCase):
             controller.ProvisioningVerifier(
                 live.arm, fixture.activation(), receipt, graph_transport=live.graph
             ).verify()
+
+    def test_live_provisioning_rejects_unexpected_bridge_app_setting(self):
+        document, evidence, receipt = fixture.activated_bundle()
+        live = LiveProvisioning(document, evidence)
+        live.extra_bridge_setting = True
+        with self.assertRaisesRegex(core.MailboxError, "provisioning-bridge-settings"):
+            controller.ProvisioningVerifier(
+                live.arm, fixture.activation(), receipt, graph_transport=live.graph
+            ).verify()
+
+    def test_bridge_lease_rejects_extra_setting_before_transient_put(self):
+        document, _, receipt = fixture.activated_bundle()
+        activation = fixture.activation()
+        settings = dict(activation.provisioning_evidence["bridgeRuntime"]["criticalAppSettings"])
+        settings["PAPERDESK_UNREVIEWED_EXECUTION_MODE"] = "enabled"
+
+        class Settings:
+            put_calls = 0
+
+            def read(self):
+                return dict(settings), core.digest(core.canonical(settings))
+
+            def put_if_digest(self, *args, **kwargs):
+                self.put_calls += 1
+
+        controller_lease = types.SimpleNamespace(renew=lambda force=False: None)
+        lease = controller.BridgeLease(
+            lambda *args: None,
+            activation,
+            core.canonical(document).decode(),
+            receipt,
+            "g" * 20,
+            "pdreq-5-1-" + "d" * 32,
+            {},
+            controller_lease,
+        )
+        lease.assert_stopped = lambda: None
+        lease.settings = Settings()
+        with self.assertRaisesRegex(core.MailboxError, "bridge-durable-settings-drift"):
+            lease.acquire()
+        self.assertEqual(lease.settings.put_calls, 0)
+        self.assertFalse(lease.owns_transient)
 
     def test_cli_publisher_token_binds_client_principal_tenant_issuer_and_app_type(self):
         activation = types.SimpleNamespace(tenant_id=TID, publisher_client_id=CID, publisher_principal_id=PID)

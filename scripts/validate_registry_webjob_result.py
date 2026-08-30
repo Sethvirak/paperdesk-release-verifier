@@ -441,7 +441,7 @@ def persistence_case(run_one: dict[str, Any], run_two: dict[str, Any]) -> str:
     first_overwrite = first["overwriteNegative"]
     second_overwrite = second["overwriteNegative"]
     if (
-        1 <= first_count <= 20
+        1 <= first_count <= 21
         and first_overwrite == "passed"
         and second_count == 0
         and second_overwrite == "not-run-completed"

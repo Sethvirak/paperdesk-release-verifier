@@ -15,18 +15,19 @@ def _claims(token):
     if len(parts)!=3: core.fail("token-jwt")
     return _json(core.b64u_decode(parts[1],"token-claims"),"token-claims")
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+
 class Http:
     def __call__(self,method,url,headers,body=None):
         request=urllib.request.Request(url,data=body,headers=dict(headers),method=method)
-        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),_NoRedirect())
         try:
             with opener.open(request,timeout=30) as response:
                 return core.Response(response.status,url,response.read(core.MAX_RESULT*2000+1),dict(response.headers))
         except urllib.error.HTTPError as error:
             return core.Response(error.code,url,error.read(core.MAX_RESULT*2+1),dict(error.headers))
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self,req,fp,code,msg,headers,newurl): return None
 class NoRedirectHttp(Http):
     def __call__(self,method,url,headers,body=None):
         request=urllib.request.Request(url,data=body,headers=dict(headers),method=method)
@@ -60,6 +61,10 @@ class ManagedIdentityTokens:
         exp=claims.get("exp"); nbf=claims.get("nbf",0)
         if type(exp) is not int or type(nbf) is not int or nbf>now+30 or exp<=now+300: core.fail("token-time")
         self.cache[resource]=(token,exp); return token
+    def identity_projection(self,resource):
+        """Return only the non-secret claims that bind one validated token."""
+        token=self.get(resource);claims=_claims(token)
+        return {"clientId":self.client_id,"principalId":self.principal_id,"tenantId":self.tenant_id,"audience":claims["aud"]}
 
 class ArmTransport:
     def __init__(self,tokens,http=None): self.tokens=tokens; self.http=http or Http()
@@ -109,11 +114,18 @@ class BlobActivationFence:
     finite lease only after the caller has validated the immutable terminal
     marker and supplies its exact proof digest to ``complete``.
     """
-    def __init__(self,account,container,blob,tokens,http=None,uuid_factory=uuid.uuid4):
-        if container!=core.FIXED_COORDS["activationFenceContainer"] or blob!=core.FIXED_COORDS["activationFenceBlob"]:core.fail("fence-coordinate")
-        self.base=f"https://{account}.blob.core.windows.net/{container}/{blob}";self.blob=blob;self.tokens=tokens;self.http=http or Http();self.uuid_factory=uuid_factory
+    INITIAL_IDLE={"schemaVersion":1,"state":"idle","stateVersion":0,"operation":"","sourceSha":"","pendingRelease":None,"preSettingsSha256":"","desiredSettingsSha256":"","leaseId":"","lastStatus":"bootstrap","lastProofSha256":"0"*64}
+    def __init__(self,account,container,blob,tokens,http=None,uuid_factory=uuid.uuid4,clock=None):
+        if (account!=core.FIXED_COORDS["packageAccount"] or container!=core.FIXED_COORDS["activationFenceContainer"]
+                or blob!=core.FIXED_COORDS["activationFenceBlob"]):core.fail("fence-coordinate")
+        self.base=f"https://{account}.blob.core.windows.net/{container}/{blob}";self.blob=blob;self.tokens=tokens;self.http=http or Http();self.uuid_factory=uuid_factory;self.clock=clock or (lambda:dt.datetime.now(dt.timezone.utc))
     def _headers(self):return {"Authorization":"Bearer "+self.tokens.get(STORAGE),"x-ms-version":"2023-11-03","x-ms-date":dt.datetime.now(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")}
-    def _read(self,lease_id=None):
+    def _stamp(self):
+        value=self.clock()
+        if not isinstance(value,dt.datetime) or value.tzinfo is None:core.fail("fence-canary-clock")
+        value=value.astimezone(dt.timezone.utc)
+        return value.strftime("%Y-%m-%dT%H:%M:%S.")+f"{value.microsecond//1000:03d}Z"
+    def _read_proof(self,lease_id=None):
         headers=self._headers()
         if lease_id:headers["x-ms-lease-id"]=lease_id
         response=self.http("GET",self.base,headers,None)
@@ -124,7 +136,9 @@ class BlobActivationFence:
         if core.canonical(doc)!=response.body:core.fail("fence-canonical")
         etag=_header(response,"ETag")
         if not re.fullmatch(r'"[^"\r\n]+"',str(etag)):core.fail("fence-etag")
-        return doc,etag
+        return doc,etag,_header(response,"x-ms-version-id")
+    def _read(self,lease_id=None):
+        doc,etag,_=self._read_proof(lease_id);return doc,etag
     def _write(self,doc,etag,lease_id):
         body=core.canonical(doc);headers=self._headers();headers.update({"x-ms-blob-type":"BlockBlob","x-ms-lease-id":lease_id,"If-Match":etag,"Content-Type":"application/json","Content-Length":str(len(body)),"x-ms-meta-sha256":core.digest(body)})
         response=self.http("PUT",self.base,headers,body)
@@ -154,6 +168,62 @@ class BlobActivationFence:
         elif any((state.get("operation"),state.get("sourceSha"),state.get("preSettingsSha256"),state.get("desiredSettingsSha256"),state.get("leaseId"))) or state.get("pendingRelease") is not None:
             core.fail("fence-state")
         return state
+    def bootstrap_canary(self,*,lease_id,duration_seconds,renewal_count,expected_etag,expected_version_id,expected_body_sha256):
+        """Exercise only a finite lease over the immutable initial idle blob.
+
+        This bootstrap path deliberately performs no blob write.  It validates
+        the exact initial bytes while holding the proposed capability, renews
+        that capability once, releases it in ``finally``, and then proves the
+        blob is still idle and Available/Unlocked.
+        """
+        idle_body=core.canonical(self.INITIAL_IDLE)
+        if (not core.GUID.fullmatch(str(lease_id)) or duration_seconds!=60 or renewal_count!=1
+                or not re.fullmatch(r'"[^"\r\n]{1,256}"',str(expected_etag))
+                or not isinstance(expected_version_id,str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}",expected_version_id)
+                or not core.SHA256.fullmatch(str(expected_body_sha256))
+                or expected_body_sha256!=core.digest(idle_body)):core.fail("fence-canary-input")
+        headers=self._headers();headers.update({"x-ms-lease-action":"acquire","x-ms-lease-duration":"60","x-ms-proposed-lease-id":lease_id})
+        acquired=self.http("PUT",self.base+"?comp=lease",headers,b"")
+        if acquired.status in {409,412}:core.fail("fence-canary-busy")
+        if acquired.status!=201:core.fail("fence-canary-acquire")
+        acquired_at="";renewed_at="";renew_status=0;release_status=0;released_at="";failure=None;cleanup_failure=None
+        try:
+            acquired_at=self._stamp()
+            state,etag,version_id=self._read_proof(lease_id)
+            if state!=self.INITIAL_IDLE or etag!=expected_etag or version_id!=expected_version_id:core.fail("fence-canary-idle-drift")
+            renewed=self._lease("renew",lease_id);renew_status=renewed.status;renewed_at=self._stamp()
+            if renewed.status!=200:core.fail("fence-canary-renew")
+        except Exception as error:
+            failure=error
+        finally:
+            try:
+                released=self._lease("release",lease_id);release_status=released.status;released_at=self._stamp()
+                if released.status not in {200,202}:cleanup_failure=core.MailboxError("fence-canary-release")
+            except Exception as error:
+                cleanup_failure=error
+        final_state="";final_status="";final_etag="";final_version="";final_body_sha="";completed_at=""
+        try:
+            head=self.http("HEAD",self.base,self._headers(),None)
+            final_state=_header(head,"x-ms-lease-state") or "";final_status=_header(head,"x-ms-lease-status") or ""
+            if (head.status!=200 or final_state.lower()!="available" or final_status.lower()!="unlocked"
+                    or _header(head,"ETag")!=expected_etag or _header(head,"x-ms-version-id")!=expected_version_id):core.fail("fence-canary-final-lease")
+            final_doc,final_etag,final_version=self._read_proof()
+            final_body_sha=core.digest(core.canonical(final_doc))
+            if (final_doc!=self.INITIAL_IDLE or final_etag!=expected_etag or final_version!=expected_version_id
+                    or final_body_sha!=expected_body_sha256):core.fail("fence-canary-final-readback")
+            completed_at=self._stamp()
+        except Exception as error:
+            if cleanup_failure is None:cleanup_failure=error
+        if cleanup_failure is not None:
+            if failure is not None:raise cleanup_failure from failure
+            raise cleanup_failure
+        if failure is not None:raise failure
+        return {"leaseId":lease_id,"leaseIdSha256":core.digest(lease_id.encode()),"leaseDurationSeconds":duration_seconds,"renewalCount":renewal_count,
+                "acquireHttpStatus":acquired.status,"renewHttpStatus":renew_status,"releaseHttpStatus":release_status,
+                "acquiredAt":acquired_at,"renewedAt":renewed_at,"releasedAt":released_at,"completedAt":completed_at,
+                "idleBodySha256":expected_body_sha256,"idleEtag":expected_etag,"idleVersionId":expected_version_id,
+                "finalLeaseState":"Available","finalLeaseStatus":"Unlocked","finalReadbackHttpStatus":200,
+                "finalReadbackBodySha256":final_body_sha,"finalReadbackEtag":final_etag,"finalReadbackVersionId":final_version}
     def recover_plan(self,*,operation,source_sha,pending_release):
         """Return only an exact orphaned held plan; idle means no recovery."""
         state,_=self._read();self._validate_state(state)

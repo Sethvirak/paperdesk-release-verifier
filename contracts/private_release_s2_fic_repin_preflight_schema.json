@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperdesk.invalid/contracts/private-release-s2-fic-repin-preflight-v1.schema.json",
+  "title": "PaperDesk private release V2 S2 FIC repin preflight",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "preflightType",
+    "status",
+    "authorizationId",
+    "observedAt",
+    "account",
+    "source",
+    "bootstrap",
+    "publisher",
+    "azureClaim",
+    "projectionSha256"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "preflightType": {"const": "paperdesk-private-release-v2-s2-fic-repin-preflight"},
+    "status": {"const": "observed-read-only"},
+    "authorizationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "observedAt": {"type": "string", "format": "date-time"},
+    "account": {"$ref": "#/$defs/azureAccount"},
+    "source": {"type": "object"},
+    "bootstrap": {"$ref": "#/$defs/bootstrapBinding"},
+    "publisher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicationQuery",
+        "application",
+        "federatedIdentityCredentialsQuery",
+        "federatedIdentityCredentials"
+      ],
+      "properties": {
+        "applicationQuery": {"type": "string", "pattern": "^https://graph\\.microsoft\\.com/v1\\.0/applications/[0-9a-f-]+\\?\\$select="},
+        "application": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "appId", "displayName", "passwordCredentials", "keyCredentials"],
+          "properties": {
+            "id": {"$ref": "#/$defs/guid"},
+            "appId": {"$ref": "#/$defs/guid"},
+            "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
+            "passwordCredentials": {"const": []},
+            "keyCredentials": {"const": []}
+          }
+        },
+        "federatedIdentityCredentialsQuery": {"type": "string", "pattern": "^https://graph\\.microsoft\\.com/v1\\.0/applications/[0-9a-f-]+/federatedIdentityCredentials$"},
+        "federatedIdentityCredentials": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {"type": "object"}
+        }
+      }
+    },
+    "azureClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resourceId", "httpStatus", "state"],
+      "properties": {
+        "resourceId": {"type": "string", "pattern": "^/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft\\.Resources/deployments/paperdesk-v2-s2-fic-repin-[0-9a-f-]+$"},
+        "httpStatus": {"const": 404},
+        "state": {"const": "absent"}
+      }
+    },
+    "projectionSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "guid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "azureAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cloud", "subscriptionId", "tenantId", "accountId", "accountObjectId", "accountType"],
+      "properties": {
+        "cloud": {"const": "AzureCloud"},
+        "subscriptionId": {"const": "9c4e0d0d-602f-4cde-84bd-337250e5b64c"},
+        "tenantId": {"const": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"},
+        "accountId": {"type": "string", "minLength": 3, "maxLength": 256},
+        "accountObjectId": {"$ref": "#/$defs/guid"},
+        "accountType": {"enum": ["user", "servicePrincipal"]}
+      }
+    },
+    "bootstrapBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originalAuthorization", "originalPreflight", "package", "terminalBundle"],
+      "properties": {
+        "originalAuthorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "authorizationId"],
+          "properties": {
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "authorizationId": {"$ref": "#/$defs/guid"}
+          }
+        },
+        "originalPreflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256"],
+          "properties": {"sha256": {"$ref": "#/$defs/sha256"}}
+        },
+        "package": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceSha", "sha256", "size"],
+          "properties": {
+            "sourceSha": {"$ref": "#/$defs/sha40"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 1, "maximum": 1073741824}
+          }
+        },
+        "terminalBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "minLength": 3, "maxLength": 512},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    }
+  }
+}

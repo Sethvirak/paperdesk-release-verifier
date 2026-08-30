@@ -8,9 +8,14 @@ and result signing off the GitHub-hosted runner. The committed source is still
 evidence is source-dormant, and the reusable workflow rejects that state before
 Azure login.
 
-No Azure mutation is authorized by merging this source. Provisioning, evidence
-commit, federated-identity credential (FIC) repin, caller integration, and an
-explicit activation decision remain separate gates.
+No Azure mutation is authorized merely by merging this source. The sole pre-S2
+Azure-mutation exception is a separately reviewed, external single-use
+authorization for the exact local bootstrap plan from the superseding
+**S1-prime** source. That exception does not authorize the reusable workflow,
+mailbox or release operations, production activation or deployment,
+accepted-release operations, or caller integration. Evidence commit, S2 review,
+federated-identity credential (FIC) repin, activated environment document, and
+exact caller pins remain separate gates.
 
 ## Immutable workflow and caller boundary
 
@@ -42,25 +47,69 @@ credential, a SAS, an account key, or Shared Key authorization.
 
 The finite trust sequence avoids an impossible self-referential third commit:
 
-1. **S1** is the reviewed, dormant, exact-SHA reusable control source. Merge S1
-   with null activation values.
-2. Provision only the exact reviewed V2 resources and temporarily bind the one
-   stable publisher FIC to S1. The local provisioner creates the versioned bridge
-   package and exact evidence while the workflow remains unable to mutate.
+1. **S1-prime** is the reviewed, dormant, exact-SHA source that supersedes the
+   earlier S1. Merge S1-prime with null activation values.
+2. A separate external single-use authorization may provision only the exact
+   reviewed V2 resources. The local provisioner creates the source-addressed,
+   versioned bridge package, completes the bounded canaries and cleanup, and
+   creates the sole temporary publisher FIC to S1-prime as its final Azure
+   mutation. This is the sole pre-S2 Azure-mutation exception; the reusable
+   workflow remains unable to operate.
 3. Commit the concrete, SHA-independent provisioning evidence and bootstrap
    receipt in **S2**. S2 must not silently change the reviewed resource policy or
    source logic.
-4. Explicitly repin the sole publisher FIC from S1 to S2. Action-time Graph and
+4. After S2 evidence acceptance, explicitly repin the sole publisher FIC from
+   S1-prime to S2. Action-time Graph and
    OIDC checks must observe only the exact S2 expression; stale or extra
    credentials fail closed.
 5. After the FIC repin and independent evidence review, the main repository pins
-   S2 and adds the exact production, persistence, and cleanup callers. No Azure
-   mutation is authorized until S2 evidence is accepted, the FIC is repinned,
-   the activation document is exact/non-null, and the caller is pinned.
+   S2 and adds the exact production, persistence, and cleanup callers. Apart
+   from the one-shot bootstrap in step 2, no Azure mutation is authorized until
+   S2 evidence is accepted, the FIC is repinned, the activated environment
+   document is exact/non-null, and the caller is pinned. Mailbox/release,
+   accepted-release, production activation/deployment, and reusable-workflow
+   operations remain forbidden before those gates.
 
 No S3 self-reference is required. Any resource drift after S2 requires new
 evidence and a new reviewed pin rather than editing a mutable environment value
 around the source checks.
+
+## One-shot bootstrap commands and local-only recovery
+
+`scripts/private_release_v2_bootstrap.py describe` is credential-free and is
+the default mode. The source-owned observation command is separate and
+read-only: `scripts/private_release_v2_bootstrap_observe.py` permits only GET
+and the exact App Settings list POST, then create-only writes a canonical
+preflight and a deliberately non-executable authorization template. It never
+promotes the template, supplies a confirmation phrase, or mutates Azure.
+
+After independent review and a separate authorization ceremony, the operator
+runs `private_release_v2_bootstrap.py apply --authorization <canonical-auth>
+--preflight <canonical-preflight>` and supplies the exact confirmation phrase on
+standard input. Neither a GitHub credential nor an Azure credential is embedded
+in either file. The executor validates all local source, signature, exact-head
+review, package, plan, authorization, freshness and account boundaries before
+constructing its Azure CLI transport.
+
+The executor retains one canonical, secret-free local-finalization snapshot
+only after Azure execution, cleanup, postconditions and the complete terminal
+bundle have validated. It create-only writes the five S2 bodies first and the
+separate terminal bundle last. A process crash may be completed with
+`private_release_v2_bootstrap.py resume-finalization --authorization
+<canonical-auth> --preflight <original-canonical-preflight>`. This recovery mode
+requires that same original authorized preflight, has no transport parameter,
+reconstructs the deterministic package bytes,
+revalidates all five retained bodies and the full terminal bundle, performs zero Azure requests or mutations,
+accepts only byte-identical existing prefixes, and
+fails on any conflict. A pre-crash `execution-terminal.json` failure summary is
+retained; it is not rewritten as success. The validated terminal bundle at the
+reviewed terminal-bundle path is the local-finalization success authority.
+The authorized receipt parent is an operator-controlled, access-restricted real
+local directory, never a symlink, junction, shared workspace, or path writable
+by another same-privilege process. Same-privilege parent replacement is outside
+the evidence threat model. A partial file retained after an ambiguous write or
+fsync failure is not removed or overwritten: retry fails on the conflict and
+requires manual reconciliation while the authorization remains consumed.
 
 ## Controller serialization and private bridge handoff
 
@@ -106,7 +155,11 @@ The V2 bridge is a new private App Service created from the beginning with:
 - package SHA-256, size, ETag, version ID, WORM policy, network posture, and
   critical full App Settings map committed in source-pinned evidence.
 
-The package URL is not a secret. The GitHub runner validates the URL as bound
+The package blob is addressed under
+`v2/control/<merged-S1-prime-source-SHA>/paperdesk-private-release-bridge.zip`.
+The activated contract binds that S1-prime package-source SHA separately from
+the later S2 control-workflow SHA, so the evidence-only S2 commit neither copies
+nor silently re-uploads the package. The package URL is not a secret. The GitHub runner validates the URL as bound
 metadata in the exact S2 evidence, but it receives no SAS, Storage bearer token,
 account key, or package-write permission. The package, accepted registry, and
 result containers must each be private and Locked for at least 91 days.
@@ -118,6 +171,44 @@ and is the sole completeness marker. Production activation uses the system
 identity with exact package-container read access and sets
 `WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID=SystemAssigned`; it never uses a
 SAS or a GitHub runner credential.
+
+## Release-state read-only accepted-baseline registry preflight
+
+The public production caller first observes the live release SHA and invokes
+the release-state read-only `registry-bridge-preflight` operation through the
+existing trusted production workflow.
+This reuses the exact production caller ID, path, ref, event and run coordinates:
+there is no fourth trusted caller and PaperDesk is not granted direct Azure or
+Storage authority. The private bridge performs two deterministic exact reads,
+never a list: `v2/accepted/<live-sha>/manifest.json` and the immutable initial
+fallback `v2/accepted/<live-sha>/bootstrap-consumed/manifest.json`. The fallback
+is valid only when the manifest source is the fixed bootstrap SHA. Both paths
+present is ambiguity; neither present, any descriptor-chain mismatch, a third
+state, or a live-production mismatch fails closed. Its bounded transport
+transiently acquires the controller lease, creates the mailbox request/result,
+installs temporary bridge App Settings, starts and stops the exact WebJob, and
+cleans up its transient control state. It does not write the registry/package
+stores, acquire the activation fence, or change production.
+
+Normal strict persistence commits the canonical source-keyed accepted manifest
+last. The public control receipt retains exact five-field `acceptedBaseline`,
+`pendingRelease`, and `consumedMarker` descriptors (with exact nulls where the
+operation does not produce one) under schema version 6. Those retained
+descriptors recover runner-loss and cross-workflow handoff without depending on
+the 90-day artifact window. Rollback dispatch is routed through the same existing
+trusted production workflow, not a new caller.
+
+The release pipeline carries four independent run identities. The source pair
+selects the verified main-push artifact and provenance; the candidate pair
+selects the successful deploy-candidate run and its exact deployment-coordinate
+receipt; the acceptance pair selects the fully accepted receipt; and the
+evidence pair selects post-deploy evidence. No pair may be reused. The durable
+v2 accepted manifest stores separate `source` and `deployment` objects and the
+source-keyed legacy registry address remains
+`v1/releases/<sha>/<source-run-id>/<acceptance-run-id>/`. Private mailbox request
+schema version 2 adds `candidateRunId` and `candidateRunAttempt`, requires them
+only for `persist-accepted-release`, and requires exact nulls for every other
+operation. The public-control receipt schema version 6 mirrors that distinction.
 
 ## Production activation fence and proof
 
@@ -205,19 +296,60 @@ Activation is blocked until all of the following are independently proven:
 - S1 source review, exact resource provisioning, S2 evidence review, sole FIC
   repin to S2, and exact main caller pin;
 - V2 bridge package upload by temporary bounded local authority, exact readback,
-  removal of the owned temporary `/32` firewall rule and Blob Data Contributor
-  assignment, and proof both are absent before bridge start;
+  removal of the owned temporary `/32` firewall rule and exact custom
+  create-new/readback package-role assignment and definition, and proof all are
+  absent before bridge start;
 - service-endpoint topology, private containers, default-deny Storage firewall,
-  exact integration subnet, and route-all outbound for bridge and production;
+  exact integration subnet, bridge `allTraffic=true` plus
+  `applicationTraffic=true`, and the production routing projection observed as
+  `applicationTraffic=true`, `allTraffic=false`, and legacy
+  `vnetRouteAllEnabled=true` without a pre-S2 production mutation;
 - exact live RBAC inventories and role definitions for publisher, bridge,
   writer, reader, signer, production activation, production system identity,
   and every audit-only assignment;
 - at-least-91-day Locked policies for package, accepted, and result containers;
 - exact versioned Key Vault key/JWK proof, bridge read-only key role, signer-only
   sign role, and no unexpected sensitive assignment;
-- immutable bootstrap receipt, managed-identity package-fetch self-test, exact
-  run-from-package marker/index/health proof, finite-lease tests, cleanup fast
-  lane plus expiry fallback, and durable retained receipts.
+- immutable bootstrap receipt and separate full canonical terminal bundle; one
+  fresh source-and-package-pinned WebJob invocation after an exact pre-run
+  history boundary reaching terminal `Success` under the exact canary control
+  and settings; managed-identity package-fetch and activation-fence cleanup;
+  finite-lease tests, cleanup fast lane plus expiry fallback, and durable
+  retained receipts. Bootstrap does not claim HTTP index/live/ready/app-health/
+  security or literal stdout-marker observation; those remain later
+  activation/deployment proofs.
 
 Until those gates pass, the null activation contract remains the controlling
-state and every mutating mode must stop before Azure login.
+state. The only mutating mode allowed before S2 is the exact separately
+authorized one-shot bootstrap; every reusable-workflow, mailbox/release,
+accepted-release, production activation/deployment, and caller-integration mode
+must stop before Azure login.
+
+## S2 repin and activation ceremony
+
+The reviewed S2 source must differ from S1-prime only by the five evidence
+components and terminal receipt bundle named by the evidence model. It must have
+the exact two trusted exact-head approvals, successful `test` check, verified
+signature and protected-main merge. The source-owned
+`private_release_v2_fic_repin.py observe` command revalidates those facts, the
+historical bootstrap authorization/preflight and all six canonical S2 files
+before making only Graph and ARM reads. It writes a fresh preflight and
+deliberately non-executable authorization template.
+
+Under a new finite external single-use authorization,
+`private_release_v2_fic_repin.py apply` first creates a permanent
+authorization-specific empty ARM deployment claim. It then deletes only the
+exact S1-prime federated identity credential, proves the credential collection
+is empty, and creates the exact sole S2 credential. Extra credentials, altered
+claims, a third state, authorization replay or S1/S2 equality fail closed. A
+same-host retry may resume only from the proven empty or exact-S2 state; it never
+creates overlapping credentials. The create-only `06-terminal-receipt.json`
+must pass `private_release_v2_fic_repin.py validate-receipt`.
+
+`private_release_v2_activation.py` is then an offline-only, create-only builder.
+It validates the bootstrap history, the six S2 files and repin receipt, derives
+`mergedControlWorkflowSha=S2` with `bridgePackageSourceSha=S1-prime`, and invokes
+the normal strict production activation loader. It cannot publish environment
+variables, update a GitHub secret, grant caller authority, call Azure or deploy.
+Those caller-integration mutations require a separate exact ledger and explicit
+authorization after the activation output has been independently reviewed.
