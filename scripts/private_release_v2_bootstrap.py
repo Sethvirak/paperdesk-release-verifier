@@ -76,6 +76,24 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS = frozenset(
+    {
+        "readBackExactSigningPublicJwk",
+        "createInitialIdleActivationFence",
+        "createControllerLeaseCanaryBlob",
+        "exerciseControllerLeaseCanary",
+        "removeControllerLeaseCanaryBlob",
+    }
+)
+STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
+    "I accept that Azure Storage exposes no ETag for this account update, so the "
+    "temporary uploader ipRules PATCH cannot atomically exclude an unrelated "
+    "concurrent administrator change during its bounded pre-read/PATCH/post-read window. "
+    "I also accept that process death after the PATCH, an ambiguous successful transport, "
+    "or a local result-journal/fsync failure can leave the exact uploader /32 in place; "
+    "execution and any later release must stop until a fresh live read proves the /32 and "
+    "all related temporary roles absent, and manual cleanup may be required."
+)
 
 
 class BootstrapError(RuntimeError):
@@ -1841,6 +1859,11 @@ def _validate_authorization_document(
         )
     ):
         fail("confirmation phrase does not match the exact authorization")
+    if (
+        confirmation_phrase is not None
+        and STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE not in confirmation_phrase
+    ):
+        fail("confirmation phrase does not explicitly accept the storage ACL and recovery residuals")
 
     single_use = _exact_keys(
         root["singleUse"],
@@ -2116,6 +2139,52 @@ def _production_boundary_requests(plan: Mapping[str, Any]) -> list[dict[str, str
     ]
 
 
+def _production_boundary_digest_document(
+    method: str,
+    url: str,
+    document: Any,
+) -> Any:
+    """Return the canonical non-persisted body used by both preflight paths.
+
+    The production app-settings response contains secret names and values.  Its
+    exact ARM envelope is validated, but only the settings map participates in
+    the in-memory digest document.  Keeping this projector in the shared
+    executor module prevents the read-only observer and the mandatory fresh
+    apply-time preflight from authorizing different response hashes.
+    """
+
+    if method != "POST":
+        return document
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.path.lower().endswith("/config/appsettings/list"):
+        fail("production boundary POST is outside the app-settings read boundary")
+    expected_id = parsed.path.removesuffix("/list")
+    if (
+        not isinstance(document, Mapping)
+        or set(document) != {"id", "location", "name", "properties", "tags", "type"}
+        or str(document.get("id", "")).lower() != expected_id.lower()
+        or document.get("name") != "appsettings"
+        or str(document.get("type", "")).lower() != "microsoft.web/sites/config"
+        or document.get("location") != "Southeast Asia"
+        or not isinstance(document.get("tags"), Mapping)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in document["tags"].items()
+        )
+    ):
+        fail("production app-settings response fields are not exact")
+    settings = document.get("properties")
+    if (
+        not isinstance(settings, Mapping)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in settings.items()
+        )
+    ):
+        fail("production app settings are not one exact string map")
+    return {"properties": dict(settings)}
+
+
 def _production_boundary_string_or_none(value: Any, label: str) -> str | None:
     if value is None:
         return None
@@ -2310,6 +2379,14 @@ def _project_production_boundary_documents(
     if not isinstance(routing, Mapping):
         fail("production outbound routing projection is absent")
     expected_site_id = site["resourceId"]
+    subnet_observations = [
+        value
+        for value in (
+            site_properties.get("virtualNetworkSubnetId"),
+            web_properties.get("virtualNetworkSubnetId"),
+        )
+        if value is not None and value != ""
+    ]
     if (
         str(site_document.get("id", "")).lower() != expected_site_id.lower()
         or site_document.get("name") != site["name"]
@@ -2318,7 +2395,8 @@ def _project_production_boundary_documents(
         or site_identity.get("type") != "SystemAssigned"
         or site_identity.get("tenantId") != TENANT
         or site_identity.get("principalId") != identity["principalId"]
-        or web_properties.get("virtualNetworkSubnetId") != subnet["resourceId"]
+        or not subnet_observations
+        or any(value != subnet["resourceId"] for value in subnet_observations)
         or routing.get("allTraffic") is not False
         or routing.get("applicationTraffic") is not True
         or web_properties.get("vnetRouteAllEnabled") is not True
@@ -2460,17 +2538,106 @@ def _validate_production_boundary_projection(
 
 
 def _quoted_etag(value: Any, label: str) -> str:
-    if not isinstance(value, str) or re.fullmatch(r'"[^"\r\n]{1,256}"', value) is None:
-        fail(f"{label} is not an exact quoted ETag")
+    if not isinstance(value, str) or not (
+        re.fullmatch(r'"[^"\r\n]{1,256}"', value) is not None
+        or re.fullmatch(r"[0-9A-Fa-f]{8,64}", value) is not None
+    ):
+        fail(f"{label} is not one exact strong ETag token")
     return value
 
 
-def _validate_storage_acl_prestate(value: Any, *, adding: bool, uploader: str) -> dict[str, Any]:
-    acl = _exact_keys(
-        value,
-        {"defaultAction", "bypass", "ipRules", "resourceAccessRules", "virtualNetworkRules"},
-        "storage ACL prestate",
+def _unpaginated_graph_collection(
+    value: Any, label: str
+) -> list[Mapping[str, Any]]:
+    if not isinstance(value, Mapping):
+        fail(f"{label} Graph collection is not one object")
+    items = value.get("value")
+    if (
+        not isinstance(items, list)
+        or value.get("@odata.nextLink") not in {None, ""}
+        or any(not isinstance(item, Mapping) for item in items)
+    ):
+        fail(f"{label} Graph collection is partial or invalid")
+    return list(items)
+
+
+def _publisher_fic_inventory(
+    value: Any,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    label: str,
+) -> tuple[Mapping[str, Any] | None, list[Mapping[str, Any]]]:
+    applications = _unpaginated_graph_collection(value, label)
+    if len(applications) > 1:
+        fail(f"{label} resolves to more than one source-named application")
+    if not applications:
+        return None, []
+    application = applications[0]
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    if (
+        application.get("displayName") != resources["publisherApplication"]["name"]
+        or not GUID.fullmatch(str(application.get("id", "")))
+        or not GUID.fullmatch(str(application.get("appId", "")))
+        or application.get("federatedIdentityCredentials@odata.nextLink")
+        not in {None, ""}
+    ):
+        fail(f"{label} publisher application inventory drifted")
+    credentials = application.get("federatedIdentityCredentials")
+    if not isinstance(credentials, list) or any(
+        not isinstance(item, Mapping) for item in credentials
+    ):
+        fail(f"{label} expanded FIC inventory is partial or invalid")
+    if len(credentials) > 1:
+        fail(f"{label} publisher FIC inventory is not sole")
+    return application, list(credentials)
+
+
+def _validate_exact_publisher_fic(
+    value: Any,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        fail(f"{label} publisher FIC is not one object")
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    resource = resources["publisherFederatedCredential"]
+    expression = resource["claimsMatchingExpressionTemplate"].replace(
+        "${authorization.source.mergedMain.commitSha}",
+        authorization["source"]["mergedMain"]["commitSha"],
     )
+    expected = {
+        "name": resource["name"],
+        "issuer": resource["issuer"],
+        "audiences": resource["audiences"],
+        "subject": None,
+        "claimsMatchingExpression": {
+            "languageVersion": resource["claimsMatchingExpressionLanguageVersion"],
+            "value": expression,
+        },
+    }
+    _guid(value.get("id"), f"{label} publisher federated credential ID")
+    projection = {key: value.get(key) for key in expected}
+    if projection != expected:
+        fail(f"{label} publisher FIC is not exact")
+    return {"id": value["id"], **projection}
+
+
+def _normalize_storage_acl_prestate(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        fail("storage ACL prestate is not one object")
+    required = {"defaultAction", "bypass", "ipRules", "virtualNetworkRules"}
+    allowed = required | {"resourceAccessRules", "ipv6Rules"}
+    if not required.issubset(value) or not set(value).issubset(allowed):
+        fail("storage ACL prestate fields are not exact")
+    normalized = dict(value)
+    normalized.setdefault("resourceAccessRules", [])
+    normalized.setdefault("ipv6Rules", [])
+    return normalized
+
+
+def _validate_storage_acl_prestate(value: Any, *, adding: bool, uploader: str) -> dict[str, Any]:
+    acl = _normalize_storage_acl_prestate(value)
     subnet = (
         f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-master-data-structure-sea/"
         "providers/Microsoft.Network/virtualNetworks/vnet-master-data-structure-sea/"
@@ -2481,6 +2648,7 @@ def _validate_storage_acl_prestate(value: Any, *, adding: bool, uploader: str) -
         acl["defaultAction"] != "Deny"
         or acl["bypass"] != "None"
         or acl["resourceAccessRules"] != []
+        or acl["ipv6Rules"] != []
         or acl["virtualNetworkRules"]
         != [{"id": subnet, "action": "Allow", "state": "Succeeded"}]
         or acl["ipRules"] != ([] if adding else [expected_rule])
@@ -2505,6 +2673,26 @@ def _resource_scope_from_plan(plan: Mapping[str, Any], scope: str) -> str:
 def _custom_role_definition_specs(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Return the exact canonical ARM projections for all reviewed custom roles."""
 
+    # These two deterministic definitions already protect the accepted-release
+    # registry in Azure.  Their authority is exactly the reviewed V2 authority,
+    # so preserve their established human-readable metadata instead of turning
+    # a harmless name/description difference into an Azure mutation.
+    established_registry_metadata = {
+        "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d": {
+            "roleName": "PaperDesk Accepted Release Blob Append Writer",
+            "description": (
+                "PaperDesk accepted-release registry: create-only blob "
+                "data-plane permission at an exact container assignment scope."
+            ),
+        },
+        "e005b62b-037b-4989-b492-932669ec0842": {
+            "roleName": "PaperDesk Accepted Release Blob Reader",
+            "description": (
+                "PaperDesk accepted-release registry: read-only blob "
+                "data-plane permission at an exact container assignment scope."
+            ),
+        },
+    }
     grouped: dict[str, dict[str, Any]] = {}
     for role in plan["roleMatrix"]:
         if role.get("definitionKind") == "BuiltInRole":
@@ -2525,13 +2713,20 @@ def _custom_role_definition_specs(plan: Mapping[str, Any]) -> dict[str, dict[str
             f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/"
             f"roleDefinitions/{definition_id}"
         )
+        metadata = established_registry_metadata.get(
+            definition_id,
+            {
+                "roleName": f"PaperDesk V2 {role['name']}",
+                "description": "PaperDesk private release V2 exact least-authority role",
+            },
+        )
         grouped[definition_id] = {
             "id": resource_id,
             "name": definition_id,
             "type": "Microsoft.Authorization/roleDefinitions",
             "properties": {
-                "roleName": f"PaperDesk V2 {role['name']}",
-                "description": "PaperDesk private release V2 exact least-authority role",
+                "roleName": metadata["roleName"],
+                "description": metadata["description"],
                 "type": "CustomRole",
                 "permissions": [permission],
                 "assignableScopes": [f"/subscriptions/{SUBSCRIPTION}"],
@@ -2805,6 +3000,43 @@ def _bootstrap_self_test_control_from_projections(
     return control
 
 
+def _temporary_role_definition_readback_url(
+    operation_id: str,
+    plan: Mapping[str, Any],
+) -> str | None:
+    temporary = plan["temporaryAccess"]
+    definition_ids = {
+        "addOwnedUploaderPackageRole": temporary["roleDefinitionId"],
+        "removeOwnedUploaderPackageRole": temporary["roleDefinitionId"],
+        "addOwnedOperatorKeyReadRole": temporary[
+            "temporaryKeyReadRoleDefinitionId"
+        ],
+        "removeOwnedOperatorKeyReadRole": temporary[
+            "temporaryKeyReadRoleDefinitionId"
+        ],
+        "addOwnedOperatorFenceBootstrapRole": temporary[
+            "temporaryFenceRoleDefinitionId"
+        ],
+        "removeOwnedOperatorFenceBootstrapRole": temporary[
+            "temporaryFenceRoleDefinitionId"
+        ],
+        "addOwnedOperatorControllerCanaryRole": temporary[
+            "temporaryControllerRoleDefinitionId"
+        ],
+        "removeOwnedOperatorControllerCanaryRole": temporary[
+            "temporaryControllerRoleDefinitionId"
+        ],
+    }
+    definition_id = definition_ids.get(operation_id)
+    if definition_id is None:
+        return None
+    return (
+        "https://management.azure.com/subscriptions/"
+        f"{SUBSCRIPTION}/providers/Microsoft.Authorization/"
+        f"roleDefinitions/{definition_id}?api-version=2022-04-01"
+    )
+
+
 def _operation_readback_url(
     operation_id: str,
     plan: Mapping[str, Any],
@@ -2866,7 +3098,13 @@ def _operation_readback_url(
             f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/{collection}",
             "2022-04-01",
         )
-        filter_value = "type eq 'CustomRole'" if collection == "roleDefinitions" else "atScopeAndBelow()"
+        if collection == "roleAssignments":
+            # The Authorization API's subscription-scoped collection already
+            # includes assignments at descendant resource scopes.  Azure
+            # rejects the formerly used atScopeAndBelow() expression; leaving
+            # the collection unfiltered is the supported exact inventory read.
+            return url
+        filter_value = "type eq 'CustomRole'"
         return f"{url}&$filter={urllib.parse.quote(filter_value, safe='()')}"
     temporary_role_operations = {
         "addOwnedUploaderPackageRole": (plan["temporaryAccess"]["scope"], plan["temporaryAccess"]["roleAssignmentId"]),
@@ -7123,6 +7361,7 @@ def _operation_context_policy(
         "createInitialIdleActivationFence": {"url", "etag", "versionId", "sha256"},
         "extendAcceptedRetentionFrom30To91Days": set(),
         "extendResultRetentionFrom30To91Days": set(),
+        "createSolePublisherFicToSignedBootstrapSource": set(),
     }
     observed_fields: set[str] = set()
     if operation_id == "retireLegacyPublisherFic":
@@ -7132,7 +7371,7 @@ def _operation_context_policy(
     elif operation_id == "createSigningKeyVersion":
         observed_fields.add("expiresAt")
     elif operation_id == "addOwnedUploaderIpv4Rule":
-        observed_fields |= {"etag", "uploaderIpv4", "preNetworkAcls"}
+        observed_fields |= {"uploaderIpv4", "preNetworkAcls"}
     elif operation_id == "removeOwnedUploaderIpv4Rule":
         observed_fields |= {"uploaderIpv4", "restoreNetworkAcls"}
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
@@ -7166,7 +7405,9 @@ def _operation_context_policy(
             "createSignerIdentity.resourceId",
             "createProductionActivationIdentity.resourceId",
         ],
-        "removeOwnedUploaderIpv4Rule": ["addOwnedUploaderIpv4Rule.postEtag"],
+        "removeOwnedUploaderIpv4Rule": [
+            "addOwnedUploaderIpv4Rule.addedNetworkAclsSha256"
+        ],
         "configureBridgeExactVersionedPackageAndCriticalSettings": [
             "uploadVersionedBridgePackage.url",
             "uploadVersionedBridgePackage.versionId",
@@ -7285,7 +7526,13 @@ def _validate_operation_context(
     context = _exact_keys(value, required, f"{operation_id} context")
 
     if "etag" in required:
-        _quoted_etag(context["etag"], f"{operation_id} context ETag")
+        if (
+            operation_id == "lockPackageRetentionAt91Days"
+            and context["etag"] is None
+        ):
+            pass
+        else:
+            _quoted_etag(context["etag"], f"{operation_id} context ETag")
     if operation_id == "retireLegacyPublisherFic" and not GUID.fullmatch(
         str(context["legacyFederatedCredentialId"])
     ):
@@ -7312,6 +7559,7 @@ def _validate_operation_context(
         settings = context["preAppSettings"]
         if (
             not isinstance(settings, dict)
+            or settings != {}
             or any(not isinstance(key, str) or not isinstance(item, str) for key, item in settings.items())
             or any(
                 key in settings
@@ -7457,7 +7705,14 @@ def validate_preflight_evidence(
         operation_id = admission["operationId"]
         if (
             operation_id not in azure_mutation_ids
-            or admission["status"] not in {"absent", "exact", "owned-present"}
+            or admission["status"]
+            not in {
+                "absent",
+                "exact",
+                "owned-present",
+                "network-inaccessible",
+                "temporary-access-inaccessible",
+            }
             or not isinstance(admission["context"], dict)
             or admission["context"].get("executionDecision")
             not in {"adopt-exact", "apply-exact"}
@@ -7469,6 +7724,16 @@ def validate_preflight_evidence(
         )
         decision = admission["context"]["executionDecision"]
         kind = operation_map[operation_id]["kind"]
+        if (
+            admission["status"] == "network-inaccessible"
+            and operation_id != "uploadVersionedBridgePackage"
+        ):
+            fail("network-inaccessible status is outside the package upload boundary")
+        if (
+            admission["status"] == "temporary-access-inaccessible"
+            and operation_id not in TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS
+        ):
+            fail("temporary-access-inaccessible status is outside a temporary RBAC boundary")
         if decision == "adopt-exact":
             expected_adopt_status = (
                 "absent" if kind.startswith(("delete-", "remove-", "temporary-remove"))
@@ -7476,17 +7741,55 @@ def validate_preflight_evidence(
             )
             if admission["status"] != expected_adopt_status:
                 fail("adopt decision is inconsistent with the observed operation state")
+        elif admission["status"] == "temporary-access-inaccessible":
+            # These exact reads are intentionally inaccessible until their
+            # source-planned, authorization-owned temporary role is created.
+            # Their subsequent writes are create-only or authorization-owned
+            # canary operations and remain protected by exact readback.
+            pass
+        elif operation_id in {
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        }:
+            etag = admission["context"].get("etag")
+            if operation_id == "lockPackageRetentionAt91Days":
+                valid_prestate = (
+                    admission["status"] == "absent" and etag is None
+                ) or (
+                    admission["status"] == "exact"
+                    and isinstance(etag, str)
+                    and _quoted_etag(etag, "package WORM prestate ETag") == etag
+                )
+            else:
+                valid_prestate = (
+                    admission["status"] == "exact"
+                    and isinstance(etag, str)
+                    and _quoted_etag(etag, "existing WORM prestate ETag") == etag
+                )
+            if not valid_prestate:
+                fail("WORM decision is not bound to one exact supported prestate")
         elif kind.startswith(("delete-", "remove-", "temporary-remove")):
             if admission["status"] not in {"exact", "owned-present"}:
                 fail("delete decision is not bound to one observed existing target")
         elif kind.startswith(("azure-global-create-only", "azure-ad-create-only", "temporary-add")):
-            if admission["status"] != "absent":
+            expected_create_statuses = (
+                {"absent", "network-inaccessible"}
+                if operation_id == "uploadVersionedBridgePackage"
+                else {"absent"}
+            )
+            if admission["status"] not in expected_create_statuses:
                 fail("create-only decision is not bound to an absent target")
         elif (
             kind.startswith("create-or-adopt")
             and operation_id
             not in {"createCustomRoleDefinitions", "createExactRoleAssignments"}
-            and admission["status"] != "absent"
+            and admission["status"]
+            not in (
+                {"absent", "network-inaccessible"}
+                if operation_id == "uploadVersionedBridgePackage"
+                else {"absent"}
+            )
         ):
             fail("create decision is not bound to an absent create-or-adopt target")
         elif operation_id in {
@@ -7494,6 +7797,11 @@ def validate_preflight_evidence(
             "createExactRoleAssignments",
         } and admission["status"] not in {"absent", "exact", "owned-present"}:
             fail("role-matrix resume state is not source-owned")
+        elif (
+            operation_id == "readBackExactSigningPublicJwk"
+            and admission["status"] != "temporary-access-inaccessible"
+        ):
+            fail("signing JWK read is not bound to the temporary RBAC boundary")
         for field, phase in (("probeIds", "preflight"), ("desiredProbeIds", "readback")):
             ids = admission[field]
             if (
@@ -7503,6 +7811,23 @@ def validate_preflight_evidence(
                 or any(item not in probe_map or probe_map[item]["phase"] != phase for item in ids)
             ):
                 fail("operation admission probe binding is invalid")
+        temporary_definition_url = _temporary_role_definition_readback_url(
+            operation_id, plan
+        )
+        if temporary_definition_url is not None:
+            definition_probes = [
+                probe_map[item]
+                for item in admission["probeIds"]
+                if probe_map[item]["method"] == "GET"
+                and probe_map[item]["url"] == temporary_definition_url
+            ]
+            if (
+                len(definition_probes) != 1
+                or definition_probes[0]["status"] != 404
+            ):
+                fail(
+                    "temporary role definition absence is not bound to the fresh preflight"
+                )
         if any(
             probe_map[item]["validatorId"] != f"operation:{operation_id}"
             for item in admission["desiredProbeIds"]
@@ -7802,6 +8127,11 @@ class AzureCliRestSession:
         allowed_audiences = {resource, resource.rstrip("/")}
         if resource == "https://graph.microsoft.com/":
             allowed_audiences.add("00000003-0000-0000-c000-000000000000")
+        if resource == "https://vault.azure.net":
+            # Azure Public Cloud may issue Key Vault tokens with the service's
+            # pre-registered application ID as ``aud`` instead of its resource
+            # URI.  Both values identify the same fixed Key Vault audience.
+            allowed_audiences.add("cfa8b339-82a2-471a-a3c9-0fc0be7a4093")
         if (
             claims.get("tid") != TENANT
             or claims.get("oid") != self.authorization["azure"]["accountObjectId"]
@@ -7877,6 +8207,115 @@ def _response_sha256(response: _RestResponse) -> str:
             raise BootstrapError("Azure REST JSON response is invalid") from exc
         return sha256_bytes(canonical_json_bytes(parsed))
     return sha256_bytes(response.body)
+
+
+def _package_blob_error_projection(
+    method: str, url: str, response: _RestResponse
+) -> dict[str, str] | None:
+    parsed = urllib.parse.urlsplit(url)
+    allowed_path = any(
+        pattern.fullmatch(parsed.path) is not None
+        for pattern in (
+            re.compile(
+                r"/paperdesk-deployment-packages/v2/control/[0-9a-f]{40}/"
+                r"paperdesk-private-release-bridge\.zip"
+            ),
+            re.compile(
+                r"/paperdesk-release-activation-control/"
+                r"v2/production-activation-fence\.json"
+            ),
+            re.compile(
+                r"/paperdesk-release-controller-lock/v2/bootstrap-canary/"
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json"
+            ),
+        )
+    )
+    if (
+        method != "GET"
+        or (parsed.hostname or "").lower()
+        != "mdspdbak2608089c4e.blob.core.windows.net"
+        or parsed.query
+        or parsed.fragment
+        or not allowed_path
+        or not 400 <= response.status <= 499
+    ):
+        return None
+    content_type = next(
+        (
+            value
+            for key, value in response.headers.items()
+            if key.lower() == "content-type"
+        ),
+        "",
+    )
+    matches = re.findall(rb"<Code>([A-Za-z0-9]+)</Code>", response.body)
+    if "xml" not in content_type.lower() or len(matches) != 1:
+        fail("storage blob error response is not one exact XML error")
+    code = matches[0].decode("ascii")
+    allowed = {
+        "AuthenticationFailed",
+        "AuthorizationFailure",
+        "AuthorizationPermissionMismatch",
+        "BlobNotFound",
+    }
+    if code not in allowed:
+        fail("storage blob preflight returned an unsupported storage error")
+    return {"storageErrorCode": code}
+
+
+def _key_vault_preflight_error_projection(
+    method: str, url: str, response: _RestResponse
+) -> dict[str, str] | None:
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        method != "GET"
+        or (parsed.hostname or "").lower()
+        != "kv-mds-sea-9c4e0d0d.vault.azure.net"
+        or parsed.path != "/keys/paperdesk-release-result-signing/versions"
+        or urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        != {"api-version": ["7.4"]}
+        or response.status != 403
+    ):
+        return None
+    try:
+        document = json.loads(
+            response.body.decode("utf-8"),
+            object_pairs_hook=_duplicate_safe_pairs,
+            parse_constant=lambda value: fail(
+                f"invalid JSON constant in Key Vault error: {value}"
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError("Key Vault preflight error is not exact JSON") from exc
+    error = document.get("error") if isinstance(document, Mapping) else None
+    inner = error.get("innererror") if isinstance(error, Mapping) else None
+    if (
+        not isinstance(error, Mapping)
+        or error.get("code") != "Forbidden"
+        or not isinstance(inner, Mapping)
+        or inner.get("code") != "ForbiddenByRbac"
+    ):
+        fail("Key Vault preflight is not blocked by the temporary RBAC boundary")
+    return {
+        "keyVaultErrorCode": "Forbidden",
+        "keyVaultInnerErrorCode": "ForbiddenByRbac",
+    }
+
+
+def _preflight_response_sha256(
+    method: str, url: str, response: _RestResponse
+) -> str:
+    storage_error = _package_blob_error_projection(method, url, response)
+    if storage_error is not None:
+        # Azure includes volatile request IDs and timestamps in the XML body.
+        # Bind the exact stable error code while status and URL remain separate
+        # preflight fields.
+        return sha256_bytes(canonical_json_bytes(storage_error))
+    key_vault_error = _key_vault_preflight_error_projection(method, url, response)
+    if key_vault_error is not None:
+        return sha256_bytes(canonical_json_bytes(key_vault_error))
+    return _response_sha256(response)
 
 
 class AzureCliBootstrapTransport:
@@ -8310,7 +8749,9 @@ class AzureCliBootstrapTransport:
         return {
             **probe,
             "status": response.status,
-            "responseSha256": _response_sha256(response),
+            "responseSha256": _preflight_response_sha256(
+                probe["method"], probe["url"], response
+            ),
         }
 
     @staticmethod
@@ -8475,6 +8916,7 @@ class AzureCliBootstrapTransport:
             network_acls = properties.get("networkAcls") if isinstance(properties, Mapping) else None
             if not isinstance(network_acls, Mapping):
                 fail("storage ACL source projection is absent")
+            network_acls = _normalize_storage_acl_prestate(network_acls)
             retained = {
                 "networkAclsSha256": sha256_bytes(canonical_json_bytes(network_acls)),
                 "defaultAction": network_acls.get("defaultAction"),
@@ -8577,6 +9019,9 @@ class AzureCliBootstrapTransport:
             }
             family = "resource-group-projection"
         elif operation_id == "retireLegacyPublisherFic":
+            remaining_credentials = _unpaginated_graph_collection(
+                document, "legacy publisher FIC terminal inventory"
+            )
             retained = {
                 "applicationObjectId": self.plan["legacyPublisherRetirement"][
                     "applicationObjectId"
@@ -8584,7 +9029,7 @@ class AzureCliBootstrapTransport:
                 "removedFederatedCredentialId": facts.get(
                     "federatedCredentialId"
                 ),
-                "federatedIdentityCredentials": document.get("value"),
+                "federatedIdentityCredentials": remaining_credentials,
             }
             family = "legacy-publisher-fic-absence-inventory"
         elif operation_id in {
@@ -8674,12 +9119,23 @@ class AzureCliBootstrapTransport:
                 "createPublisherApplication",
                 "createPublisherServicePrincipal",
                 "grantPublisherGraphApplicationReadAll",
-                "createSolePublisherFicToSignedBootstrapSource",
             }:
-                values = document.get("value")
-                if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], Mapping):
+                values = _unpaginated_graph_collection(
+                    document, f"{operation_id} readback"
+                )
+                if len(values) != 1:
                     fail("Graph readback is not one exact source-named object")
                 projection_document = values[0]
+            elif operation_id == "createSolePublisherFicToSignedBootstrapSource":
+                application, _credentials = _publisher_fic_inventory(
+                    document,
+                    self.plan,
+                    self.authorization,
+                    f"{operation_id} readback",
+                )
+                if application is None:
+                    fail("publisher FIC readback has no exact application")
+                projection_document = application
             target_id = contract.get("targetResourceId")
             target_name = contract.get("targetName")
             direct_resource_operations = {
@@ -8872,6 +9328,10 @@ class AzureCliBootstrapTransport:
                 publisher_id = projection_document.get("id")
                 if (
                     runtime_facts is None
+                    or projection_document.get(
+                        "appRoleAssignments@odata.nextLink"
+                    )
+                    not in {None, ""}
                     or projection_document.get("accountEnabled") is not True
                     or projection_document.get("servicePrincipalType") != "Application"
                     or projection_document.get("passwordCredentials") != []
@@ -8886,7 +9346,9 @@ class AzureCliBootstrapTransport:
                 ):
                     fail("publisher Graph Application.Read.All assignment is not sole and exact")
             elif operation_id == "retireLegacyPublisherFic":
-                values = document.get("value")
+                values = _unpaginated_graph_collection(
+                    document, "legacy publisher FIC readback"
+                )
                 removed_id = runtime_facts.get("federatedCredentialId") if runtime_facts else None
                 if (
                     not isinstance(values, list)
@@ -9051,14 +9513,36 @@ class AzureCliBootstrapTransport:
             elif operation_id == "readBackExactSigningPublicJwk":
                 values = document.get("value")
                 kid = runtime_facts.get("kid") if runtime_facts else None
-                matches = [item for item in values if isinstance(item, Mapping) and item.get("kid") == kid] if isinstance(values, list) else []
+                if not isinstance(values, list) or any(
+                    not isinstance(item, Mapping) for item in values
+                ):
+                    fail("public signing JWK versions inventory is invalid")
+                matches = [item for item in values if item.get("kid") == kid]
+                observed_attributes = (
+                    matches[0].get("attributes") if len(matches) == 1 else None
+                )
+                retained_attributes = (
+                    {
+                        name: observed_attributes.get(name)
+                        for name in (
+                            "enabled",
+                            "nbf",
+                            "exp",
+                            "created",
+                            "updated",
+                            "recoveryLevel",
+                            "recoverableDays",
+                            "exportable",
+                        )
+                    }
+                    if isinstance(observed_attributes, Mapping)
+                    else None
+                )
                 if (
-                    len(matches) != 1
-                    or matches[0].get("kty") != "RSA"
-                    or matches[0].get("e") != "AQAB"
-                    or matches[0].get("key_ops") != ["sign", "verify"]
-                    or matches[0].get("n") != runtime_facts.get("n")
-                    or matches[0].get("attributes") != runtime_facts.get("attributes")
+                    runtime_facts is None
+                    or document.get("nextLink") not in {None, ""}
+                    or len(matches) != 1
+                    or retained_attributes != runtime_facts.get("attributes")
                 ):
                     fail("public signing JWK versions readback is not exact")
             elif operation_id == "exerciseControllerLeaseCanary":
@@ -9098,24 +9582,12 @@ class AzureCliBootstrapTransport:
                 credentials = projection_document.get("federatedIdentityCredentials")
                 if not isinstance(credentials, list) or len(credentials) != 1 or not isinstance(credentials[0], Mapping):
                     fail("publisher FIC inventory is not sole")
-                credential = credentials[0]
-                resource = self.resources["publisherFederatedCredential"]
-                expression = resource["claimsMatchingExpressionTemplate"].replace(
-                    "${authorization.source.mergedMain.commitSha}",
-                    self.authorization["source"]["mergedMain"]["commitSha"],
+                _validate_exact_publisher_fic(
+                    credentials[0],
+                    self.plan,
+                    self.authorization,
+                    "publisher FIC readback",
                 )
-                if (
-                    credential.get("name") != resource["name"]
-                    or credential.get("issuer") != resource["issuer"]
-                    or credential.get("audiences") != resource["audiences"]
-                    or credential.get("subject") is not None
-                    or credential.get("claimsMatchingExpression")
-                    != {
-                        "languageVersion": resource["claimsMatchingExpressionLanguageVersion"],
-                        "value": expression,
-                    }
-                ):
-                    fail("publisher FIC readback is not exact")
         source_projection = self._source_operation_projection(
             contract=contract,
             response=response,
@@ -9261,10 +9733,13 @@ class AzureCliBootstrapTransport:
             )
             documents[request["id"]] = document
             original = self.probes[request["id"]]
+            digest_document = _production_boundary_digest_document(
+                request["method"], request["url"], document
+            )
             observed_probes[request["id"]] = {
                 **original,
                 "status": response.status,
-                "responseSha256": _response_sha256(response),
+                "responseSha256": sha256_bytes(canonical_json_bytes(digest_document)),
             }
         return (
             _project_production_boundary_documents(documents, self.plan),
@@ -9506,8 +9981,10 @@ class AzureCliBootstrapTransport:
                 f"/v1.0/servicePrincipals?$filter=appId%20eq%20'{self.GRAPH_APP_ID}'&$select=id,appId",
                 expected={200},
             )
-            values = graph.get("value")
-            if not isinstance(values, list) or len(values) != 1 or values[0].get("appId") != self.GRAPH_APP_ID:
+            values = _unpaginated_graph_collection(
+                graph, "Microsoft Graph service principal inventory"
+            )
+            if len(values) != 1 or values[0].get("appId") != self.GRAPH_APP_ID:
                 fail("Microsoft Graph service principal inventory is not unique")
             result = self._graph_json(
                 "POST",
@@ -9829,50 +10306,76 @@ class AzureCliBootstrapTransport:
             if network.version != 4 or network.prefixlen != 32:
                 fail("uploader IPv4 must be one exact /32")
             account = self.resources["storageAccount"]
+            target_url = self._arm_url(account["resourceId"], "2025-06-01")
+
+            def read_current_acl(label: str) -> dict[str, Any]:
+                current_response = self.session.request("GET", target_url)
+                current = self._json_response(current_response, {200}, label)
+                properties = current.get("properties")
+                network_acls = (
+                    properties.get("networkAcls")
+                    if isinstance(properties, Mapping)
+                    else None
+                )
+                return _normalize_storage_acl_prestate(network_acls)
+
             if operation_id == "addOwnedUploaderIpv4Rule":
                 restore = dict(context["preNetworkAcls"])
+                if read_current_acl("storage ACL pre-mutation readback") != restore:
+                    fail("storage ACL changed after authorization; re-observe before apply")
                 desired = dict(restore)
                 desired["ipRules"] = [{"value": str(network.network_address), "action": "Allow"}]
-                match_etag = _quoted_etag(context["etag"], "storage ACL prestate ETag")
             else:
                 add_proof = self._proof_detail(state, "addOwnedUploaderIpv4Rule")
                 expected_added_sha = add_proof.get("addedNetworkAclsSha256")
-                expected_etag = _quoted_etag(add_proof.get("postEtag"), "executor-owned storage ACL ETag")
-                current_response = self.session.request(
-                    "GET", self._arm_url(account["resourceId"], "2025-06-01")
-                )
-                current = self._json_response(current_response, {200}, "storage ACL cleanup readback")
-                properties = current.get("properties")
-                current_acl = properties.get("networkAcls") if isinstance(properties, Mapping) else None
-                current_etag = self._header(current_response, "ETag") or current.get("etag")
+                current_acl = read_current_acl("storage ACL cleanup readback")
                 if (
-                    not isinstance(current_acl, dict)
-                    or sha256_bytes(canonical_json_bytes(current_acl)) != expected_added_sha
-                    or current_etag != expected_etag
+                    sha256_bytes(canonical_json_bytes(current_acl))
+                    != expected_added_sha
                 ):
                     fail("storage ACL cleanup found concurrent drift; manual cleanup is required")
                 restore = dict(context["restoreNetworkAcls"])
                 desired = restore
-                match_etag = expected_etag
-            target_url = self._arm_url(account["resourceId"], "2025-06-01")
-            request_body = canonical_json_bytes({"properties": {"networkAcls": desired}})
+            # Patch only the temporary IPv4 list.  Azure's Storage RP exposes
+            # no storage-account ETag, so this is not an atomic compare/swap.
+            # The exact pre/post reads and minimal PATCH bound the window but
+            # cannot detect a same-window unrelated administrator ipRules
+            # update that the PATCH overwrites.  The executable confirmation
+            # phrase must explicitly accept this disclosed residual.
+            request_body = canonical_json_bytes(
+                {"properties": {"networkAcls": {"ipRules": desired["ipRules"]}}}
+            )
             response = self._mutation_request(
                 "PATCH",
                 target_url,
                 body=request_body,
-                headers={"Content-Type": "application/json", "If-Match": match_etag},
+                headers={"Content-Type": "application/json"},
                 expected={200},
             )
-            self._json_response(response, {200}, "storage exact ACL mutation")
-            post_etag = self._header(response, "ETag")
-            _quoted_etag(post_etag, "storage ACL mutation ETag")
-            return {
+            details = {
                 "cleanupKey": "uploader-ipv4-rule",
                 "uploaderIpv4": str(network),
-                "postEtag": post_etag,
                 "addedNetworkAclsSha256": sha256_bytes(canonical_json_bytes(desired)) if operation_id.startswith("add") else None,
                 "restoredNetworkAclsSha256": sha256_bytes(canonical_json_bytes(desired)) if operation_id.startswith("remove") else None,
             }
+            try:
+                self._json_response(response, {200}, "storage exact ACL mutation")
+                if read_current_acl("storage ACL post-mutation readback") != desired:
+                    fail("storage ACL mutation did not produce the exact reviewed topology")
+            except BaseException as exc:
+                if operation_id == "addOwnedUploaderIpv4Rule":
+                    raise OwnedTemporaryMutationError(
+                        "storage ACL add returned success but exact post-readback failed",
+                        {
+                            "operationId": operation_id,
+                            "status": "applied-readback-pending",
+                            "owned": True,
+                            "cleanupKey": details["cleanupKey"],
+                            "details": details,
+                        },
+                    ) from exc
+                raise
+            return details
 
         if operation_id in {
             "addOwnedUploaderPackageRole",
@@ -12129,7 +12632,14 @@ class BootstrapExecutor:
             if (
                 not isinstance(proof, Mapping)
                 or proof.get("operationId") != operation["id"]
-                or proof.get("status") not in {"absent", "exact", "owned-present"}
+                or proof.get("status")
+                not in {
+                    "absent",
+                    "exact",
+                    "owned-present",
+                    "network-inaccessible",
+                    "temporary-access-inaccessible",
+                }
             ):
                 fail(f"operation preflight is partial or drifted: {operation['id']}")
             inspections[operation["id"]] = dict(proof)
