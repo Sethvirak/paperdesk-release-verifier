@@ -2838,6 +2838,135 @@ class BootstrapTests(unittest.TestCase):
                     {},
                 )
 
+    def test_if_match_etag_serialization_is_strict_and_used_everywhere(self):
+        self.assertEqual(
+            bootstrap._if_match_etag("1DD39E07D4DEF60", "raw ARM ETag"),
+            '"1DD39E07D4DEF60"',
+        )
+        self.assertEqual(
+            bootstrap._if_match_etag('"already-quoted"', "quoted ETag"),
+            '"already-quoted"',
+        )
+        for malformed in ("", "abc", 'W/"weak"', '"unterminated'):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                bootstrap.BootstrapError, "strong ETag token"
+            ):
+                bootstrap._if_match_etag(malformed, "malformed ETag")
+
+        source = inspect.getsource(
+            bootstrap.AzureCliBootstrapTransport._mutate
+        )
+        self.assertEqual(source.count("_if_match_etag("), 5)
+        self.assertNotIn('"If-Match": str(', source)
+        self.assertNotIn('"If-Match": current_etag', source)
+
+    def test_bridge_conditional_writes_send_quoted_raw_arm_etags(self):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+
+        class Session:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, url, *, body=None, headers=None):
+                self.requests.append((method, url, body, dict(headers or {})))
+                return bootstrap._RestResponse(
+                    200,
+                    bootstrap.canonical_json_bytes({"properties": {}}),
+                    {"ETag": "1DD39E07D4DEF60"},
+                )
+
+        session = Session()
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            clock=lambda: NOW,
+            session=session,
+        )
+        resources = {
+            item["id"]: item for item in self.plan["resourceInventory"]
+        }
+        state = {
+            "proofs": {
+                "createStoppedPrivateBridge": {
+                    "details": {"etag": "1DD39E07D4DEF60"}
+                },
+                "createBridgeIdentity": {
+                    "details": {
+                        "resourceId": resources["bridgeIdentity"]["resourceId"]
+                    }
+                },
+                "createSignerIdentity": {
+                    "details": {
+                        "resourceId": resources["signerIdentity"]["resourceId"]
+                    }
+                },
+                "createProductionActivationIdentity": {
+                    "details": {
+                        "resourceId": resources[
+                            "productionActivationIdentity"
+                        ]["resourceId"]
+                    }
+                },
+            },
+            "authorizationSha256": "a" * 64,
+            "planSha256": self.plan_sha,
+            "package": self.package,
+        }
+        attach = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "attachFiveUamisOnlyToBridge"
+        )
+        attach_response = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes({}), {}
+        )
+        with mock.patch.object(
+            transport, "_mutation_request", return_value=attach_response
+        ) as request:
+            transport._mutate(attach, state)
+        self.assertEqual(
+            request.call_args.kwargs["headers"]["If-Match"],
+            '"1DD39E07D4DEF60"',
+        )
+
+        configure = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"]
+            == "configureBridgeExactVersionedPackageAndCriticalSettings"
+        )
+        state["proofs"]["uploadVersionedBridgePackage"] = {
+            "details": {
+                "url": "https://example.invalid/package.zip",
+                "versionId": "version-1",
+            }
+        }
+        with (
+            mock.patch.object(
+                bootstrap,
+                "_bootstrap_self_test_control",
+                return_value={"schemaVersion": 1},
+            ),
+            mock.patch.object(
+                transport,
+                "_arm_put",
+                return_value={"id": resources["bridgeSite"]["resourceId"]},
+            ) as arm_put,
+        ):
+            transport._mutate(configure, state)
+        self.assertEqual(
+            arm_put.call_args.kwargs["headers"]["If-Match"],
+            '"1DD39E07D4DEF60"',
+        )
+
     def test_storage_acl_normalization_preserves_supported_optional_boundaries(self):
         subnet = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/resourceGroups/"
