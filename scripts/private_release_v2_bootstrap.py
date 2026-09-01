@@ -10395,6 +10395,11 @@ class AzureCliBootstrapTransport:
                     fail("legacy bridge still has a user-assigned identity")
             elif operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
                 network_acls = properties.get("networkAcls") if isinstance(properties, Mapping) else None
+                normalized_network_acls = (
+                    _normalize_storage_acl_prestate(network_acls)
+                    if isinstance(network_acls, Mapping)
+                    else None
+                )
                 expected_digest = (
                     runtime_facts.get("addedNetworkAclsSha256")
                     if operation_id.startswith("add")
@@ -10403,8 +10408,9 @@ class AzureCliBootstrapTransport:
                     else None
                 )
                 if (
-                    not isinstance(network_acls, Mapping)
-                    or sha256_bytes(canonical_json_bytes(network_acls)) != expected_digest
+                    normalized_network_acls is None
+                    or sha256_bytes(canonical_json_bytes(normalized_network_acls))
+                    != expected_digest
                 ):
                     fail("storage network ACL readback is not exact")
             elif operation_id in {
