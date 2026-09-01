@@ -275,11 +275,23 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         transport.plan = self.plan
         transport.authorization = self.authorization
         transport.resources = self.resources
-        transport.admissions = {operation_id: {"context": {}}}
+        transport.admissions = {
+            operation_id: {"context": {"executionDecision": "apply-exact"}}
+        }
         transport._validated_source_projections = {}
         transport._package_readback_bytes = None
 
-        validated = transport._validate_readback_response(expected, response, {})
+        validated = transport._validate_readback_response(
+            expected,
+            response,
+            {
+                "bridgeIdentityMode": "pristine-no-identity",
+                "identityResourceIds": [],
+                "identityProjectionSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(None)
+                ),
+            },
+        )
         projection = validated["sourceProjection"]["projection"]
         self.assertIs(projection["httpsOnly"], True)
         self.assertEqual(projection["outboundVnetRouting"], outbound)

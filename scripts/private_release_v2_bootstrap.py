@@ -226,6 +226,64 @@ def _safe_bridge_no_identity(value: Any) -> bool:
     )
 
 
+def _validate_exact_bridge_uami_inventory(
+    identity: Any, prior: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """Validate Azure's populated five-UAMI response against prior identity proofs."""
+
+    if (
+        not isinstance(identity, Mapping)
+        or not set(identity).issubset(BRIDGE_NO_IDENTITY_FIELDS)
+        or identity.get("type") != "UserAssigned"
+        or identity.get("principalId") is not None
+        or identity.get("tenantId") is not None
+    ):
+        fail("terminal bridge outer identity posture is invalid")
+    attached = identity.get("userAssignedIdentities")
+    expected: dict[str, tuple[str, str]] = {}
+    for dependency in (
+        "createBridgeIdentity",
+        "adoptExistingRegistryWriterIdentity",
+        "adoptExistingRegistryReaderIdentity",
+        "createSignerIdentity",
+        "createProductionActivationIdentity",
+    ):
+        projection = prior.get(dependency, {}).get("projection", {})
+        resource_id = projection.get("id")
+        if not isinstance(resource_id, str):
+            fail("terminal bridge UAMI dependency is absent")
+        expected[resource_id.lower()] = (
+            _guid(projection.get("clientId"), f"{dependency} terminal clientId").lower(),
+            _guid(
+                projection.get("principalId"), f"{dependency} terminal principalId"
+            ).lower(),
+        )
+    if (
+        len(expected) != 5
+        or not isinstance(attached, Mapping)
+        or len(attached) != 5
+        or {str(item).lower() for item in attached} != set(expected)
+    ):
+        fail("terminal bridge UAMI inventory is not sole and exact")
+    for resource_id, value in attached.items():
+        if not isinstance(value, Mapping):
+            fail("terminal bridge UAMI metadata is not one object")
+        value = _exact_keys(
+            value,
+            {"clientId", "principalId"},
+            "terminal bridge UAMI metadata",
+        )
+        expected_client_id, expected_principal_id = expected[str(resource_id).lower()]
+        if (
+            _guid(value["clientId"], "terminal bridge UAMI clientId").lower()
+            != expected_client_id
+            or _guid(value["principalId"], "terminal bridge UAMI principalId").lower()
+            != expected_principal_id
+        ):
+            fail("terminal bridge UAMI metadata is not cross-bound")
+    return sorted(expected)
+
+
 def _sha40(value: Any, label: str) -> str:
     if not isinstance(value, str) or not SHA40.fullmatch(value):
         fail(f"{label} is not an exact commit SHA")
@@ -4128,6 +4186,9 @@ def _validate_operation_source_projection(
             fail("webapp terminal projection target is not exact")
         identity = body["identity"]
         if operation_id == "createStoppedPrivateBridge":
+            bridge_mode = operation_context.get("adopted", {}).get(
+                "bridgeIdentityMode", "pristine-no-identity"
+            )
             if (
                 body["kind"] != "app,linux"
                 or body["httpsOnly"] is not True
@@ -4140,35 +4201,31 @@ def _validate_operation_source_projection(
                 or not _safe_bridge_outbound_vnet_routing(
                     body["outboundVnetRouting"]
                 )
-                or not _safe_bridge_no_identity(identity)
             ):
                 fail("terminal bridge creation posture is unsafe")
+            if bridge_mode == "pristine-no-identity":
+                if not _safe_bridge_no_identity(identity):
+                    fail("terminal pristine bridge identity posture is unsafe")
+            elif bridge_mode == "exact-five-user-assigned":
+                _validate_exact_bridge_uami_inventory(identity, prior)
+            else:
+                fail("terminal bridge identity mode is invalid")
         elif operation_id == "attachFiveUamisOnlyToBridge":
-            attached = identity.get("userAssignedIdentities") if isinstance(identity, Mapping) else None
-            expected_ids: set[str] = set()
-            for target, dependency in (
-                ("bridgeIdentity", "createBridgeIdentity"),
-                ("registryWriterIdentity", "adoptExistingRegistryWriterIdentity"),
-                ("registryReaderIdentity", "adoptExistingRegistryReaderIdentity"),
-                ("signerIdentity", "createSignerIdentity"),
-                ("productionActivationIdentity", "createProductionActivationIdentity"),
-            ):
-                candidate = prior.get(dependency, {}).get("projection", {}).get("id")
-                if candidate is None:
-                    candidate = resources.get(target, {}).get("resourceId")
-                if not isinstance(candidate, str):
-                    fail("terminal bridge UAMI dependency is absent")
-                expected_ids.add(candidate.lower())
             if (
-                body["state"] != "Stopped"
+                body["kind"] != "app,linux"
+                or body["httpsOnly"] is not True
+                or body["state"] != "Stopped"
                 or body["publicNetworkAccess"] != "Disabled"
-                or not isinstance(identity, Mapping)
-                or identity.get("type") != "UserAssigned"
-                or not isinstance(attached, Mapping)
-                or {str(item).lower() for item in attached} != expected_ids
-                or any(value != {} for value in attached.values())
+                or str(body["serverFarmId"]).lower()
+                != resources["bridgeAppServicePlan"]["resourceId"].lower()
+                or str(body["virtualNetworkSubnetId"]).lower()
+                != resources["integrationSubnet"]["resourceId"].lower()
+                or not _safe_bridge_outbound_vnet_routing(
+                    body["outboundVnetRouting"]
+                )
             ):
-                fail("terminal bridge UAMI inventory is not sole and exact")
+                fail("terminal bridge UAMI attachment posture is unsafe")
+            _validate_exact_bridge_uami_inventory(identity, prior)
         elif operation_id == "detachWriterAndReaderFromLegacyBridge":
             if (
                 body["state"] != "Stopped"
@@ -7646,9 +7703,20 @@ def _operation_context_policy(
         "createProductionActivationIdentity": {"resourceId", "clientId", "principalId"},
         "createPrivatePackageContainer": set(),
         "createPrivateActivationFenceContainer": set(),
-        "createStoppedPrivateBridge": {"resourceId", "name", "etag"},
+        "createStoppedPrivateBridge": {
+            "resourceId",
+            "name",
+            "etag",
+            "bridgeIdentityMode",
+            "identityResourceIds",
+            "identityProjectionSha256",
+        },
         "createSigningKeyVersion": {"keyUriWithVersion", "expiresAt"},
-        "attachFiveUamisOnlyToBridge": set(),
+        "attachFiveUamisOnlyToBridge": {
+            "identityResourceIds",
+            "expectedEtag",
+            "identityProjectionSha256",
+        },
         "uploadVersionedBridgePackage": {"blob", "etag", "versionId", "url"},
         "lockPackageRetentionAt91Days": set(),
         "createInitialIdleActivationFence": {"url", "etag", "versionId", "sha256"},
@@ -7695,8 +7763,20 @@ def _operation_context_policy(
         "attachFiveUamisOnlyToBridge": [
             "createStoppedPrivateBridge.currentEtag",
             "createBridgeIdentity.resourceId",
+            "createBridgeIdentity.clientId",
+            "createBridgeIdentity.principalId",
+            "adoptExistingRegistryWriterIdentity.resourceId",
+            "adoptExistingRegistryWriterIdentity.clientId",
+            "adoptExistingRegistryWriterIdentity.principalId",
+            "adoptExistingRegistryReaderIdentity.resourceId",
+            "adoptExistingRegistryReaderIdentity.clientId",
+            "adoptExistingRegistryReaderIdentity.principalId",
             "createSignerIdentity.resourceId",
+            "createSignerIdentity.clientId",
+            "createSignerIdentity.principalId",
             "createProductionActivationIdentity.resourceId",
+            "createProductionActivationIdentity.clientId",
+            "createProductionActivationIdentity.principalId",
         ],
         "removeOwnedUploaderIpv4Rule": [
             "addOwnedUploaderIpv4Rule.addedNetworkAclsSha256"
@@ -7784,11 +7864,12 @@ def _validate_operation_context(
         adopted = context["adopted"]
         adopted_fields = set(policy["adoptedProjectionFields"] or [])
         adopted = _exact_keys(adopted, adopted_fields, f"{operation_id} adopted projection")
+        scalar_values = [item for item in adopted.values() if not isinstance(item, list)]
         if any(
             not isinstance(item, str)
             or len(item) > 2048
             or any(token in item.lower() for token in ("sig=", "?sv=", "bearer ", "password="))
-            for item in adopted.values()
+            for item in scalar_values
         ):
             fail(f"{operation_id} adopted projection contains an unsafe value")
         if operation_id in {"createPublisherApplication", "createPublisherServicePrincipal"}:
@@ -7827,6 +7908,39 @@ def _validate_operation_context(
             if adopted["resourceId"].lower() != expected_id.lower() or adopted["name"] != "paperdesk-release-registry-bridge-v2-9c4e0d0d":
                 fail("adopted bridge is outside the fixed plan")
             _quoted_etag(adopted["etag"], "adopted bridge ETag")
+            _sha256(
+                adopted["identityProjectionSha256"],
+                "adopted bridge identity projection",
+            )
+            if adopted["bridgeIdentityMode"] not in {
+                "pristine-no-identity",
+                "exact-five-user-assigned",
+            }:
+                fail("adopted bridge identity mode is invalid")
+            identity_ids = adopted["identityResourceIds"]
+            if (
+                not isinstance(identity_ids, list)
+                or len(identity_ids) not in {0, 5}
+                or len({str(item).lower() for item in identity_ids}) != len(identity_ids)
+                or any(not isinstance(item, str) or len(item) > 2048 for item in identity_ids)
+                or (adopted["bridgeIdentityMode"] == "pristine-no-identity")
+                != (identity_ids == [])
+            ):
+                fail("adopted bridge identity inventory is invalid")
+        if operation_id == "attachFiveUamisOnlyToBridge":
+            identity_ids = adopted["identityResourceIds"]
+            if (
+                not isinstance(identity_ids, list)
+                or len(identity_ids) != 5
+                or len({str(item).lower() for item in identity_ids}) != 5
+                or any(not isinstance(item, str) or len(item) > 2048 for item in identity_ids)
+            ):
+                fail("adopted bridge attachment identity inventory is invalid")
+            _quoted_etag(adopted["expectedEtag"], "adopted bridge attachment ETag")
+            _sha256(
+                adopted["identityProjectionSha256"],
+                "adopted bridge attachment identity projection",
+            )
         if operation_id == "createSigningKeyVersion":
             if re.fullmatch(
                 r"https://kv-mds-sea-9c4e0d0d\.vault\.azure\.net/keys/paperdesk-release-result-signing/[0-9a-f]{32}",
@@ -8229,6 +8343,30 @@ def validate_preflight_evidence(
     if admission_ids != azure_mutation_ids:
         fail("operation admissions are not in exact mutation order")
     admission_map = {item["operationId"]: item for item in admissions}
+    bridge_adopted = admission_map["createStoppedPrivateBridge"]["context"].get(
+        "adopted"
+    )
+    attach_context = admission_map["attachFiveUamisOnlyToBridge"]["context"]
+    if not isinstance(bridge_adopted, Mapping):
+        if attach_context["executionDecision"] != "apply-exact":
+            fail("new bridge is not bound to one attachment mutation")
+    elif bridge_adopted["bridgeIdentityMode"] == "pristine-no-identity":
+        if (
+            bridge_adopted["identityResourceIds"] != []
+            or attach_context["executionDecision"] != "apply-exact"
+        ):
+            fail("pristine bridge is not bound to one attachment mutation")
+    elif (
+        bridge_adopted["bridgeIdentityMode"] != "exact-five-user-assigned"
+        or attach_context["executionDecision"] != "adopt-exact"
+        or attach_context.get("adopted", {}).get("identityResourceIds")
+        != bridge_adopted["identityResourceIds"]
+        or attach_context.get("adopted", {}).get("expectedEtag")
+        != bridge_adopted["etag"]
+        or attach_context.get("adopted", {}).get("identityProjectionSha256")
+        != bridge_adopted["identityProjectionSha256"]
+    ):
+        fail("recovered bridge attachment is not exact and zero-write")
     application_adopted = admission_map["createPublisherApplication"]["context"].get("adopted")
     service_principal_adopted = admission_map["createPublisherServicePrincipal"]["context"].get("adopted")
     if isinstance(service_principal_adopted, Mapping):
@@ -10175,6 +10313,11 @@ class AzureCliBootstrapTransport:
             elif operation_id == "createStoppedPrivateBridge":
                 identity = projection_document.get("identity")
                 outbound = properties.get("outboundVnetRouting") if isinstance(properties, Mapping) else None
+                bridge_mode = (
+                    runtime_facts.get("bridgeIdentityMode")
+                    if runtime_facts is not None
+                    else None
+                )
                 if (
                     projection_document.get("kind") != "app,linux"
                     or not isinstance(properties, Mapping)
@@ -10186,22 +10329,60 @@ class AzureCliBootstrapTransport:
                     != self.resources["integrationSubnet"]["resourceId"].lower()
                     or not _safe_bridge_outbound_vnet_routing(outbound)
                     or properties.get("state") != "Stopped"
-                    or not _safe_bridge_no_identity(identity)
                 ):
                     fail("stopped private bridge readback is not exact")
+                if bridge_mode == "pristine-no-identity":
+                    if not _safe_bridge_no_identity(identity):
+                        fail("pristine bridge unexpectedly has an identity")
+                elif bridge_mode == "exact-five-user-assigned":
+                    observed_ids = _validate_exact_bridge_uami_inventory(
+                        identity, self._validated_source_projections
+                    )
+                    if observed_ids != runtime_facts.get("identityResourceIds"):
+                        fail("recovered bridge identity inventory changed")
+                else:
+                    fail("stopped bridge readback lacks one recovery mode")
+                if (
+                    runtime_facts is None
+                    or sha256_bytes(canonical_json_bytes(identity))
+                    != runtime_facts.get("identityProjectionSha256")
+                ):
+                    fail("stopped bridge identity projection changed")
             elif operation_id == "attachFiveUamisOnlyToBridge":
                 identity = projection_document.get("identity")
-                attached = identity.get("userAssignedIdentities") if isinstance(identity, Mapping) else None
                 expected_ids = runtime_facts.get("identityResourceIds") if runtime_facts else None
                 if (
-                    not isinstance(identity, Mapping)
-                    or identity.get("type") != "UserAssigned"
-                    or not isinstance(attached, Mapping)
+                    projection_document.get("kind") != "app,linux"
+                    or not isinstance(properties, Mapping)
+                    or properties.get("httpsOnly") is not True
+                    or properties.get("state") != "Stopped"
+                    or properties.get("publicNetworkAccess") != "Disabled"
+                    or str(properties.get("serverFarmId", "")).lower()
+                    != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
+                    or str(properties.get("virtualNetworkSubnetId", "")).lower()
+                    != self.resources["integrationSubnet"]["resourceId"].lower()
+                    or not _safe_bridge_outbound_vnet_routing(
+                        properties.get("outboundVnetRouting")
+                    )
                     or not isinstance(expected_ids, list)
-                    or {str(item).lower() for item in attached}
-                    != {str(item).lower() for item in expected_ids}
                 ):
                     fail("bridge UAMI attachment readback is not exact")
+                observed_ids = _validate_exact_bridge_uami_inventory(
+                    identity, self._validated_source_projections
+                )
+                if observed_ids != expected_ids:
+                    fail("bridge UAMI attachment readback is not exact")
+                if (
+                    sha256_bytes(canonical_json_bytes(identity))
+                    != runtime_facts.get("identityProjectionSha256")
+                    or _if_match_etag(
+                        self._header(response, "ETag")
+                        or projection_document.get("etag"),
+                        "bridge attachment readback ETag",
+                    )
+                    != runtime_facts.get("expectedEtag")
+                ):
+                    fail("bridge UAMI attachment ETag or projection drifted")
             elif operation_id == "detachWriterAndReaderFromLegacyBridge":
                 identity = projection_document.get("identity")
                 if isinstance(identity, Mapping) and (
@@ -11118,7 +11299,16 @@ class AzureCliBootstrapTransport:
                 fail("new private bridge did not reach the exact stopped state")
             etag = self._header(current_response, "ETag") or current.get("etag")
             _quoted_etag(etag, "created bridge ETag")
-            return {"resourceId": site["resourceId"], "name": result.get("name"), "etag": etag}
+            return {
+                "resourceId": site["resourceId"],
+                "name": result.get("name"),
+                "etag": etag,
+                "bridgeIdentityMode": "pristine-no-identity",
+                "identityResourceIds": [],
+                "identityProjectionSha256": sha256_bytes(
+                    canonical_json_bytes(current.get("identity"))
+                ),
+            }
 
         if operation_id == "attachFiveUamisOnlyToBridge":
             site = self.resources["bridgeSite"]
@@ -11152,8 +11342,18 @@ class AzureCliBootstrapTransport:
                 headers={"Content-Type": "application/json", "If-Match": bridge_etag},
                 expected={200},
             )
-            self._json_response(response, {200}, "bridge UAMI attachment")
-            return {"resourceId": site["resourceId"], "identityResourceIds": identity_ids}
+            result = self._json_response(response, {200}, "bridge UAMI attachment")
+            return {
+                "resourceId": site["resourceId"],
+                "identityResourceIds": sorted(item.lower() for item in identity_ids),
+                "expectedEtag": _if_match_etag(
+                    self._header(response, "ETag") or result.get("etag"),
+                    "bridge attachment response ETag",
+                ),
+                "identityProjectionSha256": sha256_bytes(
+                    canonical_json_bytes(result.get("identity"))
+                ),
+            }
 
         if operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
             ip_value = context.get("uploaderIpv4")

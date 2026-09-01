@@ -961,6 +961,88 @@ def _operation_admission(
             )
         fail(f"{operation_id} preflight returned unsupported status {status}")
 
+    if status == 200 and operation_id in {
+        "createStoppedPrivateBridge",
+        "attachFiveUamisOnlyToBridge",
+    }:
+        body = _body_mapping(envelope, operation_id)
+        properties = _properties(envelope, operation_id)
+        identity = body.get("identity")
+        resources = {item["id"]: item for item in plan["resourceInventory"]}
+        bridge = resources["bridgeSite"]
+        if (
+            str(body.get("id", "")).lower() != bridge["resourceId"].lower()
+            or body.get("name") != bridge["name"]
+            or body.get("kind") != "app,linux"
+            or properties.get("state") != "Stopped"
+            or properties.get("httpsOnly") is not True
+            or properties.get("publicNetworkAccess") != "Disabled"
+            or str(properties.get("serverFarmId", "")).lower()
+            != resources["bridgeAppServicePlan"]["resourceId"].lower()
+            or str(properties.get("virtualNetworkSubnetId", "")).lower()
+            != resources["integrationSubnet"]["resourceId"].lower()
+            or not bootstrap._safe_bridge_outbound_vnet_routing(
+                properties.get("outboundVnetRouting")
+            )
+        ):
+            fail("existing bridge posture is outside the recovery boundary")
+        prior = {}
+        for dependency in (
+            "createBridgeIdentity",
+            "adoptExistingRegistryWriterIdentity",
+            "adoptExistingRegistryReaderIdentity",
+            "createSignerIdentity",
+            "createProductionActivationIdentity",
+        ):
+            facts = dependency_facts.get(dependency)
+            if not isinstance(facts, Mapping):
+                fail("bridge recovery identity dependency is absent")
+            prior[dependency] = {"projection": {
+                "id": facts.get("resourceId"),
+                "clientId": facts.get("clientId"),
+                "principalId": facts.get("principalId"),
+            }}
+        if bootstrap._safe_bridge_no_identity(identity):
+            mode, identity_ids = "pristine-no-identity", []
+        else:
+            identity_ids = bootstrap._validate_exact_bridge_uami_inventory(identity, prior)
+            mode = "exact-five-user-assigned"
+        if operation_id == "createStoppedPrivateBridge":
+            return "exact", _policy_checked_context(operation_id, policy, {
+                "executionDecision": "adopt-exact",
+                "adopted": {
+                    "resourceId": body["id"], "name": body["name"],
+                    "etag": _etag(envelope, operation_id),
+                        "bridgeIdentityMode": mode,
+                        "identityResourceIds": identity_ids,
+                        "identityProjectionSha256": bootstrap.sha256_bytes(
+                            bootstrap.canonical_json_bytes(identity)
+                        ),
+                },
+            })
+        bridge_facts = dependency_facts.get("createStoppedPrivateBridge")
+        if (
+            not isinstance(bridge_facts, Mapping)
+            or bridge_facts.get("bridgeIdentityMode") != mode
+            or bridge_facts.get("identityResourceIds") != identity_ids
+            or bridge_facts.get("etag") != _etag(envelope, operation_id)
+        ):
+            fail("bridge attachment state changed during observation")
+        if mode == "exact-five-user-assigned":
+            return "exact", _policy_checked_context(operation_id, policy, {
+                "executionDecision": "adopt-exact",
+                "adopted": {
+                    "identityResourceIds": identity_ids,
+                    "expectedEtag": _etag(envelope, operation_id),
+                    "identityProjectionSha256": bootstrap.sha256_bytes(
+                        bootstrap.canonical_json_bytes(identity)
+                    ),
+                },
+            })
+        return "exact", _policy_checked_context(
+            operation_id, policy, {"executionDecision": "apply-exact"}
+        )
+
     # Microsoft Graph collection queries return HTTP 200 with ``value: []``
     # when the source-named application or service principal is absent.  Treat
     # that exact, unpaginated empty collection as logical absence for the three
