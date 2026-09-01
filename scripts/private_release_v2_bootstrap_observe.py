@@ -746,11 +746,14 @@ def _policy_checked_context(
             fail(f"{operation_id} adopted projection drifted from source policy")
     if set(context) != expected:
         fail(f"{operation_id} context drifted from the source context policy")
-    serialized = bootstrap.canonical_json_bytes(context).decode("utf-8")
-    for dependency in policy["executorDerivedDependencies"]:
-        terminal_name = dependency.rsplit(".", 1)[-1]
-        if f'"{terminal_name}":' in serialized:
-            fail(f"{operation_id} preflight authors executor-derived dependency {dependency}")
+    if decision == "apply-exact":
+        serialized = bootstrap.canonical_json_bytes(context).decode("utf-8")
+        for dependency in policy["executorDerivedDependencies"]:
+            terminal_name = dependency.rsplit(".", 1)[-1]
+            if f'"{terminal_name}":' in serialized:
+                fail(
+                    f"{operation_id} preflight authors executor-derived dependency {dependency}"
+                )
     return dict(context)
 
 
@@ -857,12 +860,62 @@ def _operation_admission(
             status = 404
         elif len(values) != 1:
             fail(f"{operation_id} must resolve to at most one Graph object")
-        elif (
-            operation_id == "grantPublisherGraphApplicationReadAll"
-            and values[0].get("appRoleAssignments@odata.nextLink")
-            not in {None, ""}
-        ):
-            fail("publisher Graph assignment inventory is partial or paginated")
+        elif operation_id == "createPublisherServicePrincipal":
+            application = dependency_facts.get("createPublisherApplication")
+            service = values[0]
+            service_object_id = service.get("id")
+            service_app_id = service.get("appId")
+            assignments = service.get("appRoleAssignments")
+            if (
+                not isinstance(assignments, list)
+                or service.get("appRoleAssignments@odata.nextLink")
+                not in {None, ""}
+            ):
+                fail("publisher Graph assignment inventory is partial or paginated")
+            if (
+                not isinstance(application, Mapping)
+                or service_app_id != application.get("appId")
+                or service.get("displayName")
+                != next(
+                    item["name"]
+                    for item in plan["resourceInventory"]
+                    if item["id"] == "publisherServicePrincipal"
+                )
+                or service.get("accountEnabled") is not True
+                or service.get("servicePrincipalType") != "Application"
+                or service.get("passwordCredentials") != []
+                or service.get("keyCredentials") != []
+            ):
+                fail(
+                    "publisher service principal is not bound to the adopted application"
+                )
+            bootstrap._guid(
+                service_object_id, "observed publisher service principal object ID"
+            )
+            bootstrap._guid(service_app_id, "observed publisher service principal app ID")
+        elif operation_id == "grantPublisherGraphApplicationReadAll":
+            publisher = dependency_facts.get("createPublisherServicePrincipal")
+            service = values[0]
+            assignments = service.get("appRoleAssignments")
+            if (
+                not isinstance(publisher, Mapping)
+                or service.get("id") != publisher.get("objectId")
+                or service.get("appId") != publisher.get("appId")
+                or service.get("accountEnabled") is not True
+                or service.get("servicePrincipalType") != "Application"
+                or service.get("passwordCredentials") != []
+                or service.get("keyCredentials") != []
+                or not isinstance(assignments, list)
+                or service.get("appRoleAssignments@odata.nextLink")
+                not in {None, ""}
+            ):
+                fail("publisher Graph assignment inventory is not exact")
+            if not assignments:
+                status = 404
+            else:
+                fail(
+                    "pre-existing publisher Graph assignment requires separately reviewed exact-adoption recovery"
+                )
 
     if operation_id in {
         "lockPackageRetentionAt91Days",
