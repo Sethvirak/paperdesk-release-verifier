@@ -99,6 +99,26 @@ def source_evidence():
     }
 
 
+def package_worm_deleted_tombstone(plan):
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    return {
+        "id": (
+            resources["packageContainer"]["resourceId"]
+            + "/immutabilityPolicies/default"
+        ),
+        "name": "default",
+        "type": (
+            "Microsoft.Storage/storageAccounts/blobServices/containers/"
+            "immutabilityPolicies"
+        ),
+        "etag": "",
+        "properties": {
+            "state": "Deleted",
+            "immutabilityPeriodSinceCreationInDays": 0,
+        },
+    }
+
+
 class FakeReadOnlySession:
     def __init__(
         self,
@@ -656,6 +676,37 @@ class ExistingPrivateContainerSession(FakeReadOnlySession):
         if request.url == self.url:
             return self._response(request, copy.deepcopy(self.projection))
         return super().read(request)
+
+
+class PackageWormDeletedTombstoneSession(FakeReadOnlySession):
+    def __init__(self, plan):
+        super().__init__(plan)
+        self.url = bootstrap._operation_readback_url(
+            "lockPackageRetentionAt91Days", plan, {}
+        )
+
+    def read(self, request):
+        if request.url != self.url:
+            return super().read(request)
+        self.requests.append(request)
+        self.assert_read_only(request)
+        body = package_worm_deleted_tombstone(self.plan)
+        headers = {"content-type": "application/json"}
+        response = observe.ReadResponse(
+            method=request.method,
+            url=request.url,
+            status=200,
+            headers=headers,
+            body=body,
+        )
+        self.envelopes[(request.method, request.url)] = {
+            "method": request.method,
+            "url": request.url,
+            "status": 200,
+            "headers": copy.deepcopy(headers),
+            "body": copy.deepcopy(body),
+        }
+        return response
 
 
 class ObserveTests(unittest.TestCase):
@@ -2134,6 +2185,317 @@ class ObserveTests(unittest.TestCase):
                 self.plan,
                 accepted_policy,
             )
+
+    def test_exact_package_deleted_tombstone_normalizes_only_to_absent_apply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        policy = bootstrap._operation_context_policy(
+            "lockPackageRetentionAt91Days", self.plan, authorization
+        )
+        envelope = {
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": package_worm_deleted_tombstone(self.plan),
+        }
+
+        status, context = observe._worm_policy_admission(
+            "lockPackageRetentionAt91Days", envelope, self.plan, policy
+        )
+
+        self.assertEqual(status, "absent")
+        self.assertEqual(
+            context,
+            {"executionDecision": "apply-exact", "etag": None},
+        )
+
+    def test_package_deleted_tombstone_rejects_every_identity_etag_and_shape_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        policy = bootstrap._operation_context_policy(
+            "lockPackageRetentionAt91Days", self.plan, authorization
+        )
+
+        def exact_envelope():
+            return {
+                "status": 200,
+                "headers": {"content-type": "application/json"},
+                "body": package_worm_deleted_tombstone(self.plan),
+            }
+
+        variants = {}
+
+        value = exact_envelope()
+        value["body"]["etag"] = '"live-etag"'
+        variants["body-etag"] = value
+
+        value = exact_envelope()
+        value["headers"]["ETag"] = '"live-etag"'
+        variants["header-etag"] = value
+
+        value = exact_envelope()
+        value["body"]["id"] = (
+            next(
+                item["resourceId"]
+                for item in self.plan["resourceInventory"]
+                if item["id"] == "resultContainer"
+            )
+            + "/immutabilityPolicies/default"
+        )
+        variants["wrong-id"] = value
+
+        value = exact_envelope()
+        value["body"]["name"] = "other"
+        variants["wrong-name"] = value
+
+        value = exact_envelope()
+        value["body"]["type"] = "Microsoft.Storage/storageAccounts"
+        variants["wrong-type"] = value
+
+        value = exact_envelope()
+        value["body"]["unexpected"] = True
+        variants["extra-body-field"] = value
+
+        value = exact_envelope()
+        del value["body"]["properties"]["state"]
+        variants["missing-state"] = value
+
+        value = exact_envelope()
+        del value["body"]["properties"][
+            "immutabilityPeriodSinceCreationInDays"
+        ]
+        variants["missing-days"] = value
+
+        for append_field in (
+            "allowProtectedAppendWrites",
+            "allowProtectedAppendWritesAll",
+        ):
+            for append_value in (False, True):
+                value = exact_envelope()
+                value["body"]["properties"][append_field] = append_value
+                variants[f"extra-{append_field}-{append_value}"] = value
+
+        for state in ("Locked", "Unlocked"):
+            value = exact_envelope()
+            value["body"]["properties"]["state"] = state
+            variants[f"state-{state}"] = value
+
+        for days in (-1, 1, False, True):
+            value = exact_envelope()
+            value["body"]["properties"][
+                "immutabilityPeriodSinceCreationInDays"
+            ] = days
+            variants[f"days-{days!r}"] = value
+
+        for label, altered in variants.items():
+            with self.subTest(label=label), self.assertRaises(
+                observe.ObserveError
+            ):
+                observe._worm_policy_admission(
+                    "lockPackageRetentionAt91Days",
+                    altered,
+                    self.plan,
+                    policy,
+                )
+
+    def test_deleted_tombstone_is_never_absence_for_accepted_or_result_policy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
+        targets = {
+            "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
+            "extendResultRetentionFrom30To91Days": "resultContainer",
+        }
+        for operation_id, target in targets.items():
+            envelope = {
+                "status": 200,
+                "headers": {"content-type": "application/json"},
+                "body": package_worm_deleted_tombstone(self.plan),
+            }
+            envelope["body"]["id"] = (
+                resources[target]["resourceId"]
+                + "/immutabilityPolicies/default"
+            )
+            policy = bootstrap._operation_context_policy(
+                operation_id, self.plan, authorization
+            )
+            with self.subTest(operation_id=operation_id), self.assertRaises(
+                observe.ObserveError
+            ):
+                observe._worm_policy_admission(
+                    operation_id, envelope, self.plan, policy
+                )
+
+    def test_preflight_replay_accepts_only_404_or_exact_200_package_absence(self):
+        observed = []
+        sessions = (
+            (FakeReadOnlySession(self.plan), 404),
+            (PackageWormDeletedTombstoneSession(self.plan), 200),
+        )
+        for session, expected_package_status in sessions:
+            with self.subTest(package_status=expected_package_status), tempfile.TemporaryDirectory() as folder:
+                _selected, preflight, template = self.build(folder, session)
+            admissions = {
+                item["operationId"]: item
+                for item in preflight["projection"]["operationAdmissions"]
+            }
+            probes = {
+                item["id"]: item for item in preflight["projection"]["probes"]
+            }
+            package = admissions["lockPackageRetentionAt91Days"]
+            self.assertEqual(package["status"], "absent")
+            self.assertEqual(
+                package["context"],
+                {"executionDecision": "apply-exact", "etag": None},
+            )
+            self.assertEqual(
+                probes[package["probeIds"][0]]["status"],
+                expected_package_status,
+            )
+            for operation_id in (
+                "extendAcceptedRetentionFrom30To91Days",
+                "extendResultRetentionFrom30To91Days",
+            ):
+                admission = admissions[operation_id]
+                self.assertEqual(admission["status"], "exact")
+                self.assertEqual(probes[admission["probeIds"][0]]["status"], 200)
+            authorization = self.promote_template(template)
+            validated, _digest = bootstrap.validate_preflight_evidence(
+                preflight, authorization, self.plan
+            )
+            self.assertEqual(validated, preflight)
+            observed.append((preflight, authorization))
+
+        preflight, authorization = observed[-1]
+        admissions = {
+            item["operationId"]: item
+            for item in preflight["projection"]["operationAdmissions"]
+        }
+        for operation_id, forged_statuses in (
+            ("lockPackageRetentionAt91Days", (201, 204, 409)),
+            ("extendAcceptedRetentionFrom30To91Days", (404,)),
+            ("extendResultRetentionFrom30To91Days", (404,)),
+        ):
+            for forged_status in forged_statuses:
+                altered = copy.deepcopy(preflight)
+                altered_authorization = copy.deepcopy(authorization)
+                altered_admissions = {
+                    item["operationId"]: item
+                    for item in altered["projection"]["operationAdmissions"]
+                }
+                probe_id = altered_admissions[operation_id]["probeIds"][0]
+                probe = next(
+                    item
+                    for item in altered["projection"]["probes"]
+                    if item["id"] == probe_id
+                )
+                probe["status"] = forged_status
+                digest = bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(altered["projection"])
+                )
+                altered["projectionSha256"] = digest
+                altered_authorization["observedPreflight"]["sha256"] = digest
+                with self.subTest(
+                    operation_id=operation_id, status=forged_status
+                ), self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "WORM admission is not bound to one supported HTTP prestate",
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        altered, altered_authorization, self.plan
+                    )
+
+    def test_preflight_replay_rejects_arbitrary_200_package_tombstone_digest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(
+                folder, PackageWormDeletedTombstoneSession(self.plan)
+            )
+        authorization = self.promote_template(template)
+        altered = copy.deepcopy(preflight)
+        altered_authorization = copy.deepcopy(authorization)
+        admission = next(
+            item
+            for item in altered["projection"]["operationAdmissions"]
+            if item["operationId"] == "lockPackageRetentionAt91Days"
+        )
+        probe = next(
+            item
+            for item in altered["projection"]["probes"]
+            if item["id"] == admission["probeIds"][0]
+        )
+        self.assertEqual(probe["status"], 200)
+        probe["responseSha256"] = "0" * 64
+        digest = bootstrap.sha256_bytes(
+            bootstrap.canonical_json_bytes(altered["projection"])
+        )
+        altered["projectionSha256"] = digest
+        altered_authorization["observedPreflight"]["sha256"] = digest
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "not bound to the exact deleted tombstone",
+        ):
+            bootstrap.validate_preflight_evidence(
+                altered, altered_authorization, self.plan
+            )
+
+    def test_package_tombstone_preflight_digest_binds_response_etag_header(self):
+        url = bootstrap._operation_readback_url(
+            "lockPackageRetentionAt91Days", self.plan, {}
+        )
+        body = package_worm_deleted_tombstone(self.plan)
+        encoded = bootstrap.canonical_json_bytes(body)
+        without_etag = bootstrap._preflight_response_sha256(
+            "GET",
+            url,
+            bootstrap._RestResponse(
+                status=200,
+                body=encoded,
+                headers={"content-type": "application/json"},
+            ),
+        )
+        with_empty_etag = bootstrap._preflight_response_sha256(
+            "GET",
+            url,
+            bootstrap._RestResponse(
+                status=200,
+                body=encoded,
+                headers={"content-type": "application/json", "ETag": ""},
+            ),
+        )
+        with_etag = bootstrap._preflight_response_sha256(
+            "GET",
+            url,
+            bootstrap._RestResponse(
+                status=200,
+                body=encoded,
+                headers={"content-type": "application/json", "ETag": '"new"'},
+            ),
+        )
+        self.assertEqual(without_etag, with_empty_etag)
+        self.assertNotEqual(without_etag, with_etag)
+        self.assertIn(
+            without_etag,
+            bootstrap._package_worm_deleted_tombstone_response_sha256s(self.plan),
+        )
+
+        envelope = {
+            "method": "GET",
+            "url": url,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": body,
+            "responseSha256": without_etag,
+        }
+        self.assertEqual(observe.response_digest(envelope), without_etag)
+        envelope["responseSha256"] = with_etag
+        with self.assertRaisesRegex(
+            observe.ObserveError,
+            "drifted from its exact projection",
+        ):
+            observe.response_digest(envelope)
 
     def test_graph_fic_inventory_rejects_partial_duplicate_and_drifted_state(self):
         with tempfile.TemporaryDirectory() as folder:

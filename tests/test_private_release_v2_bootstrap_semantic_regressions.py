@@ -667,6 +667,139 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.validate(operation_id, altered)
 
+    def test_deleted_worm_tombstone_is_never_terminal_success(self):
+        operation_id = "lockPackageRetentionAt91Days"
+        target_id = self.resources[self.operations[operation_id]["target"]]["resourceId"]
+        tombstone = self.envelope(
+            operation_id,
+            {
+                "id": target_id + "/immutabilityPolicies/default",
+                "name": "default",
+                "type": (
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                    "immutabilityPolicies"
+                ),
+                "etag": "",
+                "properties": {
+                    "state": "Deleted",
+                    "immutabilityPeriodSinceCreationInDays": 0,
+                    "allowProtectedAppendWrites": False,
+                    "allowProtectedAppendWritesAll": False,
+                },
+                "stateAfterPut": "Locked",
+                "lockPostIssued": False,
+            },
+        )
+
+        with self.assertRaises(bootstrap.BootstrapError):
+            self.validate(operation_id, tombstone)
+
+    def test_deleted_worm_tombstone_is_never_successful_executor_readback(self):
+        operation_id = "lockPackageRetentionAt91Days"
+        contract = bootstrap._validator_contract(
+            f"operation:{operation_id}", self.plan, self.authorization
+        )
+        expected = {
+            "id": "readback-package-worm",
+            "validatorId": f"operation:{operation_id}",
+            "method": contract["expectedMethod"],
+            "url": contract["expectedUrl"],
+            "validatorContract": contract,
+        }
+        response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes(
+                {
+                    "id": (
+                        self.resources["packageContainer"]["resourceId"]
+                        + "/immutabilityPolicies/default"
+                    ),
+                    "name": "default",
+                    "type": (
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "immutabilityPolicies"
+                    ),
+                    "etag": "",
+                    "properties": {
+                        "state": "Deleted",
+                        "immutabilityPeriodSinceCreationInDays": 0,
+                    },
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        transport.plan = self.plan
+        transport.authorization = self.authorization
+        transport.resources = self.resources
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "WORM policy readback is not Locked for at least 91 days",
+        ):
+            transport._validate_readback_response(
+                expected,
+                response,
+                {
+                    "stateAfterPut": "Locked",
+                    "lockPostIssued": False,
+                },
+            )
+
+    def test_absent_package_worm_execution_keeps_create_only_if_none_match(self):
+        operation_id = "lockPackageRetentionAt91Days"
+        operation = self.operations[operation_id]
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        transport.authorization = copy.deepcopy(self.authorization)
+        transport.plan = self.plan
+        transport.resources = self.resources
+        transport.admissions = {
+            operation_id: {
+                "context": {
+                    "executionDecision": "apply-exact",
+                    "etag": None,
+                }
+            }
+        }
+        calls = []
+
+        def arm_put(resource_id, api_version, body, *, headers=None, expected=None):
+            calls.append(
+                {
+                    "resourceId": resource_id,
+                    "apiVersion": api_version,
+                    "body": copy.deepcopy(body),
+                    "headers": copy.deepcopy(headers),
+                    "expected": copy.deepcopy(expected),
+                }
+            )
+            return {
+                "properties": {
+                    "state": "Locked",
+                    "immutabilityPeriodSinceCreationInDays": 91,
+                    "allowProtectedAppendWrites": False,
+                    "allowProtectedAppendWritesAll": False,
+                }
+            }
+
+        transport._arm_put = arm_put
+        result = transport._mutate(operation, {})
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["headers"], {"If-None-Match": "*"})
+        self.assertEqual(
+            calls[0]["body"],
+            {
+                "properties": {
+                    "immutabilityPeriodSinceCreationInDays": 91,
+                    "allowProtectedAppendWrites": False,
+                    "allowProtectedAppendWritesAll": False,
+                }
+            },
+        )
+        self.assertEqual(result["stateAfterPut"], "Locked")
+        self.assertFalse(result["lockPostIssued"])
+
     def test_signing_key_posture_rejects_stale_expiry_even_if_context_matches(self):
         operation_id = "createSigningKeyVersion"
         stale = OBSERVED_AT - dt.timedelta(days=1)

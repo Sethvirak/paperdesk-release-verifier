@@ -353,21 +353,34 @@ def _normalize_response(request: ReadRequest, response: ReadResponse) -> dict[st
 
 
 def response_digest(envelope: Mapping[str, Any]) -> str:
-    """Match the executor's fresh-preflight digest for the response body.
+    """Match the executor's fresh-preflight response projection.
 
     Method, URL and status are separate canonical probe fields.  JSON bodies
-    are normalized to canonical bytes exactly as the executor's
-    ``_response_sha256`` does; this makes a freshly recollected preflight
-    comparable without trusting transport-specific response headers.
+    are normalized to canonical bytes exactly as the executor does.  The exact
+    package WORM-policy probe additionally binds its ETag header because an
+    ETag appearing after authorization must stop before mutation.
     """
 
     override = envelope.get("responseSha256")
-    if isinstance(override, str):
-        return override
     body = envelope["body"]
     if isinstance(body, bytes):
-        return bootstrap.sha256_bytes(body)
-    return bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(body))
+        body_sha256 = bootstrap.sha256_bytes(body)
+    else:
+        body_sha256 = bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(body))
+    package_worm_digest = bootstrap._package_worm_policy_preflight_response_sha256(
+        str(envelope.get("method", "")),
+        str(envelope.get("url", "")),
+        envelope.get("status"),
+        body_sha256,
+        envelope.get("headers", {}),
+    )
+    if package_worm_digest is not None:
+        if isinstance(override, str) and override != package_worm_digest:
+            fail("package WORM response digest drifted from its exact projection")
+        return package_worm_digest
+    if isinstance(override, str):
+        return override
+    return body_sha256
 
 
 def _normalize_production_boundary_response(
@@ -661,6 +674,42 @@ def _worm_policy_admission(
     body = _body_mapping(envelope, operation_id)
     properties = body.get("properties")
     expected_id = resources[target]["resourceId"] + "/immutabilityPolicies/default"
+    header_etags = [
+        value
+        for key, value in envelope["headers"].items()
+        if str(key).lower() == "etag"
+    ]
+    body_keys = set(body)
+    if (
+        operation_id == "lockPackageRetentionAt91Days"
+        and body_keys
+        in (
+            {"id", "name", "type", "properties"},
+            {"id", "name", "type", "etag", "properties"},
+        )
+        and str(body.get("id", "")).lower() == expected_id.lower()
+        and body.get("name") == "default"
+        and body.get("type")
+        == "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
+        and body.get("etag") in (None, "")
+        and all(value in (None, "") for value in header_etags)
+        and isinstance(properties, Mapping)
+        and set(properties)
+        == {"immutabilityPeriodSinceCreationInDays", "state"}
+        and properties["state"] == "Deleted"
+        and type(properties["immutabilityPeriodSinceCreationInDays"]) is int
+        and properties["immutabilityPeriodSinceCreationInDays"] == 0
+    ):
+        # Storage RP can retain the deleted child resource as an HTTP 200
+        # tombstone even though the parent container has no active policy.
+        # Normalize only this exact no-ETag, zero-day package-policy shape to
+        # the existing create-only absence decision.  The executor will still
+        # use If-None-Match:* and the terminal readback must be Locked >= 91.
+        return "absent", _policy_checked_context(
+            operation_id,
+            policy,
+            {"executionDecision": "apply-exact", "etag": None},
+        )
     if (
         str(body.get("id", "")).lower() != expected_id.lower()
         or body.get("name") != "default"
