@@ -7941,6 +7941,30 @@ def validate_preflight_evidence(
                 or any(item not in probe_map or probe_map[item]["phase"] != phase for item in ids)
             ):
                 fail("operation admission probe binding is invalid")
+        if operation_id in {
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        }:
+            primary_worm_probe = probe_map[admission["probeIds"][0]]
+            supported_statuses = (
+                {404, 200}
+                if operation_id == "lockPackageRetentionAt91Days"
+                and admission["status"] == "absent"
+                else {200}
+            )
+            if primary_worm_probe["status"] not in supported_statuses:
+                fail("WORM admission is not bound to one supported HTTP prestate")
+            if (
+                operation_id == "lockPackageRetentionAt91Days"
+                and admission["status"] == "absent"
+                and primary_worm_probe["status"] == 200
+                and primary_worm_probe["responseSha256"]
+                not in _package_worm_deleted_tombstone_response_sha256s(plan)
+            ):
+                fail(
+                    "package WORM absence is not bound to the exact deleted tombstone"
+                )
         temporary_definition_url = _temporary_role_definition_readback_url(
             operation_id, plan
         )
@@ -8361,6 +8385,92 @@ def _response_sha256(response: _RestResponse) -> str:
     return sha256_bytes(response.body)
 
 
+def _is_exact_package_worm_policy_url(method: str, url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    expected_path = (
+        f"/subscriptions/{SUBSCRIPTION}/resourceGroups/"
+        "rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Storage/"
+        "storageAccounts/mdspdbak2608089c4e/blobServices/default/containers/"
+        "paperdesk-deployment-packages/immutabilityPolicies/default"
+    )
+    return (
+        method == "GET"
+        and parsed.scheme == "https"
+        and parsed.netloc.lower() == "management.azure.com"
+        and parsed.path == expected_path
+        and parsed.query == "api-version=2025-06-01"
+        and not parsed.fragment
+    )
+
+
+def _package_worm_policy_preflight_response_sha256(
+    method: str,
+    url: str,
+    status: int,
+    body_sha256: str,
+    headers: Mapping[str, Any],
+) -> str | None:
+    """Bind the package-policy HTTP ETag alongside its canonical body.
+
+    The deleted Storage RP child can be returned as HTTP 200 with no usable
+    ETag.  A body-only preflight digest would not notice an ETag appearing
+    after authorization, so this exact probe has a header-aware projection.
+    Empty and omitted ETags both mean no ETag; every non-empty value is bound.
+    """
+
+    if status != 200 or not _is_exact_package_worm_policy_url(method, url):
+        return None
+    _sha256(body_sha256, "package WORM response body digest")
+    if not isinstance(headers, Mapping):
+        fail("package WORM response headers are invalid")
+    etags = [
+        value for key, value in headers.items() if str(key).lower() == "etag"
+    ]
+    if len(etags) > 1 or any(not isinstance(value, str) for value in etags):
+        fail("package WORM response ETag headers are ambiguous")
+    etag = etags[0] if etags and etags[0] else None
+    return sha256_bytes(
+        canonical_json_bytes({"bodySha256": body_sha256, "etag": etag})
+    )
+
+
+def _package_worm_deleted_tombstone_response_sha256s(
+    plan: Mapping[str, Any],
+) -> frozenset[str]:
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    policy_id = (
+        resources["packageContainer"]["resourceId"]
+        + "/immutabilityPolicies/default"
+    )
+    base = {
+        "id": policy_id,
+        "name": "default",
+        "type": (
+            "Microsoft.Storage/storageAccounts/blobServices/containers/"
+            "immutabilityPolicies"
+        ),
+        "properties": {
+            "immutabilityPeriodSinceCreationInDays": 0,
+            "state": "Deleted",
+        },
+    }
+    url = _operation_readback_url("lockPackageRetentionAt91Days", plan, {})
+    bodies = (base, {**base, "etag": ""})
+    digests = {
+        _package_worm_policy_preflight_response_sha256(
+            "GET",
+            url,
+            200,
+            sha256_bytes(canonical_json_bytes(body)),
+            {},
+        )
+        for body in bodies
+    }
+    if None in digests:
+        fail("package WORM tombstone digest construction drifted")
+    return frozenset(str(value) for value in digests)
+
+
 def _package_blob_error_projection(
     method: str, url: str, response: _RestResponse
 ) -> dict[str, str] | None:
@@ -8553,7 +8663,15 @@ def _preflight_response_sha256(
     key_vault_error = _key_vault_preflight_error_projection(method, url, response)
     if key_vault_error is not None:
         return sha256_bytes(canonical_json_bytes(key_vault_error))
-    return _response_sha256(response)
+    body_sha256 = _response_sha256(response)
+    package_worm_digest = _package_worm_policy_preflight_response_sha256(
+        method,
+        url,
+        response.status,
+        body_sha256,
+        response.headers,
+    )
+    return package_worm_digest or body_sha256
 
 
 class AzureCliBootstrapTransport:
