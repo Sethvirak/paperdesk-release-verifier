@@ -3443,6 +3443,100 @@ class BootstrapTests(unittest.TestCase):
         ):
             bootstrap._normalize_storage_acl_prestate(unknown)
 
+    def test_storage_acl_readback_normalizes_optional_empty_families_before_digest(self):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            session=object(),
+        )
+
+        def expected_and_facts(operation_id):
+            admission = next(
+                item
+                for item in projection["operationAdmissions"]
+                if item["operationId"] == operation_id
+            )
+            expected = transport.probes[admission["desiredProbeIds"][0]]
+            if operation_id == "addOwnedUploaderIpv4Rule":
+                desired = copy.deepcopy(admission["context"]["preNetworkAcls"])
+                desired["ipRules"] = [
+                    {"value": "203.0.113.10", "action": "Allow"}
+                ]
+                digest_key = "addedNetworkAclsSha256"
+            else:
+                desired = copy.deepcopy(admission["context"]["restoreNetworkAcls"])
+                digest_key = "restoredNetworkAclsSha256"
+            facts = {
+                digest_key: bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(desired)
+                )
+            }
+            return expected, desired, facts
+
+        def response(expected, acl):
+            contract = expected["validatorContract"]
+            return bootstrap._RestResponse(
+                200,
+                bootstrap.canonical_json_bytes(
+                    {
+                        "id": contract["targetResourceId"],
+                        "name": contract["targetName"],
+                        "type": "Microsoft.Storage/storageAccounts",
+                        "properties": {"networkAcls": acl},
+                    }
+                ),
+                {},
+            )
+
+        for operation_id in (
+            "addOwnedUploaderIpv4Rule",
+            "removeOwnedUploaderIpv4Rule",
+        ):
+            expected, desired, facts = expected_and_facts(operation_id)
+            for omitted in (
+                ("resourceAccessRules",),
+                ("ipv6Rules",),
+                ("resourceAccessRules", "ipv6Rules"),
+            ):
+                azure_shape = copy.deepcopy(desired)
+                for field in omitted:
+                    azure_shape.pop(field)
+                with self.subTest(operation_id=operation_id, omitted=omitted):
+                    transport._validate_readback_response(
+                        expected, response(expected, azure_shape), facts
+                    )
+
+        expected, desired, facts = expected_and_facts(
+            "addOwnedUploaderIpv4Rule"
+        )
+        drifted = copy.deepcopy(desired)
+        drifted["ipRules"].append(
+            {"value": "198.51.100.40", "action": "Allow"}
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "storage network ACL readback is not exact"
+        ):
+            transport._validate_readback_response(
+                expected, response(expected, drifted), facts
+            )
+        unknown = copy.deepcopy(desired)
+        unknown["futureAclFamily"] = []
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "fields are not exact"
+        ):
+            transport._validate_readback_response(
+                expected, response(expected, unknown), facts
+            )
+
     def test_operation_context_rejects_any_nonempty_bridge_app_settings(self):
         projection = build_projection(self.plan, self.package)
         receipt = Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
