@@ -19,6 +19,7 @@ NOW = dt.datetime(2026, 8, 30, 8, 0, tzinfo=dt.timezone.utc)
 AUTHORIZATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ACCOUNT_OBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 LEGACY_FIC_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+GRAPH_SERVICE_PRINCIPAL_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 REVIEWED_SHA = "1" * 40
 MERGED_SHA = "2" * 40
 TREE_SHA = "3" * 40
@@ -346,6 +347,16 @@ class FakeReadOnlySession:
             # an exact empty value list, not HTTP 404.
             status = 200
             body = {"value": []}
+        elif request.url == bootstrap._microsoft_graph_service_principal_inventory_url():
+            status = 200
+            body = {
+                "value": [
+                    {
+                        "id": GRAPH_SERVICE_PRINCIPAL_ID,
+                        "appId": bootstrap.AzureCliBootstrapTransport.GRAPH_APP_ID,
+                    }
+                ]
+            }
         elif re.search(
             r"/providers/Microsoft\.Authorization/roleDefinitions/"
             r"([0-9a-f-]{36})\?",
@@ -510,11 +521,24 @@ class ResidualPublisherSession(FakeReadOnlySession):
         application_present=True,
         service_app_id=None,
         assignments=None,
+        graph_services=None,
+        graph_next_link=None,
     ):
         super().__init__(plan)
         self.application_present = application_present
         self.service_app_id = service_app_id or self.APP_ID
         self.assignments = [] if assignments is None else assignments
+        self.graph_services = (
+            [
+                {
+                    "id": GRAPH_SERVICE_PRINCIPAL_ID,
+                    "appId": bootstrap.AzureCliBootstrapTransport.GRAPH_APP_ID,
+                }
+            ]
+            if graph_services is None
+            else graph_services
+        )
+        self.graph_next_link = graph_next_link
 
     def _response(self, request, body):
         self.requests.append(request)
@@ -536,6 +560,11 @@ class ResidualPublisherSession(FakeReadOnlySession):
         return response
 
     def read(self, request):
+        if request.url == bootstrap._microsoft_graph_service_principal_inventory_url():
+            body = {"value": copy.deepcopy(self.graph_services)}
+            if self.graph_next_link is not None:
+                body["@odata.nextLink"] = self.graph_next_link
+            return self._response(request, body)
         if request.url.startswith("https://graph.microsoft.com/v1.0/applications?"):
             values = []
             if self.application_present:
@@ -584,6 +613,45 @@ class ResidualPublisherSession(FakeReadOnlySession):
                     }
                 )
             return self._response(request, {"value": values})
+        return super().read(request)
+
+
+class ExistingPrivateContainerSession(FakeReadOnlySession):
+    def __init__(self, plan, operation_id, *, projection=None):
+        super().__init__(plan)
+        self.operation_id = operation_id
+        operation = next(item for item in plan["mutations"] if item["id"] == operation_id)
+        resource = self.resources[operation["target"]]
+        self.projection = projection or {
+            "id": resource["resourceId"],
+            "name": resource["name"],
+            "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+            "properties": {"publicAccess": "None"},
+        }
+        self.url = bootstrap._operation_readback_url(operation_id, plan, {})
+
+    def _response(self, request, body):
+        self.requests.append(request)
+        self.assert_read_only(request)
+        response = observe.ReadResponse(
+            method=request.method,
+            url=request.url,
+            status=200,
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        self.envelopes[(request.method, request.url)] = {
+            "method": request.method,
+            "url": request.url,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": copy.deepcopy(body),
+        }
+        return response
+
+    def read(self, request):
+        if request.url == self.url:
+            return self._response(request, copy.deepcopy(self.projection))
         return super().read(request)
 
 
@@ -905,19 +973,230 @@ class ObserveTests(unittest.TestCase):
                 ):
                     self.build(folder, session)
 
-    def test_preexisting_publisher_graph_assignment_fails_closed(self):
+    def test_preexisting_exact_publisher_graph_assignment_is_adopted_without_graph_post(self):
         assignment = {
             "id": "55555555-5555-4555-8555-555555555555",
             "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
-            "resourceId": "66666666-6666-4666-8666-666666666666",
+            "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
             "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
         }
         session = ResidualPublisherSession(self.plan, assignments=[assignment])
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder, session)
+        admission = next(
+            item
+            for item in preflight["projection"]["operationAdmissions"]
+            if item["operationId"] == "grantPublisherGraphApplicationReadAll"
+        )
+        self.assertEqual(admission["status"], "exact")
+        self.assertEqual(
+            admission["context"],
+            {
+                "executionDecision": "adopt-exact",
+                "adopted": {
+                    "assignmentId": assignment["id"],
+                    "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
+                },
+            },
+        )
+        authorization = self.promote_template(template)
+        validated, _digest = bootstrap.validate_preflight_evidence(
+            preflight, authorization, self.plan
+        )
+        self.assertEqual(validated, preflight)
+        self.assertFalse(
+            any(
+                request.method == "POST"
+                and urllib.parse.urlsplit(request.url).hostname
+                == "graph.microsoft.com"
+                for request in session.requests
+            )
+        )
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        transport.admissions = {
+            "grantPublisherGraphApplicationReadAll": admission
+        }
+        mutations = []
+        transport._mutate = lambda operation, state: mutations.append(
+            (operation, state)
+        )
+        transport._prove_probe_ids = (
+            lambda probe_ids, label, *, runtime_facts: []
+        )
+        result = transport.apply_operation(
+            {"id": "grantPublisherGraphApplicationReadAll"}, {}
+        )
+        self.assertEqual(result["status"], "adopted-exact")
+        self.assertEqual(mutations, [])
+
+    def test_publisher_graph_service_principal_inventory_must_be_fixed_unique_and_complete(self):
+        assignment = {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
+            "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
+            "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+        }
+        exact = {
+            "id": GRAPH_SERVICE_PRINCIPAL_ID,
+            "appId": bootstrap.AzureCliBootstrapTransport.GRAPH_APP_ID,
+        }
+        cases = (
+            ([], None, "must resolve to exactly one Graph object"),
+            (
+                [exact, copy.deepcopy(exact)],
+                None,
+                "must resolve to exactly one Graph object",
+            ),
+            (
+                [exact],
+                "https://graph.microsoft.com/v1.0/servicePrincipals?$skiptoken=next",
+                "Graph collection is partial or invalid",
+            ),
+            (
+                [
+                    {
+                        "id": GRAPH_SERVICE_PRINCIPAL_ID,
+                        "appId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                    }
+                ],
+                None,
+                "inventory is not exact",
+            ),
+        )
+        for graph_services, next_link, message in cases:
+            with self.subTest(
+                count=len(graph_services),
+                next_link=next_link,
+                app_id=(graph_services[0]["appId"] if graph_services else None),
+            ), tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
+                (observe.ObserveError, bootstrap.BootstrapError), message
+            ):
+                self.build(
+                    folder,
+                    ResidualPublisherSession(
+                        self.plan,
+                        assignments=[assignment],
+                        graph_services=graph_services,
+                        graph_next_link=next_link,
+                    ),
+                )
+
+    def test_publisher_graph_assignment_must_be_sole_and_exact(self):
+        exact = {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
+            "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
+            "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+        }
+        variants = []
+        wrong_principal = copy.deepcopy(exact)
+        wrong_principal["principalId"] = "66666666-6666-4666-8666-666666666666"
+        variants.append([wrong_principal])
+        wrong_resource = copy.deepcopy(exact)
+        wrong_resource["resourceId"] = "77777777-7777-4777-8777-777777777777"
+        variants.append([wrong_resource])
+        wrong_role = copy.deepcopy(exact)
+        wrong_role["appRoleId"] = "88888888-8888-4888-8888-888888888888"
+        variants.append([wrong_role])
+        malformed_id = copy.deepcopy(exact)
+        malformed_id["id"] = "not-a-guid"
+        variants.append([malformed_id])
+        missing_id = copy.deepcopy(exact)
+        missing_id.pop("id")
+        variants.append([missing_id])
+        extra_key = copy.deepcopy(exact)
+        extra_key["unexpected"] = True
+        variants.append([extra_key])
+        variants.append([exact, copy.deepcopy(exact)])
+        for assignments in variants:
+            with self.subTest(assignments=assignments), tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
+                observe.ObserveError,
+                "not sole and exact|adoption is not sole",
+            ):
+                self.build(
+                    folder,
+                    ResidualPublisherSession(self.plan, assignments=assignments),
+                )
+
+    def test_existing_package_and_activation_containers_are_adopted_only_when_exact_private(self):
+        for operation_id in (
+            "createPrivatePackageContainer",
+            "createPrivateActivationFenceContainer",
+        ):
+            with self.subTest(operation_id=operation_id), tempfile.TemporaryDirectory() as folder:
+                _session, preflight, template = self.build(
+                    folder, ExistingPrivateContainerSession(self.plan, operation_id)
+                )
+            admission = next(
+                item
+                for item in preflight["projection"]["operationAdmissions"]
+                if item["operationId"] == operation_id
+            )
+            self.assertEqual(admission["status"], "exact")
+            self.assertEqual(
+                admission["context"],
+                {"executionDecision": "adopt-exact", "adopted": {}},
+            )
+            bootstrap.validate_preflight_evidence(
+                preflight, self.promote_template(template), self.plan
+            )
+
+    def test_existing_private_container_rejects_any_identity_or_privacy_drift(self):
+        operation_id = "createPrivatePackageContainer"
+        operation = next(
+            item for item in self.plan["mutations"] if item["id"] == operation_id
+        )
+        resource = next(
+            item
+            for item in self.plan["resourceInventory"]
+            if item["id"] == operation["target"]
+        )
+        exact = {
+            "id": resource["resourceId"],
+            "name": resource["name"],
+            "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+            "properties": {"publicAccess": "None"},
+        }
+        variants = []
+        wrong_id = copy.deepcopy(exact)
+        wrong_id["id"] = next(
+            item["resourceId"]
+            for item in self.plan["resourceInventory"]
+            if item["id"] == "storageAccount"
+        )
+        variants.append(wrong_id)
+        wrong_name = copy.deepcopy(exact)
+        wrong_name["name"] = f"default/{resource['name']}"
+        variants.append(wrong_name)
+        wrong_type = copy.deepcopy(exact)
+        wrong_type["type"] = "Microsoft.Storage/storageAccounts"
+        variants.append(wrong_type)
+        public = copy.deepcopy(exact)
+        public["properties"]["publicAccess"] = "Container"
+        variants.append(public)
+        for projection in variants:
+            with self.subTest(projection=projection), tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
+                (observe.ObserveError, bootstrap.BootstrapError),
+                "terminal container is not private and exact",
+            ):
+                self.build(
+                    folder,
+                    ExistingPrivateContainerSession(
+                        self.plan, operation_id, projection=projection
+                    ),
+                )
+
+    def test_existing_controller_lock_container_fails_closed_without_empty_proof(self):
         with tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
             observe.ObserveError,
-            "pre-existing publisher Graph assignment requires separately reviewed exact-adoption recovery",
+            "pre-existing controller lock container requires exact empty-container proof",
         ):
-            self.build(folder, session)
+            self.build(
+                folder,
+                ExistingPrivateContainerSession(
+                    self.plan, "createPrivateControllerLockContainer"
+                ),
+            )
 
     def test_apply_context_still_cannot_author_executor_dependency(self):
         policy = copy.deepcopy(

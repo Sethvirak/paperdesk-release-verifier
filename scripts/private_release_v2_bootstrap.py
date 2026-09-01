@@ -3151,6 +3151,56 @@ def _operation_readback_url(
     fail(f"no exact source-owned readback URL exists for {operation_id}")
 
 
+def _microsoft_graph_service_principal_inventory_url() -> str:
+    """Return the one source-owned Microsoft Graph resource-SP inventory read."""
+
+    return (
+        "https://graph.microsoft.com/v1.0/servicePrincipals?"
+        "$filter=appId%20eq%20'00000003-0000-0000-c000-000000000000'"
+        "&$select=id,appId"
+    )
+
+
+def _validate_private_container_projection(
+    value: Any,
+    *,
+    operation_id: str,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact ARM projection shared by observe and apply.
+
+    Storage RP container resources return the leaf container name.  The
+    ``default/<container>`` representation belongs to separately synthesized
+    WORM evidence and is not an ARM resource response.
+    """
+
+    operation = next(
+        (item for item in plan["mutations"] if item["id"] == operation_id), None
+    )
+    if operation is None or operation_id not in {
+        "createPrivatePackageContainer",
+        "createPrivateControllerLockContainer",
+        "createPrivateActivationFenceContainer",
+    }:
+        fail("private container projection references an unknown operation")
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    resource = resources[operation["target"]]
+    body = _exact_keys(
+        value,
+        {"id", "name", "type", "publicAccess"},
+        "private container projection",
+    )
+    if (
+        str(body["id"]).lower() != str(resource["resourceId"]).lower()
+        or body["name"] != resource["name"]
+        or body["type"]
+        != "Microsoft.Storage/storageAccounts/blobServices/containers"
+        or body["publicAccess"] not in {None, "None"}
+    ):
+        fail("terminal container is not private and exact")
+    return dict(body)
+
+
 def _validator_contract(
     validator_id: str,
     plan: Mapping[str, Any],
@@ -3656,6 +3706,10 @@ def _validate_operation_source_projection(
                 or body["keyCredentials"] != []
                 or body["appId"] != application.get("appId")
                 or not isinstance(body["appRoleAssignments"], list)
+                or (
+                    context.get("executionDecision") == "apply-exact"
+                    and bool(body["appRoleAssignments"])
+                )
             ):
                 fail("publisher service principal terminal projection is not exact")
             _guid(body["id"], "publisher service principal object ID")
@@ -3670,8 +3724,15 @@ def _validate_operation_source_projection(
                 "keyCredentials",
                 "appRoleAssignments",
             }
+            publisher = prior.get("createPublisherServicePrincipal", {}).get(
+                "projection", {}
+            )
             if (
                 set(body) != required
+                or body["id"] != publisher.get("id")
+                or body["appId"] != publisher.get("appId")
+                or body["displayName"]
+                != resources["publisherServicePrincipal"]["name"]
                 or body["accountEnabled"] is not True
                 or body["servicePrincipalType"] != "Application"
                 or body["passwordCredentials"] != []
@@ -3680,13 +3741,47 @@ def _validate_operation_source_projection(
             ):
                 fail("publisher Graph permission projection is not sole")
             assignment = body["appRoleAssignments"][0]
+            expected_assignment_facts = facts
+            adopted_grant = context.get("adopted")
+            if (
+                not expected_assignment_facts
+                and context.get("executionDecision") == "adopt-exact"
+                and isinstance(adopted_grant, Mapping)
+            ):
+                expected_assignment_facts = dict(adopted_grant)
             if (
                 not isinstance(assignment, Mapping)
+                or set(assignment)
+                != {"id", "principalId", "resourceId", "appRoleId"}
                 or assignment.get("principalId") != body["id"]
                 or assignment.get("appRoleId")
                 != AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL
+                or (
+                    expected_assignment_facts
+                    and assignment.get("id")
+                    != expected_assignment_facts.get("assignmentId")
+                )
+                or (
+                    expected_assignment_facts
+                    and assignment.get("resourceId")
+                    != expected_assignment_facts.get("resourceId")
+                )
+                or (
+                    context.get("executionDecision") == "adopt-exact"
+                    and publisher.get("appRoleAssignments")
+                    != body["appRoleAssignments"]
+                )
+                or (
+                    context.get("executionDecision") == "apply-exact"
+                    and publisher.get("appRoleAssignments") != []
+                )
             ):
                 fail("publisher Graph permission is not Application.Read.All")
+            _guid(assignment.get("id"), "publisher Graph assignment ID")
+            _guid(
+                assignment.get("resourceId"),
+                "Microsoft Graph service principal ID",
+            )
     elif family == "sole-publisher-fic-inventory":
         body = _exact_keys(
             body,
@@ -3780,19 +3875,11 @@ def _validate_operation_source_projection(
         if values != expected:
             fail("terminal role-assignment inventory contains a scope, principal, role, condition, or delegation drift")
     elif family == "private-container-projection":
-        body = _exact_keys(
+        _validate_private_container_projection(
             body,
-            {"id", "name", "type", "publicAccess"},
-            "private container projection",
+            operation_id=operation_id,
+            plan=plan,
         )
-        if (
-            str(body["id"]).lower() != str(contract["targetResourceId"]).lower()
-            or body["name"] != f"default/{resources[operation['target']]['name']}"
-            or body["type"]
-            != "Microsoft.Storage/storageAccounts/blobServices/containers"
-            or body["publicAccess"] not in {None, "None"}
-        ):
-            fail("terminal container is not private and exact")
     elif family == "signing-key-posture":
         body = _exact_keys(
             body,
@@ -7337,7 +7424,7 @@ def _operation_context_policy(
         "createMailboxResourceGroup": set(),
         "createPublisherApplication": {"objectId", "appId"},
         "createPublisherServicePrincipal": {"objectId", "appId", "principalId"},
-        "grantPublisherGraphApplicationReadAll": set(),
+        "grantPublisherGraphApplicationReadAll": {"assignmentId", "resourceId"},
         "retireLegacyPublisherFic": set(),
         "retireLegacyPublisherMutatorAssignment": set(),
         "retireLegacyPublisherSitesReadAssignment": set(),
@@ -7351,7 +7438,6 @@ def _operation_context_policy(
         "createSignerIdentity": {"resourceId", "clientId", "principalId"},
         "createProductionActivationIdentity": {"resourceId", "clientId", "principalId"},
         "createPrivatePackageContainer": set(),
-        "createPrivateControllerLockContainer": set(),
         "createPrivateActivationFenceContainer": set(),
         "createStoppedPrivateBridge": {"resourceId", "name", "etag"},
         "createSigningKeyVersion": {"keyUriWithVersion"},
@@ -7470,6 +7556,15 @@ def _validate_operation_context(
                 _guid(adopted[field], f"{operation_id} adopted {field}")
             if operation_id == "createPublisherServicePrincipal" and adopted["objectId"] != adopted["principalId"]:
                 fail("adopted publisher service-principal identity is inconsistent")
+        if operation_id == "grantPublisherGraphApplicationReadAll":
+            _guid(
+                adopted["assignmentId"],
+                "adopted publisher Graph assignment ID",
+            )
+            _guid(
+                adopted["resourceId"],
+                "adopted Microsoft Graph service principal ID",
+            )
         identity_targets = {
             "createBridgeIdentity": "bridgeIdentity",
             "createSignerIdentity": "signerIdentity",
@@ -7828,6 +7923,21 @@ def validate_preflight_evidence(
                 fail(
                     "temporary role definition absence is not bound to the fresh preflight"
                 )
+        if operation_id == "grantPublisherGraphApplicationReadAll":
+            graph_resource_probes = [
+                probe_map[item]
+                for item in admission["probeIds"]
+                if probe_map[item]["method"] == "GET"
+                and probe_map[item]["url"]
+                == _microsoft_graph_service_principal_inventory_url()
+            ]
+            if (
+                len(graph_resource_probes) != 1
+                or graph_resource_probes[0]["status"] != 200
+            ):
+                fail(
+                    "publisher Graph grant is not bound to the exact Microsoft Graph service-principal probe"
+                )
         if any(
             probe_map[item]["validatorId"] != f"operation:{operation_id}"
             for item in admission["desiredProbeIds"]
@@ -7842,6 +7952,13 @@ def validate_preflight_evidence(
     if isinstance(service_principal_adopted, Mapping):
         if not isinstance(application_adopted, Mapping) or service_principal_adopted["appId"] != application_adopted["appId"]:
             fail("adopted publisher service principal is not bound to the adopted application")
+    grant_adopted = admission_map["grantPublisherGraphApplicationReadAll"][
+        "context"
+    ].get("adopted")
+    if isinstance(grant_adopted, Mapping) and not isinstance(
+        service_principal_adopted, Mapping
+    ):
+        fail("adopted publisher Graph grant is not bound to an adopted service principal")
     adopted_identity_ids: list[str] = []
     for operation_id in (
         "createBridgeIdentity",
@@ -9441,6 +9558,31 @@ class AzureCliBootstrapTransport:
                     fail("publisher application readback is not credentialless and exact")
             elif operation_id == "createPublisherServicePrincipal":
                 assignments = projection_document.get("appRoleAssignments")
+                decision = self.admissions[operation_id]["context"][
+                    "executionDecision"
+                ]
+                grant_context = self.admissions[
+                    "grantPublisherGraphApplicationReadAll"
+                ]["context"]
+                adopted_grant = grant_context.get("adopted")
+                adopted_assignment_exact = not assignments or (
+                    decision == "adopt-exact"
+                    and grant_context.get("executionDecision") == "adopt-exact"
+                    and isinstance(adopted_grant, Mapping)
+                    and isinstance(assignments, list)
+                    and len(assignments) == 1
+                    and isinstance(assignments[0], Mapping)
+                    and set(assignments[0])
+                    == {"id", "principalId", "resourceId", "appRoleId"}
+                    and assignments[0].get("id")
+                    == adopted_grant.get("assignmentId")
+                    and assignments[0].get("principalId")
+                    == projection_document.get("id")
+                    and assignments[0].get("resourceId")
+                    == adopted_grant.get("resourceId")
+                    and assignments[0].get("appRoleId")
+                    == self.GRAPH_APPLICATION_READ_ALL
+                )
                 if (
                     projection_document.get("displayName") != self.resources["publisherServicePrincipal"]["name"]
                     or projection_document.get("accountEnabled") is not True
@@ -9448,7 +9590,8 @@ class AzureCliBootstrapTransport:
                     or projection_document.get("passwordCredentials") != []
                     or projection_document.get("keyCredentials") != []
                     or not isinstance(assignments, list)
-                    or bool(assignments)
+                    or (decision == "apply-exact" and bool(assignments))
+                    or not adopted_assignment_exact
                     or projection_document.get(
                         "appRoleAssignments@odata.nextLink"
                     )
@@ -9460,6 +9603,9 @@ class AzureCliBootstrapTransport:
             elif operation_id == "grantPublisherGraphApplicationReadAll":
                 assignments = projection_document.get("appRoleAssignments")
                 publisher_id = projection_document.get("id")
+                publisher_projection = self._validated_source_projections.get(
+                    "createPublisherServicePrincipal", {}
+                ).get("projection", {})
                 if (
                     runtime_facts is None
                     or projection_document.get(
@@ -9470,9 +9616,16 @@ class AzureCliBootstrapTransport:
                     or projection_document.get("servicePrincipalType") != "Application"
                     or projection_document.get("passwordCredentials") != []
                     or projection_document.get("keyCredentials") != []
+                    or publisher_id != publisher_projection.get("id")
+                    or projection_document.get("appId")
+                    != publisher_projection.get("appId")
+                    or projection_document.get("displayName")
+                    != self.resources["publisherServicePrincipal"]["name"]
                     or not isinstance(assignments, list)
                     or len(assignments) != 1
                     or not isinstance(assignments[0], Mapping)
+                    or set(assignments[0])
+                    != {"id", "principalId", "resourceId", "appRoleId"}
                     or assignments[0].get("id") != runtime_facts.get("assignmentId")
                     or assignments[0].get("principalId") != publisher_id
                     or assignments[0].get("resourceId") != runtime_facts.get("resourceId")
@@ -10112,7 +10265,9 @@ class AzureCliBootstrapTransport:
             publisher = self._proof_detail(state, "createPublisherServicePrincipal")
             graph = self._graph_json(
                 "GET",
-                f"/v1.0/servicePrincipals?$filter=appId%20eq%20'{self.GRAPH_APP_ID}'&$select=id,appId",
+                _microsoft_graph_service_principal_inventory_url().removeprefix(
+                    self.GRAPH_ROOT
+                ),
                 expected={200},
             )
             values = _unpaginated_graph_collection(

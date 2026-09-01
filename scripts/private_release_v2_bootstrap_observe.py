@@ -557,6 +557,27 @@ def _graph_one(envelope: Mapping[str, Any], label: str) -> Mapping[str, Any]:
     return values[0]
 
 
+def _microsoft_graph_service_principal_id(
+    envelope: Mapping[str, Any],
+) -> str:
+    if envelope.get("status") != 200:
+        fail("Microsoft Graph service principal inventory is unreadable")
+    service = _exact_keys(
+        _graph_one(envelope, "Microsoft Graph service principal inventory"),
+        {"id", "appId"},
+        "Microsoft Graph service principal",
+    )
+    service_id = service["id"]
+    if (
+        service["appId"]
+        != bootstrap.AzureCliBootstrapTransport.GRAPH_APP_ID
+        or not isinstance(service_id, str)
+        or GUID.fullmatch(service_id) is None
+    ):
+        fail("Microsoft Graph service principal inventory is not exact")
+    return service_id
+
+
 def _identity_adopted(envelope: Mapping[str, Any], expected_resource_id: str) -> dict[str, Any]:
     body = _body_mapping(envelope, "managed identity")
     properties = _properties(envelope, "managed identity")
@@ -571,6 +592,28 @@ def _identity_adopted(envelope: Mapping[str, Any], expected_resource_id: str) ->
     ):
         fail("managed identity adoption response drifted from the fixed resource")
     return result
+
+
+def _private_container_adopted(
+    envelope: Mapping[str, Any],
+    operation_id: str,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = _body_mapping(envelope, operation_id)
+    properties = body.get("properties")
+    if not isinstance(properties, Mapping):
+        fail(f"{operation_id} response has no exact properties object")
+    bootstrap._validate_private_container_projection(
+        {
+            "id": body.get("id"),
+            "name": body.get("name"),
+            "type": body.get("type"),
+            "publicAccess": properties.get("publicAccess"),
+        },
+        operation_id=operation_id,
+        plan=plan,
+    )
+    return {}
 
 
 def _storage_acl(envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -676,6 +719,18 @@ def _adopted_projection(
             "appId": item.get("appId"),
             "principalId": item.get("id"),
         }
+    elif operation_id == "grantPublisherGraphApplicationReadAll":
+        item = _graph_one(envelope, operation_id)
+        assignments = item.get("appRoleAssignments")
+        if not isinstance(assignments, list) or len(assignments) != 1:
+            fail("publisher Graph assignment adoption is not sole")
+        assignment = assignments[0]
+        if not isinstance(assignment, Mapping):
+            fail("publisher Graph assignment adoption is not one object")
+        result = {
+            "assignmentId": assignment.get("id"),
+            "resourceId": assignment.get("resourceId"),
+        }
     else:
         identity_targets = {
             "createBridgeIdentity": "bridgeIdentity",
@@ -774,6 +829,7 @@ def _operation_admission(
     policy: Mapping[str, Any],
     dependency_facts: Mapping[str, Mapping[str, Any]],
     built_in_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
+    graph_service_principal_envelope: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
 
@@ -897,6 +953,11 @@ def _operation_admission(
             publisher = dependency_facts.get("createPublisherServicePrincipal")
             service = values[0]
             assignments = service.get("appRoleAssignments")
+            if graph_service_principal_envelope is None:
+                fail("Microsoft Graph service principal inventory is missing")
+            graph_service_id = _microsoft_graph_service_principal_id(
+                graph_service_principal_envelope
+            )
             if (
                 not isinstance(publisher, Mapping)
                 or service.get("id") != publisher.get("objectId")
@@ -913,9 +974,44 @@ def _operation_admission(
             if not assignments:
                 status = 404
             else:
-                fail(
-                    "pre-existing publisher Graph assignment requires separately reviewed exact-adoption recovery"
+                if (
+                    len(assignments) != 1
+                    or not isinstance(assignments[0], Mapping)
+                    or set(assignments[0])
+                    != {"id", "principalId", "resourceId", "appRoleId"}
+                    or GUID.fullmatch(str(assignments[0].get("id", ""))) is None
+                    or assignments[0].get("principalId") != publisher.get("objectId")
+                    or assignments[0].get("resourceId") != graph_service_id
+                    or assignments[0].get("appRoleId")
+                    != bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL
+                ):
+                    fail("pre-existing publisher Graph assignment is not sole and exact")
+                return "exact", _policy_checked_context(
+                    operation_id,
+                    policy,
+                    {
+                        "executionDecision": "adopt-exact",
+                        "adopted": _adopted_projection(
+                            operation, envelope, plan, authorization, policy
+                        ),
+                    },
                 )
+
+    if status == 200 and operation_id in {
+        "createPrivatePackageContainer",
+        "createPrivateControllerLockContainer",
+        "createPrivateActivationFenceContainer",
+    }:
+        if operation_id == "createPrivateControllerLockContainer":
+            fail(
+                "pre-existing controller lock container requires exact empty-container proof"
+            )
+        adopted = _private_container_adopted(envelope, operation_id, plan)
+        return "exact", _policy_checked_context(
+            operation_id,
+            policy,
+            {"executionDecision": "adopt-exact", "adopted": adopted},
+        )
 
     if operation_id in {
         "lockPackageRetentionAt91Days",
@@ -1277,6 +1373,7 @@ def build_read_only_observation(
             cache[key] = _normalize_response(request, session.read(request))
         envelope = cache[key]
         built_in_role_definitions: dict[str, Mapping[str, Any]] | None = None
+        graph_service_principal_envelope: Mapping[str, Any] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
         temporary_definition_url = (
             bootstrap._temporary_role_definition_readback_url(
@@ -1345,6 +1442,24 @@ def build_read_only_observation(
                         definition_envelope,
                     )
                 )
+        if operation["id"] == "grantPublisherGraphApplicationReadAll":
+            graph_request = ReadRequest(
+                method="GET",
+                url=bootstrap._microsoft_graph_service_principal_inventory_url(),
+            )
+            graph_key = (graph_request.method, graph_request.url)
+            if graph_key not in cache:
+                cache[graph_key] = _normalize_response(
+                    graph_request, session.read(graph_request)
+                )
+            graph_service_principal_envelope = cache[graph_key]
+            extra_preflight_probes.append(
+                _preflight_probe(
+                    f"preflight-{index:02d}-graph-resource-sp",
+                    graph_request,
+                    graph_service_principal_envelope,
+                )
+            )
         status, context = _operation_admission(
             operation,
             envelope,
@@ -1355,6 +1470,7 @@ def build_read_only_observation(
             policy,
             dependency_facts,
             built_in_role_definitions,
+            graph_service_principal_envelope,
         )
         pre_id = f"preflight-{index:02d}"
         read_id = f"readback-{index:02d}"
