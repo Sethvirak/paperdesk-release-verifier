@@ -599,9 +599,15 @@ def _identity_adopted(envelope: Mapping[str, Any], expected_resource_id: str) ->
         "clientId": properties.get("clientId"),
         "principalId": properties.get("principalId"),
     }
-    if str(result["resourceId"]).lower() != expected_resource_id.lower() or any(
+    if (
+        envelope.get("status") != 200
+        or body.get("type") != "Microsoft.ManagedIdentity/userAssignedIdentities"
+        or properties.get("tenantId") != bootstrap.TENANT
+        or str(result["resourceId"]).lower() != expected_resource_id.lower()
+        or any(
         not isinstance(result[field], str) or not GUID.fullmatch(result[field])
         for field in ("clientId", "principalId")
+        )
     ):
         fail("managed identity adoption response drifted from the fixed resource")
     return result
@@ -1636,9 +1642,7 @@ def build_read_only_observation(
             }
         )
         adopted = context.get("adopted")
-        if isinstance(adopted, Mapping):
-            dependency_facts[operation["id"]] = dict(adopted)
-        elif operation["id"] in {
+        if operation["id"] in {
             "adoptExistingRegistryWriterIdentity",
             "adoptExistingRegistryReaderIdentity",
         }:
@@ -1649,11 +1653,23 @@ def build_read_only_observation(
             resource = next(
                 item for item in plan["resourceInventory"] if item["id"] == resource_id
             )
-            dependency_facts[operation["id"]] = {
-                "resourceId": resource["resourceId"],
-                "clientId": resource["clientId"],
-                "principalId": resource["principalId"],
-            }
+            # These legacy identity admissions intentionally retain an empty
+            # public adopted context.  Recovery still needs their identity
+            # facts, so derive the private dependency exclusively from the
+            # exact live GET envelope already validated for this operation.
+            # The plan contributes only the fixed target resource ID; it is
+            # never a fallback source for clientId or principalId.
+            live_identity = _identity_adopted(
+                envelope, resource["resourceId"]
+            )
+            if (
+                live_identity["clientId"] != resource["clientId"]
+                or live_identity["principalId"] != resource["principalId"]
+            ):
+                fail("fixed registry identity live projection drifted")
+            dependency_facts[operation["id"]] = live_identity
+        elif isinstance(adopted, Mapping):
+            dependency_facts[operation["id"]] = dict(adopted)
 
     production_documents: dict[str, Any] = {}
     production_probe_ids: list[str] = []
