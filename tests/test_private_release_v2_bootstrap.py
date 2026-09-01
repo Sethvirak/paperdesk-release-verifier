@@ -3010,7 +3010,9 @@ class BootstrapTests(unittest.TestCase):
         attached_projection = prior["attachFiveUamisOnlyToBridge"]["projection"]
         identity = attached_projection["identity"]
         identity_ids = sorted(item.lower() for item in identity["userAssignedIdentities"])
-        etag = '"bridge-recovery-etag"'
+        # Azure Web Apps commonly returns the strong hexadecimal ETag without
+        # HTTP quotes.  The observer retains that exact raw token.
+        etag = "1DD3A097267B9E0"
         identity_digest = bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(identity))
         create_admission = next(
             item for item in projection["operationAdmissions"]
@@ -3100,6 +3102,22 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result["status"], "adopted-exact")
         self.assertFalse(result["owned"])
         expected = transport.probes[attach_admission["desiredProbeIds"][0]]
+        for authorized_etag, live_etag in (
+            (f'"{etag}"', f'"{etag}"'),
+            (etag, f'"{etag}"'),
+            (f'"{etag}"', etag),
+        ):
+            facts = copy.deepcopy(attach_admission["context"]["adopted"])
+            facts["expectedEtag"] = authorized_etag
+            response = bootstrap._RestResponse(
+                200, bootstrap.canonical_json_bytes(body), {"ETag": live_etag}
+            )
+            with self.subTest(
+                authorized_etag=authorized_etag, live_etag=live_etag
+            ):
+                transport._validate_readback_response(
+                    expected, response, runtime_facts=facts
+                )
         invalid_responses = {}
         unsafe = copy.deepcopy(body)
         unsafe["properties"]["httpsOnly"] = False
@@ -3113,7 +3131,8 @@ class BootstrapTests(unittest.TestCase):
             200, bootstrap.canonical_json_bytes(malformed), {"ETag": etag}
         )
         invalid_responses["etag drift"] = bootstrap._RestResponse(
-            200, bootstrap.canonical_json_bytes(body), {"ETag": '"different"'}
+            200, bootstrap.canonical_json_bytes(body),
+            {"ETag": etag[:-1] + ("1" if etag[-1] != "1" else "2")},
         )
         for label, response in invalid_responses.items():
             with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
