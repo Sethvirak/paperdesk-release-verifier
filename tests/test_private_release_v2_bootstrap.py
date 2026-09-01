@@ -261,7 +261,10 @@ def build_projection(plan, package, *, adopt_operations=()):
         return value
 
     def operation_status(operation):
-        if operation["id"] == "readBackExactSigningPublicJwk":
+        if operation["id"] in {
+            "readBackExactSigningPublicJwk",
+            "proveControllerLockContainerEmpty",
+        }:
             return "temporary-access-inaccessible"
         kind = operation["kind"]
         if kind.startswith(("azure-global-create-only", "azure-ad-create-only", "temporary-add", "create-or-adopt")):
@@ -911,6 +914,34 @@ class _TerminalEvidenceFixture:
             "addOwnedOperatorControllerCanaryRole",
         ):
             self.envelope(operation_id, self.temp_role(operation_id))
+        controller_projection = self.operations[
+            "createPrivateControllerLockContainer"
+        ]["projection"]
+        self.envelope(
+            "proveControllerLockContainerEmpty",
+            {
+                "containerUrl": (
+                    "https://mdspdbak2608089c4e.blob.core.windows.net/"
+                    "paperdesk-release-controller-lock"
+                ),
+                "listUrl": (
+                    "https://mdspdbak2608089c4e.blob.core.windows.net/"
+                    "paperdesk-release-controller-lock?restype=container&comp=list"
+                ),
+                "httpStatus": 200,
+                "blobNames": [],
+                "blobCount": 0,
+                "nextMarker": "",
+                "responseSha256": self.digest(
+                    "response:proveControllerLockContainerEmpty"
+                ),
+                "observedAt": stamp(NOW + dt.timedelta(minutes=1)),
+                "privateContainerPosture": copy.deepcopy(controller_projection),
+                "controllerContainerDecision": self.contexts[
+                    "createPrivateControllerLockContainer"
+                ]["executionDecision"],
+            },
+        )
 
         package_contract = bootstrap._validator_contract(
             "operation:uploadVersionedBridgePackage", self.plan, self.authorization
@@ -1470,6 +1501,9 @@ class _TerminalEvidenceFixture:
             "principalEffectiveAssignments": copy.deepcopy(inventories),
             "controllerLockContainer": self.operations[
                 "createPrivateControllerLockContainer"
+            ]["projection"],
+            "controllerLockInitialEmptyProof": self.operations[
+                "proveControllerLockContainerEmpty"
             ]["projection"],
             "networkTopology": {
                 "virtualNetwork": {"id": vnet, "type": "Microsoft.Network/virtualNetworks", "addressSpacePrefixes": ["10.41.0.0/16"]},
@@ -2602,7 +2636,10 @@ class FakeTransport:
             raise bootstrap.BootstrapError("injected permanent failure")
         removed = operation["id"].startswith("removeOwned") or operation["id"] == "stopBridgeAfterBoundedCanary"
         removed = removed or operation["id"] == "removeControllerLeaseCanaryBlob"
-        read = operation["id"] == "readBackExactSigningPublicJwk"
+        read = operation["id"] in {
+            "readBackExactSigningPublicJwk",
+            "proveControllerLockContainerEmpty",
+        }
         self_cleaned = operation["id"] in {
             "exerciseControllerLeaseCanary",
             "startBridgeForBoundedCanary",
@@ -2914,6 +2951,313 @@ class BootstrapTests(unittest.TestCase):
         ):
             bootstrap.validate_preflight_evidence(
                 preflight, altered_authorization, self.plan
+            )
+
+    def test_controller_empty_inventory_is_strictly_zero_blob_and_unpaginated(self):
+        resource = next(
+            item
+            for item in self.plan["resourceInventory"]
+            if item["id"] == "controllerLockContainer"
+        )
+        posture = {
+            "id": resource["resourceId"],
+            "name": resource["name"],
+            "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+            "publicAccess": "None",
+        }
+        exact = (
+            b'<EnumerationResults>'
+            b'<Prefix/><Marker/><MaxResults>5000</MaxResults><Delimiter/>'
+            b'<Blobs/><NextMarker/></EnumerationResults>'
+        )
+
+        def response(body, content_type="application/xml"):
+            return bootstrap._RestResponse(
+                status=200,
+                body=body,
+                headers={"content-type": content_type},
+            )
+
+        inventory = bootstrap._strict_empty_controller_inventory(
+            response(exact),
+            plan=self.plan,
+            observed_at=stamp(NOW),
+            private_container_posture=posture,
+            controller_container_decision="apply-exact",
+        )
+        self.assertEqual(inventory["blobNames"], [])
+        self.assertEqual(inventory["nextMarker"], "")
+        malformed = [
+            b"<EnumerationResults><Blobs><Blob/></Blobs><NextMarker/></EnumerationResults>",
+            b"<EnumerationResults><Blobs><BlobPrefix/></Blobs><NextMarker/></EnumerationResults>",
+            b"<EnumerationResults><Blobs/><Blobs/><NextMarker/></EnumerationResults>",
+            b"<EnumerationResults><Blobs/><NextMarker>page-2</NextMarker></EnumerationResults>",
+            b"<EnumerationResults><Unknown/><Blobs/><NextMarker/></EnumerationResults>",
+            b"<EnumerationResults><Blobs/>",
+        ]
+        for body in malformed:
+            with self.subTest(body=body), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._strict_empty_controller_inventory(
+                    response(body),
+                    plan=self.plan,
+                    observed_at=stamp(NOW),
+                    private_container_posture=posture,
+                    controller_container_decision="apply-exact",
+                )
+        for body, content_type in (
+            (exact, "application/json"),
+            (b"x" * 1_000_001, "application/xml"),
+        ):
+            with self.subTest(content_type=content_type), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                bootstrap._strict_empty_controller_inventory(
+                    response(body, content_type),
+                    plan=self.plan,
+                    observed_at=stamp(NOW),
+                    private_container_posture=posture,
+                    controller_container_decision="apply-exact",
+                )
+
+    def test_controller_empty_proof_retries_only_recognized_authorization_403(self):
+        projection = build_projection(self.plan, self.package)
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            authorization = build_authorization(
+                self.plan, self.plan_sha, self.package, projection, receipt
+            )
+            fixture = _TerminalEvidenceFixture(
+                self.plan, self.plan_sha, self.package, receipt
+            )
+        resource = next(
+            item
+            for item in self.plan["resourceInventory"]
+            if item["id"] == "controllerLockContainer"
+        )
+        controller = fixture.envelope(
+            "createPrivateControllerLockContainer",
+            {
+                "id": resource["resourceId"],
+                "name": resource["name"],
+                "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+                "publicAccess": "None",
+            },
+        )
+        exact_xml = (
+            b"<EnumerationResults><Prefix/><Marker/><MaxResults>5000</MaxResults>"
+            b"<Delimiter/><Blobs/><NextMarker/></EnumerationResults>"
+        )
+
+        class Session:
+            def __init__(self, responses, *, repeat=False):
+                self.responses = list(responses)
+                self.repeat = repeat
+                self.requests = []
+
+            def request(self, method, url, **kwargs):
+                self.requests.append((method, url, kwargs))
+                if self.repeat:
+                    return self.responses[0]
+                return self.responses.pop(0)
+
+        def storage_error(code):
+            return bootstrap._RestResponse(
+                403,
+                f"<Error><Code>{code}</Code></Error>".encode("ascii"),
+                {"content-type": "application/xml"},
+            )
+
+        exact_response = bootstrap._RestResponse(
+            200, exact_xml, {"content-type": "application/xml"}
+        )
+
+        def transport_for(session, *, jump=False):
+            current = [NOW]
+
+            def clock():
+                return current[0]
+
+            def sleep(seconds):
+                current[0] += dt.timedelta(seconds=121 if jump else seconds)
+
+            transport = bootstrap.AzureCliBootstrapTransport(
+                authorization=authorization,
+                plan=self.plan,
+                package=self.package,
+                preflight={"projection": projection},
+                clock=clock,
+                sleep=sleep,
+                session=session,
+            )
+            transport._validated_source_projections[
+                "createPrivateControllerLockContainer"
+            ] = controller
+            return transport
+
+        session = Session(
+            [storage_error("AuthorizationPermissionMismatch"), exact_response]
+        )
+        transport = transport_for(session)
+        admission = transport.admissions["proveControllerLockContainerEmpty"]
+        proof = transport._prove_controller_lock_container_empty(
+            admission["desiredProbeIds"]
+        )[0]
+        self.assertEqual(proof["attempts"], 2)
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(
+            proof["sourceProjection"]["family"],
+            "controller-lock-initial-empty-proof",
+        )
+
+        unrecognized = Session([storage_error("AuthenticationFailed")])
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "not recognized RBAC propagation"
+        ):
+            transport_for(unrecognized)._prove_controller_lock_container_empty(
+                admission["desiredProbeIds"]
+            )
+        self.assertEqual(len(unrecognized.requests), 1)
+
+        never_converges = Session(
+            [storage_error("AuthorizationFailure")], repeat=True
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "window expired|did not converge"
+        ):
+            transport_for(
+                never_converges, jump=True
+            )._prove_controller_lock_container_empty(admission["desiredProbeIds"])
+        self.assertEqual(len(never_converges.requests), 1)
+
+    def test_pending_empty_proof_decision_is_controller_only(self):
+        pending = {"executionDecision": "adopt-pending-execution-empty-proof"}
+        self.assertEqual(
+            bootstrap._validate_operation_context(
+                "createPrivateControllerLockContainer", pending, {}
+            ),
+            pending,
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "outside the controller container"
+        ):
+            bootstrap._validate_operation_context(
+                "createMailboxResourceGroup", pending, {}
+            )
+
+    def test_pending_empty_proof_admission_status_and_decision_are_exactly_paired(self):
+        base = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        cases = (
+            "createMailboxResourceGroup",
+            "createPrivateControllerLockContainer",
+        )
+        for operation_id in cases:
+            with self.subTest(operation_id=operation_id):
+                projection = copy.deepcopy(base)
+                admission = next(
+                    item
+                    for item in projection["operationAdmissions"]
+                    if item["operationId"] == operation_id
+                )
+                admission["status"] = "adopt-pending-execution-empty-proof"
+                authorization = build_authorization(
+                    self.plan,
+                    self.plan_sha,
+                    self.package,
+                    projection,
+                    receipt,
+                )
+                preflight = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"]["observedAt"],
+                    "projection": projection,
+                    "projectionSha256": authorization["observedPreflight"]["sha256"],
+                }
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "pending empty-container status lacks its exact execution decision",
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, authorization, self.plan
+                    )
+
+    def test_adopted_signing_key_expiry_is_nested_fresh_and_readback_exact(self):
+        projection = build_projection(self.plan, self.package)
+        with tempfile.TemporaryDirectory() as folder:
+            authorization = build_authorization(
+                self.plan,
+                self.plan_sha,
+                self.package,
+                projection,
+                Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}",
+            )
+        key_uri = (
+            "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/"
+            "paperdesk-release-result-signing/" + "c" * 32
+        )
+        minimum = bootstrap.parse_time(
+            authorization["validity"]["expiresAt"], "authorization expiry"
+        ) + dt.timedelta(days=30)
+        valid = {
+            "executionDecision": "adopt-exact",
+            "adopted": {
+                "keyUriWithVersion": key_uri,
+                "expiresAt": stamp(minimum),
+            },
+        }
+        self.assertEqual(
+            bootstrap._validate_operation_context(
+                "createSigningKeyVersion", valid, authorization
+            ),
+            valid,
+        )
+        missing = copy.deepcopy(valid)
+        del missing["adopted"]["expiresAt"]
+        too_short = copy.deepcopy(valid)
+        too_short["adopted"]["expiresAt"] = stamp(minimum - dt.timedelta(seconds=1))
+        for context in (missing, too_short):
+            with self.subTest(context=context), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                bootstrap._validate_operation_context(
+                    "createSigningKeyVersion", context, authorization
+                )
+        contract = bootstrap._validator_contract(
+            "operation:createSigningKeyVersion", self.plan, authorization
+        )
+        mismatch = {
+            "schemaVersion": 1,
+            "operationId": "createSigningKeyVersion",
+            "family": "signing-key-posture",
+            "method": contract["expectedMethod"],
+            "url": contract["expectedUrl"],
+            "status": contract["expectedStatus"],
+            "target": contract["target"],
+            "targetResourceId": contract.get("targetResourceId"),
+            "responseSha256": "a" * 64,
+            "headers": {},
+            "projection": {
+                "keyUriWithVersion": key_uri,
+                "kty": "RSA",
+                "keySize": 3072,
+                "keyOps": ["sign", "verify"],
+                "enabled": True,
+                "exportable": False,
+                "expiresAt": int(minimum.timestamp()) + 1,
+                "releasePolicy": None,
+            },
+        }
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "unsafe"):
+            bootstrap._validate_operation_source_projection(
+                mismatch,
+                operation_id="createSigningKeyVersion",
+                plan=self.plan,
+                authorization=authorization,
+                prior={},
+                operation_context=valid,
             )
 
     def test_preflight_requires_fresh_temporary_role_definition_absence(self):
@@ -3985,14 +4329,32 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(
                 compensated,
                 [
-                    "addOwnedOperatorControllerCanaryRole",
                     "addOwnedOperatorFenceBootstrapRole",
                     "addOwnedOperatorKeyReadRole",
                     "addOwnedUploaderPackageRole",
+                    "addOwnedOperatorControllerCanaryRole",
                     "addOwnedUploaderIpv4Rule",
                 ],
             )
             self.assertNotIn("createPrivatePackageContainer", compensated)
+
+    def test_empty_proof_failure_compensates_controller_role_then_ip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, validated, preflight, projection, _ = self.fixture(folder)
+            transport = FakeTransport(
+                projection, fail_operation="proveControllerLockContainerEmpty"
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError, "injected permanent failure"
+            ):
+                self.executor(validated, preflight, transport).run()
+            self.assertEqual(
+                [value for kind, value in transport.calls if kind == "compensate"],
+                [
+                    "addOwnedOperatorControllerCanaryRole",
+                    "addOwnedUploaderIpv4Rule",
+                ],
+            )
 
     def test_terminal_write_failure_does_not_mask_original_failure(self):
         with tempfile.TemporaryDirectory() as folder:

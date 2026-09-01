@@ -80,6 +80,7 @@ GRAPH_APP_ROLE_ASSIGNMENT_ID = re.compile(r"^[A-Za-z0-9_-]{43}$")
 TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS = frozenset(
     {
         "readBackExactSigningPublicJwk",
+        "proveControllerLockContainerEmpty",
         "createInitialIdleActivationFence",
         "createControllerLeaseCanaryBlob",
         "exerciseControllerLeaseCanary",
@@ -94,6 +95,22 @@ STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "or a local result-journal/fsync failure can leave the exact uploader /32 in place; "
     "execution and any later release must stop until a fresh live read proves the /32 and "
     "all related temporary roles absent, and manual cleanup may be required."
+)
+
+BRIDGE_REQUIRED_OUTBOUND_VNET_ROUTING_FLAGS = frozenset(
+    {"allTraffic", "applicationTraffic"}
+)
+BRIDGE_RECOGNIZED_OUTBOUND_VNET_ROUTING_FLAGS = frozenset(
+    {
+        *BRIDGE_REQUIRED_OUTBOUND_VNET_ROUTING_FLAGS,
+        "backupRestoreTraffic",
+        "contentShareTraffic",
+        "imagePullTraffic",
+        "managedIdentityTraffic",
+    }
+)
+BRIDGE_NO_IDENTITY_FIELDS = frozenset(
+    {"type", "principalId", "tenantId", "userAssignedIdentities"}
 )
 
 
@@ -171,6 +188,42 @@ def _exact_keys(value: Any, expected: set[str], label: str) -> Mapping[str, Any]
     if not isinstance(value, dict) or set(value) != expected:
         fail(f"{label} fields are not exact")
     return value
+
+
+def _safe_bridge_outbound_vnet_routing(value: Any) -> bool:
+    """Accept only the source flags plus Azure RP's known safe enrichment.
+
+    Azure Web Apps may expand the two requested outbound-routing flags into a
+    six-flag response.  Every returned flag must be recognized and strictly
+    ``true``; missing source-mandatory flags, false/non-boolean values, and new
+    response fields all fail closed.
+    """
+
+    if not isinstance(value, Mapping):
+        return False
+    keys = set(value)
+    return (
+        BRIDGE_REQUIRED_OUTBOUND_VNET_ROUTING_FLAGS.issubset(keys)
+        and keys.issubset(BRIDGE_RECOGNIZED_OUTBOUND_VNET_ROUTING_FLAGS)
+        and all(value[key] is True for key in keys)
+    )
+
+
+def _safe_bridge_no_identity(value: Any) -> bool:
+    """Normalize an omitted Azure identity while rejecting every identity."""
+
+    if value is None:
+        return True
+    if not isinstance(value, Mapping) or not set(value).issubset(
+        BRIDGE_NO_IDENTITY_FIELDS
+    ):
+        return False
+    return (
+        value.get("type") in {None, "None"}
+        and value.get("principalId") is None
+        and value.get("tenantId") is None
+        and value.get("userAssignedIdentities") in (None, {})
+    )
 
 
 def _sha40(value: Any, label: str) -> str:
@@ -582,6 +635,12 @@ def _expected_terminal_mutation_targets(
         fail(f"terminal journal lacks the exact context for {operation_id}")
     if context.get("executionDecision") == "adopt-exact":
         return Counter(), Counter()
+    if (
+        operation_id == "createPrivateControllerLockContainer"
+        and context.get("executionDecision")
+        == "adopt-pending-execution-empty-proof"
+    ):
+        return Counter(), Counter()
     if context.get("executionDecision") != "apply-exact":
         fail(f"terminal journal operation decision is invalid: {operation_id}")
 
@@ -604,6 +663,7 @@ def _expected_terminal_mutation_targets(
         "adoptExistingRegistryWriterIdentity",
         "adoptExistingRegistryReaderIdentity",
         "readBackExactSigningPublicJwk",
+        "proveControllerLockContainerEmpty",
     }
     if operation_id in no_write_operations:
         return Counter(), Counter()
@@ -1004,6 +1064,11 @@ def _expected_permanent_outcome(
     decision = context.get("executionDecision")
     if decision == "adopt-exact":
         return "adopted-exact"
+    if (
+        mutation.get("id") == "createPrivateControllerLockContainer"
+        and decision == "adopt-pending-execution-empty-proof"
+    ):
+        return "read-back-exact"
     if decision != "apply-exact":
         fail(f"terminal outcome lacks an exact decision for {mutation['id']}")
     kind = str(mutation["kind"])
@@ -1486,6 +1551,19 @@ def load_plan() -> tuple[dict[str, Any], str]:
     before("createExactRoleAssignments", "attachFiveUamisOnlyToBridge")
     before("attachFiveUamisOnlyToBridge", "detachWriterAndReaderFromLegacyBridge")
     before("addOwnedUploaderIpv4Rule", "createInitialIdleActivationFence")
+    before("addOwnedUploaderIpv4Rule", "addOwnedOperatorControllerCanaryRole")
+    before("createPrivateControllerLockContainer", "proveControllerLockContainerEmpty")
+    before("addOwnedOperatorControllerCanaryRole", "proveControllerLockContainerEmpty")
+    for later_temporary_access in (
+        "addOwnedUploaderPackageRole",
+        "addOwnedOperatorKeyReadRole",
+        "addOwnedOperatorFenceBootstrapRole",
+        "uploadVersionedBridgePackage",
+        "readBackExactSigningPublicJwk",
+        "createInitialIdleActivationFence",
+        "createControllerLeaseCanaryBlob",
+    ):
+        before("proveControllerLockContainerEmpty", later_temporary_access)
     before("createControllerLeaseCanaryBlob", "exerciseControllerLeaseCanary")
     before("exerciseControllerLeaseCanary", "removeControllerLeaseCanaryBlob")
     before("createInitialIdleActivationFence", "removeOwnedUploaderIpv4Rule")
@@ -2117,11 +2195,17 @@ def _preflight_url_allowed(method: str, url: str) -> bool:
             parsed.path.startswith("/v1.0/") or parsed.path.startswith("/beta/")
         )
     if host == "mdspdbak2608089c4e.blob.core.windows.net":
-        return method == "GET" and parsed.path.startswith(
+        return method == "GET" and (
             (
-                "/paperdesk-deployment-packages/",
-                "/paperdesk-release-activation-control/",
-                "/paperdesk-release-controller-lock/",
+                parsed.path == "/paperdesk-release-controller-lock"
+                and parsed.query == "restype=container&comp=list"
+            )
+            or parsed.path.startswith(
+                (
+                    "/paperdesk-deployment-packages/",
+                    "/paperdesk-release-activation-control/",
+                    "/paperdesk-release-controller-lock/",
+                )
             )
         )
     if host == "kv-mds-sea-9c4e0d0d.vault.azure.net":
@@ -3167,6 +3251,11 @@ def _operation_readback_url(
         return arm(resources[target]["resourceId"] + "/immutabilityPolicies/default", "2025-06-01")
     if operation_id == "readBackExactSigningPublicJwk":
         return "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/versions?api-version=7.4"
+    if operation_id == "proveControllerLockContainerEmpty":
+        return (
+            "https://mdspdbak2608089c4e.blob.core.windows.net/"
+            f"{resources['controllerLockContainer']['name']}?restype=container&comp=list"
+        )
     if operation_id == "createInitialIdleActivationFence":
         return resources["activationFenceBlob"]["resourceId"]
     if operation_id in {
@@ -3571,6 +3660,10 @@ def _operation_projection_family(operation_id: str) -> str:
             "versioned-blob-readback",
         ),
         ({"readBackExactSigningPublicJwk"}, "public-jwk-projection"),
+        (
+            {"proveControllerLockContainerEmpty"},
+            "controller-lock-initial-empty-proof",
+        ),
         ({"exerciseControllerLeaseCanary"}, "controller-lease-canary"),
         (
             {"removeControllerLeaseCanaryBlob"},
@@ -3915,6 +4008,59 @@ def _validate_operation_source_projection(
             operation_id=operation_id,
             plan=plan,
         )
+    elif family == "controller-lock-initial-empty-proof":
+        body = _exact_keys(
+            body,
+            {
+                "containerUrl",
+                "listUrl",
+                "httpStatus",
+                "blobNames",
+                "blobCount",
+                "nextMarker",
+                "responseSha256",
+                "observedAt",
+                "privateContainerPosture",
+                "controllerContainerDecision",
+            },
+            "controller lock initial empty proof",
+        )
+        container_name = resources["controllerLockContainer"]["name"]
+        container_url = (
+            "https://mdspdbak2608089c4e.blob.core.windows.net/" + container_name
+        )
+        private_posture = prior.get(
+            "createPrivateControllerLockContainer", {}
+        ).get("projection")
+        if (
+            body["containerUrl"] != container_url
+            or body["listUrl"] != container_url + "?restype=container&comp=list"
+            or type(body["httpStatus"]) is not int
+            or body["httpStatus"] != 200
+            or body["blobNames"] != []
+            or type(body["blobCount"]) is not int
+            or body["blobCount"] != 0
+            or body["nextMarker"] != ""
+            or not SHA256.fullmatch(str(body["responseSha256"]))
+            or body["responseSha256"] != projection["responseSha256"]
+            or body["privateContainerPosture"] != private_posture
+            or body["controllerContainerDecision"]
+            not in {"apply-exact", "adopt-pending-execution-empty-proof"}
+        ):
+            fail("controller lock initial empty proof is not exact")
+        proof_observed_at = parse_time(
+            body["observedAt"], "controller lock empty proof observedAt"
+        )
+        if not (
+            parse_time(
+                authorization["validity"]["notBefore"], "authorization notBefore"
+            )
+            <= proof_observed_at
+            <= parse_time(
+                authorization["validity"]["expiresAt"], "authorization expiresAt"
+            )
+        ):
+            fail("controller lock empty proof is outside the authorization window")
     elif family == "signing-key-posture":
         body = _exact_keys(
             body,
@@ -3931,16 +4077,7 @@ def _validate_operation_source_projection(
             "signing key posture",
         )
         expected_expiry = int(
-            parse_time(context.get("expiresAt"), "signing key authorized expiresAt").timestamp()
-        )
-        minimum_expiry = int(
-            (
-                parse_time(
-                    authorization["validity"]["expiresAt"],
-                    "authorization expiresAt",
-                )
-                + dt.timedelta(days=30)
-            ).timestamp()
+            _signing_key_context_expiry(context, authorization).timestamp()
         )
         if (
             re.fullmatch(
@@ -3953,8 +4090,8 @@ def _validate_operation_source_projection(
             or body["keyOps"] != ["sign", "verify"]
             or body["enabled"] is not True
             or body["exportable"] is not False
+            or type(body["expiresAt"]) is not int
             or body["expiresAt"] != expected_expiry
-            or expected_expiry < minimum_expiry
             or body["releasePolicy"] is not None
         ):
             fail("signing-key terminal projection is unsafe")
@@ -3988,11 +4125,10 @@ def _validate_operation_source_projection(
                 != resources["bridgeAppServicePlan"]["resourceId"].lower()
                 or str(body["virtualNetworkSubnetId"]).lower()
                 != resources["integrationSubnet"]["resourceId"].lower()
-                or body["outboundVnetRouting"]
-                != {"allTraffic": True, "applicationTraffic": True}
-                or not isinstance(identity, Mapping)
-                or identity.get("type") not in {None, "None"}
-                or identity.get("userAssignedIdentities") not in (None, {})
+                or not _safe_bridge_outbound_vnet_routing(
+                    body["outboundVnetRouting"]
+                )
+                or not _safe_bridge_no_identity(identity)
             ):
                 fail("terminal bridge creation posture is unsafe")
         elif operation_id == "attachFiveUamisOnlyToBridge":
@@ -5231,6 +5367,7 @@ def _validate_rich_provisioning_sources(
                 "principalDirectAssignments",
                 "principalEffectiveAssignments",
                 "controllerLockContainer",
+                "controllerLockInitialEmptyProof",
                 "networkTopology",
             },
             "rich provisioning source projections",
@@ -5355,6 +5492,19 @@ def _validate_rich_provisioning_sources(
     )
     if source["controllerLockContainer"] != controller:
         fail("rich controller-lock source does not bind the exact private container")
+    empty_proof = prior.get("proveControllerLockContainerEmpty", {}).get("projection")
+    controller_context = operation_contexts.get("createPrivateControllerLockContainer")
+    if (
+        source["controllerLockInitialEmptyProof"] != empty_proof
+        or not isinstance(empty_proof, Mapping)
+        or empty_proof.get("privateContainerPosture") != controller
+        or not isinstance(controller_context, Mapping)
+        or empty_proof.get("controllerContainerDecision")
+        != controller_context.get("executionDecision")
+        or empty_proof.get("blobNames") != []
+        or empty_proof.get("nextMarker") != ""
+    ):
+        fail("rich controller-lock source lacks the authorization-bound empty proof")
 
     subnet_id = resources["integrationSubnet"]["resourceId"]
     vnet_id = resources["integrationVnet"]["resourceId"]
@@ -6117,6 +6267,9 @@ def build_terminal_source_evidence(
         "controllerLockContainer": projection(
             "createPrivateControllerLockContainer"
         ),
+        "controllerLockInitialEmptyProof": projection(
+            "proveControllerLockContainerEmpty"
+        ),
         "networkTopology": {
             "virtualNetwork": {
                 "id": vnet_id,
@@ -6631,6 +6784,13 @@ def validate_terminal_source_evidence(
                 operation_context=operation_contexts.get(mutation["id"]),
             )
         )
+        if mutation["id"] == "proveControllerLockContainerEmpty":
+            inner_stamp = parse_time(
+                validated_operations[mutation["id"]]["projection"]["observedAt"],
+                "controller lock empty proof inner observedAt",
+            )
+            if not claimed_at <= inner_stamp <= stamp:
+                fail("controller lock empty proof timestamp is not execution-bound")
 
     permanent = source["permanentMutationProjections"]
     if not isinstance(permanent, list) or len(permanent) != len(expected_permanent):
@@ -7475,7 +7635,7 @@ def _operation_context_policy(
         "createPrivatePackageContainer": set(),
         "createPrivateActivationFenceContainer": set(),
         "createStoppedPrivateBridge": {"resourceId", "name", "etag"},
-        "createSigningKeyVersion": {"keyUriWithVersion"},
+        "createSigningKeyVersion": {"keyUriWithVersion", "expiresAt"},
         "attachFiveUamisOnlyToBridge": set(),
         "uploadVersionedBridgePackage": {"blob", "etag", "versionId", "url"},
         "lockPackageRetentionAt91Days": set(),
@@ -7551,6 +7711,8 @@ def _operation_context_policy(
     decisions = ["apply-exact"]
     if adopted_fields is not None:
         decisions.append("adopt-exact")
+    if operation_id == "createPrivateControllerLockContainer":
+        decisions.append("adopt-pending-execution-empty-proof")
     return {
         "schemaVersion": 1,
         "operationId": operation_id,
@@ -7564,6 +7726,25 @@ def _operation_context_policy(
     }
 
 
+def _signing_key_context_expiry(
+    context: Mapping[str, Any], authorization: Mapping[str, Any]
+) -> dt.datetime:
+    if context.get("executionDecision") == "adopt-exact":
+        adopted = context.get("adopted")
+        if not isinstance(adopted, Mapping):
+            fail("adopted signing-key context is absent")
+        candidate = adopted.get("expiresAt")
+    else:
+        candidate = context.get("expiresAt")
+    expiry = parse_time(candidate, "signing key authorized expiresAt")
+    minimum = parse_time(
+        authorization["validity"]["expiresAt"], "authorization expiresAt"
+    ) + dt.timedelta(days=30)
+    if expiry < minimum:
+        fail("signing-key expiry is shorter than authorization expiry plus 30 days")
+    return expiry
+
+
 def _validate_operation_context(
     operation_id: str,
     value: Mapping[str, Any],
@@ -7572,6 +7753,18 @@ def _validate_operation_context(
     plan, _ = load_plan()
     policy = _operation_context_policy(operation_id, plan, authorization)
     decision = value.get("executionDecision")
+    if decision == "adopt-pending-execution-empty-proof":
+        if operation_id != "createPrivateControllerLockContainer":
+            fail("pending empty-container proof is outside the controller container")
+        if decision not in policy["allowedDecisions"]:
+            fail("controller pending proof decision is outside source policy")
+        return dict(
+            _exact_keys(
+                value,
+                {"executionDecision"},
+                "createPrivateControllerLockContainer context",
+            )
+        )
     if decision == "adopt-exact":
         if "adopt-exact" not in policy["allowedDecisions"]:
             fail(f"{operation_id} may not be skipped or adopted")
@@ -7622,11 +7815,13 @@ def _validate_operation_context(
             if adopted["resourceId"].lower() != expected_id.lower() or adopted["name"] != "paperdesk-release-registry-bridge-v2-9c4e0d0d":
                 fail("adopted bridge is outside the fixed plan")
             _quoted_etag(adopted["etag"], "adopted bridge ETag")
-        if operation_id == "createSigningKeyVersion" and re.fullmatch(
-            r"https://kv-mds-sea-9c4e0d0d\.vault\.azure\.net/keys/paperdesk-release-result-signing/[0-9a-f]{32}",
-            adopted["keyUriWithVersion"],
-        ) is None:
-            fail("adopted signing-key version URI is outside the fixed vault/key")
+        if operation_id == "createSigningKeyVersion":
+            if re.fullmatch(
+                r"https://kv-mds-sea-9c4e0d0d\.vault\.azure\.net/keys/paperdesk-release-result-signing/[0-9a-f]{32}",
+                adopted["keyUriWithVersion"],
+            ) is None:
+                fail("adopted signing-key version URI is outside the fixed vault/key")
+            _signing_key_context_expiry(context, authorization)
         if operation_id == "uploadVersionedBridgePackage":
             expected_url = _operation_readback_url(operation_id, load_plan()[0], authorization)
             if (
@@ -7842,10 +8037,15 @@ def validate_preflight_evidence(
                 "owned-present",
                 "network-inaccessible",
                 "temporary-access-inaccessible",
+                "adopt-pending-execution-empty-proof",
             }
             or not isinstance(admission["context"], dict)
             or admission["context"].get("executionDecision")
-            not in {"adopt-exact", "apply-exact"}
+            not in {
+                "adopt-exact",
+                "apply-exact",
+                "adopt-pending-execution-empty-proof",
+            }
             or len(canonical_json_bytes(admission["context"])) > 65536
         ):
             fail("operation admission is invalid")
@@ -7854,6 +8054,15 @@ def validate_preflight_evidence(
         )
         decision = admission["context"]["executionDecision"]
         kind = operation_map[operation_id]["kind"]
+        if decision == "adopt-pending-execution-empty-proof":
+            if (
+                operation_id != "createPrivateControllerLockContainer"
+                or admission["status"]
+                != "adopt-pending-execution-empty-proof"
+            ):
+                fail("pending empty-container proof is not bound to the controller container")
+        elif admission["status"] == "adopt-pending-execution-empty-proof":
+            fail("pending empty-container status lacks its exact execution decision")
         if (
             admission["status"] == "network-inaccessible"
             and operation_id != "uploadVersionedBridgePackage"
@@ -7864,7 +8073,9 @@ def validate_preflight_evidence(
             and operation_id not in TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS
         ):
             fail("temporary-access-inaccessible status is outside a temporary RBAC boundary")
-        if decision == "adopt-exact":
+        if decision == "adopt-pending-execution-empty-proof":
+            pass
+        elif decision == "adopt-exact":
             expected_adopt_status = (
                 "absent" if kind.startswith(("delete-", "remove-", "temporary-remove"))
                 else "exact"
@@ -8385,6 +8596,88 @@ def _response_sha256(response: _RestResponse) -> str:
     return sha256_bytes(response.body)
 
 
+def _strict_empty_controller_inventory(
+    response: _RestResponse,
+    *,
+    plan: Mapping[str, Any],
+    observed_at: str,
+    private_container_posture: Mapping[str, Any],
+    controller_container_decision: str,
+) -> dict[str, Any]:
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    container_name = resources["controllerLockContainer"]["name"]
+    container_url = (
+        "https://mdspdbak2608089c4e.blob.core.windows.net/" + container_name
+    )
+    list_url = container_url + "?restype=container&comp=list"
+    content_type = next(
+        (value for key, value in response.headers.items() if key.lower() == "content-type"),
+        "",
+    )
+    if (
+        response.status != 200
+        or not response.body
+        or len(response.body) > 1_000_000
+        or "xml" not in content_type.lower()
+    ):
+        fail("controller lock initial inventory is not one bounded XML response")
+    try:
+        root = ET.fromstring(response.body)
+    except ET.ParseError as exc:
+        raise BootstrapError("controller lock initial inventory XML is invalid") from exc
+    if root.tag != "EnumerationResults":
+        fail("controller lock initial inventory root is not exact")
+    allowed_attributes = {"ServiceEndpoint", "ContainerName"}
+    if set(root.attrib) - allowed_attributes:
+        fail("controller lock initial inventory has unknown root attributes")
+    if root.attrib.get("ContainerName", container_name) != container_name:
+        fail("controller lock initial inventory names a different container")
+    if root.attrib.get("ServiceEndpoint", container_url.rsplit("/", 1)[0] + "/") not in {
+        container_url.rsplit("/", 1)[0],
+        container_url.rsplit("/", 1)[0] + "/",
+    }:
+        fail("controller lock initial inventory names a different service endpoint")
+    children = list(root)
+    tags = [child.tag for child in children]
+    allowed_tags = {"Prefix", "Marker", "MaxResults", "Delimiter", "Blobs", "NextMarker"}
+    if any(tag not in allowed_tags for tag in tags) or any(tags.count(tag) > 1 for tag in allowed_tags):
+        fail("controller lock initial inventory schema is not exact")
+    blobs_nodes = [child for child in children if child.tag == "Blobs"]
+    marker_nodes = [child for child in children if child.tag == "NextMarker"]
+    if len(blobs_nodes) != 1 or len(marker_nodes) != 1:
+        fail("controller lock initial inventory lacks one Blobs and NextMarker")
+    for child in children:
+        if child.tag in {"Blobs", "NextMarker"}:
+            continue
+        if list(child) or child.attrib:
+            fail("controller lock initial inventory scalar field is malformed")
+        value = str(child.text or "").strip()
+        if child.tag == "MaxResults":
+            if value and (not value.isdigit() or not 1 <= int(value) <= 5000):
+                fail("controller lock initial inventory MaxResults is invalid")
+        elif value:
+            fail("controller lock initial inventory paging/filter fields are nonempty")
+    blobs = blobs_nodes[0]
+    next_marker = marker_nodes[0]
+    if list(blobs) or blobs.attrib or str(blobs.text or "").strip():
+        fail("controller lock initial inventory contains a blob or unknown child")
+    if list(next_marker) or next_marker.attrib or str(next_marker.text or "").strip():
+        fail("controller lock initial inventory is paginated")
+    posture = json.loads(canonical_json_bytes(private_container_posture).decode("utf-8"))
+    return {
+        "containerUrl": container_url,
+        "listUrl": list_url,
+        "httpStatus": 200,
+        "blobNames": [],
+        "blobCount": 0,
+        "nextMarker": "",
+        "responseSha256": sha256_bytes(response.body),
+        "observedAt": observed_at,
+        "privateContainerPosture": posture,
+        "controllerContainerDecision": controller_container_decision,
+    }
+
+
 def _is_exact_package_worm_policy_url(method: str, url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     expected_path = (
@@ -8475,7 +8768,7 @@ def _package_blob_error_projection(
     method: str, url: str, response: _RestResponse
 ) -> dict[str, str] | None:
     parsed = urllib.parse.urlsplit(url)
-    allowed_path = any(
+    ordinary_allowed_path = any(
         pattern.fullmatch(parsed.path) is not None
         for pattern in (
             re.compile(
@@ -8493,13 +8786,17 @@ def _package_blob_error_projection(
             ),
         )
     )
+    controller_list = (
+        parsed.path == "/paperdesk-release-controller-lock"
+        and parsed.query == "restype=container&comp=list"
+    )
     if (
         method != "GET"
         or (parsed.hostname or "").lower()
         != "mdspdbak2608089c4e.blob.core.windows.net"
-        or parsed.query
+        or (parsed.query and not controller_list)
         or parsed.fragment
-        or not allowed_path
+        or not (ordinary_allowed_path or controller_list)
         or not 400 <= response.status <= 499
     ):
         return None
@@ -9190,7 +9487,10 @@ class AzureCliBootstrapTransport:
         }
         headers = {key: value for key, value in headers.items() if value is not None}
 
-        if operation_id == "removeControllerLeaseCanaryBlob":
+        if operation_id == "proveControllerLockContainerEmpty":
+            retained = facts.get("controllerLockInitialEmptyProof")
+            family = "controller-lock-initial-empty-proof"
+        elif operation_id == "removeControllerLeaseCanaryBlob":
             inventory = facts.get("controllerLockInventory")
             retained = {
                 "absent": response.status == 404,
@@ -9300,7 +9600,9 @@ class AzureCliBootstrapTransport:
                 "id": projection_document.get("id"),
                 "name": projection_document.get("name"),
                 "kind": projection_document.get("kind"),
-                "httpsOnly": projection_document.get("httpsOnly"),
+                "httpsOnly": properties.get("httpsOnly")
+                if isinstance(properties, Mapping)
+                else None,
                 "state": properties.get("state") if isinstance(properties, Mapping) else None,
                 "publicNetworkAccess": properties.get("publicNetworkAccess") if isinstance(properties, Mapping) else None,
                 "serverFarmId": properties.get("serverFarmId") if isinstance(properties, Mapping) else None,
@@ -9490,7 +9792,15 @@ class AzureCliBootstrapTransport:
             fail("readback status is not the source-defined invariant")
         document: Mapping[str, Any] = {}
         expected_body_sha = contract.get("expectedBodySha256")
-        if expected_body_sha is not None:
+        if contract.get("operationId") == "proveControllerLockContainerEmpty":
+            proof = (
+                runtime_facts.get("controllerLockInitialEmptyProof")
+                if isinstance(runtime_facts, Mapping)
+                else None
+            )
+            if not isinstance(proof, Mapping):
+                fail("controller lock empty readback lacks its canonical proof")
+        elif expected_body_sha is not None:
             if (
                 expected["url"] != contract.get("expectedUrl")
                 or sha256_bytes(response.body) != expected_body_sha
@@ -9842,9 +10152,9 @@ class AzureCliBootstrapTransport:
                     or runtime_facts is None
                     or attributes.get("exp")
                     != int(
-                        parse_time(
-                            self.admissions[operation_id]["context"].get("expiresAt"),
-                            "signing key authorized expiresAt",
+                        _signing_key_context_expiry(
+                            self.admissions[operation_id]["context"],
+                            self.authorization,
                         ).timestamp()
                     )
                     or properties.get("release_policy") is not None
@@ -9855,18 +10165,16 @@ class AzureCliBootstrapTransport:
                 outbound = properties.get("outboundVnetRouting") if isinstance(properties, Mapping) else None
                 if (
                     projection_document.get("kind") != "app,linux"
-                    or projection_document.get("httpsOnly") is not True
                     or not isinstance(properties, Mapping)
+                    or properties.get("httpsOnly") is not True
                     or properties.get("serverFarmId", "").lower()
                     != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
                     or properties.get("publicNetworkAccess") != "Disabled"
                     or properties.get("virtualNetworkSubnetId", "").lower()
                     != self.resources["integrationSubnet"]["resourceId"].lower()
-                    or outbound != {"allTraffic": True, "applicationTraffic": True}
+                    or not _safe_bridge_outbound_vnet_routing(outbound)
                     or properties.get("state") != "Stopped"
-                    or not isinstance(identity, Mapping)
-                    or identity.get("type") not in {"None", None}
-                    or identity.get("userAssignedIdentities") not in (None, {})
+                    or not _safe_bridge_no_identity(identity)
                 ):
                     fail("stopped private bridge readback is not exact")
             elif operation_id == "attachFiveUamisOnlyToBridge":
@@ -10136,6 +10444,95 @@ class AzureCliBootstrapTransport:
                 detail = str(last_error) if last_error is not None else "unknown drift"
                 fail(f"{label} readback did not converge: {probe_id}: {detail}")
         return proofs
+
+    def _prove_controller_lock_container_empty(
+        self, ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        if len(ids) != 1:
+            fail("controller lock empty proof must bind one exact readback probe")
+        expected = self.probes[ids[0]]
+        if (
+            expected.get("phase") != "readback"
+            or expected.get("method") != "GET"
+            or expected.get("validatorId")
+            != "operation:proveControllerLockContainerEmpty"
+        ):
+            fail("controller lock empty proof probe is not exact")
+        started = self.clock()
+        expires = parse_time(
+            self.authorization["validity"]["expiresAt"], "authorization expiresAt"
+        )
+        not_before = parse_time(
+            self.authorization["validity"]["notBefore"], "authorization notBefore"
+        )
+        deadline = min(
+            expires,
+            started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS),
+        )
+        attempts = 0
+        while attempts < 64:
+            before_request = self.clock()
+            if before_request < not_before or before_request >= deadline:
+                fail("authorization or convergence window expired before empty-container proof")
+            attempts += 1
+            response = self.session.request(
+                "GET",
+                expected["url"],
+                headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
+            )
+            observed = self.clock()
+            if observed >= deadline:
+                fail("authorization or convergence window expired during empty-container proof")
+            if response.status == 403:
+                error = _package_blob_error_projection("GET", expected["url"], response)
+                if error is None or error.get("storageErrorCode") not in {
+                    "AuthorizationFailure",
+                    "AuthorizationPermissionMismatch",
+                }:
+                    fail("controller lock proof 403 is not recognized RBAC propagation")
+                delay = min(0.25 * (2 ** (attempts - 1)), 2.0)
+                if attempts >= 64 or observed + dt.timedelta(seconds=delay) >= deadline:
+                    fail("controller lock proof RBAC access did not converge")
+                self.sleep(delay)
+                continue
+            if response.status != 200:
+                fail("controller lock proof returned an unsupported status")
+            create_projection = self._validated_source_projections.get(
+                "createPrivateControllerLockContainer"
+            )
+            private_posture = (
+                create_projection.get("projection")
+                if isinstance(create_projection, Mapping)
+                else None
+            )
+            create_context = self.admissions[
+                "createPrivateControllerLockContainer"
+            ]["context"]
+            if not isinstance(private_posture, Mapping):
+                fail("controller lock proof lacks the exact private ARM posture")
+            observed_at = self._timestamp(observed)
+            inventory = _strict_empty_controller_inventory(
+                response,
+                plan=self.plan,
+                observed_at=observed_at,
+                private_container_posture=private_posture,
+                controller_container_decision=str(
+                    create_context.get("executionDecision")
+                ),
+            )
+            facts = {"controllerLockInitialEmptyProof": inventory}
+            proof = self._validate_readback_response(
+                expected, response, runtime_facts=facts
+            )
+            proof.update(
+                {
+                    "attempts": attempts,
+                    "startedAt": self._timestamp(started),
+                    "observedAt": observed_at,
+                }
+            )
+            return [proof]
+        fail("controller lock proof exceeded the bounded attempts")
 
     def collect_preflight(self, plan: Mapping[str, Any]) -> Mapping[str, Any]:
         if plan is not self.plan and canonical_json_bytes(plan) != canonical_json_bytes(self.plan):
@@ -11620,6 +12017,23 @@ class AzureCliBootstrapTransport:
     ) -> Mapping[str, Any]:
         admission = self.admissions[operation["id"]]
         decision = admission["context"]["executionDecision"]
+        if decision == "adopt-pending-execution-empty-proof":
+            if operation["id"] != "createPrivateControllerLockContainer":
+                fail("pending empty proof is outside the controller container")
+            readbacks = self._prove_probe_ids(
+                admission["desiredProbeIds"],
+                "createPrivateControllerLockContainer pending adoption",
+            )
+            return {
+                "operationId": operation["id"],
+                "status": "verified-exact",
+                "owned": False,
+                "details": {
+                    "readbackProjections": [
+                        item["sourceProjection"] for item in readbacks
+                    ]
+                },
+            }
         if decision == "adopt-exact":
             details = dict(admission["context"].get("adopted", {}))
             readbacks = self._prove_probe_ids(
@@ -11638,6 +12052,20 @@ class AzureCliBootstrapTransport:
             }
         self._active_operation_id = operation["id"]
         try:
+            if operation["id"] == "proveControllerLockContainerEmpty":
+                details = {}
+                readbacks = self._prove_controller_lock_container_empty(
+                    admission["desiredProbeIds"]
+                )
+                details["readbackProjections"] = [
+                    item["sourceProjection"] for item in readbacks
+                ]
+                return {
+                    "operationId": operation["id"],
+                    "status": "verified-exact",
+                    "owned": False,
+                    "details": details,
+                }
             details = dict(self._mutate(operation, state))
             try:
                 readbacks = self._prove_probe_ids(
@@ -13081,6 +13509,7 @@ class BootstrapExecutor:
                     "owned-present",
                     "network-inaccessible",
                     "temporary-access-inaccessible",
+                    "adopt-pending-execution-empty-proof",
                 }
             ):
                 fail(f"operation preflight is partial or drifted: {operation['id']}")

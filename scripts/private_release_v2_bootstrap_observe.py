@@ -797,10 +797,17 @@ def _adopted_projection(
                 "etag": _etag(envelope, operation_id),
             }
         elif operation_id == "createSigningKeyVersion":
+            properties = _properties(envelope, operation_id)
+            attributes = properties.get("attributes")
+            if not isinstance(attributes, Mapping) or type(attributes.get("exp")) is not int:
+                fail("adopted signing key lacks one exact live expiry")
             result = {
-                "keyUriWithVersion": _properties(envelope, operation_id).get(
-                    "keyUriWithVersion"
-                )
+                "keyUriWithVersion": properties.get("keyUriWithVersion"),
+                "expiresAt": _stamp(
+                    dt.datetime.fromtimestamp(
+                        attributes["exp"], tz=dt.timezone.utc
+                    )
+                ),
             }
         elif operation_id == "uploadVersionedBridgePackage":
             url = bootstrap._operation_readback_url(operation_id, plan, authorization)
@@ -841,6 +848,10 @@ def _policy_checked_context(
         fail(f"{operation_id} decision is outside the source context policy")
     if decision == "apply-exact":
         expected = {"executionDecision", *policy["observedApplyFields"]}
+    elif decision == "adopt-pending-execution-empty-proof":
+        if operation_id != "createPrivateControllerLockContainer":
+            fail("pending empty-container proof is outside the controller container")
+        expected = {"executionDecision"}
     else:
         expected = {"executionDecision", "adopted"}
         adopted = context.get("adopted")
@@ -1056,8 +1067,11 @@ def _operation_admission(
         "createPrivateActivationFenceContainer",
     }:
         if operation_id == "createPrivateControllerLockContainer":
-            fail(
-                "pre-existing controller lock container requires exact empty-container proof"
+            _private_container_adopted(envelope, operation_id, plan)
+            return "adopt-pending-execution-empty-proof", _policy_checked_context(
+                operation_id,
+                policy,
+                {"executionDecision": "adopt-pending-execution-empty-proof"},
             )
         adopted = _private_container_adopted(envelope, operation_id, plan)
         return "exact", _policy_checked_context(

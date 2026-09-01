@@ -3423,6 +3423,7 @@ def _validate_rich_source_projections(
             "principalDirectAssignments",
             "principalEffectiveAssignments",
             "controllerLockContainer",
+            "controllerLockInitialEmptyProof",
             "networkTopology",
         },
         "rich provisioning source projections",
@@ -3580,6 +3581,51 @@ def _validate_rich_source_projections(
         != str(controller.get("scope", "")).lower()
     ):
         fail("controller-lock container source projection is invalid")
+    empty_proof = _exact_keys(
+        _canonical_projection(
+            source["controllerLockInitialEmptyProof"],
+            "controller-lock initial empty proof",
+        ),
+        {
+            "containerUrl",
+            "listUrl",
+            "httpStatus",
+            "blobNames",
+            "blobCount",
+            "nextMarker",
+            "responseSha256",
+            "observedAt",
+            "privateContainerPosture",
+            "controllerContainerDecision",
+        },
+        "controller-lock initial empty proof",
+    )
+    controller_name = _resource(plan, "controllerLockContainer")["name"]
+    controller_url = (
+        "https://mdspdbak2608089c4e.blob.core.windows.net/" + controller_name
+    )
+    if (
+        empty_proof["containerUrl"] != controller_url
+        or empty_proof["listUrl"]
+        != controller_url + "?restype=container&comp=list"
+        or type(empty_proof["httpStatus"]) is not int
+        or empty_proof["httpStatus"] != 200
+        or empty_proof["blobNames"] != []
+        or type(empty_proof["blobCount"]) is not int
+        or empty_proof["blobCount"] != 0
+        or empty_proof["nextMarker"] != ""
+        or not SHA256.fullmatch(str(empty_proof["responseSha256"]))
+        or empty_proof["privateContainerPosture"] != controller_body
+        or empty_proof["controllerContainerDecision"]
+        not in {"apply-exact", "adopt-pending-execution-empty-proof"}
+    ):
+        fail("controller-lock initial empty proof is invalid")
+    _observation_in_window(
+        empty_proof["observedAt"],
+        "controller-lock initial empty proof observedAt",
+        started_at=context["notBefore"],
+        completed_at=context["expiresAt"],
+    )
 
     bridge_runtime = provisioning.get("bridgeRuntime")
     topology = (
