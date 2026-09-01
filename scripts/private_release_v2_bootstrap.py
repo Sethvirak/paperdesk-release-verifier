@@ -2663,6 +2663,18 @@ def _quoted_etag(value: Any, label: str) -> str:
     return value
 
 
+def _if_match_etag(value: Any, label: str) -> str:
+    """Serialize one validated strong ETag for an HTTP ``If-Match`` header.
+
+    Some Azure Resource Provider responses expose the strong token without
+    the HTTP-required double quotes.  Keep already quoted entity-tags exact,
+    but quote the validated raw hexadecimal form before sending it back.
+    """
+
+    etag = _quoted_etag(value, label)
+    return etag if etag.startswith('"') else f'"{etag}"'
+
+
 def _unpaginated_graph_collection(
     value: Any, label: str
 ) -> list[Mapping[str, Any]]:
@@ -10897,7 +10909,12 @@ class AzureCliBootstrapTransport:
                 "PATCH",
                 target_url,
                 body=request_body,
-                headers={"Content-Type": "application/json", "If-Match": str(context.get("etag", ""))},
+                headers={
+                    "Content-Type": "application/json",
+                    "If-Match": _if_match_etag(
+                        context.get("etag"), "legacy bridge ETag"
+                    ),
+                },
                 expected={200},
             )
             self._json_response(response, {200}, "legacy bridge identity detach")
@@ -11106,7 +11123,9 @@ class AzureCliBootstrapTransport:
         if operation_id == "attachFiveUamisOnlyToBridge":
             site = self.resources["bridgeSite"]
             bridge = self._proof_detail(state, "createStoppedPrivateBridge")
-            bridge_etag = _quoted_etag(bridge.get("etag"), "current bridge ETag")
+            bridge_etag = _if_match_etag(
+                bridge.get("etag"), "current bridge ETag"
+            )
             identity_ids = [
                 self._identity_detail(state, name)["resourceId"]
                 for name in (
@@ -11286,7 +11305,13 @@ class AzureCliBootstrapTransport:
                         "allowProtectedAppendWritesAll": False,
                     }
                 },
-                headers={"If-Match": str(current_etag)} if current_etag else {"If-None-Match": "*"},
+                headers={
+                    "If-Match": _if_match_etag(
+                        current_etag, "immutability policy ETag"
+                    )
+                }
+                if current_etag
+                else {"If-None-Match": "*"},
             )
             properties = result.get("properties")
             state_name = properties.get("state") if isinstance(properties, dict) else None
@@ -11341,12 +11366,15 @@ class AzureCliBootstrapTransport:
                 != context["preAppSettingsSha256"]
             ):
                 fail("bridge app settings drifted after authorization")
-            _quoted_etag(current_etag, "bridge app-settings precondition ETag")
             result = self._arm_put(
                 site["resourceId"] + "/config/appsettings",
                 "2025-03-01",
                 {"properties": desired},
-                headers={"If-Match": current_etag},
+                headers={
+                    "If-Match": _if_match_etag(
+                        current_etag, "bridge app-settings precondition ETag"
+                    )
+                },
             )
             return {
                 "resourceId": result.get("id"),
@@ -11620,7 +11648,9 @@ class AzureCliBootstrapTransport:
                 body=None,
                 headers={
                     "x-ms-version": "2023-11-03",
-                    "If-Match": _quoted_etag(created["etag"], "controller canary cleanup ETag"),
+                    "If-Match": _if_match_etag(
+                        created["etag"], "controller canary cleanup ETag"
+                    ),
                     "x-ms-delete-snapshots": "include",
                 },
                 expected={202},
