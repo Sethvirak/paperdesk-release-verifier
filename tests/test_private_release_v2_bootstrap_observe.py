@@ -282,7 +282,9 @@ class FakeReadOnlySession:
             status = 200
             body = {
                 "id": writer["resourceId"],
+                "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
                 "properties": {
+                    "tenantId": bootstrap.TENANT,
                     "clientId": writer["clientId"],
                     "principalId": writer["principalId"],
                 },
@@ -293,7 +295,9 @@ class FakeReadOnlySession:
             status = 200
             body = {
                 "id": reader["resourceId"],
+                "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
                 "properties": {
+                    "tenantId": bootstrap.TENANT,
                     "clientId": reader["clientId"],
                     "principalId": reader["principalId"],
                 },
@@ -1092,6 +1096,185 @@ class ObserveTests(unittest.TestCase):
                     self.plan, authorization, NOW, "203.0.113.10/32",
                     create_policy, dependency_facts,
                 )
+
+    def test_full_observer_recovers_exact_five_from_live_fixed_identity_projections(self):
+        class ExactFiveBridgeSession(FakeReadOnlySession):
+            def __init__(self, plan):
+                super().__init__(plan)
+                self.live_ids = {}
+                for key in (
+                    "bridgeIdentity", "registryWriterIdentity",
+                    "registryReaderIdentity", "signerIdentity",
+                    "productionActivationIdentity",
+                ):
+                    resource = self.resources[key]
+                    self.live_ids[key] = {
+                        "clientId": resource.get("clientId") or str(
+                            uuid.uuid5(uuid.UUID(AUTHORIZATION_ID), key + ":client")
+                        ),
+                        "principalId": resource.get("principalId") or str(
+                            uuid.uuid5(uuid.UUID(AUTHORIZATION_ID), key + ":principal")
+                        ),
+                    }
+
+            def read(self, request):
+                response = super().read(request)
+                for key, ids in self.live_ids.items():
+                    resource = self.resources[key]
+                    if request.url.startswith(
+                        f"https://management.azure.com{resource['resourceId']}?"
+                    ):
+                        return observe.ReadResponse(
+                            method=response.method, url=response.url, status=200,
+                            headers={}, body={
+                                "id": resource["resourceId"],
+                                "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                                "properties": {
+                                    "tenantId": bootstrap.TENANT, **ids,
+                                },
+                            },
+                        )
+                bridge = self.resources["bridgeSite"]
+                expected_url = bootstrap._operation_readback_url(
+                    "createStoppedPrivateBridge", self.plan, {}
+                )
+                if request.method == "GET" and request.url == expected_url:
+                    attached = {}
+                    for key in (
+                        "bridgeIdentity", "registryWriterIdentity",
+                        "registryReaderIdentity", "signerIdentity",
+                        "productionActivationIdentity",
+                    ):
+                        identity = self.resources[key]
+                        attached[identity["resourceId"]] = {
+                            **self.live_ids[key],
+                        }
+                    return observe.ReadResponse(
+                        method=response.method, url=response.url, status=200,
+                        headers={"ETag": '"live-exact-five"'},
+                        body={
+                            "id": bridge["resourceId"], "name": bridge["name"],
+                            "type": "Microsoft.Web/sites", "kind": "app,linux",
+                            "identity": {
+                                "type": "UserAssigned", "principalId": None,
+                                "tenantId": None,
+                                "userAssignedIdentities": attached,
+                            },
+                            "properties": {
+                                "state": "Stopped", "httpsOnly": True,
+                                "publicNetworkAccess": "Disabled",
+                                "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
+                                "virtualNetworkSubnetId": self.resources["integrationSubnet"]["resourceId"],
+                                "outboundVnetRouting": {
+                                    "allTraffic": True, "applicationTraffic": True,
+                                },
+                            },
+                        },
+                    )
+                return response
+
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(
+                folder, ExactFiveBridgeSession(self.plan)
+            )
+        admissions = {
+            item["operationId"]: item
+            for item in preflight["projection"]["operationAdmissions"]
+        }
+        self.assertEqual(
+            admissions["adoptExistingRegistryWriterIdentity"]["context"],
+            {"executionDecision": "adopt-exact", "adopted": {}},
+        )
+        self.assertEqual(
+            admissions["adoptExistingRegistryReaderIdentity"]["context"],
+            {"executionDecision": "adopt-exact", "adopted": {}},
+        )
+        self.assertEqual(
+            admissions["createStoppedPrivateBridge"]["context"]["adopted"]["bridgeIdentityMode"],
+            "exact-five-user-assigned",
+        )
+        self.assertEqual(
+            admissions["attachFiveUamisOnlyToBridge"]["context"]["executionDecision"],
+            "adopt-exact",
+        )
+        bootstrap.validate_preflight_evidence(
+            preflight, self.promote_template(template), self.plan
+        )
+
+    def test_full_observer_rejects_fixed_registry_live_identity_id_drift(self):
+        for field in ("clientId", "principalId"):
+            class DriftedRegistryIdentitySession(FakeReadOnlySession):
+                def read(inner_self, request):
+                    response = super(DriftedRegistryIdentitySession, inner_self).read(request)
+                    writer = inner_self.resources["registryWriterIdentity"]
+                    if request.url.startswith(
+                        f"https://management.azure.com{writer['resourceId']}?"
+                    ):
+                        body = copy.deepcopy(response.body)
+                        body["properties"][field] = (
+                            "33333333-3333-4333-8333-333333333333"
+                        )
+                        return observe.ReadResponse(
+                            method=response.method, url=response.url,
+                            status=response.status, headers=response.headers,
+                            body=body,
+                        )
+                    return response
+
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                with self.assertRaisesRegex(
+                    observe.ObserveError, "fixed registry identity live projection drifted"
+                ):
+                    self.build(folder, DriftedRegistryIdentitySession(self.plan))
+
+    def test_live_identity_dependency_rejects_missing_or_unsafe_arm_projection(self):
+        resource = next(
+            item for item in self.plan["resourceInventory"]
+            if item["id"] == "registryWriterIdentity"
+        )
+        exact = {
+            "status": 200,
+            "body": {
+                "id": resource["resourceId"],
+                "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                "properties": {
+                    "tenantId": bootstrap.TENANT,
+                    "clientId": resource["clientId"],
+                    "principalId": resource["principalId"],
+                },
+            },
+        }
+        variants = {}
+        for field in ("clientId", "principalId"):
+            missing = copy.deepcopy(exact)
+            missing["body"]["properties"].pop(field)
+            variants[f"missing {field}"] = missing
+            null = copy.deepcopy(exact)
+            null["body"]["properties"][field] = None
+            variants[f"null {field}"] = null
+            malformed = copy.deepcopy(exact)
+            malformed["body"]["properties"][field] = "not-a-guid"
+            variants[f"malformed {field}"] = malformed
+        wrong_resource = copy.deepcopy(exact)
+        wrong_resource["body"]["id"] += "-other"
+        variants["wrong resource"] = wrong_resource
+        wrong_type = copy.deepcopy(exact)
+        wrong_type["body"]["type"] = "Microsoft.Web/sites"
+        variants["wrong type"] = wrong_type
+        wrong_tenant = copy.deepcopy(exact)
+        wrong_tenant["body"]["properties"]["tenantId"] = (
+            "44444444-4444-4444-8444-444444444444"
+        )
+        variants["wrong tenant"] = wrong_tenant
+        absent = copy.deepcopy(exact)
+        absent["status"] = 404
+        variants["404 cannot use plan metadata"] = absent
+        for label, envelope in variants.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                observe.ObserveError,
+                "managed identity adoption response drifted from the fixed resource",
+            ):
+                observe._identity_adopted(envelope, resource["resourceId"])
 
     def test_residual_publisher_application_and_service_principal_are_adopted(self):
         with tempfile.TemporaryDirectory() as folder:
