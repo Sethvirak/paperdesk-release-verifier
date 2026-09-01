@@ -2967,6 +2967,157 @@ class BootstrapTests(unittest.TestCase):
             '"1DD39E07D4DEF60"',
         )
 
+    def _custom_role_retry_transport(self, member_state, responses):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        specs = bootstrap._custom_role_definition_specs(self.plan)
+        definition_id = sorted(specs)[0]
+        expected = specs[definition_id]
+
+        class Session:
+            def __init__(self, queue):
+                self.queue = list(queue)
+                self.requests = []
+
+            def request(self, method, url, *, body=None, headers=None):
+                self.requests.append((method, url, body, dict(headers or {})))
+                result = self.queue.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        session = Session(responses)
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            clock=lambda: NOW,
+            sleep=lambda _delay: None,
+            session=session,
+        )
+        transport.admissions["createCustomRoleDefinitions"]["context"] = {
+            "executionDecision": "apply-exact",
+            "memberStates": {definition_id: member_state},
+        }
+        operation = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "createCustomRoleDefinitions"
+        )
+        exact = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(expected), {}
+        )
+        created = bootstrap._RestResponse(
+            201, bootstrap.canonical_json_bytes(expected), {}
+        )
+        return transport, operation, session, exact, created, {definition_id: expected}
+
+    def test_role_reconciliation_retries_transient_precondition_get(self):
+        transient = bootstrap.BootstrapError("Azure REST transport failed closed")
+        transport, operation, session, exact, _created, specs = (
+            self._custom_role_retry_transport("exact", [transient])
+        )
+        session.queue.extend([exact, exact])
+        with (
+            mock.patch.object(
+                bootstrap, "_custom_role_definition_specs", return_value=specs
+            ),
+            mock.patch.object(transport, "_mutation_request") as mutation,
+        ):
+            result = transport._mutate(operation, {})
+        self.assertEqual(len(result["roleDefinitions"]), 1)
+        self.assertEqual([item[0] for item in session.requests], ["GET", "GET", "GET"])
+        mutation.assert_not_called()
+
+    def test_role_reconciliation_exhausts_only_bounded_get_retries(self):
+        failures = [
+            bootstrap.BootstrapError("Azure REST transport failed closed")
+            for _ in range(3)
+        ]
+        transport, operation, session, _exact, _created, specs = (
+            self._custom_role_retry_transport("exact", failures)
+        )
+        with (
+            mock.patch.object(
+                bootstrap, "_custom_role_definition_specs", return_value=specs
+            ),
+            mock.patch.object(transport, "_mutation_request") as mutation,
+            self.assertRaisesRegex(
+                bootstrap.BootstrapError, "Azure REST transport failed closed"
+            ),
+        ):
+            transport._mutate(operation, {})
+        self.assertEqual([item[0] for item in session.requests], ["GET"] * 3)
+        mutation.assert_not_called()
+
+    def test_role_reconciliation_retries_post_put_readback_without_replaying_put(self):
+        transient = bootstrap.BootstrapError("Azure REST transport failed closed")
+        absent = bootstrap._RestResponse(404, b"", {})
+        transport, operation, session, exact, created, specs = (
+            self._custom_role_retry_transport("absent", [absent])
+        )
+        session.queue.extend([transient, exact])
+        with (
+            mock.patch.object(
+                bootstrap, "_custom_role_definition_specs", return_value=specs
+            ),
+            mock.patch.object(
+                transport, "_mutation_request", return_value=created
+            ) as mutation,
+        ):
+            result = transport._mutate(operation, {})
+        self.assertEqual(len(result["roleDefinitions"]), 1)
+        mutation.assert_called_once()
+        self.assertEqual(mutation.call_args.args[0], "PUT")
+        self.assertEqual([item[0] for item in session.requests], ["GET", "GET", "GET"])
+
+    def test_role_reconciliation_never_retries_direct_mutation_failure(self):
+        absent = bootstrap._RestResponse(404, b"", {})
+        transport, operation, session, _exact, _created, specs = (
+            self._custom_role_retry_transport("absent", [absent])
+        )
+        with (
+            mock.patch.object(
+                bootstrap, "_custom_role_definition_specs", return_value=specs
+            ),
+            mock.patch.object(
+                transport,
+                "_mutation_request",
+                side_effect=bootstrap.BootstrapError(
+                    "Azure REST transport failed closed"
+                ),
+            ) as mutation,
+            self.assertRaisesRegex(
+                bootstrap.BootstrapError, "Azure REST transport failed closed"
+            ),
+        ):
+            transport._mutate(operation, {})
+        mutation.assert_called_once()
+        self.assertEqual([item[0] for item in session.requests], ["GET"])
+
+    def test_both_role_reconciliation_loops_own_only_bounded_get_retries(self):
+        source = inspect.getsource(bootstrap.AzureCliBootstrapTransport._mutate)
+        custom = source.split(
+            'if operation_id == "createCustomRoleDefinitions":', 1
+        )[1].split('if operation_id == "createExactRoleAssignments":', 1)[0]
+        assignments = source.split(
+            'if operation_id == "createExactRoleAssignments":', 1
+        )[1].split('if operation_id == "createStoppedPrivateBridge":', 1)[0]
+        for label, block in (("custom roles", custom), ("role assignments", assignments)):
+            with self.subTest(loop=label):
+                self.assertEqual(
+                    block.count('_read_request_with_transport_retry("GET", url)'),
+                    2,
+                )
+                self.assertNotIn('self.session.request("GET", url)', block)
+                self.assertEqual(block.count("self._mutation_request("), 1)
+
     def test_storage_acl_normalization_preserves_supported_optional_boundaries(self):
         subnet = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/resourceGroups/"
