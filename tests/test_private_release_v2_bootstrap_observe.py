@@ -20,6 +20,9 @@ AUTHORIZATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ACCOUNT_OBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 LEGACY_FIC_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 GRAPH_SERVICE_PRINCIPAL_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+CANONICAL_GRAPH_ASSIGNMENT_ID = (
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+)
 REVIEWED_SHA = "1" * 40
 MERGED_SHA = "2" * 40
 TREE_SHA = "3" * 40
@@ -975,7 +978,7 @@ class ObserveTests(unittest.TestCase):
 
     def test_preexisting_exact_publisher_graph_assignment_is_adopted_without_graph_post(self):
         assignment = {
-            "id": "55555555-5555-4555-8555-555555555555",
+            "id": CANONICAL_GRAPH_ASSIGNMENT_ID,
             "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
             "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
             "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
@@ -1083,7 +1086,7 @@ class ObserveTests(unittest.TestCase):
 
     def test_publisher_graph_assignment_must_be_sole_and_exact(self):
         exact = {
-            "id": "55555555-5555-4555-8555-555555555555",
+            "id": CANONICAL_GRAPH_ASSIGNMENT_ID,
             "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
             "resourceId": GRAPH_SERVICE_PRINCIPAL_ID,
             "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
@@ -1098,9 +1101,17 @@ class ObserveTests(unittest.TestCase):
         wrong_role = copy.deepcopy(exact)
         wrong_role["appRoleId"] = "88888888-8888-4888-8888-888888888888"
         variants.append([wrong_role])
-        malformed_id = copy.deepcopy(exact)
-        malformed_id["id"] = "not-a-guid"
-        variants.append([malformed_id])
+        malformed_ids = (
+            CANONICAL_GRAPH_ASSIGNMENT_ID[:-1],
+            CANONICAL_GRAPH_ASSIGNMENT_ID + "A",
+            CANONICAL_GRAPH_ASSIGNMENT_ID + "=",
+            CANONICAL_GRAPH_ASSIGNMENT_ID[:-1] + "+",
+            CANONICAL_GRAPH_ASSIGNMENT_ID[:-1] + "9",
+        )
+        for value in malformed_ids:
+            malformed_id = copy.deepcopy(exact)
+            malformed_id["id"] = value
+            variants.append([malformed_id])
         missing_id = copy.deepcopy(exact)
         missing_id.pop("id")
         variants.append([missing_id])
@@ -1110,8 +1121,8 @@ class ObserveTests(unittest.TestCase):
         variants.append([exact, copy.deepcopy(exact)])
         for assignments in variants:
             with self.subTest(assignments=assignments), tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
-                observe.ObserveError,
-                "not sole and exact|adoption is not sole",
+                (observe.ObserveError, bootstrap.BootstrapError),
+                "not sole and exact|adoption is not sole|not an exact Microsoft Graph assignment ID",
             ):
                 self.build(
                     folder,
