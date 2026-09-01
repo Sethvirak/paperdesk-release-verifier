@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import urllib.parse
+import uuid
 
 from scripts import private_release_v2_bootstrap as bootstrap
 from scripts import private_release_v2_bootstrap_observe as observe
@@ -758,6 +759,7 @@ class ObserveTests(unittest.TestCase):
             self.assertFalse(
                 any(item.method in {"PUT", "PATCH", "DELETE"} for item in session.requests)
             )
+
             self.assertEqual(template["executable"], False)
             self.assertEqual(template["status"], observe.TEMPLATE_STATUS)
             self.assertNotIn("authorizationType", template)
@@ -963,6 +965,133 @@ class ObserveTests(unittest.TestCase):
             )
             self.assertEqual(validated_preflight, preflight)
             self.assertEqual(validated_digest, digest)
+
+    def test_exact_five_bridge_recovery_is_jointly_admitted_without_attach_write(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
+        dependency_facts = {}
+        attached = {}
+        for dependency, key in (
+            ("createBridgeIdentity", "bridgeIdentity"),
+            ("adoptExistingRegistryWriterIdentity", "registryWriterIdentity"),
+            ("adoptExistingRegistryReaderIdentity", "registryReaderIdentity"),
+            ("createSignerIdentity", "signerIdentity"),
+            ("createProductionActivationIdentity", "productionActivationIdentity"),
+        ):
+            resource = resources[key]
+            client_id = resource.get("clientId") or str(
+                uuid.uuid5(uuid.UUID(AUTHORIZATION_ID), key + ":client")
+            )
+            principal_id = resource.get("principalId") or str(
+                uuid.uuid5(uuid.UUID(AUTHORIZATION_ID), key + ":principal")
+            )
+            dependency_facts[dependency] = {
+                "resourceId": resource["resourceId"],
+                "clientId": client_id,
+                "principalId": principal_id,
+            }
+            attached[resource["resourceId"]] = {
+                "clientId": client_id,
+                "principalId": principal_id,
+            }
+        bridge = resources["bridgeSite"]
+        envelope = {
+            "status": 200,
+            "headers": {"etag": '"bridge-recovery-etag"'},
+            "body": {
+                "id": bridge["resourceId"],
+                "name": bridge["name"],
+                "type": "Microsoft.Web/sites",
+                "kind": "app,linux",
+                "identity": {
+                    "type": "UserAssigned",
+                    "principalId": None,
+                    "tenantId": None,
+                    "userAssignedIdentities": attached,
+                },
+                "properties": {
+                    "state": "Stopped",
+                    "httpsOnly": True,
+                    "publicNetworkAccess": "Disabled",
+                    "serverFarmId": resources["bridgeAppServicePlan"]["resourceId"],
+                    "virtualNetworkSubnetId": resources["integrationSubnet"]["resourceId"],
+                    "outboundVnetRouting": {
+                        "allTraffic": True,
+                        "applicationTraffic": True,
+                    },
+                },
+            },
+        }
+        operations = {item["id"]: item for item in self.plan["mutations"]}
+        create_policy = bootstrap._operation_context_policy(
+            "createStoppedPrivateBridge", self.plan, authorization
+        )
+        _status, create_context = observe._operation_admission(
+            operations["createStoppedPrivateBridge"], envelope, self.plan,
+            authorization, NOW, "203.0.113.10/32", create_policy,
+            dependency_facts,
+        )
+        self.assertEqual(
+            create_context["adopted"]["bridgeIdentityMode"],
+            "exact-five-user-assigned",
+        )
+        dependency_facts["createStoppedPrivateBridge"] = create_context["adopted"]
+        attach_policy = bootstrap._operation_context_policy(
+            "attachFiveUamisOnlyToBridge", self.plan, authorization
+        )
+        _status, attach_context = observe._operation_admission(
+            operations["attachFiveUamisOnlyToBridge"], envelope, self.plan,
+            authorization, NOW, "203.0.113.10/32", attach_policy,
+            dependency_facts,
+        )
+        self.assertEqual(attach_context["executionDecision"], "adopt-exact")
+        self.assertEqual(
+            attach_context["adopted"]["identityResourceIds"],
+            create_context["adopted"]["identityResourceIds"],
+        )
+
+        invalid = {}
+        missing = copy.deepcopy(envelope)
+        missing["body"]["identity"]["userAssignedIdentities"].pop(
+            next(iter(attached))
+        )
+        invalid["missing identity"] = missing
+        extra = copy.deepcopy(envelope)
+        extra["body"]["identity"]["userAssignedIdentities"][
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourceGroups/extra/providers/Microsoft.ManagedIdentity/"
+            "userAssignedIdentities/extra"
+        ] = {
+            "clientId": "11111111-1111-4111-8111-111111111111",
+            "principalId": "22222222-2222-4222-8222-222222222222",
+        }
+        invalid["extra identity"] = extra
+        mixed = copy.deepcopy(envelope)
+        mixed["body"]["identity"]["type"] = "SystemAssigned, UserAssigned"
+        invalid["mixed system identity"] = mixed
+        malformed = copy.deepcopy(envelope)
+        first = next(iter(malformed["body"]["identity"]["userAssignedIdentities"]))
+        malformed["body"]["identity"]["userAssignedIdentities"][first][
+            "clientId"
+        ] = "not-a-guid"
+        invalid["malformed client metadata"] = malformed
+        malformed_principal = copy.deepcopy(envelope)
+        first = next(iter(malformed_principal["body"]["identity"]["userAssignedIdentities"]))
+        malformed_principal["body"]["identity"]["userAssignedIdentities"][first][
+            "principalId"
+        ] = "not-a-guid"
+        invalid["malformed principal metadata"] = malformed_principal
+        for label, candidate in invalid.items():
+            with self.subTest(label=label), self.assertRaises(
+                (observe.ObserveError, bootstrap.BootstrapError)
+            ):
+                observe._operation_admission(
+                    operations["createStoppedPrivateBridge"], candidate,
+                    self.plan, authorization, NOW, "203.0.113.10/32",
+                    create_policy, dependency_facts,
+                )
 
     def test_residual_publisher_application_and_service_principal_are_adopted(self):
         with tempfile.TemporaryDirectory() as folder:

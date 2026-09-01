@@ -877,7 +877,10 @@ class _TerminalEvidenceFixture:
         )
         self.envelope("createExactRoleAssignments", {"roleAssignments": assignments})
         attached = {
-            self.operations[operation_id]["projection"]["id"]: {}
+            self.operations[operation_id]["projection"]["id"]: {
+                "clientId": self.operations[operation_id]["projection"]["clientId"],
+                "principalId": self.operations[operation_id]["projection"]["principalId"],
+            }
             for operation_id in (
                 "createBridgeIdentity",
                 "adoptExistingRegistryWriterIdentity",
@@ -2856,7 +2859,7 @@ class BootstrapTests(unittest.TestCase):
         source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._mutate
         )
-        self.assertEqual(source.count("_if_match_etag("), 5)
+        self.assertEqual(source.count("_if_match_etag("), 6)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
 
@@ -2926,16 +2929,45 @@ class BootstrapTests(unittest.TestCase):
             if item["id"] == "attachFiveUamisOnlyToBridge"
         )
         attach_response = bootstrap._RestResponse(
-            200, bootstrap.canonical_json_bytes({}), {}
+            200,
+            bootstrap.canonical_json_bytes(
+                {
+                    "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                            resources[key]["resourceId"]: {}
+                            for key in (
+                                "bridgeIdentity",
+                                "registryWriterIdentity",
+                                "registryReaderIdentity",
+                                "signerIdentity",
+                                "productionActivationIdentity",
+                            )
+                        },
+                    }
+                }
+            ),
+            {"ETag": "1DD39E07D4DEF61"},
         )
         with mock.patch.object(
             transport, "_mutation_request", return_value=attach_response
         ) as request:
             transport._mutate(attach, state)
+        self.assertEqual(request.call_count, 1)
         self.assertEqual(
             request.call_args.kwargs["headers"]["If-Match"],
             '"1DD39E07D4DEF60"',
         )
+        with mock.patch.object(
+            transport,
+            "_mutation_request",
+            return_value=bootstrap._RestResponse(
+                412, bootstrap.canonical_json_bytes({"error": "precondition"}), {}
+            ),
+        ) as rejected:
+            with self.assertRaises(bootstrap.BootstrapError):
+                transport._mutate(attach, state)
+        self.assertEqual(rejected.call_count, 1)
 
         configure = next(
             item
@@ -2965,6 +2997,238 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(
             arm_put.call_args.kwargs["headers"]["If-Match"],
             '"1DD39E07D4DEF60"',
+        )
+
+    def test_recovered_exact_five_attachment_is_get_proved_without_patch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        projection = copy.deepcopy(fixture["preflightProjection"])
+        prior = {
+            item["operationId"]: item["sourceProjection"]
+            for item in fixture["sourceEvidence"]["allOperationProjections"]
+        }
+        attached_projection = prior["attachFiveUamisOnlyToBridge"]["projection"]
+        identity = attached_projection["identity"]
+        identity_ids = sorted(item.lower() for item in identity["userAssignedIdentities"])
+        etag = '"bridge-recovery-etag"'
+        identity_digest = bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(identity))
+        create_admission = next(
+            item for item in projection["operationAdmissions"]
+            if item["operationId"] == "createStoppedPrivateBridge"
+        )
+        create_admission["status"] = "exact"
+        create_admission["context"] = {
+            "executionDecision": "adopt-exact",
+            "adopted": {
+                "resourceId": attached_projection["id"],
+                "name": attached_projection["name"],
+                "etag": etag,
+                "bridgeIdentityMode": "exact-five-user-assigned",
+                "identityResourceIds": identity_ids,
+                "identityProjectionSha256": identity_digest,
+            },
+        }
+        attach_admission = next(
+            item
+            for item in projection["operationAdmissions"]
+            if item["operationId"] == "attachFiveUamisOnlyToBridge"
+        )
+        attach_admission["status"] = "exact"
+        attach_admission["context"] = {
+            "executionDecision": "adopt-exact",
+            "adopted": {
+                "identityResourceIds": identity_ids,
+                "expectedEtag": etag,
+                "identityProjectionSha256": identity_digest,
+            },
+        }
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            clock=lambda: NOW,
+            session=mock.Mock(),
+        )
+        bootstrap.validate_preflight_evidence(
+            {
+                "schemaVersion": 1,
+                "status": "observed-read-only",
+                "observedAt": authorization["observedPreflight"]["observedAt"],
+                "projection": projection,
+                "projectionSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(projection)
+                ),
+            },
+            authorization,
+            self.plan,
+        )
+        transport._validated_source_projections.update(prior)
+        body = {
+            "id": attached_projection["id"],
+            "name": attached_projection["name"],
+            "type": "Microsoft.Web/sites",
+            "kind": attached_projection["kind"],
+            "identity": identity,
+            "properties": {
+                key: attached_projection[key]
+                for key in (
+                    "httpsOnly", "state", "publicNetworkAccess", "serverFarmId",
+                    "virtualNetworkSubnetId", "outboundVnetRouting",
+                )
+            },
+        }
+        transport.session.request.return_value = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(body), {"ETag": etag}
+        )
+        attach = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "attachFiveUamisOnlyToBridge"
+        )
+        with mock.patch.object(transport, "_mutate") as mutate:
+            result = transport.apply_operation(attach, {})
+        mutate.assert_not_called()
+        self.assertEqual(transport.session.request.call_count, 1)
+        self.assertEqual(transport.session.request.call_args.args[0], "GET")
+        self.assertEqual(result["status"], "adopted-exact")
+        self.assertFalse(result["owned"])
+        expected = transport.probes[attach_admission["desiredProbeIds"][0]]
+        invalid_responses = {}
+        unsafe = copy.deepcopy(body)
+        unsafe["properties"]["httpsOnly"] = False
+        invalid_responses["unsafe posture"] = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(unsafe), {"ETag": etag}
+        )
+        malformed = copy.deepcopy(body)
+        first = next(iter(malformed["identity"]["userAssignedIdentities"]))
+        malformed["identity"]["userAssignedIdentities"][first]["clientId"] = "not-a-guid"
+        invalid_responses["malformed identity metadata"] = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(malformed), {"ETag": etag}
+        )
+        invalid_responses["etag drift"] = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(body), {"ETag": '"different"'}
+        )
+        for label, response in invalid_responses.items():
+            with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
+                transport._validate_readback_response(
+                    expected, response,
+                    runtime_facts=attach_admission["context"]["adopted"],
+                )
+
+    def test_recovered_bridge_preflight_cross_binding_rejects_every_tamper(self):
+        projection = build_projection(self.plan, self.package)
+        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
+        identity_ids = sorted(
+            resources[key]["resourceId"] for key in (
+                "bridgeIdentity", "registryWriterIdentity", "registryReaderIdentity",
+                "signerIdentity", "productionActivationIdentity",
+            )
+        )
+        create = next(item for item in projection["operationAdmissions"] if item["operationId"] == "createStoppedPrivateBridge")
+        attach = next(item for item in projection["operationAdmissions"] if item["operationId"] == "attachFiveUamisOnlyToBridge")
+        create["status"] = "exact"
+        create["context"] = {"executionDecision": "adopt-exact", "adopted": {
+            "resourceId": resources["bridgeSite"]["resourceId"],
+            "name": resources["bridgeSite"]["name"], "etag": '"recovery"',
+            "bridgeIdentityMode": "exact-five-user-assigned",
+            "identityResourceIds": identity_ids, "identityProjectionSha256": "a" * 64,
+        }}
+        attach["status"] = "exact"
+        attach["context"] = {"executionDecision": "adopt-exact", "adopted": {
+            "identityResourceIds": identity_ids, "expectedEtag": '"recovery"',
+            "identityProjectionSha256": "a" * 64,
+        }}
+        receipt = Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+
+        def validate(candidate):
+            authorization = build_authorization(
+                self.plan, self.plan_sha, self.package, candidate, receipt
+            )
+            document = {
+                "schemaVersion": 1, "status": "observed-read-only",
+                "observedAt": authorization["observedPreflight"]["observedAt"],
+                "projection": candidate,
+                "projectionSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(candidate)
+                ),
+            }
+            return bootstrap.validate_preflight_evidence(document, authorization, self.plan)
+
+        validate(copy.deepcopy(projection))
+        for label, mutate in {
+            "mode": lambda c, a: c["context"]["adopted"].__setitem__("bridgeIdentityMode", "pristine-no-identity"),
+            "decision": lambda c, a: a["context"].__setitem__("executionDecision", "apply-exact"),
+            "list": lambda c, a: a["context"]["adopted"].__setitem__("identityResourceIds", list(reversed(identity_ids))),
+            "etag": lambda c, a: a["context"]["adopted"].__setitem__("expectedEtag", '"other"'),
+            "digest": lambda c, a: a["context"]["adopted"].__setitem__("identityProjectionSha256", "b" * 64),
+        }.items():
+            candidate = copy.deepcopy(projection)
+            candidate_create = next(item for item in candidate["operationAdmissions"] if item["operationId"] == "createStoppedPrivateBridge")
+            candidate_attach = next(item for item in candidate["operationAdmissions"] if item["operationId"] == "attachFiveUamisOnlyToBridge")
+            mutate(candidate_create, candidate_attach)
+            with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
+                validate(candidate)
+
+    def test_pristine_attachment_patches_once_then_get_proves_same_etag_and_digest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization, plan=self.plan, package=self.package,
+            preflight={"projection": projection}, clock=lambda: NOW,
+            session=mock.Mock(),
+        )
+        prior = {
+            item["operationId"]: item["sourceProjection"]
+            for item in fixture["sourceEvidence"]["allOperationProjections"]
+        }
+        transport._validated_source_projections.update(prior)
+        attached = prior["attachFiveUamisOnlyToBridge"]["projection"]
+        body = {
+            "id": attached["id"], "name": attached["name"],
+            "type": "Microsoft.Web/sites", "kind": attached["kind"],
+            "identity": attached["identity"],
+            "properties": {key: attached[key] for key in (
+                "httpsOnly", "state", "publicNetworkAccess", "serverFarmId",
+                "virtualNetworkSubnetId", "outboundVnetRouting",
+            )},
+        }
+        response = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(body), {"ETag": '"after-attach"'}
+        )
+        transport.session.request.return_value = response
+        state = {"proofs": {"createStoppedPrivateBridge": {"details": {"etag": '"before-attach"'}}}}
+        for operation_id, resource_key in (
+            ("createBridgeIdentity", "bridgeIdentity"),
+            ("adoptExistingRegistryWriterIdentity", "registryWriterIdentity"),
+            ("adoptExistingRegistryReaderIdentity", "registryReaderIdentity"),
+            ("createSignerIdentity", "signerIdentity"),
+            ("createProductionActivationIdentity", "productionActivationIdentity"),
+        ):
+            resource = next(item for item in self.plan["resourceInventory"] if item["id"] == resource_key)
+            state["proofs"][operation_id] = {"details": {"resourceId": resource["resourceId"]}}
+        attach = next(item for item in self.plan["mutations"] if item["id"] == "attachFiveUamisOnlyToBridge")
+        with mock.patch.object(transport, "_mutation_request", return_value=response) as patch:
+            result = transport.apply_operation(attach, state)
+        patch.assert_called_once()
+        self.assertEqual(patch.call_args.args[0], "PATCH")
+        self.assertEqual(patch.call_args.kwargs["headers"]["If-Match"], '"before-attach"')
+        self.assertEqual(transport.session.request.call_count, 1)
+        self.assertEqual(result["details"]["expectedEtag"], '"after-attach"')
+        self.assertEqual(
+            result["details"]["identityProjectionSha256"],
+            bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(attached["identity"])),
         )
 
     def _custom_role_retry_transport(self, member_state, responses):
@@ -4930,6 +5194,32 @@ class BootstrapTests(unittest.TestCase):
             all(permanent[item]["outcome"] == "adopted-exact" for item in adopted)
         )
 
+    def test_terminal_journal_rejects_attach_patch_when_preflight_adopts_exact(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        inputs = self._terminal_journal_validation_inputs(fixture)
+        attach_projection = next(
+            item["sourceProjection"] for item in fixture["sourceEvidence"]["allOperationProjections"]
+            if item["operationId"] == "attachFiveUamisOnlyToBridge"
+        )
+        identity = attach_projection["projection"]["identity"]
+        inputs["operation_contexts"]["attachFiveUamisOnlyToBridge"] = {
+            "executionDecision": "adopt-exact",
+            "adopted": {
+                "identityResourceIds": sorted(identity["userAssignedIdentities"], key=str.lower),
+                "expectedEtag": '"adopted-attach"',
+                "identityProjectionSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(identity)
+                ),
+            },
+        }
+        journal = fixture["sourceEvidence"]["productionBoundary"]["mutationJournal"]
+        self.assertTrue(any(
+            item["operationId"] == "attachFiveUamisOnlyToBridge" for item in journal
+        ))
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._validate_sanitized_mutation_journal(journal, **inputs)
+
     def test_terminal_journal_rejects_omitted_duplicate_or_failed_mutation_result(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
@@ -5387,6 +5677,112 @@ class BootstrapTests(unittest.TestCase):
                 preflight_projection=fixture["preflightProjection"],
                 evidence=altered,
             )
+
+    def test_terminal_attach_projection_rejects_unsafe_nonidentity_posture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        for field, value in (
+            ("kind", "app"),
+            ("httpsOnly", False),
+            ("serverFarmId", "/subscriptions/invalid/serverfarm"),
+            ("virtualNetworkSubnetId", "/subscriptions/invalid/subnet"),
+            ("outboundVnetRouting", {"allTraffic": False, "applicationTraffic": False}),
+        ):
+            altered = copy.deepcopy(fixture["sourceEvidence"])
+            projection = next(
+                item["sourceProjection"]["projection"]
+                for item in altered["permanentMutationProjections"]
+                if item["mutationId"] == "attachFiveUamisOnlyToBridge"
+            )
+            projection[field] = value
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.validate_terminal_source_evidence(
+                    plan=fixture["plan"], authorization=fixture["authorization"],
+                    preflight_projection=fixture["preflightProjection"], evidence=altered,
+                )
+
+    def test_terminal_bridge_uami_inventory_accepts_populated_arm_metadata_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        evidence = fixture["sourceEvidence"]
+        source_projection = copy.deepcopy(next(
+            item
+            for item in evidence["allOperationProjections"]
+            if item["operationId"] == "attachFiveUamisOnlyToBridge"
+        )["sourceProjection"])
+        attachment = source_projection["projection"]["identity"][
+            "userAssignedIdentities"
+        ]
+        resource_id, metadata = next(iter(attachment.items()))
+        del attachment[resource_id]
+        attachment[resource_id.upper()] = metadata
+        prior = {
+            item["operationId"]: item["sourceProjection"]
+            for item in evidence["allOperationProjections"]
+        }
+        operation_context = next(
+            item["context"]
+            for item in fixture["preflightProjection"]["operationAdmissions"]
+            if item["operationId"] == "attachFiveUamisOnlyToBridge"
+        )
+        bootstrap._validate_operation_source_projection(
+            source_projection,
+            operation_id="attachFiveUamisOnlyToBridge",
+            plan=fixture["plan"],
+            authorization=fixture["authorization"],
+            prior=prior,
+            operation_context=operation_context,
+            runtime_facts={},
+        )
+
+    def test_terminal_bridge_uami_inventory_rejects_malformed_or_unbound_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+
+        def altered_attachment():
+            altered = copy.deepcopy(fixture["sourceEvidence"])
+            attachment = next(
+                item
+                for item in altered["permanentMutationProjections"]
+                if item["mutationId"] == "attachFiveUamisOnlyToBridge"
+            )["sourceProjection"]["projection"]["identity"]["userAssignedIdentities"]
+            return altered, attachment
+
+        mutations = {
+            "non-object": lambda attachment, key: attachment.__setitem__(key, []),
+            "missing principalId": lambda attachment, key: attachment[key].pop(
+                "principalId"
+            ),
+            "mismatched clientId": lambda attachment, key: attachment[key].__setitem__(
+                "clientId", str(uuid.uuid5(uuid.UUID(AUTH_ID), "wrong-client"))
+            ),
+            "unknown nested field": lambda attachment, key: attachment[key].__setitem__(
+                "tenantId", bootstrap.TENANT
+            ),
+            "duplicate case-variant identity": lambda attachment, key: attachment.__setitem__(
+                key.upper(), copy.deepcopy(attachment[key])
+            ),
+            "extra identity": lambda attachment, _key: attachment.__setitem__(
+                "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/extra/providers/Microsoft.ManagedIdentity/userAssignedIdentities/extra",
+                {
+                    "clientId": str(uuid.uuid5(uuid.UUID(AUTH_ID), "extra-client")),
+                    "principalId": str(
+                        uuid.uuid5(uuid.UUID(AUTH_ID), "extra-principal")
+                    ),
+                },
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                altered, attachment = altered_attachment()
+                mutate(attachment, next(iter(attachment)))
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_terminal_source_evidence(
+                        plan=fixture["plan"],
+                        authorization=fixture["authorization"],
+                        preflight_projection=fixture["preflightProjection"],
+                        evidence=altered,
+                    )
 
     def test_full_terminal_source_evidence_rejects_postcondition_tamper(self):
         with tempfile.TemporaryDirectory() as folder:
