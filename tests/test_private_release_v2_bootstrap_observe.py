@@ -498,6 +498,95 @@ class FakeReadOnlySession:
             raise AssertionError("read-only request carried a body")
 
 
+class ResidualPublisherSession(FakeReadOnlySession):
+    APP_OBJECT_ID = "11111111-1111-4111-8111-111111111111"
+    APP_ID = "22222222-2222-4222-8222-222222222222"
+    SERVICE_OBJECT_ID = "33333333-3333-4333-8333-333333333333"
+
+    def __init__(
+        self,
+        plan,
+        *,
+        application_present=True,
+        service_app_id=None,
+        assignments=None,
+    ):
+        super().__init__(plan)
+        self.application_present = application_present
+        self.service_app_id = service_app_id or self.APP_ID
+        self.assignments = [] if assignments is None else assignments
+
+    def _response(self, request, body):
+        self.requests.append(request)
+        self.assert_read_only(request)
+        response = observe.ReadResponse(
+            method=request.method,
+            url=request.url,
+            status=200,
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        self.envelopes[(request.method, request.url)] = {
+            "method": request.method,
+            "url": request.url,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": copy.deepcopy(body),
+        }
+        return response
+
+    def read(self, request):
+        if request.url.startswith("https://graph.microsoft.com/v1.0/applications?"):
+            values = []
+            if self.application_present:
+                values.append(
+                    {
+                        "id": self.APP_OBJECT_ID,
+                        "appId": self.APP_ID,
+                        "displayName": self.resources["publisherApplication"]["name"],
+                        "signInAudience": "AzureADMyOrg",
+                        "passwordCredentials": [],
+                        "keyCredentials": [],
+                    }
+                )
+            return self._response(request, {"value": values})
+        if request.url.startswith(
+            "https://graph.microsoft.com/v1.0/servicePrincipals?"
+        ) and "paperdesk-release-publisher-v2-9c4e0d0d" in request.url:
+            return self._response(
+                request,
+                {
+                    "value": [
+                        {
+                            "id": self.SERVICE_OBJECT_ID,
+                            "appId": self.service_app_id,
+                            "displayName": self.resources[
+                                "publisherServicePrincipal"
+                            ]["name"],
+                            "accountEnabled": True,
+                            "servicePrincipalType": "Application",
+                            "passwordCredentials": [],
+                            "keyCredentials": [],
+                            "appRoleAssignments": copy.deepcopy(self.assignments),
+                        }
+                    ]
+                },
+            )
+        if request.url.startswith("https://graph.microsoft.com/beta/applications?"):
+            values = []
+            if self.application_present:
+                values.append(
+                    {
+                        "id": self.APP_OBJECT_ID,
+                        "appId": self.APP_ID,
+                        "displayName": self.resources["publisherApplication"]["name"],
+                        "federatedIdentityCredentials": [],
+                    }
+                )
+            return self._response(request, {"value": values})
+        return super().read(request)
+
+
 class ObserveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -752,6 +841,236 @@ class ObserveTests(unittest.TestCase):
             )
             self.assertEqual(validated_preflight, preflight)
             self.assertEqual(validated_digest, digest)
+
+    def test_residual_publisher_application_and_service_principal_are_adopted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = ResidualPublisherSession(self.plan)
+            _session, preflight, template = self.build(folder, session)
+
+        admissions = {
+            item["operationId"]: item
+            for item in preflight["projection"]["operationAdmissions"]
+        }
+        self.assertEqual(
+            admissions["createPublisherApplication"]["context"],
+            {
+                "executionDecision": "adopt-exact",
+                "adopted": {
+                    "objectId": session.APP_OBJECT_ID,
+                    "appId": session.APP_ID,
+                },
+            },
+        )
+        self.assertEqual(
+            admissions["createPublisherServicePrincipal"]["context"],
+            {
+                "executionDecision": "adopt-exact",
+                "adopted": {
+                    "objectId": session.SERVICE_OBJECT_ID,
+                    "appId": session.APP_ID,
+                    "principalId": session.SERVICE_OBJECT_ID,
+                },
+            },
+        )
+        self.assertEqual(
+            admissions["grantPublisherGraphApplicationReadAll"]["status"],
+            "absent",
+        )
+        self.assertEqual(
+            admissions["grantPublisherGraphApplicationReadAll"]["context"],
+            {"executionDecision": "apply-exact"},
+        )
+        authorization = self.promote_template(template)
+        validated, _digest = bootstrap.validate_preflight_evidence(
+            preflight, authorization, self.plan
+        )
+        self.assertEqual(validated, preflight)
+
+    def test_residual_service_principal_must_match_an_adopted_application(self):
+        cases = (
+            ResidualPublisherSession(
+                self.plan,
+                service_app_id="44444444-4444-4444-8444-444444444444",
+            ),
+            ResidualPublisherSession(self.plan, application_present=False),
+        )
+        for session in cases:
+            with self.subTest(
+                application_present=session.application_present,
+                service_app_id=session.service_app_id,
+            ), tempfile.TemporaryDirectory() as folder:
+                with self.assertRaisesRegex(
+                    observe.ObserveError,
+                    "publisher service principal is not bound to the adopted application",
+                ):
+                    self.build(folder, session)
+
+    def test_preexisting_publisher_graph_assignment_fails_closed(self):
+        assignment = {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
+            "resourceId": "66666666-6666-4666-8666-666666666666",
+            "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+        }
+        session = ResidualPublisherSession(self.plan, assignments=[assignment])
+        with tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
+            observe.ObserveError,
+            "pre-existing publisher Graph assignment requires separately reviewed exact-adoption recovery",
+        ):
+            self.build(folder, session)
+
+    def test_apply_context_still_cannot_author_executor_dependency(self):
+        policy = copy.deepcopy(
+            bootstrap._operation_context_policy(
+                "createPublisherServicePrincipal", self.plan, {}
+            )
+        )
+        policy["observedApplyFields"] = ["appId"]
+        with self.assertRaisesRegex(
+            observe.ObserveError,
+            "preflight authors executor-derived dependency",
+        ):
+            observe._policy_checked_context(
+                "createPublisherServicePrincipal",
+                policy,
+                {
+                    "executionDecision": "apply-exact",
+                    "appId": ResidualPublisherSession.APP_ID,
+                },
+            )
+
+    def test_service_principal_readback_requires_materialized_unpaginated_assignments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        probes = {
+            item["validatorContract"]["operationId"]: item
+            for item in preflight["projection"]["probes"]
+            if item["phase"] == "readback"
+            and isinstance(item.get("validatorContract"), dict)
+            and item["validatorContract"].get("kind")
+            == "source-operation-invariants-v1"
+        }
+
+        class NoRequestSession:
+            def request(self, *_args, **_kwargs):
+                raise AssertionError("direct readback validation attempted a request")
+
+        def response(document):
+            return bootstrap._RestResponse(
+                status=200,
+                body=bootstrap.canonical_json_bytes(document),
+                headers={"content-type": "application/json"},
+            )
+
+        def transport_with_application():
+            transport = bootstrap.AzureCliBootstrapTransport(
+                authorization=authorization,
+                plan=self.plan,
+                package=bootstrap.build_package_descriptor(),
+                preflight=preflight,
+                clock=lambda: NOW,
+                sleep=lambda _seconds: None,
+                session=NoRequestSession(),
+            )
+            application = {
+                "id": ResidualPublisherSession.APP_OBJECT_ID,
+                "appId": ResidualPublisherSession.APP_ID,
+                "displayName": next(
+                    item["name"]
+                    for item in self.plan["resourceInventory"]
+                    if item["id"] == "publisherApplication"
+                ),
+                "signInAudience": "AzureADMyOrg",
+                "passwordCredentials": [],
+                "keyCredentials": [],
+            }
+            transport._validate_readback_response(
+                probes["createPublisherApplication"],
+                response({"value": [application]}),
+                runtime_facts={
+                    "objectId": application["id"],
+                    "appId": application["appId"],
+                },
+            )
+            return transport
+
+        service = {
+            "id": ResidualPublisherSession.SERVICE_OBJECT_ID,
+            "appId": ResidualPublisherSession.APP_ID,
+            "displayName": next(
+                item["name"]
+                for item in self.plan["resourceInventory"]
+                if item["id"] == "publisherServicePrincipal"
+            ),
+            "accountEnabled": True,
+            "servicePrincipalType": "Application",
+            "passwordCredentials": [],
+            "keyCredentials": [],
+            "appRoleAssignments": [],
+            "appRoleAssignments@odata.context": "https://graph.microsoft.com/v1.0/$metadata#appRoleAssignments",
+            "tags": [],
+        }
+        facts = {
+            "objectId": service["id"],
+            "appId": service["appId"],
+            "principalId": service["id"],
+        }
+        proof = transport_with_application()._validate_readback_response(
+            probes["createPublisherServicePrincipal"],
+            response(
+                {
+                    "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#servicePrincipals",
+                    "value": [service],
+                }
+            ),
+            runtime_facts=facts,
+        )
+        self.assertEqual(
+            set(proof["sourceProjection"]["projection"]),
+            {
+                "id",
+                "appId",
+                "displayName",
+                "accountEnabled",
+                "servicePrincipalType",
+                "passwordCredentials",
+                "keyCredentials",
+                "appRoleAssignments",
+            },
+        )
+
+        broken = []
+        omitted = copy.deepcopy(service)
+        omitted.pop("appRoleAssignments")
+        broken.append(omitted)
+        null_relationship = copy.deepcopy(service)
+        null_relationship["appRoleAssignments"] = None
+        broken.append(null_relationship)
+        paginated = copy.deepcopy(service)
+        paginated["appRoleAssignments@odata.nextLink"] = (
+            "https://graph.microsoft.com/v1.0/next"
+        )
+        broken.append(paginated)
+        nonempty = copy.deepcopy(service)
+        nonempty["appRoleAssignments"] = [
+            {
+                "id": "55555555-5555-4555-8555-555555555555",
+                "principalId": ResidualPublisherSession.SERVICE_OBJECT_ID,
+                "resourceId": "66666666-6666-4666-8666-666666666666",
+                "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+            }
+        ]
+        broken.append(nonempty)
+        for candidate in broken:
+            with self.subTest(keys=sorted(candidate)), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                transport_with_application()._validate_readback_response(
+                    probes["createPublisherServicePrincipal"],
+                    response({"value": [candidate]}),
+                    runtime_facts=facts,
+                )
 
     def test_observed_production_boundary_matches_executor_fresh_preflight(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -2683,6 +2683,22 @@ class BootstrapTests(unittest.TestCase):
         )
         self.assertNotIn("atScopeAndBelow", url)
 
+    def test_service_principal_readback_expands_app_role_assignments(self):
+        url = bootstrap._operation_readback_url(
+            "createPublisherServicePrincipal", self.plan, {}
+        )
+        self.assertIn(
+            "&$expand=appRoleAssignments($select=id,principalId,resourceId,appRoleId)",
+            url,
+        )
+        self.assertNotIn("keyCredentials,appRoleAssignments", url)
+        self.assertEqual(
+            url,
+            bootstrap._operation_readback_url(
+                "grantPublisherGraphApplicationReadAll", self.plan, {}
+            ),
+        )
+
     def test_storage_acl_normalization_preserves_supported_optional_boundaries(self):
         subnet = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/resourceGroups/"

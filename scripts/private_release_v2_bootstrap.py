@@ -3052,7 +3052,7 @@ def _operation_readback_url(
     if operation_id == "createPublisherApplication":
         return "https://graph.microsoft.com/v1.0/applications?$filter=displayName%20eq%20'paperdesk-release-publisher-v2-9c4e0d0d'&$select=id,appId,displayName,signInAudience,passwordCredentials,keyCredentials"
     if operation_id == "createPublisherServicePrincipal":
-        return "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=displayName%20eq%20'paperdesk-release-publisher-v2-9c4e0d0d'&$select=id,appId,displayName,accountEnabled,servicePrincipalType,passwordCredentials,keyCredentials,appRoleAssignments"
+        return "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=displayName%20eq%20'paperdesk-release-publisher-v2-9c4e0d0d'&$select=id,appId,displayName,accountEnabled,servicePrincipalType,passwordCredentials,keyCredentials&$expand=appRoleAssignments($select=id,principalId,resourceId,appRoleId)"
     if operation_id == "grantPublisherGraphApplicationReadAll":
         return "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=displayName%20eq%20'paperdesk-release-publisher-v2-9c4e0d0d'&$select=id,appId,displayName,accountEnabled,servicePrincipalType,passwordCredentials,keyCredentials&$expand=appRoleAssignments($select=id,principalId,resourceId,appRoleId)"
     if operation_id in {"retireLegacyPublisherFic", "createSolePublisherFicToSignedBootstrapSource"}:
@@ -9440,12 +9440,19 @@ class AzureCliBootstrapTransport:
                 ):
                     fail("publisher application readback is not credentialless and exact")
             elif operation_id == "createPublisherServicePrincipal":
+                assignments = projection_document.get("appRoleAssignments")
                 if (
                     projection_document.get("displayName") != self.resources["publisherServicePrincipal"]["name"]
                     or projection_document.get("accountEnabled") is not True
                     or projection_document.get("servicePrincipalType") != "Application"
                     or projection_document.get("passwordCredentials") != []
                     or projection_document.get("keyCredentials") != []
+                    or not isinstance(assignments, list)
+                    or bool(assignments)
+                    or projection_document.get(
+                        "appRoleAssignments@odata.nextLink"
+                    )
+                    not in {None, ""}
                     or runtime_facts is None
                     or projection_document.get("appId") != runtime_facts.get("appId")
                 ):
