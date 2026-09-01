@@ -979,7 +979,11 @@ def _operation_admission(
                     or not isinstance(assignments[0], Mapping)
                     or set(assignments[0])
                     != {"id", "principalId", "resourceId", "appRoleId"}
-                    or GUID.fullmatch(str(assignments[0].get("id", ""))) is None
+                    or bootstrap._graph_app_role_assignment_id(
+                        assignments[0].get("id"),
+                        "observed publisher Graph assignment ID",
+                    )
+                    != assignments[0].get("id")
                     or assignments[0].get("principalId") != publisher.get("objectId")
                     or assignments[0].get("resourceId") != graph_service_id
                     or assignments[0].get("appRoleId")

@@ -76,6 +76,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+GRAPH_APP_ROLE_ASSIGNMENT_ID = re.compile(r"^[A-Za-z0-9_-]{43}$")
 TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS = frozenset(
     {
         "readBackExactSigningPublicJwk",
@@ -187,6 +188,38 @@ def _sha256(value: Any, label: str) -> str:
 def _guid(value: Any, label: str) -> str:
     if not isinstance(value, str) or not GUID.fullmatch(value):
         fail(f"{label} is not an exact GUID")
+    return value
+
+
+def _graph_app_role_assignment_id(value: Any, label: str) -> str:
+    """Validate a Microsoft Graph appRoleAssignment resource identifier.
+
+    Graph exposes this directory-resource ``id`` as an opaque string.  Current
+    tenants return a canonical unpadded base64url token containing 32 bytes;
+    older fixtures and API surfaces may expose an ordinary directory GUID.
+    Exact equality across observe, authorization, mutation/readback, and
+    terminal evidence remains the authority boundary in either representation.
+    """
+
+    if isinstance(value, str) and GUID.fullmatch(value):
+        return value
+    if not isinstance(value, str) or GRAPH_APP_ROLE_ASSIGNMENT_ID.fullmatch(value) is None:
+        fail(f"{label} is not an exact Microsoft Graph assignment ID")
+    try:
+        decoded = base64.b64decode(
+            value.encode("ascii") + b"=",
+            altchars=b"-_",
+            validate=True,
+        )
+    except (UnicodeEncodeError, binascii.Error) as exc:
+        raise BootstrapError(
+            f"{label} is not an exact Microsoft Graph assignment ID"
+        ) from exc
+    if (
+        len(decoded) != 32
+        or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != value
+    ):
+        fail(f"{label} is not an exact Microsoft Graph assignment ID")
     return value
 
 
@@ -3777,7 +3810,9 @@ def _validate_operation_source_projection(
                 )
             ):
                 fail("publisher Graph permission is not Application.Read.All")
-            _guid(assignment.get("id"), "publisher Graph assignment ID")
+            _graph_app_role_assignment_id(
+                assignment.get("id"), "publisher Graph assignment ID"
+            )
             _guid(
                 assignment.get("resourceId"),
                 "Microsoft Graph service principal ID",
@@ -7557,7 +7592,7 @@ def _validate_operation_context(
             if operation_id == "createPublisherServicePrincipal" and adopted["objectId"] != adopted["principalId"]:
                 fail("adopted publisher service-principal identity is inconsistent")
         if operation_id == "grantPublisherGraphApplicationReadAll":
-            _guid(
+            _graph_app_role_assignment_id(
                 adopted["assignmentId"],
                 "adopted publisher Graph assignment ID",
             )

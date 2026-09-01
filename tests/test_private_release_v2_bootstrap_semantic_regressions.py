@@ -16,6 +16,12 @@ OPERATOR_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 SOURCE_SHA = "2" * 40
 TREE_SHA = "3" * 40
 OBSERVED_AT = dt.datetime(2026, 8, 30, 4, 0, tzinfo=dt.timezone.utc)
+CANONICAL_GRAPH_ASSIGNMENT_ID = (
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+)
+OTHER_CANONICAL_GRAPH_ASSIGNMENT_ID = (
+    "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+)
 
 
 def stamp(value: dt.datetime) -> str:
@@ -218,7 +224,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         operation_id = "grantPublisherGraphApplicationReadAll"
         publisher_id = "10000000-0000-4000-8000-000000000003"
         publisher_app_id = "10000000-0000-4000-8000-000000000002"
-        assignment_id = "10000000-0000-4000-8000-000000000010"
+        assignment_id = CANONICAL_GRAPH_ASSIGNMENT_ID
         graph_resource_id = "10000000-0000-4000-8000-000000000011"
         service = {
             "id": publisher_id,
@@ -255,6 +261,24 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             valid,
         )
 
+        adopted_prior = copy.deepcopy(prior)
+        adopted_prior["createPublisherServicePrincipal"]["projection"][
+            "appRoleAssignments"
+        ] = [copy.deepcopy(assignment)]
+        adopted_context = {
+            "executionDecision": "adopt-exact",
+            "adopted": copy.deepcopy(runtime_facts),
+        }
+        self.assertEqual(
+            self.validate(
+                operation_id,
+                valid,
+                prior=adopted_prior,
+                operation_context=adopted_context,
+            ),
+            valid,
+        )
+
         nonempty_prior = copy.deepcopy(prior)
         nonempty_prior["createPublisherServicePrincipal"]["projection"][
             "appRoleAssignments"
@@ -279,7 +303,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         variants.append(("publisher", wrong_publisher, runtime_facts))
         wrong_assignment_id = copy.deepcopy(valid)
         wrong_assignment_id["projection"]["appRoleAssignments"][0]["id"] = (
-            "10000000-0000-4000-8000-000000000013"
+            OTHER_CANONICAL_GRAPH_ASSIGNMENT_ID
         )
         variants.append(("assignment-id", wrong_assignment_id, runtime_facts))
         wrong_principal = copy.deepcopy(valid)

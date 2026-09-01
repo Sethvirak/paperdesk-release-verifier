@@ -24,6 +24,11 @@ TREE = "3" * 40
 PARENT = "4" * 40
 ACCOUNT_OBJECT = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 AUTH_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+# Representative of the live Microsoft Graph appRoleAssignment ID shape:
+# canonical unpadded base64url encoding of exactly 32 opaque bytes.
+CANONICAL_GRAPH_ASSIGNMENT_ID = (
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+)
 EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "I accept that Azure Storage exposes no ETag for this account update, so the "
     "temporary uploader ipRules PATCH cannot atomically exclude an unrelated "
@@ -2727,6 +2732,74 @@ class BootstrapTests(unittest.TestCase):
                 "grantPublisherGraphApplicationReadAll", self.plan, {}
             ),
         )
+
+    def test_graph_assignment_id_accepts_live_shape_and_rejects_noncanonical_forms(self):
+        assignment_id = CANONICAL_GRAPH_ASSIGNMENT_ID
+        resource_id = "33333333-3333-4333-8333-333333333333"
+        legacy_guid = "22222222-2222-4222-8222-222222222222"
+        self.assertEqual(len(assignment_id), 43)
+        self.assertEqual(
+            len(base64.urlsafe_b64decode(assignment_id + "=")),
+            32,
+        )
+        self.assertEqual(
+            bootstrap._graph_app_role_assignment_id(
+                assignment_id, "live publisher Graph assignment ID"
+            ),
+            assignment_id,
+        )
+        self.assertEqual(
+            bootstrap._graph_app_role_assignment_id(
+                legacy_guid, "legacy publisher Graph assignment ID"
+            ),
+            legacy_guid,
+        )
+        context = {
+            "executionDecision": "adopt-exact",
+            "adopted": {
+                "assignmentId": assignment_id,
+                "resourceId": resource_id,
+            },
+        }
+        self.assertEqual(
+            bootstrap._validate_operation_context(
+                "grantPublisherGraphApplicationReadAll",
+                context,
+                {},
+            ),
+            context,
+        )
+
+        malformed = {
+            "short": assignment_id[:-1],
+            "long": assignment_id + "A",
+            "padded": assignment_id + "=",
+            "alphabet": assignment_id[:-1] + "+",
+            # The low padding bits differ. Python can decode this to the same
+            # 32 bytes, but canonical re-encoding produces the original token.
+            "noncanonical": assignment_id[:-1] + "9",
+        }
+        self.assertEqual(
+            base64.urlsafe_b64decode(malformed["noncanonical"] + "="),
+            base64.urlsafe_b64decode(assignment_id + "="),
+        )
+        for variant, value in malformed.items():
+            with self.subTest(variant=variant), self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "not an exact Microsoft Graph assignment ID",
+            ):
+                bootstrap._graph_app_role_assignment_id(value, "assignment ID")
+            invalid_context = copy.deepcopy(context)
+            invalid_context["adopted"]["assignmentId"] = value
+            with self.subTest(context_variant=variant), self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "not an exact Microsoft Graph assignment ID",
+            ):
+                bootstrap._validate_operation_context(
+                    "grantPublisherGraphApplicationReadAll",
+                    invalid_context,
+                    {},
+                )
 
     def test_storage_acl_normalization_preserves_supported_optional_boundaries(self):
         subnet = (
