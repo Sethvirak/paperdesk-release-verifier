@@ -135,6 +135,156 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     self.validate(operation_id, altered)
 
+    def test_bridge_posture_accepts_known_rp_enrichment_and_null_identity(self):
+        operation_id = "createStoppedPrivateBridge"
+        contract = bootstrap._validator_contract(
+            f"operation:{operation_id}", self.plan, self.authorization
+        )
+        body = {
+            "id": contract["targetResourceId"],
+            "name": contract["targetName"],
+            "kind": "app,linux",
+            "httpsOnly": True,
+            "state": "Stopped",
+            "publicNetworkAccess": "Disabled",
+            "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
+            "virtualNetworkSubnetId": self.resources["integrationSubnet"][
+                "resourceId"
+            ],
+            "outboundVnetRouting": {
+                "allTraffic": True,
+                "applicationTraffic": True,
+                "backupRestoreTraffic": True,
+                "contentShareTraffic": True,
+                "imagePullTraffic": True,
+                "managedIdentityTraffic": True,
+            },
+            "identity": None,
+        }
+        valid = self.envelope(operation_id, body)
+        self.assertEqual(self.validate(operation_id, valid), valid)
+
+    def test_bridge_posture_rejects_unsafe_rp_enrichment_or_identity(self):
+        operation_id = "createStoppedPrivateBridge"
+        contract = bootstrap._validator_contract(
+            f"operation:{operation_id}", self.plan, self.authorization
+        )
+        body = {
+            "id": contract["targetResourceId"],
+            "name": contract["targetName"],
+            "kind": "app,linux",
+            "httpsOnly": True,
+            "state": "Stopped",
+            "publicNetworkAccess": "Disabled",
+            "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
+            "virtualNetworkSubnetId": self.resources["integrationSubnet"][
+                "resourceId"
+            ],
+            "outboundVnetRouting": {
+                "allTraffic": True,
+                "applicationTraffic": True,
+                "contentShareTraffic": True,
+            },
+            "identity": None,
+        }
+        variants = []
+
+        false_extra = copy.deepcopy(body)
+        false_extra["outboundVnetRouting"]["contentShareTraffic"] = False
+        variants.append(("false-extra", false_extra))
+
+        wrong_type = copy.deepcopy(body)
+        wrong_type["outboundVnetRouting"]["contentShareTraffic"] = "true"
+        variants.append(("wrong-type", wrong_type))
+
+        unknown_extra = copy.deepcopy(body)
+        unknown_extra["outboundVnetRouting"]["futureTraffic"] = True
+        variants.append(("unknown-extra", unknown_extra))
+
+        system_identity = copy.deepcopy(body)
+        system_identity["identity"] = {
+            "type": "SystemAssigned",
+            "principalId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "tenantId": bootstrap.TENANT,
+        }
+        variants.append(("system-identity", system_identity))
+
+        user_identity = copy.deepcopy(body)
+        user_identity["identity"] = {
+            "type": "UserAssigned",
+            "userAssignedIdentities": {
+                self.resources["bridgeIdentity"]["resourceId"]: {}
+            },
+        }
+        variants.append(("user-identity", user_identity))
+
+        for variant, altered in variants:
+            with self.subTest(variant=variant), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                self.validate(operation_id, self.envelope(operation_id, altered))
+
+    def test_live_bridge_readback_projects_properties_https_and_rp_enrichment(self):
+        operation_id = "createStoppedPrivateBridge"
+        contract = bootstrap._validator_contract(
+            f"operation:{operation_id}", self.plan, self.authorization
+        )
+        outbound = {
+            "allTraffic": True,
+            "applicationTraffic": True,
+            "backupRestoreTraffic": True,
+            "contentShareTraffic": True,
+            "imagePullTraffic": True,
+            "managedIdentityTraffic": True,
+        }
+        document = {
+            "id": contract["targetResourceId"],
+            "name": contract["targetName"],
+            "type": "Microsoft.Web/sites",
+            "kind": "app,linux",
+            "identity": None,
+            "properties": {
+                "httpsOnly": True,
+                "state": "Stopped",
+                "publicNetworkAccess": "Disabled",
+                "serverFarmId": self.resources["bridgeAppServicePlan"][
+                    "resourceId"
+                ],
+                "virtualNetworkSubnetId": self.resources["integrationSubnet"][
+                    "resourceId"
+                ],
+                "outboundVnetRouting": outbound,
+            },
+        }
+        response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes(document),
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '\"bridge-etag\"',
+            },
+        )
+        expected = {
+            "id": "readback-create-stopped-private-bridge",
+            "validatorId": f"operation:{operation_id}",
+            "method": contract["expectedMethod"],
+            "url": contract["expectedUrl"],
+            "validatorContract": contract,
+        }
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        transport.plan = self.plan
+        transport.authorization = self.authorization
+        transport.resources = self.resources
+        transport.admissions = {operation_id: {"context": {}}}
+        transport._validated_source_projections = {}
+        transport._package_readback_bytes = None
+
+        validated = transport._validate_readback_response(expected, response, {})
+        projection = validated["sourceProjection"]["projection"]
+        self.assertIs(projection["httpsOnly"], True)
+        self.assertEqual(projection["outboundVnetRouting"], outbound)
+        self.assertIsNone(projection["identity"])
+
     def test_all_private_container_terminal_projections_use_arm_leaf_name_and_exact_shape(self):
         operation_ids = (
             "createPrivatePackageContainer",
@@ -1262,6 +1412,53 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             altered_local["journalSha256"] = bootstrap.sha256_bytes(
                 bootstrap.canonical_json_bytes(altered_journal)
             )
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.validate_terminal_source_evidence(
+                    plan=fixture["plan"],
+                    authorization=fixture["authorization"],
+                    preflight_projection=fixture["preflightProjection"],
+                    evidence=altered,
+                )
+
+    def test_terminal_controller_empty_proof_binds_inner_digest_and_time(self):
+        from tests.test_private_release_v2_bootstrap import (
+            AUTH_ID,
+            build_valid_terminal_source_evidence_fixture,
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = build_valid_terminal_source_evidence_fixture(
+                Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            )
+        source = fixture["sourceEvidence"]
+        entry = next(
+            item
+            for item in source["allOperationProjections"]
+            if item["operationId"] == "proveControllerLockContainerEmpty"
+        )
+        variants = []
+        digest_drift = copy.deepcopy(source)
+        digest_entry = next(
+            item
+            for item in digest_drift["allOperationProjections"]
+            if item["operationId"] == "proveControllerLockContainerEmpty"
+        )
+        digest_entry["sourceProjection"]["projection"]["responseSha256"] = "f" * 64
+        variants.append(digest_drift)
+        time_drift = copy.deepcopy(source)
+        time_entry = next(
+            item
+            for item in time_drift["allOperationProjections"]
+            if item["operationId"] == "proveControllerLockContainerEmpty"
+        )
+        outer = bootstrap.parse_time(
+            time_entry["observedAt"], "proof wrapper observedAt"
+        )
+        time_entry["sourceProjection"]["projection"]["observedAt"] = stamp(
+            outer + dt.timedelta(seconds=1)
+        )
+        variants.append(time_drift)
+        for altered in variants:
             with self.assertRaises(bootstrap.BootstrapError):
                 bootstrap.validate_terminal_source_evidence(
                     plan=fixture["plan"],

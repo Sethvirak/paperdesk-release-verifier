@@ -1248,16 +1248,66 @@ class ObserveTests(unittest.TestCase):
                     ),
                 )
 
-    def test_existing_controller_lock_container_fails_closed_without_empty_proof(self):
-        with tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(
-            observe.ObserveError,
-            "pre-existing controller lock container requires exact empty-container proof",
-        ):
-            self.build(
+    def test_existing_controller_lock_container_is_pending_execution_empty_proof(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(
                 folder,
                 ExistingPrivateContainerSession(
                     self.plan, "createPrivateControllerLockContainer"
                 ),
+            )
+        admission = next(
+            item
+            for item in preflight["projection"]["operationAdmissions"]
+            if item["operationId"] == "createPrivateControllerLockContainer"
+        )
+        self.assertEqual(
+            admission,
+            {
+                "operationId": "createPrivateControllerLockContainer",
+                "status": "adopt-pending-execution-empty-proof",
+                "probeIds": admission["probeIds"],
+                "desiredProbeIds": admission["desiredProbeIds"],
+                "context": {
+                    "executionDecision": "adopt-pending-execution-empty-proof"
+                },
+            },
+        )
+        bootstrap.validate_preflight_evidence(
+            preflight, self.promote_template(template), self.plan
+        )
+
+    def test_adopted_signing_key_context_retains_live_expiry(self):
+        operation = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "createSigningKeyVersion"
+        )
+        expiry = NOW + dt.timedelta(days=60)
+        envelope = {
+            "headers": {},
+            "body": {
+                "properties": {
+                    "keyUriWithVersion": (
+                        "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/"
+                        "paperdesk-release-result-signing/" + "c" * 32
+                    ),
+                    "attributes": {"exp": int(expiry.timestamp())},
+                }
+            },
+        }
+        policy = bootstrap._operation_context_policy(
+            operation["id"], self.plan, {}
+        )
+        adopted = observe._adopted_projection(
+            operation, envelope, self.plan, {}, policy
+        )
+        self.assertEqual(adopted["expiresAt"], observe._stamp(expiry))
+        missing = copy.deepcopy(envelope)
+        del missing["body"]["properties"]["attributes"]["exp"]
+        with self.assertRaisesRegex(observe.ObserveError, "live expiry"):
+            observe._adopted_projection(
+                operation, missing, self.plan, {}, policy
             )
 
     def test_apply_context_still_cannot_author_executor_dependency(self):

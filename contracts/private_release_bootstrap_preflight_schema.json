@@ -53,6 +53,7 @@
                   "absent",
                   "exact",
                   "owned-present",
+                  "adopt-pending-execution-empty-proof",
                   "network-inaccessible",
                   "temporary-access-inaccessible"
                 ]
