@@ -1288,6 +1288,148 @@ class ObserveTests(unittest.TestCase):
             )
         self.assertEqual(http_failure.calls, 1)
 
+    def test_executor_mutation_readback_retries_transport_failures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        admission = next(
+            item
+            for item in preflight["projection"]["operationAdmissions"]
+            if item["operationId"] == "createMailboxResourceGroup"
+        )
+        probe_id = admission["desiredProbeIds"][0]
+        expected_probe = next(
+            item
+            for item in preflight["projection"]["probes"]
+            if item["id"] == probe_id
+        )
+        resource = next(
+            item
+            for item in self.plan["resourceInventory"]
+            if item["id"] == "mailboxResourceGroup"
+        )
+        location = self.plan["azure"]["location"]
+
+        class FlakyReadbackSession:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, *, body=None, headers=None):
+                self.calls.append((method, url, body, headers))
+                if len(self.calls) <= 2:
+                    raise bootstrap.BootstrapError(
+                        "Azure REST transport failed closed"
+                    )
+                return bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(
+                        {
+                            "id": resource["resourceId"],
+                            "name": resource["name"],
+                            "type": "Microsoft.Resources/resourceGroups",
+                            "location": location,
+                        }
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        session = FlakyReadbackSession()
+        sleeps = []
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            clock=lambda: NOW + dt.timedelta(seconds=1),
+            sleep=sleeps.append,
+            session=session,
+        )
+        proofs = transport._prove_probe_ids(
+            [probe_id], "createMailboxResourceGroup mutation"
+        )
+
+        self.assertEqual([item["id"] for item in proofs], [probe_id])
+        self.assertEqual(proofs[0]["attempts"], 1)
+        self.assertEqual(len(session.calls), 3)
+        self.assertTrue(
+            all(
+                method == "GET" and url == expected_probe["url"] and body is None
+                for method, url, body, _headers in session.calls
+            )
+        )
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_executor_mutation_readback_retries_fixed_read_only_post(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder)
+        authorization = self.promote_template(template)
+        admission = next(
+            item
+            for item in preflight["projection"]["operationAdmissions"]
+            if item["operationId"]
+            == "configureBridgeExactVersionedPackageAndCriticalSettings"
+        )
+        probe_id = admission["desiredProbeIds"][0]
+        expected_probe = next(
+            item
+            for item in preflight["projection"]["probes"]
+            if item["id"] == probe_id
+        )
+        self.assertEqual(expected_probe["method"], "POST")
+
+        class FlakyReadbackSession:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, *, body=None, headers=None):
+                self.calls.append((method, url, body, headers))
+                if len(self.calls) <= 2:
+                    raise bootstrap.BootstrapError(
+                        "Azure REST transport failed closed"
+                    )
+                return bootstrap._RestResponse(
+                    status=200,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+
+        session = FlakyReadbackSession()
+        sleeps = []
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=bootstrap.build_package_descriptor(),
+            preflight=preflight,
+            clock=lambda: NOW + dt.timedelta(seconds=1),
+            sleep=sleeps.append,
+            session=session,
+        )
+        transport._validate_readback_response = (
+            lambda expected, response, *, runtime_facts=None: {
+                "id": expected["id"],
+                "validatorId": expected["validatorId"],
+                "status": response.status,
+                "responseSha256": bootstrap._response_sha256(response),
+                "sourceProjection": {"runtimeFactsProvided": runtime_facts is not None},
+            }
+        )
+        proofs = transport._prove_probe_ids(
+            [probe_id],
+            "configureBridgeExactVersionedPackageAndCriticalSettings mutation",
+            runtime_facts={},
+        )
+
+        self.assertEqual([item["id"] for item in proofs], [probe_id])
+        self.assertEqual(proofs[0]["attempts"], 1)
+        self.assertEqual(len(session.calls), 3)
+        self.assertTrue(
+            all(
+                method == "POST" and url == expected_probe["url"] and body == b""
+                for method, url, body, _headers in session.calls
+            )
+        )
+        self.assertEqual(sleeps, [0.5, 1.0])
+
     def test_worm_admission_accepts_only_supported_exact_prestates(self):
         with tempfile.TemporaryDirectory() as folder:
             _session, _preflight, template = self.build(folder)

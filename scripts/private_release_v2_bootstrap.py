@@ -9785,7 +9785,7 @@ class AzureCliBootstrapTransport:
                     last_error = BootstrapError("authorization or convergence window expired before readback")
                     break
                 attempts += 1
-                response = self.session.request(
+                response = self._read_request_with_transport_retry(
                     expected["method"],
                     expected["url"],
                     body=b"" if expected["method"] == "POST" else None,
