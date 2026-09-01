@@ -10380,7 +10380,10 @@ class AzureCliBootstrapTransport:
                         or projection_document.get("etag"),
                         "bridge attachment readback ETag",
                     )
-                    != runtime_facts.get("expectedEtag")
+                    != _if_match_etag(
+                        runtime_facts.get("expectedEtag"),
+                        "expected bridge attachment ETag",
+                    )
                 ):
                     fail("bridge UAMI attachment ETag or projection drifted")
             elif operation_id == "detachWriterAndReaderFromLegacyBridge":
