@@ -331,6 +331,26 @@ def build_projection(plan, package, *, adopt_operations=()):
                 }
             )
             preflight_probe_ids.append(temporary_definition_probe_id)
+        if operation["id"] == "grantPublisherGraphApplicationReadAll":
+            graph_resource_probe_id = (
+                f"pre-{index}-{operation['id']}-graph-resource-sp"
+            )
+            probes.append(
+                {
+                    "id": graph_resource_probe_id,
+                    "phase": "preflight",
+                    "method": "GET",
+                    "url": bootstrap._microsoft_graph_service_principal_inventory_url(),
+                    "requestBodySha256": None,
+                    "status": 200,
+                    "responseSha256": bootstrap.sha256_bytes(
+                        f"pre-graph-resource-sp-{index}".encode()
+                    ),
+                    "validatorId": None,
+                    "validatorContract": None,
+                }
+            )
+            preflight_probe_ids.append(graph_resource_probe_id)
         admissions.append(
             {
                 "operationId": operation["id"],
@@ -543,7 +563,7 @@ class _TerminalEvidenceFixture:
     def digest(label):
         return bootstrap.sha256_bytes(label.encode("utf-8"))
 
-    def envelope(self, operation_id, body, *, headers=None):
+    def envelope(self, operation_id, body, *, headers=None, runtime_facts=None):
         contract = bootstrap._validator_contract(
             f"operation:{operation_id}", self.plan, self.authorization
         )
@@ -568,6 +588,7 @@ class _TerminalEvidenceFixture:
             authorization=self.authorization,
             prior=self.operations,
             operation_context=self.contexts[operation_id],
+            runtime_facts=runtime_facts or {},
         )
         self.operations[operation_id] = validated
         return validated
@@ -756,7 +777,15 @@ class _TerminalEvidenceFixture:
                 "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
             }
         ]
-        self.envelope("grantPublisherGraphApplicationReadAll", granted)
+        graph_assignment = granted["appRoleAssignments"][0]
+        self.envelope(
+            "grantPublisherGraphApplicationReadAll",
+            granted,
+            runtime_facts={
+                "assignmentId": graph_assignment["id"],
+                "resourceId": graph_assignment["resourceId"],
+            },
+        )
 
         dynamic_identities = {
             "createBridgeIdentity": "bridgeIdentity",
@@ -790,7 +819,7 @@ class _TerminalEvidenceFixture:
             resource = self.resources[resource_key]
             self.envelope(
                 operation_id,
-                {"id": resource["resourceId"], "name": f"default/{resource['name']}", "type": "Microsoft.Storage/storageAccounts/blobServices/containers", "publicAccess": "None"},
+                {"id": resource["resourceId"], "name": resource["name"], "type": "Microsoft.Storage/storageAccounts/blobServices/containers", "publicAccess": "None"},
             )
 
         key_uri = (
@@ -2766,6 +2795,52 @@ class BootstrapTests(unittest.TestCase):
                 "configureBridgeExactVersionedPackageAndCriticalSettings",
                 context,
                 authorization,
+            )
+
+    def test_controller_lock_handcrafted_adoption_is_rejected_by_policy_and_preflight(self):
+        projection = build_projection(self.plan, self.package)
+        receipt = Path("C:/outside") / (
+            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+        )
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        operation_id = "createPrivateControllerLockContainer"
+        handcrafted = {"executionDecision": "adopt-exact", "adopted": {}}
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "may not be skipped or adopted",
+        ):
+            bootstrap._validate_operation_context(
+                operation_id, handcrafted, authorization
+            )
+
+        altered_projection = copy.deepcopy(projection)
+        admission = next(
+            item
+            for item in altered_projection["operationAdmissions"]
+            if item["operationId"] == operation_id
+        )
+        admission["status"] = "exact"
+        admission["context"] = handcrafted
+        digest = bootstrap.sha256_bytes(
+            bootstrap.canonical_json_bytes(altered_projection)
+        )
+        altered_authorization = copy.deepcopy(authorization)
+        altered_authorization["observedPreflight"]["sha256"] = digest
+        preflight = {
+            "schemaVersion": 1,
+            "status": "observed-read-only",
+            "observedAt": altered_authorization["observedPreflight"]["observedAt"],
+            "projection": altered_projection,
+            "projectionSha256": digest,
+        }
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "may not be skipped or adopted",
+        ):
+            bootstrap.validate_preflight_evidence(
+                preflight, altered_authorization, self.plan
             )
 
     def test_preflight_requires_fresh_temporary_role_definition_absence(self):

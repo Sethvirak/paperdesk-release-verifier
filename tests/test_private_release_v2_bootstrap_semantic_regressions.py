@@ -129,6 +129,53 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     self.validate(operation_id, altered)
 
+    def test_all_private_container_terminal_projections_use_arm_leaf_name_and_exact_shape(self):
+        operation_ids = (
+            "createPrivatePackageContainer",
+            "createPrivateControllerLockContainer",
+            "createPrivateActivationFenceContainer",
+        )
+        for operation_id in operation_ids:
+            operation = self.operations[operation_id]
+            resource = self.resources[operation["target"]]
+            body = {
+                "id": resource["resourceId"],
+                "name": resource["name"],
+                "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+                "publicAccess": "None",
+            }
+            valid = self.envelope(operation_id, body)
+            with self.subTest(operation_id=operation_id, variant="exact"):
+                self.assertEqual(self.validate(operation_id, valid), valid)
+
+            variants = []
+            wrong_id = copy.deepcopy(valid)
+            wrong_id["projection"]["id"] = self.resources["storageAccount"][
+                "resourceId"
+            ]
+            variants.append(("id", wrong_id))
+            wrong_name = copy.deepcopy(valid)
+            wrong_name["projection"]["name"] = f"default/{resource['name']}"
+            variants.append(("name", wrong_name))
+            wrong_type = copy.deepcopy(valid)
+            wrong_type["projection"]["type"] = "Microsoft.Storage/storageAccounts"
+            variants.append(("type", wrong_type))
+            public = copy.deepcopy(valid)
+            public["projection"]["publicAccess"] = "Container"
+            variants.append(("publicAccess", public))
+            missing = copy.deepcopy(valid)
+            missing["projection"].pop("publicAccess")
+            variants.append(("missing", missing))
+            extra = copy.deepcopy(valid)
+            extra["projection"]["unexpected"] = True
+            variants.append(("extra", extra))
+
+            for variant, altered in variants:
+                with self.subTest(operation_id=operation_id, variant=variant), self.assertRaises(
+                    bootstrap.BootstrapError
+                ):
+                    self.validate(operation_id, altered)
+
     def _identity_priors(self):
         values = {
             "createPublisherApplication": {
@@ -166,6 +213,107 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             },
         }
         return values
+
+    def test_publisher_graph_terminal_projection_is_cross_bound_to_exact_assignment(self):
+        operation_id = "grantPublisherGraphApplicationReadAll"
+        publisher_id = "10000000-0000-4000-8000-000000000003"
+        publisher_app_id = "10000000-0000-4000-8000-000000000002"
+        assignment_id = "10000000-0000-4000-8000-000000000010"
+        graph_resource_id = "10000000-0000-4000-8000-000000000011"
+        service = {
+            "id": publisher_id,
+            "appId": publisher_app_id,
+            "displayName": self.resources["publisherServicePrincipal"]["name"],
+            "accountEnabled": True,
+            "servicePrincipalType": "Application",
+            "passwordCredentials": [],
+            "keyCredentials": [],
+            "appRoleAssignments": [],
+        }
+        assignment = {
+            "id": assignment_id,
+            "principalId": publisher_id,
+            "resourceId": graph_resource_id,
+            "appRoleId": bootstrap.AzureCliBootstrapTransport.GRAPH_APPLICATION_READ_ALL,
+        }
+        granted = copy.deepcopy(service)
+        granted["appRoleAssignments"] = [assignment]
+        prior = {"createPublisherServicePrincipal": {"projection": service}}
+        runtime_facts = {
+            "assignmentId": assignment_id,
+            "resourceId": graph_resource_id,
+        }
+        valid = self.envelope(operation_id, granted)
+        self.assertEqual(
+            self.validate(
+                operation_id,
+                valid,
+                prior=prior,
+                operation_context={"executionDecision": "apply-exact"},
+                runtime_facts=runtime_facts,
+            ),
+            valid,
+        )
+
+        nonempty_prior = copy.deepcopy(prior)
+        nonempty_prior["createPublisherServicePrincipal"]["projection"][
+            "appRoleAssignments"
+        ] = [copy.deepcopy(assignment)]
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "publisher Graph permission is not Application.Read.All",
+        ):
+            self.validate(
+                operation_id,
+                valid,
+                prior=nonempty_prior,
+                operation_context={"executionDecision": "apply-exact"},
+                runtime_facts=runtime_facts,
+            )
+
+        variants = []
+        wrong_publisher = copy.deepcopy(valid)
+        wrong_publisher["projection"]["id"] = (
+            "10000000-0000-4000-8000-000000000012"
+        )
+        variants.append(("publisher", wrong_publisher, runtime_facts))
+        wrong_assignment_id = copy.deepcopy(valid)
+        wrong_assignment_id["projection"]["appRoleAssignments"][0]["id"] = (
+            "10000000-0000-4000-8000-000000000013"
+        )
+        variants.append(("assignment-id", wrong_assignment_id, runtime_facts))
+        wrong_principal = copy.deepcopy(valid)
+        wrong_principal["projection"]["appRoleAssignments"][0]["principalId"] = (
+            "10000000-0000-4000-8000-000000000014"
+        )
+        variants.append(("principal", wrong_principal, runtime_facts))
+        wrong_resource = copy.deepcopy(valid)
+        wrong_resource["projection"]["appRoleAssignments"][0]["resourceId"] = (
+            "10000000-0000-4000-8000-000000000015"
+        )
+        variants.append(("resource", wrong_resource, runtime_facts))
+        wrong_role = copy.deepcopy(valid)
+        wrong_role["projection"]["appRoleAssignments"][0]["appRoleId"] = (
+            "10000000-0000-4000-8000-000000000016"
+        )
+        variants.append(("role", wrong_role, runtime_facts))
+        duplicate = copy.deepcopy(valid)
+        duplicate["projection"]["appRoleAssignments"].append(
+            copy.deepcopy(assignment)
+        )
+        variants.append(("duplicate", duplicate, runtime_facts))
+
+        for variant, altered, facts in variants:
+            with self.subTest(variant=variant), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                self.validate(
+                    operation_id,
+                    altered,
+                    prior=prior,
+                    operation_context={"executionDecision": "apply-exact"},
+                    runtime_facts=facts,
+                )
 
     def test_role_assignment_inventory_rejects_one_altered_scope(self):
         operation_id = "createExactRoleAssignments"
