@@ -10972,7 +10972,7 @@ class AzureCliBootstrapTransport:
                 expected_projection = specs[definition_id]
                 resource_id = expected_projection["id"]
                 url = self._arm_url(resource_id, "2022-04-01")
-                before = self.session.request("GET", url)
+                before = self._read_request_with_transport_retry("GET", url)
                 state_name = "absent" if before.status == 404 else "exact"
                 if before.status == 200:
                     current = self._json_response(
@@ -11000,7 +11000,7 @@ class AzureCliBootstrapTransport:
                     if _project_role_definition(created) != expected_projection:
                         fail(f"custom role create response drifted: {definition_id}")
                 readback = self._json_response(
-                    self.session.request("GET", url),
+                    self._read_request_with_transport_retry("GET", url),
                     {200},
                     f"custom role {definition_id} readback",
                 )
@@ -11022,7 +11022,7 @@ class AzureCliBootstrapTransport:
                 )
                 assignment_id = expected_projection["id"]
                 url = self._arm_url(assignment_id, "2022-04-01")
-                before = self.session.request("GET", url)
+                before = self._read_request_with_transport_retry("GET", url)
                 state_name = "absent" if before.status == 404 else "exact"
                 if before.status == 200:
                     current = self._json_response(
@@ -11055,7 +11055,7 @@ class AzureCliBootstrapTransport:
                     if _project_role_assignment(created) != expected_projection:
                         fail(f"role assignment create response drifted: {role['name']}")
                 readback = self._json_response(
-                    self.session.request("GET", url),
+                    self._read_request_with_transport_retry("GET", url),
                     {200},
                     f"role assignment {role['name']} readback",
                 )
