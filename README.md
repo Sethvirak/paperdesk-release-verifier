@@ -239,6 +239,17 @@ errors, authentication failures, and expiry fail closed. GET readiness proves
 read/network access, not write permission: a failed or ambiguous PUT is never
 replayed.
 
+The controller-container empty proof uses the same ten-minute Storage readiness
+budget, bounded by the authorization expiry and 64 GET attempts, with backoff
+capped at 15 seconds. Only the two recognized authorization-propagation 403s
+may wait; malformed errors, authentication failures, transport ambiguity, a
+different target, or a nonempty/paginated inventory stop immediately. Success
+still requires the exact source-bound empty-container and private-posture proof.
+Failure diagnostics retain only a fixed stage, elapsed time, attempt count,
+HTTP status and allowlisted Storage error code in stderr and the local failed
+terminal receipt; response messages, raw bodies, IP addresses and tokens are
+never copied into these diagnostics.
+
 The plan also binds exactly three existing `CanNotDelete` locks and the eight
 role-assignment removals they protect. A fresh complete subscription lock
 inventory must prove all three reviewed projections and reject any additional lock
@@ -248,6 +259,9 @@ reviewed lock, deletes only its exact assignment, and restores the original
 lock in `finally` before deleting a temporary role definition. The journal
 binds exact targets, lock bodies, and this order. Only readbacks may retry;
 assignment and definition absence have bounded convergence windows.
+Temporary-role cleanup 404s retain the specific assignment/definition absence
+proofs and exact lock-restoration evidence before generic absence handling; a
+bare 404 cannot stand in for complete cleanup evidence.
 
 The production App Service lock `paperdesk-protect-app-delete` is bound only
 to retirement of legacy sites-read assignment

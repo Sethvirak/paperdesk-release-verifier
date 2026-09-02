@@ -3792,7 +3792,7 @@ class BootstrapTests(unittest.TestCase):
                 return current[0]
 
             def sleep(seconds):
-                current[0] += dt.timedelta(seconds=121 if jump else seconds)
+                current[0] += dt.timedelta(seconds=601 if jump else seconds)
 
             transport = bootstrap.AzureCliBootstrapTransport(
                 authorization=authorization,
@@ -5097,6 +5097,46 @@ class BootstrapTests(unittest.TestCase):
                     "addOwnedUploaderIpv4Rule",
                 ],
             )
+
+    def test_controller_readiness_failure_retains_only_safe_diagnostics_after_cleanup(self):
+        secret = "Bearer private-token 203.0.113.19 raw-message-secret"
+        for code, expected in (
+            ("AuthorizationPermissionMismatch", "AuthorizationPermissionMismatch"),
+            (secret, "unknown"),
+        ):
+            with self.subTest(code=expected), tempfile.TemporaryDirectory() as folder:
+                _, validated, preflight, projection, receipt = self.fixture(folder)
+                transport = FakeTransport(projection)
+                original_apply = transport.apply_operation
+
+                def apply(operation, state):
+                    if operation["id"] == "proveControllerLockContainerEmpty":
+                        transport.calls.append(("apply", operation["id"]))
+                        raise bootstrap.ControllerReadinessError(
+                            "controller lock proof did not converge",
+                            elapsed_seconds=600, attempts=44, status=403, error_code=code,
+                        )
+                    return original_apply(operation, state)
+
+                with mock.patch.object(transport, "apply_operation", side_effect=apply):
+                    with self.assertRaises(bootstrap.ControllerReadinessError):
+                        self.executor(validated, preflight, transport).run()
+                terminal, raw = bootstrap.load_json(
+                    receipt / "execution-terminal.json", require_canonical=True
+                )
+                self.assertEqual(terminal["status"], "failed")
+                self.assertTrue(terminal["consumed"])
+                self.assertIsNone(terminal["terminalBundlePath"])
+                self.assertEqual(terminal["failureDiagnostic"], {
+                    "stage": "controller-lock-empty-proof", "elapsedSeconds": 600,
+                    "attempts": 44, "status": 403, "errorCode": expected,
+                })
+                self.assertNotIn(secret.encode(), raw)
+                self.assertNotIn(b"private-token", raw)
+                self.assertEqual(
+                    [value for kind, value in transport.calls if kind == "compensate"],
+                    ["addOwnedOperatorControllerCanaryRole", "addOwnedUploaderIpv4Rule"],
+                )
 
     def test_terminal_write_failure_does_not_mask_original_failure(self):
         with tempfile.TemporaryDirectory() as folder:
