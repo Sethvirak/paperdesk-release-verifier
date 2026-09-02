@@ -254,10 +254,28 @@ capped at 15 seconds. Only the two recognized authorization-propagation 403s
 may wait; malformed errors, authentication failures, transport ambiguity, a
 different target, or a nonempty/paginated inventory stop immediately. Success
 still requires the exact source-bound empty-container and private-posture proof.
-Failure diagnostics retain only a fixed stage, elapsed time, attempt count,
-HTTP status and allowlisted Storage error code in stderr and the local failed
-terminal receipt; response messages, raw bodies, IP addresses and tokens are
-never copied into these diagnostics.
+Failure diagnostics retain a fixed stage, elapsed time, attempt count,
+HTTP status, allowlisted Storage error code and stop reason in stderr and the
+local failed terminal receipt. Controller errors distinguish the ten-minute
+readiness limit from expiry of the outer authorization. Both Storage readiness
+paths retain only shape-validated provider request IDs and canonical server
+dates; response messages, raw bodies, IP addresses and tokens are never copied.
+
+Both paths can additionally retain metadata from the credential used for the
+last observed response: process-cache reuse versus an Azure CLI request,
+bounded token issuance/expiry/observation Unix timestamps, and a successful
+account-binding flag. A CLI request does not imply newly issued credentials;
+the CLI can return its own cached token. Missing or invalid issuance metadata
+stays unknown and does not change token acceptance. A later transport failure
+does not pair earlier response headers with a newer credential snapshot.
+Role-readback diagnostics contain only SHA-256 digests of the exact definition
+and assignment already validated through ARM, not a planned-role declaration
+or proof that the data plane has propagated that role. Missing observed
+evidence stays null. This instrumentation makes no extra credential or Azure
+requests, does not force token refresh, and never broadens permissions,
+changes wait/retry limits, or authorizes another execution. Historical failed
+receipts remain immutable; these facts are available only on a later freshly
+authorized attempt.
 
 The plan also binds exactly three existing `CanNotDelete` locks and the eight
 role-assignment removals they protect. A fresh complete subscription lock
