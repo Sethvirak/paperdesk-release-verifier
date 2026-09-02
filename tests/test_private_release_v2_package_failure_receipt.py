@@ -46,10 +46,19 @@ class PackageFailureReceiptTests(unittest.TestCase):
             code = SECRET if hostile else "AuthorizationPermissionMismatch"
             request_id = SECRET if hostile else "12345678-1234-0123-ABCD-123456789ABC"
             server_date = SECRET if hostile else "Wed, 02 Sep 2026 00:00:00 GMT"
+            credential = SECRET if hostile else {
+                "source": "process-cache", "tokenIssuedAtUnix": 1788307140,
+                "tokenExpiresAtUnix": 1788310800, "tokenObservedAtUnix": 1788307200,
+                "accountBindingVerified": True,
+            }
+            role_readback = {"definitionSha256": SECRET, "assignmentSha256": SECRET} if hostile else {
+                "definitionSha256": "a" * 64, "assignmentSha256": "b" * 64,
+            }
             failure = bootstrap.PackageReadinessError(
                 "package data-plane readiness did not converge before its deadline",
                 elapsed_seconds=600, attempts=43, status=403, error_code=code,
                 stop_reason="deadline", request_id=request_id, server_date=server_date,
+                credential=credential, role_readback=role_readback,
             )
 
             def apply(operation, state):
@@ -86,6 +95,8 @@ class PackageFailureReceiptTests(unittest.TestCase):
                 "errorCode": "unknown" if hostile else code,
                 "stopReason": "deadline", "requestId": None if hostile else request_id,
                 "serverDate": None if hostile else server_date,
+                "credential": None if hostile else credential,
+                "roleReadback": None if hostile else role_readback,
             })
             for value in (raw, consumed_raw):
                 for secret in (SECRET, "package-receipt-private-token", "203.0.113.51", "raw-response-secret"):

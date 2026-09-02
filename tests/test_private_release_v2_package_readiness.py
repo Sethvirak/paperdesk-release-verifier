@@ -238,12 +238,14 @@ class PackageReadinessTests(unittest.TestCase):
         )
 
     def assert_package_diagnostic(self, error, *, attempts, status, code, elapsed,
-                                  reason, request_id=None, server_date=None):
+                                  reason, request_id=None, server_date=None,
+                                  credential=None, role_readback=None):
         self.assertEqual(type(error).__name__, "PackageReadinessError")
         self.assertEqual(error.diagnostic, {
             "stage": "package-upload-readiness", "elapsedSeconds": elapsed,
             "attempts": attempts, "status": status, "errorCode": code,
             "stopReason": reason, "requestId": request_id, "serverDate": server_date,
+            "credential": credential, "roleReadback": role_readback,
         })
         rendered = str(error) + "".join(traceback.format_exception(error))
         for field in ("stage=", "elapsedSeconds=", "attempts=", "status=", "errorCode=",
@@ -427,6 +429,45 @@ class PackageReadinessTests(unittest.TestCase):
                 self.assertEqual([item[0] for item in session.requests], ["GET"])
                 self.assertEqual(self.sleeps, [])
                 self.assertEqual(journal.records, [])
+
+    def test_credential_snapshot_stays_paired_with_last_observed_response(self):
+        observed = {
+            "source": "azure-cli-request", "tokenIssuedAtUnix": int(NOW.timestamp()) - 60,
+            "tokenExpiresAtUnix": int(NOW.timestamp()) + 3600,
+            "tokenObservedAtUnix": int(NOW.timestamp()), "accountBindingVerified": True,
+        }
+        response = self.private_error(headers={
+            "Content-Type": "application/xml", "x-ms-request-id": "12345678-1234-0123-ABCD-123456789ABC",
+        })
+        transport, session, journal = self.transport([response, RuntimeError(SECRET)])
+        snapshots = iter([observed, {"source": "process-cache"}])
+        session.storage_credential_diagnostic = lambda: next(snapshots)
+        with self.assertRaises(bootstrap.PackageReadinessError) as error:
+            transport._prove_package_upload_ready(self.url)
+        self.assert_package_diagnostic(error.exception, attempts=2, status=403,
+            code="AuthorizationPermissionMismatch", elapsed=1, reason="transport-error",
+            request_id="12345678-1234-0123-ABCD-123456789ABC", credential=observed)
+        self.assertEqual(next(snapshots), {"source": "process-cache"})
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(journal.records, [])
+
+    def test_package_role_diagnostics_hash_only_validated_observed_projections(self):
+        transport, session, journal = self.transport([self.private_error(code="AuthenticationFailed")])
+        definition, assignment = {"permissions": ["read"]}, {"scope": "exact"}
+        transport._validated_source_projections["addOwnedUploaderPackageRole"] = {
+            "family": "temporary-role-projection",
+            "projection": {"definition": definition, "assignment": assignment},
+        }
+        expected = {
+            "definitionSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(definition)),
+            "assignmentSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(assignment)),
+        }
+        with self.assertRaises(bootstrap.PackageReadinessError) as error:
+            transport._prove_package_upload_ready(self.url)
+        self.assert_package_diagnostic(error.exception, attempts=1, status=403,
+            code="AuthenticationFailed", elapsed=0, reason="unsupported-denial", role_readback=expected)
+        self.assertEqual(len(session.requests), 1)
+        self.assertEqual(journal.records, [])
 
 
 if __name__ == "__main__":

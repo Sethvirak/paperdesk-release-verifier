@@ -211,12 +211,72 @@ class BootstrapError(RuntimeError):
     """A source, authorization, preflight, or execution boundary failed closed."""
 
 
+def _storage_response_correlation(request_id: Any, server_date: Any) -> dict[str, Any]:
+    """Allow only bounded provider correlation metadata, never response text."""
+    safe_request_id = request_id if isinstance(request_id, str) and re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request_id
+    ) else None
+    safe_server_date = None
+    if isinstance(server_date, str) and len(server_date) == 29:
+        try:
+            parsed = dt.datetime.strptime(server_date, "%a, %d %b %Y %H:%M:%S GMT")
+            if parsed.strftime("%a, %d %b %Y %H:%M:%S GMT") == server_date:
+                safe_server_date = server_date
+        except ValueError:
+            pass
+    return {"requestId": safe_request_id, "serverDate": safe_server_date}
+
+
+def _safe_storage_credential_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Metadata only; missing/invalid iat is not a new credential acceptance gate."""
+    if not isinstance(value, Mapping):
+        return None
+
+    def epoch(key: str) -> int | None:
+        number = value.get(key)
+        return number if type(number) is int and 0 <= number <= 4102444800 else None
+
+    observed = epoch("tokenObservedAtUnix")
+    issued = epoch("tokenIssuedAtUnix")
+    if observed is None or (issued is not None and issued > observed + 30):
+        issued = None
+    source = value.get("source")
+    return {
+        "source": source if source in ("process-cache", "azure-cli-request") else None,
+        "tokenIssuedAtUnix": issued,
+        "tokenExpiresAtUnix": epoch("tokenExpiresAtUnix"),
+        "tokenObservedAtUnix": observed,
+        "accountBindingVerified": True if value.get("accountBindingVerified") is True else None,
+    }
+
+
+def _safe_storage_role_diagnostic(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    keys = ("definitionSha256", "assignmentSha256")
+    if not all(isinstance(value.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", value[key])
+               for key in keys):
+        return None
+    return {key: value[key] for key in keys}
+
+
 class ControllerReadinessError(BootstrapError):
     """Retain bounded, non-secret controller GET diagnostics, never response text."""
 
+    STOP_REASONS = frozenset({
+        "invalid-target", "invalid-authorization-window", "expired-before-get",
+        "authorization-expired", "readiness-timeout", "transport-error",
+        "expired-during-get", "unsupported-status", "unsafe-xml", "malformed-xml",
+        "invalid-error-shape", "error-code-mismatch", "unsupported-denial",
+        "attempt-limit", "missing-private-posture", "invalid-empty-proof",
+    })
+
     def __init__(
         self, message: str, *, elapsed_seconds: float, attempts: int,
-        status: int | None, error_code: str,
+        status: int | None, error_code: str, stop_reason: str = "unknown",
+        request_id: str | None = None, server_date: str | None = None,
+        credential: Mapping[str, Any] | None = None,
+        role_readback: Mapping[str, Any] | None = None,
     ) -> None:
         self.diagnostic = {
             "stage": "controller-lock-empty-proof",
@@ -227,6 +287,10 @@ class ControllerReadinessError(BootstrapError):
                 "AuthorizationFailure", "AuthorizationPermissionMismatch",
                 "AuthenticationFailed", "BlobNotFound",
             } else "unknown",
+            "stopReason": stop_reason if stop_reason in self.STOP_REASONS else "unknown",
+            **_storage_response_correlation(request_id, server_date),
+            "credential": _safe_storage_credential_diagnostic(credential),
+            "roleReadback": _safe_storage_role_diagnostic(role_readback),
         }
         detail = " ".join(f"{key}={value}" for key, value in self.diagnostic.items())
         super().__init__(f"{message}; {detail}")
@@ -251,20 +315,9 @@ class PackageReadinessError(BootstrapError):
         self, message: str, *, elapsed_seconds: float, attempts: int,
         status: int | None, error_code: str, stop_reason: str = "unknown",
         request_id: str | None = None, server_date: str | None = None,
+        credential: Mapping[str, Any] | None = None,
+        role_readback: Mapping[str, Any] | None = None,
     ) -> None:
-        # Azure request IDs can use a non-RFC UUID version nibble. Accept only
-        # the fixed hex/hyphen shape, never arbitrary header values or URLs.
-        safe_request_id = request_id if isinstance(request_id, str) and re.fullmatch(
-            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request_id
-        ) else None
-        safe_server_date = None
-        if isinstance(server_date, str) and len(server_date) == 29:
-            try:
-                parsed = dt.datetime.strptime(server_date, "%a, %d %b %Y %H:%M:%S GMT")
-                if parsed.strftime("%a, %d %b %Y %H:%M:%S GMT") == server_date:
-                    safe_server_date = server_date
-            except ValueError:
-                pass
         self.diagnostic = {
             "stage": "package-upload-readiness",
             "elapsedSeconds": round(max(0.0, elapsed_seconds), 3),
@@ -272,8 +325,9 @@ class PackageReadinessError(BootstrapError):
             "status": status if type(status) is int and 100 <= status <= 599 else None,
             "errorCode": error_code if error_code in self.ERROR_CODES else "unknown",
             "stopReason": stop_reason if stop_reason in self.STOP_REASONS else "unknown",
-            "requestId": safe_request_id,
-            "serverDate": safe_server_date,
+            **_storage_response_correlation(request_id, server_date),
+            "credential": _safe_storage_credential_diagnostic(credential),
+            "roleReadback": _safe_storage_role_diagnostic(role_readback),
         }
         detail = " ".join(f"{key}={value}" for key, value in self.diagnostic.items())
         super().__init__(f"{message}; {detail}")
@@ -8829,6 +8883,8 @@ class AzureCliRestSession:
         self.authorization = authorization
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self._tokens: dict[str, tuple[str, int]] = {}
+        self._token_issued_at: dict[str, int | None] = {}
+        self._storage_credential_observation: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect()
         )
@@ -8906,10 +8962,30 @@ class AzureCliRestSession:
             fail("Azure CLI access token claims are invalid")
         return claims
 
+    def storage_credential_diagnostic(self) -> dict[str, Any] | None:
+        # No token lookup, CLI call, refresh, or claim disclosure occurs here.
+        return _safe_storage_credential_diagnostic(self._storage_credential_observation)
+
+    def _observe_storage_credential(
+        self, resource: str, *, source: str, issued: Any, expires: int, observed: int,
+    ) -> None:
+        if resource == "https://storage.azure.com/":
+            self._storage_credential_observation = _safe_storage_credential_diagnostic({
+                "source": source,
+                "tokenIssuedAtUnix": issued,
+                "tokenExpiresAtUnix": expires,
+                "tokenObservedAtUnix": observed,
+                "accountBindingVerified": True,
+            })
+
     def _token(self, resource: str) -> str:
         now = int(self.clock().timestamp())
         cached = self._tokens.get(resource)
         if cached is not None and cached[1] - now > 300:
+            self._observe_storage_credential(
+                resource, source="process-cache", issued=self._token_issued_at.get(resource),
+                expires=cached[1], observed=now,
+            )
             return cached[0]
         document = self._run_az_json(
             [
@@ -8946,6 +9022,13 @@ class AzureCliRestSession:
         ):
             fail("Azure CLI access token is not bound to the authorized account")
         self._tokens[resource] = (token, claims["exp"])
+        # The CLI may return its own cached token. Never label this a fresh token.
+        issued = claims.get("iat")
+        self._token_issued_at[resource] = issued if type(issued) is int else None
+        self._observe_storage_credential(
+            resource, source="azure-cli-request", issued=issued,
+            expires=claims["exp"], observed=now,
+        )
         return token
 
     def request(
@@ -9452,6 +9535,29 @@ class AzureCliBootstrapTransport:
 
     def bind_journal(self, ledger: "UseLedger") -> None:
         self._ledger = ledger
+
+    def _storage_credential_snapshot(self) -> dict[str, Any] | None:
+        # Diagnostic observation never requests/refreshes a token or changes a gate.
+        try:
+            snapshot = getattr(self.session, "storage_credential_diagnostic", None)
+            return _safe_storage_credential_diagnostic(snapshot()) if callable(snapshot) else None
+        except Exception:
+            return None
+
+    def _storage_role_readback_snapshot(self, operation_id: str) -> dict[str, str] | None:
+        envelope = self._validated_source_projections.get(operation_id)
+        if not isinstance(envelope, Mapping) or envelope.get("family") != "temporary-role-projection":
+            return None
+        projection = envelope.get("projection")
+        if not isinstance(projection, Mapping) or not all(
+            isinstance(projection.get(key), Mapping) for key in ("definition", "assignment")
+        ):
+            return None
+        # Only observed, already validated ARM projections; no planned-role inference.
+        return {
+            "definitionSha256": sha256_bytes(canonical_json_bytes(projection["definition"])),
+            "assignmentSha256": sha256_bytes(canonical_json_bytes(projection["assignment"])),
+        }
 
     def _record_mutation(
         self,
@@ -10942,6 +11048,8 @@ class AzureCliBootstrapTransport:
         last_code = "unknown"
         last_request_id: str | None = None
         last_server_date: str | None = None
+        last_credential: dict[str, Any] | None = None
+        role_readback = self._storage_role_readback_snapshot("addOwnedUploaderPackageRole")
 
         def fail_readiness(message: str, reason: str) -> None:
             raise PackageReadinessError(
@@ -10949,6 +11057,7 @@ class AzureCliBootstrapTransport:
                 attempts=attempts, status=last_status, error_code=last_code,
                 stop_reason=reason, request_id=last_request_id,
                 server_date=last_server_date,
+                credential=last_credential, role_readback=role_readback,
             ) from None
 
         try:
@@ -10997,6 +11106,7 @@ class AzureCliBootstrapTransport:
             last_code = "unknown"
             last_request_id = self._header(response, "x-ms-request-id")
             last_server_date = self._header(response, "Date")
+            last_credential = self._storage_credential_snapshot()
             if observed >= deadline:
                 fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
             if response.status not in {403, 404}:
@@ -11064,16 +11174,22 @@ class AzureCliBootstrapTransport:
         attempts = 0
         last_status: int | None = None
         last_code = "unknown"
+        last_request_id: str | None = None
+        last_server_date: str | None = None
+        last_credential: dict[str, Any] | None = None
+        role_readback = self._storage_role_readback_snapshot("addOwnedOperatorControllerCanaryRole")
 
-        def fail_readiness(message: str) -> None:
+        def fail_readiness(message: str, reason: str) -> None:
             raise ControllerReadinessError(
                 message,
                 elapsed_seconds=(self.clock() - started).total_seconds(),
                 attempts=attempts, status=last_status, error_code=last_code,
+                stop_reason=reason, request_id=last_request_id, server_date=last_server_date,
+                credential=last_credential, role_readback=role_readback,
             ) from None
 
         if len(ids) != 1:
-            fail_readiness("controller lock empty proof must bind one exact readback probe")
+            fail_readiness("controller lock empty proof must bind one exact readback probe", "invalid-target")
         expected = self.probes.get(ids[0])
         if (
             not isinstance(expected, Mapping)
@@ -11085,13 +11201,18 @@ class AzureCliBootstrapTransport:
                 "proveControllerLockContainerEmpty", self.plan, self.authorization
             )
         ):
-            fail_readiness("controller lock empty proof probe is not exact")
-        expires = parse_time(
-            self.authorization["validity"]["expiresAt"], "authorization expiresAt"
-        )
-        not_before = parse_time(
-            self.authorization["validity"]["notBefore"], "authorization notBefore"
-        )
+            fail_readiness("controller lock empty proof probe is not exact", "invalid-target")
+        try:
+            expires = parse_time(
+                self.authorization["validity"]["expiresAt"], "authorization expiresAt"
+            )
+            not_before = parse_time(
+                self.authorization["validity"]["notBefore"], "authorization notBefore"
+            )
+            if expires <= not_before:
+                fail("invalid authorization interval")
+        except (BootstrapError, KeyError, TypeError):
+            fail_readiness("controller lock proof authorization window is invalid", "invalid-authorization-window")
         deadline = min(
             expires,
             started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
@@ -11099,7 +11220,9 @@ class AzureCliBootstrapTransport:
         while attempts < 64:
             before_request = self.clock()
             if before_request < not_before or before_request >= deadline:
-                fail_readiness("authorization or convergence window expired before empty-container proof")
+                reason = ("expired-before-get" if attempts == 0 else
+                          "authorization-expired" if before_request >= expires else "readiness-timeout")
+                fail_readiness("authorization or convergence window expired before empty-container proof", reason)
             attempts += 1
             try:
                 response = self.session.request(
@@ -11110,48 +11233,58 @@ class AzureCliBootstrapTransport:
             except Exception:
                 # No transport exception text or body enters diagnostics, and
                 # an ambiguous GET is not replayed by this readiness loop.
-                fail_readiness("controller lock proof transport failed closed")
+                fail_readiness("controller lock proof transport failed closed", "transport-error")
             observed = self.clock()
             last_status = response.status
             last_code = "unknown"
+            last_request_id = self._header(response, "x-ms-request-id")
+            last_server_date = self._header(response, "Date")
+            last_credential = self._storage_credential_snapshot()
             if observed >= deadline:
-                fail_readiness("authorization or convergence window expired during empty-container proof")
+                fail_readiness("authorization or convergence window expired during empty-container proof", "expired-during-get")
             if response.status == 403:
                 if (
                     len(response.body) > 65536
                     or b"<!DOCTYPE" in response.body.upper()
                     or b"<!ENTITY" in response.body.upper()
                 ):
-                    fail_readiness("controller lock proof error XML is unsafe or oversized")
+                    fail_readiness("controller lock proof error XML is unsafe or oversized", "unsafe-xml")
                 try:
                     document = ET.fromstring(response.body)
-                    children = list(document)
-                    if (
-                        document.tag != "Error" or document.attrib
-                        or (document.text or "").strip()
-                        or [child.tag for child in children].count("Code") != 1
-                        or [child.tag for child in children].count("Message") > 1
-                        or any(
-                            child.tag not in {"Code", "Message"} or child.attrib
-                            or list(child) or (child.tail or "").strip()
-                            for child in children
-                        )
-                    ):
-                        fail_readiness("controller lock proof error XML is not exact")
-                    error = _package_blob_error_projection("GET", expected["url"], response)
-                except (ET.ParseError, BootstrapError):
-                    fail_readiness("controller lock proof error XML or code is not recognized")
-                last_code = error.get("storageErrorCode", "unknown") if error else "unknown"
+                except ET.ParseError:
+                    fail_readiness("controller lock proof error XML is malformed", "malformed-xml")
+                children = list(document)
+                if (
+                    document.tag != "Error" or document.attrib
+                    or (document.text or "").strip()
+                    or [child.tag for child in children].count("Code") != 1
+                    or [child.tag for child in children].count("Message") > 1
+                    or any(
+                        child.tag not in {"Code", "Message"} or child.attrib
+                        or list(child) or (child.tail or "").strip()
+                        for child in children
+                    )
+                ):
+                    fail_readiness("controller lock proof error XML is not exact", "invalid-error-shape")
+                candidate_code = document.findtext("Code")
                 header_code = self._header(response, "x-ms-error-code")
-                if header_code is not None and header_code != last_code:
-                    fail_readiness("controller lock proof error header and XML code disagree")
+                if header_code is not None and header_code != candidate_code:
+                    fail_readiness("controller lock proof error header and XML code disagree", "error-code-mismatch")
+                if candidate_code in {"AuthorizationFailure", "AuthorizationPermissionMismatch",
+                                      "AuthenticationFailed", "BlobNotFound"}:
+                    last_code = candidate_code
+                try:
+                    error = _package_blob_error_projection("GET", expected["url"], response)
+                except BootstrapError:
+                    fail_readiness("controller lock proof error code is not recognized", "unsupported-denial")
+                last_code = error.get("storageErrorCode", "unknown") if error else "unknown"
                 if last_code not in {
                     "AuthorizationFailure",
                     "AuthorizationPermissionMismatch",
                 }:
-                    fail_readiness("controller lock proof 403 is not recognized RBAC propagation")
+                    fail_readiness("controller lock proof 403 is not recognized RBAC propagation", "unsupported-denial")
                 if attempts >= 64:
-                    fail_readiness("controller lock proof RBAC access did not converge")
+                    fail_readiness("controller lock proof RBAC access did not converge", "attempt-limit")
                 delay = min(
                     float(2 ** min(attempts - 1, 4)), 15.0,
                     (deadline - observed).total_seconds(),
@@ -11159,7 +11292,7 @@ class AzureCliBootstrapTransport:
                 self.sleep(delay)
                 continue
             if response.status != 200:
-                fail_readiness("controller lock proof returned an unsupported status")
+                fail_readiness("controller lock proof returned an unsupported status", "unsupported-status")
             create_projection = self._validated_source_projections.get(
                 "createPrivateControllerLockContainer"
             )
@@ -11172,7 +11305,7 @@ class AzureCliBootstrapTransport:
                 "createPrivateControllerLockContainer"
             ]["context"]
             if not isinstance(private_posture, Mapping):
-                fail_readiness("controller lock proof lacks the exact private ARM posture")
+                fail_readiness("controller lock proof lacks the exact private ARM posture", "missing-private-posture")
             observed_at = self._timestamp(observed)
             try:
                 inventory = _strict_empty_controller_inventory(
@@ -11189,7 +11322,7 @@ class AzureCliBootstrapTransport:
                     expected, response, runtime_facts=facts
                 )
             except BootstrapError:
-                fail_readiness("controller lock proof inventory or source validation failed")
+                fail_readiness("controller lock proof inventory or source validation failed", "invalid-empty-proof")
             proof.update(
                 {
                     "attempts": attempts,
@@ -11198,7 +11331,7 @@ class AzureCliBootstrapTransport:
                 }
             )
             return [proof]
-        fail_readiness("controller lock proof exceeded the bounded attempts")
+        fail_readiness("controller lock proof exceeded the bounded attempts", "attempt-limit")
 
     def collect_preflight(self, plan: Mapping[str, Any]) -> Mapping[str, Any]:
         if plan is not self.plan and canonical_json_bytes(plan) != canonical_json_bytes(self.plan):

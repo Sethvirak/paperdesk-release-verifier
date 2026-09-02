@@ -5133,6 +5133,8 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(terminal["failureDiagnostic"], {
                     "stage": "controller-lock-empty-proof", "elapsedSeconds": 600,
                     "attempts": 44, "status": 403, "errorCode": expected,
+                    "stopReason": "unknown", "requestId": None, "serverDate": None,
+                    "credential": None, "roleReadback": None,
                 })
                 self.assertNotIn(secret.encode(), raw)
                 self.assertNotIn(b"private-token", raw)
