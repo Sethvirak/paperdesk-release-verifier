@@ -31,6 +31,7 @@ PARENT_SHA = "4" * 40
 PHRASE = (
     "Authorize the separately reviewed exact PaperDesk V2 bootstrap. "
     + bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+    + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
 )
 
 
@@ -183,7 +184,14 @@ class FakeReadOnlySession:
             ),
             None,
         )
-        if production_match == "production-boundary-site":
+        if request.url == bootstrap._cleanup_lock_inventory_url():
+            status = 200
+            body = {"value": [
+                {"id": lock["resourceId"], "name": lock["resourceId"].rsplit("/", 1)[-1],
+                 "type": "Microsoft.Authorization/locks", "properties": copy.deepcopy(lock["properties"])}
+                for lock in bootstrap._expected_cleanup_lock_inventory()["locks"]
+            ]}
+        elif production_match == "production-boundary-site":
             site = self.resources["productionSite"]
             status = 200
             body = {
@@ -775,6 +783,7 @@ class ObserveTests(unittest.TestCase):
                     "id": "temporary-storage-ip-rules-and-recovery-residuals",
                     "exactConfirmationText": (
                         bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+                        + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
                     ),
                 },
             )
@@ -807,6 +816,14 @@ class ObserveTests(unittest.TestCase):
             probes = {item["id"]: item for item in projection["probes"]}
             admissions = projection["operationAdmissions"]
             admissions_by_id = {item["operationId"]: item for item in admissions}
+            lock_probe = probes["preflight-cleanup-lock-inventory"]
+            self.assertEqual(lock_probe["method"], "GET")
+            self.assertEqual(lock_probe["url"], bootstrap._cleanup_lock_inventory_url())
+            self.assertEqual(lock_probe["status"], 200)
+            self.assertEqual(lock_probe["responseSha256"], bootstrap.sha256_bytes(
+                bootstrap.canonical_json_bytes(bootstrap._expected_cleanup_lock_inventory())))
+            self.assertIn("preflight-cleanup-lock-inventory",
+                          admissions_by_id["claimAzureSingleUseAuthorization"]["probeIds"])
             for operation_id in (
                 "createPublisherApplication",
                 "createPublisherServicePrincipal",

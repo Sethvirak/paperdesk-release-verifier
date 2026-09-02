@@ -369,6 +369,34 @@
     "leaseRenewals": 1,
     "cleanup": "remove-only-exact-ip-rule-package-assignment-key-read-definition-assignment-fence-definition-assignment-controller-canary-blob-definition-and-assignment-created-by-this-authorization"
   },
+  "deletionProtection": {
+    "locks": {
+      "rollback": {
+        "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Authorization/locks/paperdesk-rollback-cannot-delete",
+        "properties": {
+          "level": "CanNotDelete",
+          "notes": "Protects verified PaperDesk pre-migration attachment rollback copy; remove lock explicitly before authorized retirement."
+        }
+      },
+      "signingVault": {
+        "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete",
+        "properties": {
+          "level": "CanNotDelete",
+          "notes": "PaperDesk production Key Vault deletion protection. Remove only for an approved delete, replacement, RBAC cleanup, or diagnostic cleanup."
+        }
+      }
+    },
+    "operationLocks": {
+      "removeOwnedUploaderPackageRole": "rollback",
+      "removeOwnedOperatorKeyReadRole": "signingVault",
+      "removeOwnedOperatorFenceBootstrapRole": "rollback",
+      "removeOwnedOperatorControllerCanaryRole": "rollback",
+      "removeLegacyWriterResultAssignment": "rollback",
+      "removeLegacyReaderResultAssignment": "rollback",
+      "retireLegacyPublisherResultReadAssignment": "rollback"
+    },
+    "policy": "exact-lock-suspend-and-finally-restore-no-mutation-retry"
+  },
   "legacyPublisherRetirement": {
     "applicationObjectId": "f80b1856-f955-4c97-b63f-682c244da14d",
     "applicationDisplayName": "mds-external-production-control-oidc",

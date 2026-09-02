@@ -231,6 +231,34 @@ The exact plan may temporarily add only:
 - an exact fence-bootstrap role limited to creating/reading the canonical idle
   activation-fence blob.
 
+Package upload first performs bounded, read-only GET readiness checks against
+the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
+single create-only PUT; recognized authorization-propagation 403s may wait for
+up to ten minutes within the authorization window. Existing blobs, malformed
+errors, authentication failures, and expiry fail closed. GET readiness proves
+read/network access, not write permission: a failed or ambiguous PUT is never
+replayed.
+
+The plan also binds exactly two existing `CanNotDelete` locks and the seven
+role-assignment removals they protect. A fresh complete subscription lock
+inventory must prove both reviewed projections and reject any additional lock
+affecting a planned deletion before the Azure claim. Each protected deletion
+then rechecks that inventory and the authorized assignment, suspends only its
+reviewed lock, deletes only its exact assignment, and restores the original
+lock in `finally` before deleting a temporary role definition. The journal
+binds exact targets, lock bodies, and this order. Only readbacks may retry;
+assignment and definition absence have bounded convergence windows.
+
+New lock suspension requires an unexpired authorization, including during
+compensation. Only restoration of the exact suspended lock may proceed after
+expiry. A changed lock is never overwritten. Fresh bootstrap authorization
+must explicitly accept the lock-concurrency and interruption residuals in
+addition to the existing Storage firewall residuals. If a process dies or a
+request/journal result is ambiguous, deletion protection can remain absent;
+execution stays NO-GO pending fresh proof and, where necessary, separately
+authorized manual cleanup. Consumed authorizations and historical failure
+receipts are never reused or rewritten.
+
 It uses Azure AD create-only upload or adopts only an already-present exact
 immutable source-keyed version. Evidence says which path occurred: only a
 current-authorization create records `If-None-Match:*` and HTTP 201; adoption
