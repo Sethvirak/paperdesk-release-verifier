@@ -168,7 +168,7 @@ class BlobActivationFence:
         elif any((state.get("operation"),state.get("sourceSha"),state.get("preSettingsSha256"),state.get("desiredSettingsSha256"),state.get("leaseId"))) or state.get("pendingRelease") is not None:
             core.fail("fence-state")
         return state
-    def bootstrap_canary(self,*,lease_id,duration_seconds,renewal_count,expected_etag,expected_version_id,expected_body_sha256):
+    def bootstrap_canary(self,*,lease_id,duration_seconds,renewal_count,expected_etag,expected_version_id,expected_body_sha256,deadline):
         """Exercise only a finite lease over the immutable initial idle blob.
 
         This bootstrap path deliberately performs no blob write.  It validates
@@ -182,7 +182,11 @@ class BlobActivationFence:
                 or not isinstance(expected_version_id,str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}",expected_version_id)
                 or not core.SHA256.fullmatch(str(expected_body_sha256))
                 or expected_body_sha256!=core.digest(idle_body)):core.fail("fence-canary-input")
+        expires=core.parse_time(deadline,"fence-canary-deadline")
+        def require_live():
+            if self.clock()>=expires:core.fail("fence-canary-expired")
         headers=self._headers();headers.update({"x-ms-lease-action":"acquire","x-ms-lease-duration":"60","x-ms-proposed-lease-id":lease_id})
+        require_live()
         acquired=self.http("PUT",self.base+"?comp=lease",headers,b"")
         if acquired.status in {409,412}:core.fail("fence-canary-busy")
         if acquired.status!=201:core.fail("fence-canary-acquire")
@@ -191,7 +195,9 @@ class BlobActivationFence:
             acquired_at=self._stamp()
             state,etag,version_id=self._read_proof(lease_id)
             if state!=self.INITIAL_IDLE or etag!=expected_etag or version_id!=expected_version_id:core.fail("fence-canary-idle-drift")
-            renewed=self._lease("renew",lease_id);renew_status=renewed.status;renewed_at=self._stamp()
+            renew_headers=self._headers();renew_headers.update({"x-ms-lease-action":"renew","x-ms-lease-id":lease_id})
+            require_live()
+            renewed=self.http("PUT",self.base+"?comp=lease",renew_headers,b"");renew_status=renewed.status;renewed_at=self._stamp()
             if renewed.status!=200:core.fail("fence-canary-renew")
         except Exception as error:
             failure=error
@@ -218,6 +224,7 @@ class BlobActivationFence:
             if failure is not None:raise cleanup_failure from failure
             raise cleanup_failure
         if failure is not None:raise failure
+        require_live()
         return {"leaseId":lease_id,"leaseIdSha256":core.digest(lease_id.encode()),"leaseDurationSeconds":duration_seconds,"renewalCount":renewal_count,
                 "acquireHttpStatus":acquired.status,"renewHttpStatus":renew_status,"releaseHttpStatus":release_status,
                 "acquiredAt":acquired_at,"renewedAt":renewed_at,"releasedAt":released_at,"completedAt":completed_at,

@@ -118,6 +118,7 @@ class Tests(unittest.TestCase):
             expected_etag=ETAG,
             expected_version_id=VERSION,
             expected_body_sha256=BODY_SHA,
+            deadline="2026-08-30T00:15:00.000Z",
         )
 
     def test_canary_uses_one_finite_lease_without_writing_fence_state(self):

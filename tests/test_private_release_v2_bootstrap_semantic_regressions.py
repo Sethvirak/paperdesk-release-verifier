@@ -731,7 +731,9 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             ),
         }
         control = bootstrap._bootstrap_self_test_control_from_projections(
-            self.authorization, prior
+            self.authorization, prior,
+            {"bootstrapSelfTestIssuedAt": self.authorization["validity"]["notBefore"],
+             "bootstrapSelfTestExpiresAt": bootstrap._bootstrap_self_test_timing(self.authorization, self.authorization["validity"]["notBefore"])["expiresAt"]},
         )
         upload = prior["uploadVersionedBridgePackage"]["projection"]
         package_url = upload["url"] + "?versionid=" + urllib.parse.quote(
@@ -755,6 +757,9 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         body = {
             "preAppSettingsSha256": context["preAppSettingsSha256"],
+            "bootstrapSelfTestIssuedAt": control["issuedAt"],
+            "bootstrapSelfTestExpiresAt": control["expiresAt"],
+            "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired})),
             "settingsSha256": bootstrap.sha256_bytes(
                 bootstrap.canonical_json_bytes(desired)
             ),
