@@ -38,9 +38,18 @@ EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "execution and any later release must stop until a fresh live read proves the /32 and "
     "all related temporary roles absent, and manual cleanup may be required."
 )
+EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
+    "I authorize temporary removal and exact restoration of only the two reviewed "
+    "CanNotDelete locks for the exact role-assignment deletions bound in this plan. "
+    "I accept that lock updates have no atomic concurrency guard and that interruption, "
+    "ambiguous transport, or journal failure can leave deletion protection absent; "
+    "execution must stop NO-GO until fresh reads prove both exact locks restored and "
+    "all related temporary access absent, and manual cleanup may be required."
+)
 PHRASE = (
     "Authorize the exact one-shot PaperDesk V2 bootstrap plan. "
     + EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+    + " " + EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE
 )
 
 
@@ -359,6 +368,22 @@ def build_projection(plan, package, *, adopt_operations=()):
                 }
             )
             preflight_probe_ids.append(graph_resource_probe_id)
+        if operation["id"] == "claimAzureSingleUseAuthorization":
+            lock_probe_id = "preflight-cleanup-lock-inventory"
+            probes.append({
+                "id": lock_probe_id,
+                "phase": "preflight",
+                "method": "GET",
+                "url": bootstrap._cleanup_lock_inventory_url(),
+                "requestBodySha256": None,
+                "status": 200,
+                "responseSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(bootstrap._expected_cleanup_lock_inventory())
+                ),
+                "validatorId": None,
+                "validatorContract": None,
+            })
+            preflight_probe_ids.append(lock_probe_id)
         admissions.append(
             {
                 "operationId": operation["id"],
@@ -715,6 +740,7 @@ class _TerminalEvidenceFixture:
             "definitionResourceId": added["definitionResourceId"],
             "assignmentRemoved": True,
             "definitionRemoved": True,
+            "deletionLock": bootstrap._expected_deletion_lock_proof(operation_id),
             "assignmentAbsenceProjection": {
                 "resourceId": added["assignmentResourceId"],
                 "absent": True,
@@ -1128,7 +1154,10 @@ class _TerminalEvidenceFixture:
             "removeLegacyWriterResultAssignment",
             "removeLegacyReaderResultAssignment",
         ):
-            self.envelope(operation_id, {"absent": True})
+            self.envelope(operation_id, {
+                "absent": True,
+                "deletionLock": bootstrap._expected_deletion_lock_proof(operation_id),
+            })
         self.envelope(
             "retireLegacyPublisherFic",
             {"applicationObjectId": self.plan["legacyPublisherRetirement"]["applicationObjectId"], "removedFederatedCredentialId": self.contexts["retireLegacyPublisherFic"]["legacyFederatedCredentialId"], "federatedIdentityCredentials": []},
@@ -1138,7 +1167,11 @@ class _TerminalEvidenceFixture:
             "retireLegacyPublisherSitesReadAssignment",
             "retireLegacyPublisherResultReadAssignment",
         ):
-            self.envelope(operation_id, {"absent": True})
+            body = {"absent": True}
+            lock_proof = bootstrap._expected_deletion_lock_proof(operation_id)
+            if lock_proof is not None:
+                body["deletionLock"] = lock_proof
+            self.envelope(operation_id, body)
         fic = self.resources["publisherFederatedCredential"]
         self.envelope(
             "createSolePublisherFicToSignedBootstrapSource",
@@ -1189,9 +1222,28 @@ class _TerminalEvidenceFixture:
                 operation_projections=self.operations,
                 operation_contexts=self.contexts,
             )
-            for target, count in sorted(required.items()):
+            def mutation_order(item):
+                target = item[0]
+                method, url = target.split(" ", 1)
+                is_lock = "/providers/microsoft.authorization/locks/" in url.lower()
+                if is_lock:
+                    return (0 if method == "DELETE" else 2, target)
+                if method == "DELETE" and "/roleassignments/" in url.lower():
+                    return (1, target)
+                return (3, target)
+
+            for target, count in sorted(required.items(), key=mutation_order):
                 method, normalized_url = target.split(" ", 1)
                 target_url = exact_url(normalized_url)
+                if "/providers/microsoft.authorization/locks/" in target_url.lower():
+                    target_url = ("https://management.azure.com"
+                        + bootstrap._expected_deletion_lock_proof(operation_id)["resourceId"]
+                        + "?api-version=2016-09-01")
+                elif (bootstrap._expected_deletion_lock_proof(operation_id) is not None
+                      and "/roleassignments/" in target_url.lower()):
+                    target_url = ("https://management.azure.com"
+                        + bootstrap._cleanup_assignment_resources(self.plan)[operation_id]
+                        + "?api-version=2022-04-01")
                 for occurrence in range(count):
                     intent_sequence = len(journal) + 1
                     intent_id = f"cloud-mutation-{intent_sequence:04d}"
@@ -1214,6 +1266,11 @@ class _TerminalEvidenceFixture:
                         "versionId": None,
                         "recordedAt": stamp(recorded),
                     }
+                    if "/providers/microsoft.authorization/locks/" in target_url.lower():
+                        lock_proof = bootstrap._expected_deletion_lock_proof(operation_id)
+                        request_bytes = (b"" if method == "DELETE" else
+                            bootstrap.canonical_json_bytes({"properties": lock_proof["properties"]}))
+                        intent["requestBodySha256"] = bootstrap.sha256_bytes(request_bytes)
                     journal.append(intent)
                     result = copy.deepcopy(intent)
                     versioned_headers = (
@@ -3998,6 +4055,10 @@ class BootstrapTests(unittest.TestCase):
         )
         return auth, validated, validated_preflight, projection, receipt
 
+    def test_deletion_lock_residual_acceptance_exact_reviewed_wording(self):
+        self.assertEqual(bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE,
+                         EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE)
+
     def test_authorization_requires_explicit_storage_acl_residual_acceptance(self):
         self.assertEqual(
             bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE,
@@ -5281,6 +5342,69 @@ class BootstrapTests(unittest.TestCase):
             "operation_projections": fixture["operationProjections"],
             "operation_contexts": contexts,
         }
+
+    def test_cleanup_terminal_proofs_reject_missing_or_drifted_restored_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        inputs = self._terminal_journal_validation_inputs(fixture)
+        protected = [operation_id for operation_id in fixture["operationProjections"]
+                     if bootstrap._expected_deletion_lock_proof(operation_id) is not None]
+        self.assertEqual(len(protected), 7)
+        for operation_id in protected:
+            original = fixture["operationProjections"][operation_id]
+            for field, value in (("restored", False), ("assignmentAbsent", False),
+                                 ("resourceId", "/subscriptions/unrelated"),
+                                 ("properties", {"level": "ReadOnly"}), (None, None)):
+                with self.subTest(operation=operation_id, field=field):
+                    altered = copy.deepcopy(original)
+                    if field is None:
+                        altered["projection"].pop("deletionLock")
+                    else:
+                        altered["projection"]["deletionLock"][field] = value
+                    with self.assertRaises(bootstrap.BootstrapError):
+                        bootstrap._validate_operation_source_projection(
+                            altered, operation_id=operation_id, plan=fixture["plan"],
+                            authorization=fixture["authorization"],
+                            prior=fixture["operationProjections"],
+                            operation_context=inputs["operation_contexts"][operation_id],
+                            runtime_facts={},
+                        )
+
+    def test_cleanup_terminal_journal_requires_nested_exact_lock_mutations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        inputs = self._terminal_journal_validation_inputs(fixture)
+        original = fixture["sourceEvidence"]["productionBoundary"]["mutationJournal"]
+        operation_id = "removeOwnedUploaderPackageRole"
+        entries = [item for item in original if item["operationId"] == operation_id]
+        intents = [item for item in entries if item["phase"] == "intent"]
+        self.assertEqual([item["method"] for item in intents], ["DELETE", "DELETE", "PUT", "DELETE"])
+        self.assertIn("/locks/", intents[0]["targetUrl"].lower())
+        self.assertEqual(intents[0]["targetUrl"], intents[2]["targetUrl"])
+        for mode in ("omit-restore", "restore-before-assignment", "definition-before-restore"):
+            with self.subTest(mode=mode):
+                pairs = [entries[i:i + 2] for i in range(0, len(entries), 2)]
+                if mode == "omit-restore":
+                    pairs.pop(2)
+                elif mode == "restore-before-assignment":
+                    pairs[1], pairs[2] = pairs[2], pairs[1]
+                else:
+                    pairs[2], pairs[3] = pairs[3], pairs[2]
+                replacement = [item for pair in pairs for item in pair]
+                altered = []
+                inserted = False
+                for item in original:
+                    if item["operationId"] == operation_id:
+                        if not inserted:
+                            altered.extend(copy.deepcopy(replacement))
+                            inserted = True
+                    else:
+                        altered.append(copy.deepcopy(item))
+                for index, item in enumerate(altered):
+                    item["sequence"] = index + 1
+                    item["recordedAt"] = stamp(NOW + dt.timedelta(milliseconds=(index + 1) * 10))
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_sanitized_mutation_journal(altered, **inputs)
 
     def test_terminal_journal_covers_every_mutating_outcome_and_keeps_adoption_no_write(self):
         with tempfile.TemporaryDirectory() as folder:

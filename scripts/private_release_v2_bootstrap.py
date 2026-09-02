@@ -40,8 +40,10 @@ import xml.etree.ElementTree as ET
 
 try:
     from scripts import build_private_release_bridge_package as package_builder
+    from scripts import private_release_v2_cleanup_locks as cleanup_locks
 except ModuleNotFoundError:  # direct ``python scripts/...`` execution
     import build_private_release_bridge_package as package_builder  # type: ignore
+    import private_release_v2_cleanup_locks as cleanup_locks  # type: ignore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +72,7 @@ TRUSTED_REVIEWERS = {
 MAX_AUTHORIZATION_SECONDS = 1800
 MAX_PREFLIGHT_AGE_SECONDS = 300
 MAX_READBACK_CONVERGENCE_SECONDS = 120
+MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -96,6 +99,96 @@ STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "execution and any later release must stop until a fresh live read proves the /32 and "
     "all related temporary roles absent, and manual cleanup may be required."
 )
+DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
+    "I authorize temporary removal and exact restoration of only the two reviewed "
+    "CanNotDelete locks for the exact role-assignment deletions bound in this plan. "
+    "I accept that lock updates have no atomic concurrency guard and that interruption, "
+    "ambiguous transport, or journal failure can leave deletion protection absent; "
+    "execution must stop NO-GO until fresh reads prove both exact locks restored and "
+    "all related temporary access absent, and manual cleanup may be required."
+)
+
+
+def _expected_deletion_protection() -> dict[str, Any]:
+    return {
+        "locks": copy.deepcopy(cleanup_locks.REVIEWED_CLEANUP_LOCKS),
+        "operationLocks": dict(cleanup_locks.REVIEWED_OPERATION_LOCKS),
+        "policy": "exact-lock-suspend-and-finally-restore-no-mutation-retry",
+    }
+
+
+def _cleanup_lock_inventory_url() -> str:
+    return (f"https://management.azure.com/subscriptions/{SUBSCRIPTION}/providers/"
+            "Microsoft.Authorization/locks?api-version=2016-09-01")
+
+
+def _expected_cleanup_lock_inventory() -> dict[str, Any]:
+    return {"locks": [copy.deepcopy(cleanup_locks.REVIEWED_CLEANUP_LOCKS[key])
+                      for key in sorted(cleanup_locks.REVIEWED_CLEANUP_LOCKS)]}
+
+
+def _expected_deletion_lock_proof(operation_id: str) -> dict[str, Any] | None:
+    key = cleanup_locks.applicable_cleanup_lock(operation_id)
+    if key is None:
+        return None
+    return {**copy.deepcopy(cleanup_locks.REVIEWED_CLEANUP_LOCKS[key]),
+            "restored": True, "assignmentAbsent": True}
+
+
+def _cleanup_assignment_resources(plan: Mapping[str, Any]) -> dict[str, str]:
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    temporary = plan["temporaryAccess"]
+    result = {}
+    for operation_id, scope, field in (
+        ("removeOwnedUploaderPackageRole", "packageContainer", "roleAssignmentId"),
+        ("removeOwnedOperatorKeyReadRole", "signingKey", "temporaryKeyReadRoleAssignmentId"),
+        ("removeOwnedOperatorFenceBootstrapRole", "activationFenceContainer", "temporaryFenceRoleAssignmentId"),
+        ("removeOwnedOperatorControllerCanaryRole", "controllerLockContainer", "temporaryControllerRoleAssignmentId"),
+    ):
+        result[operation_id] = (resources[scope]["resourceId"]
+            + "/providers/Microsoft.Authorization/roleAssignments/" + temporary[field])
+    legacy = plan["legacyPublisherRetirement"]
+    result.update({
+        "retireLegacyPublisherMutatorAssignment": legacy["roleAssignmentResourceIds"][0],
+        "retireLegacyPublisherSitesReadAssignment": legacy["roleAssignmentResourceIds"][1],
+        "retireLegacyPublisherResultReadAssignment": legacy["roleAssignmentResourceIds"][2],
+        "removeLegacyWriterResultAssignment": legacy["legacyWriterResultAssignmentResourceId"],
+        "removeLegacyReaderResultAssignment": legacy["legacyReaderResultAssignmentResourceId"],
+    })
+    return result
+
+
+def _cleanup_lock_inventory_projection(document: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
+    # Subscription-level list is exhaustive; never follow an unreviewed nextLink.
+    if (not isinstance(document, Mapping) or set(document) - {"value", "nextLink"}
+        or document.get("nextLink") not in (None, "") or not isinstance(document.get("value"), list)):
+        fail("cleanup lock inventory is incomplete or paginated")
+    targets = list(_cleanup_assignment_resources(plan).values())
+    for field in ("roleDefinitionId", "temporaryKeyReadRoleDefinitionId",
+                  "temporaryFenceRoleDefinitionId", "temporaryControllerRoleDefinitionId"):
+        targets.append(f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/"
+                       + plan["temporaryAccess"][field])
+    expected = {item["resourceId"].lower(): item for item in cleanup_locks.REVIEWED_CLEANUP_LOCKS.values()}
+    found = set()
+    for item in document["value"]:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+            fail("cleanup lock inventory contains an invalid lock")
+        lock_id = item["id"].lower()
+        marker = "/providers/microsoft.authorization/locks/"
+        if marker not in lock_id or not lock_id.startswith(f"/subscriptions/{SUBSCRIPTION}/".lower()):
+            fail("cleanup lock inventory contains an out-of-scope lock")
+        scope, name = lock_id.rsplit(marker, 1)
+        if not name or "/" in name:
+            fail("cleanup lock inventory contains a malformed lock ID")
+        if not any(target.lower() == scope or target.lower().startswith(scope + "/") for target in targets):
+            continue
+        if lock_id not in expected or lock_id in found:
+            fail("unexpected or duplicate inherited cleanup deletion lock")
+        cleanup_locks.validate_lock_document(item, expected[lock_id], fail)
+        found.add(lock_id)
+    if found != set(expected):
+        fail("reviewed cleanup deletion protection is missing")
+    return _expected_cleanup_lock_inventory()
 
 BRIDGE_REQUIRED_OUTBOUND_VNET_ROUTING_FLAGS = frozenset(
     {"allTraffic", "applicationTraffic"}
@@ -364,6 +457,11 @@ def _mutation_target_allowed(
     host = parsed.hostname or ""
     path = parsed.path
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    lock_proof = _expected_deletion_lock_proof(operation_id)
+    if lock_proof is not None and target_url == (
+        "https://management.azure.com" + lock_proof["resourceId"] + "?api-version=2016-09-01"
+    ):
+        return method in {"DELETE", "PUT"}
     production_name = resources["productionSite"]["name"].lower()
     accepted_name = resources["acceptedContainer"]["name"].lower()
     lowered_url = target_url.lower()
@@ -788,7 +886,12 @@ def _expected_terminal_mutation_targets(
         ],
     }
     if operation_id in legacy_assignments:
-        return one("DELETE", arm(legacy_assignments[operation_id], "2022-04-01"))
+        required, optional = one("DELETE", arm(legacy_assignments[operation_id], "2022-04-01"))
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is not None:
+            for method in ("DELETE", "PUT"):
+                required[_normalized_mutation_target(method, arm(lock_proof["resourceId"], "2016-09-01"))] = 1
+        return required, optional
 
     uami_targets = {
         "createBridgeIdentity": "bridgeIdentity",
@@ -937,7 +1040,7 @@ def _expected_terminal_mutation_targets(
             + assignment_id
         )
         method = "PUT" if operation_id.startswith("addOwned") else "DELETE"
-        return Counter(
+        required = Counter(
             {
                 _normalized_mutation_target(
                     method, arm(definition_resource, "2022-04-01")
@@ -946,7 +1049,12 @@ def _expected_terminal_mutation_targets(
                     method, arm(assignment_resource, "2022-04-01")
                 ): 1,
             }
-        ), Counter()
+        )
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is not None:
+            for lock_method in ("DELETE", "PUT"):
+                required[_normalized_mutation_target(lock_method, arm(lock_proof["resourceId"], "2016-09-01"))] = 1
+        return required, Counter()
     if operation_id == "uploadVersionedBridgePackage":
         blob = (
             f"https://mdspdbak2608089c4e.blob.core.windows.net/"
@@ -1083,6 +1191,26 @@ def _validate_terminal_mutation_coverage(
         missing_or_unexpected = set(actual) - set(required) - set(optional)
         if missing_or_unexpected:
             fail(f"terminal mutation journal contains an unknown write for {operation_id}")
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is not None and required:
+            results = [item for item in journal if item.get("phase") == "result"
+                       and item.get("operationId") == operation_id]
+            lock_url = "https://management.azure.com" + lock_proof["resourceId"] + "?api-version=2016-09-01"
+            assignment_url = "https://management.azure.com" + _cleanup_assignment_resources(plan)[operation_id] + "?api-version=2022-04-01"
+            expected_prefix = [("DELETE", lock_url), ("DELETE", assignment_url), ("PUT", lock_url)]
+            if [(item["method"], item["targetUrl"]) for item in results[:3]] != expected_prefix:
+                fail("cleanup lock must bracket assignment deletion before definition deletion")
+            ordered = [(item["phase"], item["method"], item["targetUrl"]) for item in journal
+                       if item.get("operationId") == operation_id]
+            paired = [(phase, item["method"], item["targetUrl"]) for item in results
+                      for phase in ("intent", "result")]
+            if ordered != paired:
+                fail("protected cleanup mutation intents and results must be serially paired")
+            for item in results:
+                if item["targetUrl"] == lock_url:
+                    expected_body = canonical_json_bytes({"properties": lock_proof["properties"]}) if item["method"] == "PUT" else b""
+                    if item["requestBodySha256"] != sha256_bytes(expected_body):
+                        fail("cleanup lock mutation body differs from exact reviewed protection")
 
     for operation_id in (
         "uploadVersionedBridgePackage",
@@ -1476,12 +1604,15 @@ def load_plan() -> tuple[dict[str, Any], str]:
         "orderingRules",
         "irreversibleMutationIds",
         "temporaryAccess",
+        "deletionProtection",
         "legacyPublisherRetirement",
         "postconditions",
         "evidenceOutputs",
         "prohibitions",
     }
     plan = dict(_exact_keys(value, expected_root, "bootstrap plan"))
+    if plan["deletionProtection"] != _expected_deletion_protection():
+        fail("bootstrap deletion-lock targets, projections, or operation bindings drifted")
     if (
         plan["schemaVersion"] != 1
         or plan["planId"] != "paperdesk-private-release-v2-bootstrap-v1"
@@ -2033,6 +2164,8 @@ def _validate_authorization_document(
         and STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE not in confirmation_phrase
     ):
         fail("confirmation phrase does not explicitly accept the storage ACL and recovery residuals")
+    if confirmation_phrase is not None and DELETION_LOCK_RESIDUAL_ACCEPTANCE not in confirmation_phrase:
+        fail("confirmation phrase does not explicitly authorize exact deletion-lock suspension and recovery")
 
     single_use = _exact_keys(
         root["singleUse"],
@@ -3841,7 +3974,10 @@ def _validate_operation_source_projection(
     context = dict(operation_context or {})
     facts = dict(runtime_facts or {})
     if family == "exact-absence":
-        if body != {"absent": True} or projection["status"] != 404:
+        expected_absence = {"absent": True}
+        if _expected_deletion_lock_proof(operation_id) is not None:
+            expected_absence["deletionLock"] = _expected_deletion_lock_proof(operation_id)
+        if body != expected_absence or projection["status"] != 404:
             fail(f"{operation_id} terminal absence proof is fabricated")
     elif family == "azure-single-use-claim":
         expected_claim = {
@@ -4386,6 +4522,7 @@ def _validate_operation_source_projection(
                 "definitionRemoved",
                 "assignmentAbsenceProjection",
                 "definitionAbsenceProjection",
+                "deletionLock",
             },
             "temporary role cleanup projection",
         )
@@ -4437,6 +4574,7 @@ def _validate_operation_source_projection(
             != {"resourceId": assignment_resource, "absent": True}
             or body["definitionAbsenceProjection"]
             != {"resourceId": definition_resource, "absent": True}
+            or body["deletionLock"] != _expected_deletion_lock_proof(operation_id)
         ):
             fail("temporary role cleanup did not prove both exact absences")
     elif family == "versioned-blob-readback":
@@ -7239,9 +7377,11 @@ def _terminal_temporary_role_component(
     add_count = _terminal_successful_mutation_count(
         mutation_journal, add_mutation_id
     )
-    remove_count = _terminal_successful_mutation_count(
-        mutation_journal, remove_mutation_id
-    )
+    # Lock suspension/restoration are separate exact targets, not role removals.
+    role_removals = [item for item in mutation_journal
+                    if item.get("operationId") == remove_mutation_id
+                    and "/providers/microsoft.authorization/locks/" not in str(item.get("targetUrl", "")).lower()]
+    remove_count = _terminal_successful_mutation_count(role_removals, remove_mutation_id)
     if add_count != 2 or remove_count != 2:
         fail("terminal temporary role ownership lacks both exact subcalls")
     body = {
@@ -8305,6 +8445,12 @@ def validate_preflight_evidence(
         temporary_definition_url = _temporary_role_definition_readback_url(
             operation_id, plan
         )
+        if operation_id == "claimAzureSingleUseAuthorization":
+            lock_probes = [probe_map[item] for item in admission["probeIds"]
+                           if probe_map[item]["method"] == "GET" and probe_map[item]["url"] == _cleanup_lock_inventory_url()]
+            if (len(lock_probes) != 1 or lock_probes[0]["status"] != 200
+                or lock_probes[0]["responseSha256"] != sha256_bytes(canonical_json_bytes(_expected_cleanup_lock_inventory()))):
+                fail("cleanup deletion locks are not bound to fresh exact preflight")
         if temporary_definition_url is not None:
             definition_probes = [
                 probe_map[item]
@@ -9098,6 +9244,14 @@ def _arm_storage_absence_error_projection(
 def _preflight_response_sha256(
     method: str, url: str, response: _RestResponse
 ) -> str:
+    if method == "GET" and url == _cleanup_lock_inventory_url():
+        if response.status != 200:
+            fail("cleanup lock inventory is not readable")
+        try:
+            document = json.loads(response.body)
+        except (ValueError, UnicodeError) as exc:
+            raise BootstrapError("cleanup lock inventory is invalid JSON") from exc
+        return sha256_bytes(canonical_json_bytes(_cleanup_lock_inventory_projection(document, load_plan()[0])))
     storage_error = _package_blob_error_projection(method, url, response)
     if storage_error is not None:
         # Azure includes volatile request IDs and timestamps in the XML body.
@@ -9242,7 +9396,7 @@ class AzureCliBootstrapTransport:
             expires = parse_time(
                 self.authorization["validity"]["expiresAt"], "authorization expiresAt"
             )
-            if not not_before <= now <= expires:
+            if not not_before <= now < expires:
                 fail("authorization expired before a cloud mutation subcall")
         intent_path = self._ledger.append_cloud_mutation(
             {
@@ -9911,6 +10065,9 @@ class AzureCliBootstrapTransport:
             family = "temporary-role-cleanup-absence"
         else:
             fail(f"operation lacks a source-evidence projection family: {operation_id}")
+
+        if _expected_deletion_lock_proof(operation_id) is not None:
+            retained["deletionLock"] = facts.get("deletionLock")
 
         return {
             "schemaVersion": 1,
@@ -10647,6 +10804,83 @@ class AzureCliBootstrapTransport:
                 fail(f"{label} readback did not converge: {probe_id}: {detail}")
         return proofs
 
+    def _prove_package_upload_ready(self, url: str) -> None:
+        """Wait for exact-target read access and absence, never retry a write.
+
+        ARM role/ACL readback does not prove Storage data-plane propagation.
+        Only recognized authorization denials may converge to BlobNotFound;
+        an existing object or any other response is drift, not permission to PUT.
+        """
+        _sha40(self.authorization["source"]["mergedMain"]["commitSha"], "package source SHA")
+        expected_url = _operation_readback_url(
+            "uploadVersionedBridgePackage", self.plan, self.authorization
+        )
+        if url != expected_url:
+            fail("package readiness URL is not the exact source-derived target")
+        started = self.clock()
+        not_before = parse_time(
+            self.authorization["validity"]["notBefore"], "authorization notBefore"
+        )
+        expires = parse_time(
+            self.authorization["validity"]["expiresAt"], "authorization expiresAt"
+        )
+        deadline = min(
+            expires,
+            started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+        )
+        for attempt in range(64):
+            now = self.clock()
+            if now < not_before or now >= deadline:
+                fail("package data-plane readiness authorization or convergence window expired")
+            response = self.session.request(
+                "GET", url,
+                headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
+            )
+            observed = self.clock()
+            if observed >= deadline:
+                fail("package data-plane readiness window expired during GET")
+            if response.status not in {403, 404}:
+                fail(f"package readiness returned unsupported HTTP status {response.status}")
+            if (
+                len(response.body) > 65536
+                or b"<!DOCTYPE" in response.body.upper()
+                or b"<!ENTITY" in response.body.upper()
+            ):
+                fail("package readiness error XML is unsafe or oversized")
+            try:
+                document = ET.fromstring(response.body)
+            except ET.ParseError as exc:
+                raise BootstrapError("package readiness error XML is malformed") from exc
+            children = list(document)
+            if (
+                document.tag != "Error" or document.attrib
+                or (document.text or "").strip()
+                or [child.tag for child in children].count("Code") != 1
+                or [child.tag for child in children].count("Message") > 1
+                or any(
+                    child.tag not in {"Code", "Message"} or child.attrib
+                    or list(child) or (child.tail or "").strip()
+                    for child in children
+                )
+            ):
+                fail("package readiness error XML is not one exact Storage error")
+            error = _package_blob_error_projection("GET", url, response)
+            code = error.get("storageErrorCode") if error is not None else None
+            header_code = self._header(response, "x-ms-error-code")
+            if header_code is not None and header_code != code:
+                fail("package readiness error header and XML code disagree")
+            if response.status == 404:
+                if code != "BlobNotFound":
+                    fail("package readiness 404 is not exact BlobNotFound")
+                return
+            if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
+                fail("package readiness 403 is not recognized authorization propagation")
+            delay = min(float(2 ** min(attempt, 4)), 15.0)
+            if attempt == 63 or observed + dt.timedelta(seconds=delay) >= deadline:
+                fail("package data-plane readiness did not converge before its deadline")
+            self.sleep(delay)
+        raise AssertionError("unreachable package readiness loop")
+
     def _prove_controller_lock_container_empty(
         self, ids: Sequence[str]
     ) -> list[dict[str, Any]]:
@@ -10835,6 +11069,97 @@ class AzureCliBootstrapTransport:
     def _arm_delete(self, resource_id: str, api_version: str) -> None:
         url = self._arm_url(resource_id, api_version)
         self._mutation_request("DELETE", url, expected={200, 202, 204})
+
+    def _verify_cleanup_lock_inventory(self, operation_id: str, expected_lock_key: str | None) -> None:
+        if cleanup_locks.applicable_cleanup_lock(operation_id) != expected_lock_key:
+            fail("cleanup lock binding is not exact")
+        response = self._read_request_with_transport_retry("GET", _cleanup_lock_inventory_url())
+        document = self._json_response(response, {200}, "cleanup lock inventory")
+        _cleanup_lock_inventory_projection(document, self.plan)
+
+    def _require_cleanup_delete_window(self, operation_id: str) -> None:
+        # A pre-existing protection lock is not executor-owned temporary state.
+        # New suspension always needs a live authorization, even in compensation.
+        now = self.clock()
+        if not (parse_time(self.authorization["validity"]["notBefore"], "notBefore") <= now
+                < parse_time(self.authorization["validity"]["expiresAt"], "expiresAt")):
+            fail("authorization expired before protected assignment deletion")
+
+    def _guarded_assignment_delete(self, operation_id: str, resource_id: str,
+                                   authorized_projection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if getattr(self, "_protected_cleanup_blocked", False):
+            fail("protected cleanup is NO-GO; fresh authorization is required")
+        try:
+            return self._guarded_assignment_delete_impl(operation_id, resource_id, authorized_projection)
+        except BaseException:
+            # The guard's already-entered finally is the sole restoration attempt.
+            # Executor compensation must not become an implicit mutation retry.
+            self._protected_cleanup_blocked = True
+            raise
+
+    def _guarded_assignment_delete_impl(self, operation_id: str, resource_id: str,
+                                       authorized_projection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if _cleanup_assignment_resources(self.plan).get(operation_id) != resource_id:
+            fail("guarded assignment deletion target is not source-bound")
+        assignment_url = self._arm_url(resource_id, "2022-04-01")
+        before = self._read_request_with_transport_retry("GET", assignment_url)
+        expected_assignment = {"id": resource_id}
+        def project_assignment(document):
+            if str(document.get("id", "")).lower() != resource_id.lower():
+                fail("guarded assignment precondition ID drifted")
+            return {**_project_role_assignment(document), "id": resource_id}
+        if before.status != 404:
+            document = self._json_response(before, {200}, "guarded assignment precondition")
+            expected_assignment = project_assignment(document)
+        if operation_id.startswith("removeOwned"):
+            expected_assignment = ({**dict(authorized_projection), "id": resource_id}
+                                   if authorized_projection is not None else {"id": resource_id})
+            if before.status == 200 and project_assignment(document) != expected_assignment:
+                fail("temporary assignment drifted after its authorized cleanup precondition")
+        else:
+            # A fresh GET supplies evidence, never new deletion authority. Legacy
+            # targets remain bound to the exact authorization-time preflight.
+            admission = self.admissions[operation_id]
+            probes = [self.probes[key] for key in admission["probeIds"]
+                      if self.probes[key]["method"] == "GET" and self.probes[key]["url"] == assignment_url]
+            if (len(probes) != 1 or probes[0]["status"] != before.status
+                or probes[0]["responseSha256"] != _preflight_response_sha256("GET", assignment_url, before)):
+                fail("legacy assignment drifted from its authorized preflight")
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is None:
+            fail("guarded deletion has no reviewed lock")
+        lock_url = self._arm_url(lock_proof["resourceId"], "2016-09-01")
+
+        def mutate(method, url, *, body=None, expected, restore=False):
+            if (method, url) not in {("DELETE", lock_url), ("PUT", lock_url), ("DELETE", assignment_url)}:
+                fail("guarded cleanup attempted an unrelated mutation")
+            if restore and (method != "PUT" or url != lock_url
+                            or body != canonical_json_bytes({"properties": lock_proof["properties"]})):
+                fail("guarded restoration is not the exact original lock")
+            if not restore:
+                self._require_cleanup_delete_window(operation_id)
+            return self._mutation_request(method, url, body=body,
+                headers={"Content-Type": "application/json"} if body is not None else None,
+                expected=expected, cleanup=restore)
+
+        guard = cleanup_locks.CleanupLockGuard(
+            read_request=self._read_request_with_transport_retry,
+            mutate_request=mutate,
+            verify_lock_inventory=self._verify_cleanup_lock_inventory,
+            clock=self.clock, sleep=self.sleep, fail=fail,
+            require_live_authorization=lambda: self._require_cleanup_delete_window(operation_id),
+        )
+        return guard.delete_assignment(operation_id=operation_id, assignment_url=assignment_url,
+            expected_assignment_projection=expected_assignment, project_assignment=project_assignment)
+
+    def _prove_adopted_assignment_lock(self, operation_id: str) -> dict[str, Any]:
+        key = cleanup_locks.applicable_cleanup_lock(operation_id)
+        self._verify_cleanup_lock_inventory(operation_id, key)
+        spec = cleanup_locks.REVIEWED_CLEANUP_LOCKS[key]
+        response = self._read_request_with_transport_retry("GET", self._arm_url(spec["resourceId"], "2016-09-01"))
+        cleanup_locks.validate_lock_document(self._json_response(response, {200}, "adopted cleanup lock"), spec, fail)
+        # The normal readback separately proves the adopted assignment's absence.
+        return _expected_deletion_lock_proof(operation_id)
 
     def _graph_json(
         self,
@@ -11064,6 +11389,10 @@ class AzureCliBootstrapTransport:
         }
         if operation_id in legacy_assignment_operations:
             resource_id = legacy_assignment_operations[operation_id]
+            if _expected_deletion_lock_proof(operation_id) is not None:
+                proof = self._guarded_assignment_delete(operation_id, resource_id)
+                return {"removedResourceId": resource_id, "deletionLock": proof}
+            self._verify_cleanup_lock_inventory(operation_id, None)
             self._arm_delete(resource_id, "2022-04-01")
             return {"removedResourceId": resource_id}
 
@@ -11465,6 +11794,7 @@ class AzureCliBootstrapTransport:
                 fail("bridge package bytes drifted after authorization")
             blob = f"v2/control/{source_sha}/paperdesk-private-release-bridge.zip"
             url = f"{self.STORAGE_ROOT}/{self.resources['packageContainer']['name']}/{blob}"
+            self._prove_package_upload_ready(url)
             response = self._mutation_request(
                 "PUT",
                 url,
@@ -12070,6 +12400,16 @@ class AzureCliBootstrapTransport:
         fail(f"Azure transport has no mutation handler: {operation_id}")
 
     def _mutate_temporary_role(self, operation_id: str, state: Mapping[str, Any]) -> Mapping[str, Any]:
+        if operation_id.startswith("remove") and getattr(self, "_protected_cleanup_blocked", False):
+            fail("protected cleanup is NO-GO; fresh authorization is required")
+        try:
+            return self._mutate_temporary_role_impl(operation_id, state)
+        except BaseException:
+            if operation_id.startswith("remove"):
+                self._protected_cleanup_blocked = True
+            raise
+
+    def _mutate_temporary_role_impl(self, operation_id: str, state: Mapping[str, Any]) -> Mapping[str, Any]:
         add = operation_id.startswith("addOwned")
         if "UploaderPackage" in operation_id:
             assignment_id = self.plan["temporaryAccess"]["roleAssignmentId"]
@@ -12127,11 +12467,23 @@ class AzureCliBootstrapTransport:
                 "roleDefinitionId": definition_resource,
             }
         }
+        expected_assignment_projection = {
+            "id": assignment_resource,
+            "name": assignment_id,
+            "type": "Microsoft.Authorization/roleAssignments",
+            "properties": {
+                **assignment_body["properties"],
+                "scope": scope,
+                "condition": None,
+                "conditionVersion": None,
+                "delegatedManagedIdentityResourceId": None,
+            },
+        }
 
         exact_readbacks: dict[str, Mapping[str, Any]] = {}
 
         def read_exact(resource_id: str, expected_body: Mapping[str, Any], label: str) -> str:
-            response = self.session.request(
+            response = self._read_request_with_transport_retry(
                 "GET", self._arm_url(resource_id, "2022-04-01")
             )
             if response.status == 404:
@@ -12156,6 +12508,8 @@ class AzureCliBootstrapTransport:
                     "properties": projection,
                 }
             else:
+                if _project_role_assignment(document) != expected_assignment_projection:
+                    fail(f"{label} differs from the source-authorized assignment")
                 projection = {
                     "principalId": properties.get("principalId"),
                     "principalType": properties.get("principalType"),
@@ -12230,17 +12584,36 @@ class AzureCliBootstrapTransport:
         assignment_state = read_exact(
             assignment_resource, assignment_body, "temporary role assignment cleanup precondition"
         )
-        if assignment_state == "exact":
-            self._arm_delete(assignment_resource, "2022-04-01")
+        deletion_lock = self._guarded_assignment_delete(
+            operation_id, assignment_resource,
+            expected_assignment_projection if assignment_state == "exact" else None,
+        )
         definition_state = read_exact(
             definition_resource, definition_body, "temporary role definition cleanup precondition"
         )
         if definition_state == "exact":
             self._arm_delete(definition_resource, "2022-04-01")
-        if read_exact(assignment_resource, assignment_body, "temporary role assignment cleanup readback") != "absent":
-            fail("temporary role assignment cleanup did not reach absence")
-        if read_exact(definition_resource, definition_body, "temporary role definition cleanup readback") != "absent":
-            fail("temporary role definition cleanup did not reach absence")
+        # Azure RBAC deletion readback can converge well after a successful DELETE.
+        # Retry only exact read-only observations, never the mutation itself.
+        previous = self.clock()
+        deadline = previous + dt.timedelta(seconds=600)
+        for attempt in range(64):
+            before = self.clock()
+            if before < previous or before >= deadline:
+                fail("temporary role definition cleanup exceeded its readback window")
+            observed_state = read_exact(definition_resource, definition_body, "temporary role definition cleanup readback")
+            after = self.clock()
+            if after < before or after > deadline:
+                fail("temporary role definition cleanup exceeded its readback window")
+            if observed_state == "absent":
+                break
+            remaining = (deadline - after).total_seconds()
+            if remaining <= 0 or attempt == 63:
+                fail("temporary role definition cleanup did not reach bounded absence")
+            self.sleep(min(15, remaining))
+            previous = after
+        if read_exact(assignment_resource, assignment_body, "temporary role assignment final absence") != "absent":
+            fail("temporary role assignment reappeared during cleanup")
         return {
             "cleanupKey": cleanup_key,
             "assignmentResourceId": assignment_resource,
@@ -12249,6 +12622,7 @@ class AzureCliBootstrapTransport:
             "definitionRemoved": definition_state == "exact",
             "assignmentAbsenceProjection": {"resourceId": assignment_resource, "absent": True},
             "definitionAbsenceProjection": {"resourceId": definition_resource, "absent": True},
+            "deletionLock": deletion_lock,
         }
 
     def apply_operation(
@@ -12275,6 +12649,8 @@ class AzureCliBootstrapTransport:
             }
         if decision == "adopt-exact":
             details = dict(admission["context"].get("adopted", {}))
+            if _expected_deletion_lock_proof(operation["id"]) is not None:
+                details["deletionLock"] = self._prove_adopted_assignment_lock(operation["id"])
             readbacks = self._prove_probe_ids(
                 admission["desiredProbeIds"],
                 f"{operation['id']} adopt",
@@ -12316,6 +12692,8 @@ class AzureCliBootstrapTransport:
                     item["sourceProjection"] for item in readbacks
                 ]
             except BootstrapError as readback_error:
+                if _expected_deletion_lock_proof(operation["id"]) is not None:
+                    self._protected_cleanup_blocked = True
                 cleanup_key = details.get("cleanupKey")
                 if operation.get("temporary") is True and cleanup_key:
                     provisional = {
@@ -12329,6 +12707,10 @@ class AzureCliBootstrapTransport:
                         f"temporary mutation readback failed: {operation['id']}: {readback_error}",
                         provisional,
                     ) from readback_error
+                raise
+            except BaseException:
+                if _expected_deletion_lock_proof(operation["id"]) is not None:
+                    self._protected_cleanup_blocked = True
                 raise
         finally:
             self._active_operation_id = None
@@ -12381,11 +12763,16 @@ class AzureCliBootstrapTransport:
             details = dict(self._mutate(cleanup_operation, state))
         finally:
             self._active_operation_id = None
-        self._prove_probe_ids(
-            self.admissions[cleanup_id]["desiredProbeIds"],
-            f"{cleanup_id} compensation",
-            runtime_facts=details,
-        )
+        try:
+            self._prove_probe_ids(
+                self.admissions[cleanup_id]["desiredProbeIds"],
+                f"{cleanup_id} compensation",
+                runtime_facts=details,
+            )
+        except BaseException:
+            if _expected_deletion_lock_proof(cleanup_id) is not None:
+                self._protected_cleanup_blocked = True
+            raise
         if details.get("cleanupKey") != proof.get("cleanupKey"):
             fail("temporary compensation cleanup key drifted")
         return {

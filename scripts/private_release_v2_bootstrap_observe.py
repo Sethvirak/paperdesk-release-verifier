@@ -1530,6 +1530,17 @@ def build_read_only_observation(
         built_in_role_definitions: dict[str, Mapping[str, Any]] | None = None
         graph_service_principal_envelope: Mapping[str, Any] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
+        if operation["id"] == "claimAzureSingleUseAuthorization":
+            lock_request = ReadRequest(method="GET", url=bootstrap._cleanup_lock_inventory_url())
+            lock_envelope = _normalize_response(lock_request, session.read(lock_request))
+            if lock_envelope["status"] != 200:
+                fail("cleanup deletion-lock inventory is not readable")
+            lock_projection = bootstrap._cleanup_lock_inventory_projection(
+                _body_mapping(lock_envelope, "cleanup deletion locks"), plan
+            )
+            lock_probe = _preflight_probe("preflight-cleanup-lock-inventory", lock_request, lock_envelope)
+            lock_probe["responseSha256"] = bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(lock_projection))
+            extra_preflight_probes.append(lock_probe)
         temporary_definition_url = (
             bootstrap._temporary_role_definition_readback_url(
                 operation["id"], plan
@@ -1741,6 +1752,7 @@ def build_read_only_observation(
             "id": "temporary-storage-ip-rules-and-recovery-residuals",
             "exactConfirmationText": (
                 bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+                + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
             ),
         },
         "ceremonyRequirements": [
