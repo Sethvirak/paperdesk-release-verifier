@@ -66,7 +66,7 @@ def run_bootstrap_self_test(value):
             or core.canonical(control).decode()!=raw):core.fail("entry-bootstrap-self-test")
     issued=core.parse_time(control.get("issuedAt"),"entry-bootstrap-self-test-issued");expires=core.parse_time(control.get("expiresAt"),"entry-bootstrap-self-test-expires")
     now=dt.datetime.now(dt.timezone.utc)
-    if expires<=issued or (expires-issued).total_seconds()>900 or now<issued-dt.timedelta(seconds=30) or now>expires:core.fail("entry-bootstrap-self-test-time")
+    if expires<=issued or (expires-issued).total_seconds()>900 or now<issued-dt.timedelta(seconds=30) or now>=expires:core.fail("entry-bootstrap-self-test-time")
     forbidden=("PAPERDESK_PRIVATE_RELEASE_ACTIVATION_JSON","PAPERDESK_CONTROL_WORKFLOW_SHA","PAPERDESK_TRANSIENT_GITHUB_TOKEN",
                "PAPERDESK_PRIVATE_RELEASE_PROVISIONING_EVIDENCE_JSON","PAPERDESK_PRIVATE_RELEASE_PROVISIONING_EVIDENCE_SHA256",
                "PAPERDESK_PRIVATE_RELEASE_BRIDGE_RUNTIME_RECEIPT_JSON","PAPERDESK_PRIVATE_RELEASE_BRIDGE_RUNTIME_RECEIPT_SHA256",
@@ -80,7 +80,7 @@ def run_bootstrap_self_test(value):
             or identity["tenantId"]!=control["tenantId"] or identity["audience"] not in {azure.STORAGE,azure.STORAGE.rstrip("/")}):core.fail("entry-bootstrap-self-test-identity")
     fence=azure.BlobActivationFence(control["activationFenceAccount"],control["activationFenceContainer"],control["activationFenceBlob"],bridge_tokens)
     canary=fence.bootstrap_canary(lease_id=control["activationFenceLeaseId"],duration_seconds=control["leaseDurationSeconds"],renewal_count=control["leaseRenewalCount"],
-                                  expected_etag=control["activationFenceEtag"],expected_version_id=control["activationFenceVersionId"],expected_body_sha256=control["activationFenceBodySha256"])
+                                  expected_etag=control["activationFenceEtag"],expected_version_id=control["activationFenceVersionId"],expected_body_sha256=control["activationFenceBodySha256"],deadline=control["expiresAt"])
     marker={"schemaVersion":1,"status":"bootstrap-bridge-canary-complete","control":control,"controlSha256":hashlib.sha256(raw.encode()).hexdigest(),
             "packageExecution":{"status":"executed-from-exact-versioned-run-from-package","packageSha256":control["packageSha256"],"sourceSha":control["bridgePackageSourceSha"]},
             "bridgeIdentity":{"resourceId":control["bridgeIdentityResourceId"],**identity},"activationFenceCanary":canary,

@@ -232,6 +232,53 @@ class ControllerReadinessError(BootstrapError):
         super().__init__(f"{message}; {detail}")
 
 
+class PackageReadinessError(BootstrapError):
+    """Retain only bounded, allowlisted facts from the last package GET."""
+
+    ERROR_CODES = frozenset({
+        "AuthorizationFailure", "AuthorizationPermissionMismatch",
+        "AuthenticationFailed", "BlobNotFound", "ContainerNotFound",
+    })
+    STOP_REASONS = frozenset({
+        "invalid-target", "invalid-authorization-window", "expired-before-get",
+        "transport-error", "expired-during-get", "unsupported-status",
+        "unsafe-xml", "malformed-xml", "invalid-error-shape",
+        "error-code-mismatch", "unexpected-absence-code", "unsupported-denial",
+        "deadline", "attempt-limit",
+    })
+
+    def __init__(
+        self, message: str, *, elapsed_seconds: float, attempts: int,
+        status: int | None, error_code: str, stop_reason: str = "unknown",
+        request_id: str | None = None, server_date: str | None = None,
+    ) -> None:
+        # Azure request IDs can use a non-RFC UUID version nibble. Accept only
+        # the fixed hex/hyphen shape, never arbitrary header values or URLs.
+        safe_request_id = request_id if isinstance(request_id, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request_id
+        ) else None
+        safe_server_date = None
+        if isinstance(server_date, str) and len(server_date) == 29:
+            try:
+                parsed = dt.datetime.strptime(server_date, "%a, %d %b %Y %H:%M:%S GMT")
+                if parsed.strftime("%a, %d %b %Y %H:%M:%S GMT") == server_date:
+                    safe_server_date = server_date
+            except ValueError:
+                pass
+        self.diagnostic = {
+            "stage": "package-upload-readiness",
+            "elapsedSeconds": round(max(0.0, elapsed_seconds), 3),
+            "attempts": max(0, attempts),
+            "status": status if type(status) is int and 100 <= status <= 599 else None,
+            "errorCode": error_code if error_code in self.ERROR_CODES else "unknown",
+            "stopReason": stop_reason if stop_reason in self.STOP_REASONS else "unknown",
+            "requestId": safe_request_id,
+            "serverDate": safe_server_date,
+        }
+        detail = " ".join(f"{key}={value}" for key, value in self.diagnostic.items())
+        super().__init__(f"{message}; {detail}")
+
+
 class OwnedTemporaryMutationError(BootstrapError):
     """A temporary mutation succeeded but its readback failed.
 
@@ -1272,6 +1319,21 @@ def _validate_terminal_mutation_coverage(
             fail(
                 f"versioned create result is not cross-bound to exact readback: {operation_id}"
             )
+
+
+    configure_id = "configureBridgeExactVersionedPackageAndCriticalSettings"
+    configure = operation_projections.get(configure_id, {}).get("projection", {})
+    issued = parse_time(configure.get("bootstrapSelfTestIssuedAt"), "journal canary issuance")
+    expiry = parse_time(configure.get("bootstrapSelfTestExpiresAt"), "journal canary expiry")
+    writes = [item for item in journal if item.get("operationId") == configure_id]
+    if len(writes) != 2 or [item.get("phase") for item in writes] != ["intent", "result"]:
+        fail("canary settings require exactly one journaled PUT")
+    intent_at = parse_time(writes[0]["recordedAt"], "canary settings intent")
+    result_at = parse_time(writes[1]["recordedAt"], "canary settings result")
+    if (not issued <= intent_at <= issued + dt.timedelta(seconds=30)
+            or not intent_at <= result_at < expiry
+            or any(item.get("requestBodySha256") != configure.get("settingsRequestBodySha256") for item in writes)):
+        fail("canary timing or settings body differs from exact mutation journal")
 
 
 def _expected_permanent_outcome(
@@ -3241,10 +3303,6 @@ def _bootstrap_self_test_static_control(
     readbacks immediately before the bridge settings full-map PUT.
     """
 
-    not_before = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
-    expires = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
-    issued = not_before
-    self_test_expires = min(expires, not_before + dt.timedelta(seconds=900))
     return {
         "schemaVersion": 1,
         "mode": "package-fetch-self-test",
@@ -3261,13 +3319,28 @@ def _bootstrap_self_test_static_control(
         "leaseDurationSeconds": 60,
         "leaseRenewalCount": 1,
         "nonce": authorization["authorizationId"].replace("-", ""),
-        "issuedAt": issued.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "expiresAt": self_test_expires.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
     }
 
 
+def _bootstrap_self_test_timing(authorization: Mapping[str, Any], issued_at: str) -> dict[str, str]:
+    """One issuance inside the unchanged outer authorization; never renew it."""
+    issued = parse_time(issued_at, "bootstrap self-test issuedAt")
+    start = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
+    end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
+    if not start <= issued < end:
+        fail("bootstrap self-test issuance is outside live authorization")
+    return {"issuedAt": issued_at, "expiresAt": min(end, issued + dt.timedelta(seconds=900)).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+
+
+def _validated_bootstrap_self_test_timing(authorization: Mapping[str, Any], projection: Mapping[str, Any]) -> dict[str, str]:
+    timing = _bootstrap_self_test_timing(authorization, projection.get("bootstrapSelfTestIssuedAt"))
+    if timing["expiresAt"] != projection.get("bootstrapSelfTestExpiresAt"):
+        fail("bootstrap self-test retained expiry is not exact")
+    return timing
+
+
 def _bootstrap_self_test_control(
-    authorization: Mapping[str, Any], state: Mapping[str, Any]
+    authorization: Mapping[str, Any], state: Mapping[str, Any], *, issued_at: str
 ) -> dict[str, Any]:
     """Join dynamic, proven Azure facts into the exact bridge canary control."""
 
@@ -3281,6 +3354,7 @@ def _bootstrap_self_test_control(
     bridge = proof("createBridgeIdentity")
     fence = proof("createInitialIdleActivationFence")
     control = _bootstrap_self_test_static_control(authorization)
+    control.update(_bootstrap_self_test_timing(authorization, issued_at))
     control.update(
         {
             "authorizationSha256": sha256_bytes(
@@ -3313,6 +3387,7 @@ def _bootstrap_self_test_control(
 def _bootstrap_self_test_control_from_projections(
     authorization: Mapping[str, Any],
     prior: Mapping[str, Mapping[str, Any]],
+    timing_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive the canary control only from already validated source projections."""
 
@@ -3321,6 +3396,9 @@ def _bootstrap_self_test_control_from_projections(
     if not isinstance(bridge, Mapping) or not isinstance(fence, Mapping):
         fail("bootstrap self-test source projections are incomplete")
     control = _bootstrap_self_test_static_control(authorization)
+    if timing_projection is None:
+        timing_projection = prior.get("configureBridgeExactVersionedPackageAndCriticalSettings", {}).get("projection", {})
+    control.update(_validated_bootstrap_self_test_timing(authorization, timing_projection))
     control.update(
         {
             "authorizationSha256": sha256_bytes(
@@ -4819,6 +4897,9 @@ def _validate_operation_source_projection(
             "preAppSettingsSha256",
             "settingsSha256",
             "bootstrapSelfTestControlSha256",
+            "bootstrapSelfTestIssuedAt",
+            "bootstrapSelfTestExpiresAt",
+            "settingsRequestBodySha256",
             "packageUrl",
             "packageVersionId",
         }
@@ -4826,7 +4907,7 @@ def _validate_operation_source_projection(
         upload = prior.get("uploadVersionedBridgePackage", {}).get("projection", {})
         if not isinstance(context.get("preAppSettings"), Mapping):
             fail("authorized pre-app-settings map is absent")
-        control = _bootstrap_self_test_control_from_projections(authorization, prior)
+        control = _bootstrap_self_test_control_from_projections(authorization, prior, body)
         package_url = (
             f"{upload.get('url')}?versionid="
             + urllib.parse.quote(str(upload.get("versionId")), safe="")
@@ -4854,6 +4935,7 @@ def _validate_operation_source_projection(
             or body["preAppSettingsSha256"]
             != sha256_bytes(canonical_json_bytes(context["preAppSettings"]))
             or body["settingsSha256"] != expected_settings_sha
+            or body["settingsRequestBodySha256"] != sha256_bytes(canonical_json_bytes({"properties": desired}))
             or body["bootstrapSelfTestControlSha256"] != expected_control_sha
             or body["packageUrl"] != package_url
             or body["packageVersionId"] != upload.get("versionId")
@@ -4890,6 +4972,10 @@ def _validate_operation_source_projection(
         fence = prior.get("createInitialIdleActivationFence", {}).get("projection", {})
         auth_start = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
         auth_end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
+
+        control_timing = _validated_bootstrap_self_test_timing(authorization, configure)
+        control_start = parse_time(control_timing["issuedAt"], "canary control issuedAt")
+        control_end = parse_time(control_timing["expiresAt"], "canary control expiresAt")
 
         def site_state(value: Any, expected_state: str, label: str) -> Mapping[str, Any]:
             item = _exact_keys(
@@ -5035,6 +5121,8 @@ def _validate_operation_source_projection(
                 <= trigger_at
             )
             or terminal_started < trigger_at - dt.timedelta(seconds=5)
+            or not control_start <= trigger_at < control_end
+            or not control_start <= terminal_started <= terminal_ended < control_end
             or terminal_ended > terminal_observed + dt.timedelta(seconds=5)
             or parse_time(stopped["observedAt"], "stopped bridge observedAt")
             < terminal_observed
@@ -10034,6 +10122,9 @@ class AzureCliBootstrapTransport:
                     "preAppSettingsSha256",
                     "settingsSha256",
                     "bootstrapSelfTestControlSha256",
+                    "bootstrapSelfTestIssuedAt",
+                    "bootstrapSelfTestExpiresAt",
+                    "settingsRequestBodySha256",
                     "packageUrl",
                     "packageVersionId",
                 )
@@ -10845,46 +10936,83 @@ class AzureCliBootstrapTransport:
         Only recognized authorization denials may converge to BlobNotFound;
         an existing object or any other response is drift, not permission to PUT.
         """
-        _sha40(self.authorization["source"]["mergedMain"]["commitSha"], "package source SHA")
-        expected_url = _operation_readback_url(
-            "uploadVersionedBridgePackage", self.plan, self.authorization
-        )
-        if url != expected_url:
-            fail("package readiness URL is not the exact source-derived target")
         started = self.clock()
-        not_before = parse_time(
-            self.authorization["validity"]["notBefore"], "authorization notBefore"
-        )
-        expires = parse_time(
-            self.authorization["validity"]["expiresAt"], "authorization expiresAt"
-        )
+        attempts = 0
+        last_status: int | None = None
+        last_code = "unknown"
+        last_request_id: str | None = None
+        last_server_date: str | None = None
+
+        def fail_readiness(message: str, reason: str) -> None:
+            raise PackageReadinessError(
+                message, elapsed_seconds=(self.clock() - started).total_seconds(),
+                attempts=attempts, status=last_status, error_code=last_code,
+                stop_reason=reason, request_id=last_request_id,
+                server_date=last_server_date,
+            ) from None
+
+        try:
+            _sha40(self.authorization["source"]["mergedMain"]["commitSha"], "package source SHA")
+            expected_url = _operation_readback_url(
+                "uploadVersionedBridgePackage", self.plan, self.authorization
+            )
+        except (BootstrapError, KeyError, TypeError):
+            fail_readiness("package readiness source target is invalid", "invalid-target")
+        if url != expected_url:
+            fail_readiness("package readiness URL is not the exact source-derived target", "invalid-target")
+        try:
+            not_before = parse_time(
+                self.authorization["validity"]["notBefore"], "authorization notBefore"
+            )
+            expires = parse_time(
+                self.authorization["validity"]["expiresAt"], "authorization expiresAt"
+            )
+            if expires <= not_before:
+                fail("invalid authorization interval")
+        except (BootstrapError, KeyError, TypeError):
+            fail_readiness("package readiness authorization window is invalid", "invalid-authorization-window")
         deadline = min(
             expires,
             started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
         )
-        for attempt in range(64):
+        while attempts < 64:
             now = self.clock()
             if now < not_before or now >= deadline:
-                fail("package data-plane readiness authorization or convergence window expired")
-            response = self.session.request(
-                "GET", url,
-                headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
-            )
+                fail_readiness(
+                    "package data-plane readiness authorization or convergence window expired",
+                    "expired-before-get" if attempts == 0 else "deadline",
+                )
+            attempts += 1
+            try:
+                response = self.session.request(
+                    "GET", url,
+                    headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
+                )
+            except Exception:
+                # Do not retry an ambiguous request or copy exception text.
+                # The last safely observed response remains diagnostic only.
+                fail_readiness("package readiness transport failed closed", "transport-error")
             observed = self.clock()
+            last_status = response.status
+            last_code = "unknown"
+            last_request_id = self._header(response, "x-ms-request-id")
+            last_server_date = self._header(response, "Date")
             if observed >= deadline:
-                fail("package data-plane readiness window expired during GET")
+                fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
             if response.status not in {403, 404}:
-                fail(f"package readiness returned unsupported HTTP status {response.status}")
+                fail_readiness("package readiness returned unsupported HTTP status", "unsupported-status")
+            content_type = self._header(response, "Content-Type")
             if (
                 len(response.body) > 65536
                 or b"<!DOCTYPE" in response.body.upper()
                 or b"<!ENTITY" in response.body.upper()
+                or not isinstance(content_type, str) or "xml" not in content_type.lower()
             ):
-                fail("package readiness error XML is unsafe or oversized")
+                fail_readiness("package readiness error XML is unsafe or oversized", "unsafe-xml")
             try:
                 document = ET.fromstring(response.body)
-            except ET.ParseError as exc:
-                raise BootstrapError("package readiness error XML is malformed") from exc
+            except ET.ParseError:
+                fail_readiness("package readiness error XML is malformed", "malformed-xml")
             children = list(document)
             if (
                 document.tag != "Error" or document.attrib
@@ -10897,23 +11025,37 @@ class AzureCliBootstrapTransport:
                     for child in children
                 )
             ):
-                fail("package readiness error XML is not one exact Storage error")
-            error = _package_blob_error_projection("GET", url, response)
-            code = error.get("storageErrorCode") if error is not None else None
+                fail_readiness("package readiness error XML is not one exact Storage error", "invalid-error-shape")
+            candidate_code = document.findtext("Code")
             header_code = self._header(response, "x-ms-error-code")
-            if header_code is not None and header_code != code:
-                fail("package readiness error header and XML code disagree")
+            if header_code is not None and header_code != candidate_code:
+                fail_readiness("package readiness error header and XML code disagree", "error-code-mismatch")
+            if candidate_code in PackageReadinessError.ERROR_CODES:
+                last_code = candidate_code
+            try:
+                error = _package_blob_error_projection("GET", url, response)
+            except BootstrapError:
+                fail_readiness(
+                    "package readiness Storage error is not accepted",
+                    "unexpected-absence-code" if response.status == 404 else "unsupported-denial",
+                )
+            code = error.get("storageErrorCode") if error is not None else None
             if response.status == 404:
                 if code != "BlobNotFound":
-                    fail("package readiness 404 is not exact BlobNotFound")
+                    fail_readiness("package readiness 404 is not exact BlobNotFound", "unexpected-absence-code")
+                if self.clock() >= deadline:
+                    fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
                 return
             if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
-                fail("package readiness 403 is not recognized authorization propagation")
-            delay = min(float(2 ** min(attempt, 4)), 15.0)
-            if attempt == 63 or observed + dt.timedelta(seconds=delay) >= deadline:
-                fail("package data-plane readiness did not converge before its deadline")
+                fail_readiness("package readiness 403 is not recognized authorization propagation", "unsupported-denial")
+            if attempts == 64:
+                fail_readiness("package data-plane readiness exceeded bounded attempts", "attempt-limit")
+            remaining = (deadline - self.clock()).total_seconds()
+            if remaining <= 0:
+                fail_readiness("package data-plane readiness did not converge before its deadline", "deadline")
+            delay = min(float(2 ** min(attempts - 1, 4)), 15.0, remaining)
             self.sleep(delay)
-        raise AssertionError("unreachable package readiness loop")
+        fail_readiness("package data-plane readiness exceeded bounded attempts", "attempt-limit")
 
     def _prove_controller_lock_container_empty(
         self, ids: Sequence[str]
@@ -11963,20 +12105,6 @@ class AzureCliBootstrapTransport:
             desired = dict(context["preAppSettings"])
             expected_url = f"{upload['url']}?versionid={urllib.parse.quote(str(upload['versionId']), safe='') }"
             reader_id = self.resources["registryReaderIdentity"]["resourceId"]
-            self_test_control = _bootstrap_self_test_control(
-                self.authorization, state
-            )
-            self_test_control_bytes = canonical_json_bytes(self_test_control)
-            critical = {
-                "WEBSITE_RUN_FROM_PACKAGE": expected_url,
-                "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": reader_id,
-                "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
-                "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": (
-                    self_test_control_bytes.decode("utf-8")
-                ),
-            }
-            desired.update(critical)
             site = self.resources["bridgeSite"]
             current_response = self.session.request(
                 "POST",
@@ -11993,6 +12121,17 @@ class AzureCliBootstrapTransport:
                 != context["preAppSettingsSha256"]
             ):
                 fail("bridge app settings drifted after authorization")
+            self_test_control = _bootstrap_self_test_control(
+                self.authorization, state, issued_at=self._timestamp(self.clock())
+            )
+            self_test_control_bytes = canonical_json_bytes(self_test_control)
+            desired.update({
+                "WEBSITE_RUN_FROM_PACKAGE": expected_url,
+                "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": reader_id,
+                "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
+                "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": self_test_control_bytes.decode("utf-8"),
+            })
             result = self._arm_put(
                 site["resourceId"] + "/config/appsettings",
                 "2025-03-01",
@@ -12010,6 +12149,9 @@ class AzureCliBootstrapTransport:
                 "packageUrl": expected_url,
                 "packageVersionId": upload["versionId"],
                 "bootstrapSelfTestControl": self_test_control,
+                "bootstrapSelfTestIssuedAt": self_test_control["issuedAt"],
+                "bootstrapSelfTestExpiresAt": self_test_control["expiresAt"],
+                "settingsRequestBodySha256": sha256_bytes(canonical_json_bytes({"properties": desired})),
                 "bootstrapSelfTestControlSha256": sha256_bytes(
                     self_test_control_bytes
                 ),
@@ -12326,6 +12468,12 @@ class AzureCliBootstrapTransport:
 
         if operation_id == "startBridgeForBoundedCanary":
             site = self.resources["bridgeSite"]
+            configure = self._proof_detail(state, "configureBridgeExactVersionedPackageAndCriticalSettings")
+            timing = _validated_bootstrap_self_test_timing(self.authorization, configure)
+            def require_live_canary() -> None:
+                if not parse_time(timing["issuedAt"], "canary issuedAt") <= self.clock() < parse_time(timing["expiresAt"], "canary expiresAt"):
+                    fail("bridge canary control is no longer live")
+            require_live_canary()
             job = "paperdesk-accepted-release-registry"
             initial = self._wait_for_site_state(
                 site_resource_id=site["resourceId"],
@@ -12350,6 +12498,7 @@ class AzureCliBootstrapTransport:
             try:
                 # Once the intent is durable, even an ambiguous transport
                 # failure is followed by an exact stop in the cleanup path.
+                require_live_canary()
                 start_attempted = True
                 self._mutation_request(
                     "POST", start_url, body=b"", expected={200, 202}
@@ -12364,6 +12513,7 @@ class AzureCliBootstrapTransport:
                     job_name=job,
                 )
                 trigger_requested_at = self.clock()
+                require_live_canary()
                 run = self._mutation_request(
                     "POST",
                     run_url,
@@ -14404,7 +14554,7 @@ class BootstrapExecutor:
                 "failureType": None if failure is None else type(failure).__name__,
                 "consumed": True,
             }
-            if isinstance(failure, ControllerReadinessError):
+            if isinstance(failure, (ControllerReadinessError, PackageReadinessError)):
                 terminal["failureDiagnostic"] = dict(failure.diagnostic)
             # The authorization-specific directory and single-use-state.json
             # are the durable consumed boundary.  Terminal evidence is useful,

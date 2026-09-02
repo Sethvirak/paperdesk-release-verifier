@@ -1080,7 +1080,8 @@ class _TerminalEvidenceFixture:
             "configureBridgeExactVersionedPackageAndCriticalSettings"
         ]
         control = bootstrap._bootstrap_self_test_control_from_projections(
-            self.authorization, self.operations
+            self.authorization, self.operations,
+            {"bootstrapSelfTestIssuedAt": stamp(NOW), "bootstrapSelfTestExpiresAt": stamp(NOW + dt.timedelta(seconds=900))},
         )
         upload = self.operations["uploadVersionedBridgePackage"]["projection"]
         package_url = upload["url"] + "?versionid=" + urllib.parse.quote(
@@ -1098,7 +1099,7 @@ class _TerminalEvidenceFixture:
         )
         self.envelope(
             "configureBridgeExactVersionedPackageAndCriticalSettings",
-            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"]},
+            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
         )
 
         def worm(operation_id):
@@ -1272,6 +1273,8 @@ class _TerminalEvidenceFixture:
                             bootstrap.canonical_json_bytes({"properties": lock_proof["properties"]}))
                         intent["requestBodySha256"] = bootstrap.sha256_bytes(request_bytes)
                     journal.append(intent)
+                    if operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
+                        intent["requestBodySha256"] = self.operations[operation_id]["projection"]["settingsRequestBodySha256"]
                     result = copy.deepcopy(intent)
                     versioned_headers = (
                         self.operations[operation_id]["headers"]
@@ -3042,7 +3045,7 @@ class BootstrapTests(unittest.TestCase):
             mock.patch.object(
                 bootstrap,
                 "_bootstrap_self_test_control",
-                return_value={"schemaVersion": 1},
+                return_value={"schemaVersion": 1, "issuedAt": stamp(NOW), "expiresAt": stamp(NOW + dt.timedelta(seconds=900))},
             ),
             mock.patch.object(
                 transport,
@@ -5333,6 +5336,8 @@ class BootstrapTests(unittest.TestCase):
                         "details": {
                             "settingsSha256": "5" * 64,
                             "bootstrapSelfTestControlSha256": "6" * 64,
+                            "bootstrapSelfTestIssuedAt": stamp(NOW),
+                            "bootstrapSelfTestExpiresAt": stamp(NOW + dt.timedelta(seconds=900)),
                         }
                     },
                     "uploadVersionedBridgePackage": {

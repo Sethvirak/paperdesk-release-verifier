@@ -239,6 +239,15 @@ errors, authentication failures, and expiry fail closed. GET readiness proves
 read/network access, not write permission: a failed or ambiguous PUT is never
 replayed.
 
+Failed package GET readiness retains a fixed stage and stop reason, elapsed
+time, attempt count, last HTTP status, and an allowlisted Storage error code in
+stderr and the local failed terminal receipt. An optional Storage request ID
+must have the fixed hexadecimal UUID shape; an optional server date must be a
+canonical GMT HTTP date. Missing, malformed, or hostile header values become
+null. Raw response bodies/messages, URLs, IP addresses, credentials and transport
+exception text are never retained. These facts diagnose a failed attempt; they
+do not turn a denied or ambiguous request into permission to upload or retry.
+
 The controller-container empty proof uses the same ten-minute Storage readiness
 budget, bounded by the authorization expiry and 64 GET attempts, with backoff
 capped at 15 seconds. Only the two recognized authorization-propagation 403s
@@ -301,6 +310,15 @@ canary; one-way accepted/result retention extensions from 30 to 91 days occur
 only after every reversible proof has passed and only when the authorization
 explicitly names those mutations. The current production routing projection is
 observed but not changed during bootstrap.
+
+The canary's maximum 15-minute lifetime starts just in time after the final
+settings precondition read, rather than at preflight preparation. Its expiry
+is still clipped to the unchanged outer bootstrap authorization. Retained
+issuance/expiry timestamps reconstruct the exact control and settings digests
+and bind to the single settings-PUT journal entry. The control is never refreshed
+or replayed; an expired retained control blocks bridge startup and WebJob
+triggering. Lease acquisition and renewal also honor that same deadline, while
+exact finally-release cleanup remains permitted after expiry.
 
 The production command sequence is explicit. `describe` is the default local,
 credential-free view. `observe` is a separate Azure read-only program: it accepts
