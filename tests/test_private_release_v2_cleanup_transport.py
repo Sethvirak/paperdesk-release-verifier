@@ -20,6 +20,7 @@ TEMPORARY = (
 LEGACY = (
     "removeLegacyWriterResultAssignment", "removeLegacyReaderResultAssignment",
     "retireLegacyPublisherResultReadAssignment",
+    "retireLegacyPublisherSitesReadAssignment",
 )
 
 
@@ -278,7 +279,7 @@ class CleanupTransportTests(unittest.TestCase):
         self.assertFalse(session.definition_deleted)
         self.assertTrue(any(item["properties"]["level"] == "ReadOnly" for item in session.locks.values()))
 
-    def test_all_three_legacy_deletes_require_authorized_exact_preflight(self):
+    def test_all_protected_legacy_deletes_require_authorized_exact_preflight(self):
         for operation_id in LEGACY:
             for change in (None, "missing-probe", "digest", "principal"):
                 with self.subTest(operation=operation_id, change=change):

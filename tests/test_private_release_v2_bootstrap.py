@@ -39,11 +39,11 @@ EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "all related temporary roles absent, and manual cleanup may be required."
 )
 EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
-    "I authorize temporary removal and exact restoration of only the two reviewed "
+    "I authorize temporary removal and exact restoration of only the three reviewed "
     "CanNotDelete locks for the exact role-assignment deletions bound in this plan. "
     "I accept that lock updates have no atomic concurrency guard and that interruption, "
     "ambiguous transport, or journal failure can leave deletion protection absent; "
-    "execution must stop NO-GO until fresh reads prove both exact locks restored and "
+    "execution must stop NO-GO until fresh reads prove all three exact locks restored and "
     "all related temporary access absent, and manual cleanup may be required."
 )
 PHRASE = (
@@ -4059,6 +4059,30 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE,
                          EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE)
 
+    def test_previous_two_lock_confirmation_cannot_authorize_three_lock_plan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            projection = build_projection(self.plan, self.package)
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            authorization = build_authorization(
+                self.plan, self.plan_sha, self.package, projection, receipt
+            )
+            previous_phrase = PHRASE.replace(
+                "only the three reviewed", "only the two reviewed"
+            ).replace("all three exact locks restored", "both exact locks restored")
+            authorization["confirmation"]["phraseSha256"] = bootstrap.sha256_bytes(
+                previous_phrase.encode("utf-8")
+            )
+            path = Path(folder) / "previous-two-lock-confirmation.json"
+            canonical_file(path, authorization)
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "does not explicitly authorize exact deletion-lock suspension",
+            ):
+                bootstrap.validate_authorization(
+                    path, plan=self.plan, plan_sha256=self.plan_sha,
+                    package=self.package, confirmation_phrase=previous_phrase, now=NOW,
+                )
+
     def test_authorization_requires_explicit_storage_acl_residual_acceptance(self):
         self.assertEqual(
             bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE,
@@ -5349,7 +5373,7 @@ class BootstrapTests(unittest.TestCase):
         inputs = self._terminal_journal_validation_inputs(fixture)
         protected = [operation_id for operation_id in fixture["operationProjections"]
                      if bootstrap._expected_deletion_lock_proof(operation_id) is not None]
-        self.assertEqual(len(protected), 7)
+        self.assertEqual(len(protected), 8)
         for operation_id in protected:
             original = fixture["operationProjections"][operation_id]
             for field, value in (("restored", False), ("assignmentAbsent", False),
@@ -5610,6 +5634,31 @@ class BootstrapTests(unittest.TestCase):
             ),
             (False, True),
         )
+
+    def test_production_lock_exception_is_exact_and_does_not_allow_site_writes(self):
+        spec = self.plan["deletionProtection"]["locks"]["productionApp"]
+        lock_url = "https://management.azure.com" + spec["resourceId"] + "?api-version=2016-09-01"
+        site_url = "https://management.azure.com" + next(
+            item["resourceId"] for item in self.plan["resourceInventory"]
+            if item["id"] == "productionSite"
+        )
+        for method in ("DELETE", "PUT"):
+            self.assertEqual(bootstrap._forbidden_release_mutation_classes(
+                method, lock_url, self.plan), (False, False))
+        forbidden = [
+            ("PATCH", lock_url), ("POST", lock_url),
+            ("DELETE", lock_url.replace("protect-app-delete", "other-lock")),
+            ("DELETE", lock_url + "&extra=true"),
+            ("DELETE", lock_url + "#fragment"),
+            ("DELETE", lock_url.replace("2016-09-01", "2025-03-01")),
+            ("DELETE", site_url + "?api-version=2025-03-01"),
+            ("PUT", site_url + "/config/appsettings?api-version=2025-03-01"),
+            ("POST", site_url + "/restart?api-version=2025-03-01"),
+        ]
+        for method, url in forbidden:
+            with self.subTest(method=method, url=url):
+                self.assertEqual(bootstrap._forbidden_release_mutation_classes(
+                    method, url, self.plan), (True, False))
 
     def test_public_terminal_source_builder_produces_one_valid_complete_snapshot(self):
         with tempfile.TemporaryDirectory() as folder:

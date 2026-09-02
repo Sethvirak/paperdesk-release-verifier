@@ -371,6 +371,13 @@
   },
   "deletionProtection": {
     "locks": {
+      "productionApp": {
+        "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-app-delete",
+        "properties": {
+          "level": "CanNotDelete",
+          "notes": "PaperDesk production App Service deletion protection. Remove only for an approved delete, replacement, RBAC cleanup, or diagnostic cleanup."
+        }
+      },
       "rollback": {
         "resourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Authorization/locks/paperdesk-rollback-cannot-delete",
         "properties": {
@@ -393,7 +400,8 @@
       "removeOwnedOperatorControllerCanaryRole": "rollback",
       "removeLegacyWriterResultAssignment": "rollback",
       "removeLegacyReaderResultAssignment": "rollback",
-      "retireLegacyPublisherResultReadAssignment": "rollback"
+      "retireLegacyPublisherResultReadAssignment": "rollback",
+      "retireLegacyPublisherSitesReadAssignment": "productionApp"
     },
     "policy": "exact-lock-suspend-and-finally-restore-no-mutation-retry"
   },

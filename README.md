@@ -239,15 +239,23 @@ errors, authentication failures, and expiry fail closed. GET readiness proves
 read/network access, not write permission: a failed or ambiguous PUT is never
 replayed.
 
-The plan also binds exactly two existing `CanNotDelete` locks and the seven
+The plan also binds exactly three existing `CanNotDelete` locks and the eight
 role-assignment removals they protect. A fresh complete subscription lock
-inventory must prove both reviewed projections and reject any additional lock
+inventory must prove all three reviewed projections and reject any additional lock
 affecting a planned deletion before the Azure claim. Each protected deletion
 then rechecks that inventory and the authorized assignment, suspends only its
 reviewed lock, deletes only its exact assignment, and restores the original
 lock in `finally` before deleting a temporary role definition. The journal
 binds exact targets, lock bodies, and this order. Only readbacks may retry;
 assignment and definition absence have bounded convergence windows.
+
+The production App Service lock `paperdesk-protect-app-delete` is bound only
+to retirement of legacy sites-read assignment
+`784fb5eb-c6ac-41ca-902a-cdae92334ade`. Its suspension does not authorize deleting
+or configuring the production site, touching the separately preserved
+`b24a4ca5-de40-47c8-90d8-caf08759dfb2` assignment, or suspending the unrelated
+production Storage/PostgreSQL locks. The exact app lock must be restored before
+that assignment-retirement operation can succeed.
 
 New lock suspension requires an unexpired authorization, including during
 compensation. Only restoration of the exact suspended lock may proceed after

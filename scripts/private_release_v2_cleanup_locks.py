@@ -24,6 +24,21 @@ POLL_SECONDS = 2
 SUBSCRIPTION = "9c4e0d0d-602f-4cde-84bd-337250e5b64c"
 
 REVIEWED_CLEANUP_LOCKS = {
+    "productionApp": {
+        "resourceId": (
+            f"/subscriptions/{SUBSCRIPTION}/resourceGroups/"
+            "rg-master-data-structure-sea/providers/Microsoft.Web/sites/"
+            "master-data-structure-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/"
+            "paperdesk-protect-app-delete"
+        ),
+        "properties": {
+            "level": "CanNotDelete",
+            "notes": (
+                "PaperDesk production App Service deletion protection. Remove only "
+                "for an approved delete, replacement, RBAC cleanup, or diagnostic cleanup."
+            ),
+        },
+    },
     "rollback": {
         "resourceId": (
             f"/subscriptions/{SUBSCRIPTION}/resourceGroups/"
@@ -63,6 +78,7 @@ REVIEWED_OPERATION_LOCKS = {
     "removeLegacyWriterResultAssignment": "rollback",
     "removeLegacyReaderResultAssignment": "rollback",
     "retireLegacyPublisherResultReadAssignment": "rollback",
+    "retireLegacyPublisherSitesReadAssignment": "productionApp",
 }
 
 

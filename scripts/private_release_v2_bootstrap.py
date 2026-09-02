@@ -100,11 +100,11 @@ STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE = (
     "all related temporary roles absent, and manual cleanup may be required."
 )
 DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
-    "I authorize temporary removal and exact restoration of only the two reviewed "
+    "I authorize temporary removal and exact restoration of only the three reviewed "
     "CanNotDelete locks for the exact role-assignment deletions bound in this plan. "
     "I accept that lock updates have no atomic concurrency guard and that interruption, "
     "ambiguous transport, or journal failure can leave deletion protection absent; "
-    "execution must stop NO-GO until fresh reads prove both exact locks restored and "
+    "execution must stop NO-GO until fresh reads prove all three exact locks restored and "
     "all related temporary access absent, and manual cleanup may be required."
 )
 
@@ -723,9 +723,11 @@ def _forbidden_release_mutation_classes(
 ) -> tuple[bool, bool]:
     """Classify forbidden production-runtime and accepted-blob writes.
 
-    Exact Microsoft.Authorization children under the production site or
-    accepted container are reviewed bootstrap RBAC mutations, not application
-    release mutations.  Conversely, ARM site/config/deploy actions and Blob
+    Exact Microsoft.Authorization role assignments and the reviewed app-lock
+    suspension/restoration are bootstrap authorization-control mutations, not
+    application release mutations. Their exact operation, cardinality, bodies,
+    and restoration are independently required by journal validation.
+    Conversely, ARM site/config/deploy actions and Blob
     data-plane writes remain forbidden even when a caller relabels them with an
     otherwise permitted operation ID.
     """
@@ -743,11 +745,20 @@ def _forbidden_release_mutation_classes(
         production_path
         + "/providers/microsoft.authorization/roleassignments/"
     )
+    production_lock = cleanup_locks.REVIEWED_CLEANUP_LOCKS["productionApp"]
+    reviewed_lock_write = (
+        method.upper() in {"DELETE", "PUT"}
+        and target_url.lower() == (
+            "https://management.azure.com" + production_lock["resourceId"]
+            + "?api-version=2016-09-01"
+        ).lower()
+    )
     production_site_write = (
         path == production_path
         or (
             path.startswith(production_path + "/")
             and not path.startswith(authorization_child)
+            and not reviewed_lock_write
         )
         or host
         in {
