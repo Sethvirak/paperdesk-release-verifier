@@ -121,10 +121,13 @@ class Fixture:
 
 
 class CleanupLockTests(unittest.TestCase):
-    def test_exact_seven_operation_mapping(self):
-        self.assertEqual(len(locks.REVIEWED_OPERATION_LOCKS), 7)
+    def test_exact_three_locks_and_eight_operation_mapping(self):
+        self.assertEqual(set(locks.REVIEWED_CLEANUP_LOCKS), {"rollback", "signingVault", "productionApp"})
+        self.assertEqual(len(locks.REVIEWED_OPERATION_LOCKS), 8)
         self.assertEqual(list(locks.REVIEWED_OPERATION_LOCKS.values()).count("rollback"), 6)
         self.assertEqual(locks.applicable_cleanup_lock("removeOwnedOperatorKeyReadRole"), "signingVault")
+        self.assertEqual(locks.applicable_cleanup_lock("retireLegacyPublisherSitesReadAssignment"), "productionApp")
+        self.assertEqual(list(locks.REVIEWED_OPERATION_LOCKS.values()).count("productionApp"), 1)
         self.assertIsNone(locks.applicable_cleanup_lock("retireLegacyPublisherMutatorAssignment"))
 
     def test_exact_properties_include_no_extra_owner_or_changed_note(self):
@@ -149,7 +152,7 @@ class CleanupLockTests(unittest.TestCase):
         with self.assertRaises(GuardFailure):
             locks.validate_lock_document(value, fixture.spec, fail)
 
-    def test_all_seven_operations_restore_exact_lock_with_three_mutations(self):
+    def test_all_eight_operations_restore_exact_lock_with_three_mutations(self):
         for operation in locks.REVIEWED_OPERATION_LOCKS:
             fixture = Fixture(operation)
             proof = fixture.run()
@@ -166,6 +169,44 @@ class CleanupLockTests(unittest.TestCase):
                 self.assertEqual([x[4] for x in fixture.mutations], [False, False, True])
                 self.assertEqual(json.loads(fixture.mutations[-1][2]), {"properties": fixture.spec["properties"]})
                 self.assertEqual(fixture.lock, fixture.lock_document())
+
+    def test_production_app_cleanup_deletes_only_assignment_and_restores_lock(self):
+        fixture = Fixture("retireLegacyPublisherSitesReadAssignment")
+        site = (f"/subscriptions/{locks.SUBSCRIPTION}/resourceGroups/rg-master-data-structure-sea"
+                "/providers/Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d")
+        self.assertEqual(fixture.spec["resourceId"], site +
+                         "/providers/Microsoft.Authorization/locks/paperdesk-protect-app-delete")
+        fixture.assignment["id"] = site + "/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade"
+        fixture.expected = copy.deepcopy(fixture.assignment)
+        fixture.assignment_url = locks.ARM_ROOT + fixture.assignment["id"] + "?api-version=2022-04-01"
+        self.assertTrue(fixture.run()["restored"])
+        self.assertEqual([(item[0], item[1]) for item in fixture.mutations], [
+            ("DELETE", fixture.lock_url), ("DELETE", fixture.assignment_url), ("PUT", fixture.lock_url)])
+        self.assertEqual(fixture.inventory_calls, [(fixture.operation, "productionApp")])
+        self.assertEqual(fixture.lock, fixture.lock_document())
+        self.assertFalse(any(url.split("?", 1)[0] == locks.ARM_ROOT + site
+                             for _, url, *_ in fixture.mutations))
+
+    def test_production_app_guard_rejects_site_and_unrelated_resource_scopes(self):
+        prefix = f"/subscriptions/{locks.SUBSCRIPTION}/resourceGroups/rg-master-data-structure-sea/providers/"
+        site = prefix + "Microsoft.Web/sites/master-data-structure-sea-9c4e0d0d"
+        suffix = "/providers/Microsoft.Authorization/roleAssignments/784fb5eb-c6ac-41ca-902a-cdae92334ade"
+        targets = {
+            "production site itself": site,
+            "bridge": prefix + "Microsoft.Web/sites/paperdesk-release-registry-bridge-9c4e0d0d" + suffix,
+            "production storage": prefix + "Microsoft.Storage/storageAccounts/mdspaperdesksea9c4e" + suffix,
+            "postgres": prefix + "Microsoft.DBforPostgreSQL/flexibleServers/unrelated-postgres" + suffix,
+        }
+        for label, target in targets.items():
+            with self.subTest(target=label):
+                fixture = Fixture("retireLegacyPublisherSitesReadAssignment")
+                expected = copy.deepcopy(fixture.expected)
+                expected["id"] = target
+                with self.assertRaisesRegex(GuardFailure, "outside its exact reviewed lock scope"):
+                    fixture.run(assignment_url=locks.ARM_ROOT + target + "?api-version=2022-04-01",
+                                expected_assignment_projection=expected)
+                self.assertEqual(fixture.requests, [])
+                self.assertEqual(fixture.mutations, [])
 
     def test_absent_assignment_still_checks_inventory_and_exact_lock(self):
         fixture = Fixture()
