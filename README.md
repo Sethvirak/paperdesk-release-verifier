@@ -273,10 +273,13 @@ responses for the exact versioned public-key GET. The fence path retries only th
 two recognized Storage authorization-propagation 403s and requires exact
 `404 / BlobNotFound` before its single create-only PUT. Transport ambiguity,
 unexpected absence, malformed responses, and all write ambiguity fail closed.
-Every Storage XML response is first decoded as strict UTF-8 without a BOM or
-NUL byte. DTD and entity declarations are rejected in the decoded text before
-the bounded, operation-specific XML shape is parsed. UTF-16 or other alternate
-encodings therefore cannot bypass the entity prohibition.
+Every Storage XML response is first decoded as strict UTF-8 with either no BOM
+or exactly one leading UTF-8 BOM, matching Azure Blob's live error responses.
+Double/embedded UTF-8 BOMs, UTF-16/UTF-32 BOMs, and NUL bytes are rejected. DTD
+and entity declarations are rejected in the decoded text before the bounded,
+operation-specific XML shape is parsed, so alternate encodings cannot bypass
+the entity prohibition. Read-only observer requests to Blob Storage always bind
+the same exact `x-ms-version: 2023-11-03` used by the executor.
 
 Failed package GET readiness retains a fixed stage and stop reason, elapsed
 time, attempt count, last HTTP status, and an allowlisted Storage error code in

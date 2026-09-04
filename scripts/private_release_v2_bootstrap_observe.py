@@ -81,6 +81,9 @@ OBSERVED_HEADERS = {
     "x-ms-lease-status",
     "x-ms-version-id",
 }
+TEMPORARY_STORAGE_RBAC_DENIAL_CODES = frozenset(
+    {"AuthorizationFailure", "AuthorizationPermissionMismatch"}
+)
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -231,9 +234,17 @@ class AzureCliReadOnlySession:
             self.account()
         assert self._session is not None
         response = None
+        hostname = (urllib.parse.urlsplit(request.url).hostname or "").lower()
+        request_kwargs = (
+            {"headers": {"x-ms-version": bootstrap.STORAGE_API_VERSION}}
+            if hostname == "mdspdbak2608089c4e.blob.core.windows.net"
+            else {}
+        )
         for attempt in range(3):
             try:
-                response = self._session.request(request.method, request.url)
+                response = self._session.request(
+                    request.method, request.url, **request_kwargs
+                )
                 break
             except bootstrap.BootstrapError as exc:
                 if (
@@ -915,11 +926,10 @@ def _operation_admission(
                 {"storageErrorCode"},
                 "package blob pre-network error",
             )
-            if error["storageErrorCode"] not in {
-                "AuthenticationFailed",
-                "AuthorizationFailure",
-                "AuthorizationPermissionMismatch",
-            }:
+            if (
+                error["storageErrorCode"]
+                not in TEMPORARY_STORAGE_RBAC_DENIAL_CODES
+            ):
                 fail("package blob preflight is not blocked by temporary access")
             return "network-inaccessible", _policy_checked_context(
                 operation_id,
@@ -952,11 +962,10 @@ def _operation_admission(
                 {"storageErrorCode"},
                 f"{operation_id} temporary storage-access error",
             )
-            if error["storageErrorCode"] not in {
-                "AuthenticationFailed",
-                "AuthorizationFailure",
-                "AuthorizationPermissionMismatch",
-            }:
+            if (
+                error["storageErrorCode"]
+                not in TEMPORARY_STORAGE_RBAC_DENIAL_CODES
+            ):
                 fail(
                     f"{operation_id} preflight is not blocked by temporary RBAC"
                 )
