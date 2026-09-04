@@ -227,9 +227,31 @@ The exact plan may temporarily add only:
 - an authorization-specific custom role on the exact package container with
   only create-new blob and exact readback DataActions;
 - an exact metadata-only Key Vault read role needed to capture the public JWK;
-  and
 - an exact fence-bootstrap role limited to creating/reading the canonical idle
-  activation-fence blob.
+  activation-fence blob; and
+- an exact controller-canary role limited to reading, creating, leasing, and
+  deleting the authorization-specific canary blob in the controller container.
+
+Every consumed bootstrap attempt owns eight temporary custom-role definition and
+assignment GUIDs derived deterministically from its unique authorization ID and
+the source-controlled UUID namespace and labels. The reviewed plan digest remains
+the source contract; the executor binds a separate in-memory plan, so a later
+authorization deterministically receives a disjoint ID set without changing the
+authorized resource or mutation IDs.
+
+Fresh preflight and terminal-boundary reads require all eight historical retired
+definition/assignment pairs to return `404`. New definitions and assignments also
+carry a canonical marker containing their authorization ID and cleanup key. The
+exhaustive unpaginated subscription custom-role and descendant assignment
+inventories reject every surviving marker, including one from a prior
+authorization whose deployment claim was later deleted. Any residual or
+reappearing temporary access stops before a claim or before successful completion.
+
+The executor keeps these protected role lifecycles contiguous and non-overlapping:
+controller proof/canary, package readiness/upload, signing-key public-JWK read,
+and activation-fence readiness/create. Each assignment and definition reaches
+exact absence before the next role is created. This limits failure compensation
+to one protected role plus the exact temporary IPv4 rule.
 
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
@@ -237,23 +259,74 @@ single create-only PUT; recognized authorization-propagation 403s may wait for
 up to ten minutes within the authorization window. Existing blobs, malformed
 errors, authentication failures, and expiry fail closed. GET readiness proves
 read/network access, not write permission: a failed or ambiguous PUT is never
-replayed.
+replayed. The last GET is scheduled no later than 90 seconds before its work
+deadline, reserving the 45-second CLI credential limit and the 45-second REST
+response limit. A separate 780-second window remains before authorization expiry
+for the single active protected assignment's guarded deletion. The deadline is
+rechecked after credential acquisition and also limits the HTTP wait. A terminal
+denial fails immediately after the last allowed GET so compensation enters that
+cleanup window; it cannot start another readiness request.
+
+The sequential Key Vault and activation-fence roles have their own bounded
+readiness checks. The key path retries only exact `Forbidden` / `ForbiddenByRbac`
+responses for the exact versioned public-key GET. The fence path retries only the
+two recognized Storage authorization-propagation 403s and requires exact
+`404 / BlobNotFound` before its single create-only PUT. Transport ambiguity,
+unexpected absence, malformed responses, and all write ambiguity fail closed.
+Every Storage XML response is first decoded as strict UTF-8 without a BOM or
+NUL byte. DTD and entity declarations are rejected in the decoded text before
+the bounded, operation-specific XML shape is parsed. UTF-16 or other alternate
+encodings therefore cannot bypass the entity prohibition.
 
 Failed package GET readiness retains a fixed stage and stop reason, elapsed
 time, attempt count, last HTTP status, and an allowlisted Storage error code in
 stderr and the local failed terminal receipt. An optional Storage request ID
 must have the fixed hexadecimal UUID shape; an optional server date must be a
 canonical GMT HTTP date. Missing, malformed, or hostile header values become
-null. Raw response bodies/messages, URLs, IP addresses, credentials and transport
+null. Every Storage request carries a unique canonical `x-ms-client-request-id`.
+A failed readiness receipt also retains at most 64 fixed-shape attempt records:
+start/completion timestamps, bounded duration, client and provider correlation
+IDs, status, allowlisted error code, and response-versus-transport outcome. Raw
+response bodies/messages, URLs, IP addresses, credentials and transport
 exception text are never retained. These facts diagnose a failed attempt; they
 do not turn a denied or ambiguous request into permission to upload or retry.
 
-The controller-container empty proof uses the same ten-minute Storage readiness
-budget, bounded by the authorization expiry and 64 GET attempts, with backoff
-capped at 15 seconds. Only the two recognized authorization-propagation 403s
+The controller-container empty proof has the same ten-minute global readiness
+cap and 64-GET limit. The bootstrap authorization is capped at exactly 3,600
+seconds (60 minutes): account validation, fresh preflight, the durable claim,
+and reviewed pre-controller operations have a hard 600-second budget; 630
+seconds then admit the exact controller role through seven bounded ARM calls;
+600 seconds remain available for data-plane propagation; and one 90-second
+envelope remains for the create-only canary PUT. Another exact 900 seconds
+stage the nominal finite-lease canary and every owned cleanup request, including
+one safe conditional-DELETE replay and a 30-second local margin. The final 780
+seconds protect role cleanup, including a full 120-second lock propagation
+boundary followed by one 90-second observation envelope. Natural finite expiry is accepted only as the
+exact Storage state `Expired` with `Unlocked` status and `Fixed` duration; it is
+not misreported as `Available`. Backoff is capped at 15 seconds. Only the two
+recognized authorization-propagation 403s
 may wait; malformed errors, authentication failures, transport ambiguity, a
 different target, or a nonempty/paginated inventory stop immediately. Success
 still requires the exact source-bound empty-container and private-posture proof.
+The 60-minute limit is the hard controller-safety window, not a promise that
+every later Azure propagation wait will also finish in the same attempt. The
+executor rechecks live authorization before each later mutation. Expiry stops
+before the next write and compensates every executor-owned temporary resource;
+the exact permanent prefix remains for fresh observation and adopt-exact resume
+under a newly reviewed authorization, receipt directory, claim, and temporary
+resource IDs. A consumed or expired authorization is never reused.
+The authorization-specific bridge App Settings remain executor-owned after
+their single conditional PUT. The authorization binds both the complete
+preflight settings map and its strong ETag; the final pre-PUT read must match
+both. A later failure before the validated terminal
+source input is durably persisted first proves the bridge Stopped, reads the
+complete current settings map once, and restores the exact preflight map only
+when the current map is either the preflight state or the exact authorized
+desired state. Restoration uses the current strong ETag in one conditional PUT
+and one exact readback. An ambiguous restoration is not replayed, and a third
+state is left untouched for explicit operator recovery. Once the durable
+terminal source input exists, settings ownership is retired because local-only
+finalization reconstructs the same success evidence without another Azure read.
 Failure diagnostics retain a fixed stage, elapsed time, attempt count,
 HTTP status, allowlisted Storage error code and stop reason in stderr and the
 local failed terminal receipt. Controller errors distinguish the ten-minute
@@ -273,7 +346,8 @@ and assignment already validated through ARM, not a planned-role declaration
 or proof that the data plane has propagated that role. Missing observed
 evidence stays null. This instrumentation makes no extra credential or Azure
 requests, does not force token refresh, and never broadens permissions,
-changes wait/retry limits, or authorizes another execution. Historical failed
+changes the ten-minute/64-attempt limits or 60-minute authorization lifetime,
+or authorizes another execution. Historical failed
 receipts remain immutable; these facts are available only on a later freshly
 authorized attempt.
 
@@ -358,6 +432,26 @@ python -B scripts/private_release_v2_bootstrap.py apply \
   --authorization /external/bootstrap-authorization.json \
   --preflight /external/bootstrap-preflight.json
 ```
+
+The exact authorization confirmation also accepts the hard process-death
+residual at the bridge configuration boundary:
+
+> I accept that process death after the bridge configuration or site-start
+> request can leave a consumed use ledger and durable unresolved mutation
+> intent while the bridge site remains changed or running. Recovery may require
+> an exact site stop and conditional restoration of the source-bound prestate
+> under a separate explicit authorization; every fresh apply must stop until
+> that durable intent and live state are fully resolved.
+
+This is a manual operator recovery boundary. Preserve the consumed receipt
+directory and mutation journal. Do not run a fresh observation or apply while
+the intent is unresolved. Under a separately reviewed recovery authorization,
+first prove or restore the exact Stopped site state, then read the complete App
+Settings map. Restore the source-bound preflight map with the live strong ETag
+only when the map is the exact desired state from the consumed authorization;
+an exact prestate needs no settings write, and any third state must remain
+untouched for investigation. A fresh bootstrap observation may start only after
+the durable intent and both live states have been reconciled.
 
 If Azure execution and full terminal validation completed but the process died
 while creating the five S2 files, local finalization may resume without a token,

@@ -42,12 +42,21 @@
     "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
     "packageBlobTemplate": "v2/control/{mergedSourceSha}/paperdesk-private-release-bridge.zip",
     "activationFenceBlob": "v2/production-activation-fence.json",
-    "temporaryPackageRoleDefinitionId": "d3021f37-75b7-5dad-84ce-8bf84dd11e93",
-    "temporaryPackageRoleAssignmentId": "39989cff-44ef-596e-8b46-0a433bb5c0e2",
-    "temporaryKeyReadRoleDefinitionId": "dba37aa5-3824-5c68-91ac-5f1e24e7aa9c",
-    "temporaryKeyReadRoleAssignmentId": "9420cd85-94df-5156-99b7-9a011702c69e",
-    "temporaryFenceRoleDefinitionId": "1c425126-8044-52d8-b4f5-6dac8d60b1e1",
-    "temporaryFenceRoleAssignmentId": "bdfe78bb-909b-54df-86a0-1620898addf0",
+    "temporaryRoleIdDerivation": {
+      "algorithm": "uuid5",
+      "namespace": "15a228ac-3249-535f-940d-d915c5ce4b70",
+      "nameTemplate": "{authorizationId}:{label}",
+      "labels": {
+        "roleDefinitionId": "package-role-definition",
+        "roleAssignmentId": "package-role-assignment",
+        "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
+        "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
+        "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
+        "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
+        "temporaryControllerRoleDefinitionId": "controller-canary-role-definition",
+        "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
+      }
+    },
     "wormRetentionDays": 91,
     "finiteLeaseSeconds": 60,
     "finiteLeaseRenewalCount": 1,

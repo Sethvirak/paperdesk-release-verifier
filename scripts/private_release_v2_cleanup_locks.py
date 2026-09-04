@@ -19,6 +19,8 @@ import urllib.parse
 ARM_ROOT = "https://management.azure.com"
 LOCK_API_VERSION = "2016-09-01"
 LOCK_CONVERGENCE_SECONDS = 120
+LOCK_FINAL_OBSERVATION_SECONDS = 90
+FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS = 1
 ASSIGNMENT_ABSENCE_SECONDS = 600
 POLL_SECONDS = 2
 SUBSCRIPTION = "9c4e0d0d-602f-4cde-84bd-337250e5b64c"
@@ -141,14 +143,17 @@ class CleanupLockGuard:
         sleep: Callable[[float], None],
         fail: Callable[[str], Any],
         require_live_authorization: Callable[[], Any],
+        post_delete_read_request: Callable[..., Any] | None = None,
     ) -> None:
         self.read_request = read_request
+        self.post_delete_read_request = post_delete_read_request or read_request
         self.mutate_request = mutate_request
         self.verify_lock_inventory = verify_lock_inventory
         self.clock = clock
         self.sleep = sleep
         self.fail = fail
         self.require_live_authorization = require_live_authorization
+        self.assignment_was_present: bool | None = None
 
     def _now(self) -> dt.datetime:
         value = self.clock()
@@ -170,8 +175,14 @@ class CleanupLockGuard:
         url: str,
         validate: Callable[[Mapping[str, Any]], Any],
         label: str,
+        *,
+        read_request: Callable[..., Any] | None = None,
+        deadline: dt.datetime | None = None,
     ) -> str:
-        response = self.read_request("GET", url)
+        request_kwargs = {} if deadline is None else {"deadline": deadline}
+        response = (read_request or self.read_request)(
+            "GET", url, **request_kwargs
+        )
         if response.status == 404:
             return "absent"
         if response.status != 200:
@@ -186,22 +197,80 @@ class CleanupLockGuard:
         validate: Callable[[Mapping[str, Any]], Any],
         label: str,
         seconds: int,
+        *,
+        read_request: Callable[..., Any] | None = None,
+        final_observation_seconds: int = 0,
     ) -> None:
         started = self._now()
-        deadline = started + dt.timedelta(seconds=seconds)
+        convergence_boundary = started + dt.timedelta(seconds=seconds)
+        alignment_slack = (
+            FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            if final_observation_seconds > 0
+            else 0
+        )
+        hard_deadline = convergence_boundary + dt.timedelta(
+            seconds=alignment_slack + final_observation_seconds
+        )
         previous = started
         # The attempt cap also bounds callers with a frozen or faulty test clock.
         for _ in range(seconds // POLL_SECONDS + 1):
             before = self._now()
-            if before < previous or before > deadline:
+            if before < previous or before > hard_deadline:
                 _reject(self.fail, f"{label} exceeded its bounded readback window")
-            state = self._read_state(url, validate, label)
+            if (
+                final_observation_seconds > 0
+                and before < convergence_boundary
+                and before
+                + dt.timedelta(seconds=final_observation_seconds)
+                >= convergence_boundary
+            ):
+                # Do not spend the one final transport envelope on a request
+                # that begins before the propagation boundary and can return a
+                # stale response after it.  Start that final observation at the
+                # boundary itself.
+                self.sleep((convergence_boundary - before).total_seconds())
+                aligned = self._now()
+                if (
+                    aligned < convergence_boundary
+                    or aligned
+                    > convergence_boundary
+                    + dt.timedelta(seconds=alignment_slack)
+                ):
+                    _reject(
+                        self.fail,
+                        f"{label} settlement clock is invalid",
+                    )
+                before = aligned
+            final_observation = (
+                final_observation_seconds > 0
+                and before >= convergence_boundary
+            )
+            request_deadline = (
+                before + dt.timedelta(seconds=final_observation_seconds)
+                if final_observation
+                else convergence_boundary
+            )
+            if request_deadline > hard_deadline:
+                _reject(self.fail, f"{label} exceeded its bounded readback window")
+            state = self._read_state(
+                url,
+                validate,
+                label,
+                read_request=read_request,
+                deadline=request_deadline,
+            )
             after = self._now()
-            if after < before or after > deadline:
+            if after < before or after > request_deadline:
                 _reject(self.fail, f"{label} exceeded its bounded readback window")
             if state == desired:
                 return
-            remaining = (deadline - after).total_seconds()
+            # A caller may reserve one full transport envelope after the
+            # propagation boundary.  The first observation completing at or
+            # after that boundary is final; the extra envelope is read time,
+            # never a longer convergence allowance.
+            if final_observation or after >= convergence_boundary:
+                break
+            remaining = (convergence_boundary - after).total_seconds()
             if remaining <= 0:
                 break
             previous = after
@@ -210,7 +279,12 @@ class CleanupLockGuard:
 
     def _restore_lock(self, url: str, spec: Mapping[str, Any]) -> None:
         validate = lambda document: validate_lock_document(document, spec, self.fail)
-        state = self._read_state(url, validate, "cleanup lock restoration precondition")
+        state = self._read_state(
+            url,
+            validate,
+            "cleanup lock restoration precondition",
+            read_request=self.post_delete_read_request,
+        )
         if state == "exact":
             return
         body = json.dumps(
@@ -230,11 +304,13 @@ class CleanupLockGuard:
             self._poll_state(
                 url, "exact", validate, "cleanup lock ambiguous restoration",
                 LOCK_CONVERGENCE_SECONDS,
+                read_request=self.post_delete_read_request,
             )
             raise
         self._poll_state(
             url, "exact", validate, "cleanup lock restoration",
             LOCK_CONVERGENCE_SECONDS,
+            read_request=self.post_delete_read_request,
         )
 
     def delete_assignment(
@@ -268,19 +344,19 @@ class CleanupLockGuard:
 
         def validate_assignment(document: Mapping[str, Any]) -> None:
             if project_assignment(document) != expected:
-                _reject(self.fail, "assignment cleanup found a changed assignment snapshot")
+                _reject(
+                    self.fail,
+                    "temporary assignment drifted: changed assignment no longer matches the source-authorized assignment",
+                )
 
-        initial = self._read_state(
-            assignment_url, validate_assignment, "assignment cleanup precondition"
-        )
         self.verify_lock_inventory(operation_id, lock_key)
         validate_lock = lambda document: validate_lock_document(document, spec, self.fail)
         if self._read_state(lock_url, validate_lock, "cleanup lock precondition") != "exact":
             _reject(self.fail, "reviewed cleanup lock is absent before suspension")
-        if self._read_state(
-            assignment_url, validate_assignment, "assignment cleanup final precondition"
-        ) != initial:
-            _reject(self.fail, "assignment cleanup precondition changed during lock inventory")
+        initial = self._read_state(
+            assignment_url, validate_assignment, "assignment cleanup precondition"
+        )
+        self.assignment_was_present = initial == "exact"
         proof = {
             "resourceId": spec["resourceId"],
             "properties": copy.deepcopy(spec["properties"]),
@@ -300,6 +376,7 @@ class CleanupLockGuard:
             self._poll_state(
                 lock_url, "absent", validate_lock, "cleanup lock suspension",
                 LOCK_CONVERGENCE_SECONDS,
+                final_observation_seconds=LOCK_FINAL_OBSERVATION_SECONDS,
             )
             if self._read_state(
                 assignment_url, validate_assignment, "assignment cleanup suspended precondition"
@@ -312,6 +389,8 @@ class CleanupLockGuard:
             self._poll_state(
                 assignment_url, "absent", validate_assignment, "assignment cleanup absence",
                 ASSIGNMENT_ABSENCE_SECONDS,
+                read_request=self.post_delete_read_request,
+                final_observation_seconds=LOCK_FINAL_OBSERVATION_SECONDS,
             )
         finally:
             self._restore_lock(lock_url, spec)

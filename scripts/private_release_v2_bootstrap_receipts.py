@@ -23,6 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = ROOT / "contracts" / "private_release_bootstrap_evidence_model.json"
 PLAN_PATH = ROOT / "contracts" / "private_release_bootstrap_plan.json"
+BOOTSTRAP_MAX_AUTHORIZATION_SECONDS = 3600
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -518,7 +519,8 @@ def _context(authorization: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[
     if (
         auth_executor["path"] != "scripts/private_release_v2_bootstrap.py"
         or auth_plan["path"] != "contracts/private_release_bootstrap_plan.json"
-        or validity["maximumLifetimeSeconds"] != 1800
+        or validity["maximumLifetimeSeconds"]
+        != BOOTSTRAP_MAX_AUTHORIZATION_SECONDS
         or observed["maximumAgeSeconds"] != 300
         or confirmation["encoding"] != "utf-8-exact-no-newline"
     ):
@@ -559,7 +561,11 @@ def _context(authorization: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[
         fail("authorization Azure account type is invalid")
     not_before = _timestamp(validity.get("notBefore"), "authorization notBefore")
     expires_at = _timestamp(validity.get("expiresAt"), "authorization expiresAt")
-    if expires_at <= not_before or (expires_at - not_before).total_seconds() > 1800:
+    if (
+        expires_at <= not_before
+        or (expires_at - not_before).total_seconds()
+        > BOOTSTRAP_MAX_AUTHORIZATION_SECONDS
+    ):
         fail("authorization validity window is invalid")
     expected_claim_resource_id = (
         f"/subscriptions/{constants['subscriptionId']}/providers/Microsoft.Resources/deployments/"
@@ -601,6 +607,23 @@ def _context(authorization: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[
         ) from exc
     if dict(validated_authorization.document) != dict(authorization):
         fail("immutable authorization validator changed the supplied evidence")
+    role_id_deriver = getattr(bootstrap, "derive_temporary_role_ids", None)
+    if (
+        not callable(role_id_deriver)
+        or constants.get("temporaryRoleIdDerivation")
+        != reviewed_plan.get("temporaryAccess", {}).get(
+            "temporaryRoleIdDerivation"
+        )
+    ):
+        fail("temporary role ID derivation contract is unavailable or drifted")
+    try:
+        temporary_role_ids = role_id_deriver(reviewed_plan, authorization_id)
+    except Exception as exc:
+        if isinstance(exc, BootstrapReceiptError):
+            raise
+        raise BootstrapReceiptError(
+            f"authorization-owned temporary role IDs are invalid: {exc}"
+        ) from exc
     if context_terminal_path := model.get("requiredS2TerminalBundlePath"):
         if context_terminal_path != S2_TERMINAL_BUNDLE_PATH:
             fail("terminal receipt bundle path is not exact")
@@ -635,6 +658,7 @@ def _context(authorization: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[
         "azureClaimResourceId": expected_claim_resource_id,
         "mutationIds": mutation_ids,
         "irreversibleMutationIds": irreversible,
+        "temporaryRoleIds": temporary_role_ids,
     }
 
 
@@ -1182,6 +1206,8 @@ def _validate_production_boundary(
         {
             "authorizedPreflightProjection",
             "postExecutionProjection",
+            "freshPreflightRetiredRoleAbsence",
+            "postExecutionRetiredRoleAbsence",
             "projectionsEqual",
             "journaledProductionWriteCount",
             "acceptedContainerWriteJournal",
@@ -1562,7 +1588,7 @@ def _validate_temporary_cleanup(
         started_at=started_at,
         completed_at=completed_at,
     )
-    constants = context["model"]["constants"]
+    temporary_role_ids = context["temporaryRoleIds"]
     temporary = plan.get("temporaryAccess")
     if not isinstance(temporary, Mapping):
         fail("plan temporaryAccess is invalid")
@@ -1571,8 +1597,8 @@ def _validate_temporary_cleanup(
     _validate_temporary_role(
         document["packageUploaderRole"],
         "temporaryAccessCleanup.packageUploaderRole",
-        definition_id=temporary["roleDefinitionId"],
-        assignment_id=temporary["roleAssignmentId"],
+        definition_id=temporary_role_ids["roleDefinitionId"],
+        assignment_id=temporary_role_ids["roleAssignmentId"],
         scope_id=_resource(plan, temporary["scope"])["resourceId"],
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedUploaderPackageRole",
@@ -1589,8 +1615,8 @@ def _validate_temporary_cleanup(
     _validate_temporary_role(
         document["operatorKeyReadRole"],
         "temporaryAccessCleanup.operatorKeyReadRole",
-        definition_id=constants["temporaryKeyReadRoleDefinitionId"],
-        assignment_id=constants["temporaryKeyReadRoleAssignmentId"],
+        definition_id=temporary_role_ids["temporaryKeyReadRoleDefinitionId"],
+        assignment_id=temporary_role_ids["temporaryKeyReadRoleAssignmentId"],
         scope_id=_resource(plan, temporary["temporaryKeyReadScope"])["resourceId"],
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedOperatorKeyReadRole",
@@ -1607,8 +1633,8 @@ def _validate_temporary_cleanup(
     _validate_temporary_role(
         document["operatorFenceRole"],
         "temporaryAccessCleanup.operatorFenceRole",
-        definition_id=constants["temporaryFenceRoleDefinitionId"],
-        assignment_id=constants["temporaryFenceRoleAssignmentId"],
+        definition_id=temporary_role_ids["temporaryFenceRoleDefinitionId"],
+        assignment_id=temporary_role_ids["temporaryFenceRoleAssignmentId"],
         scope_id=_resource(plan, temporary["temporaryFenceScope"])["resourceId"],
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedOperatorFenceBootstrapRole",
@@ -1625,8 +1651,8 @@ def _validate_temporary_cleanup(
     _validate_temporary_role(
         document["operatorControllerRole"],
         "temporaryAccessCleanup.operatorControllerRole",
-        definition_id=temporary["temporaryControllerRoleDefinitionId"],
-        assignment_id=temporary["temporaryControllerRoleAssignmentId"],
+        definition_id=temporary_role_ids["temporaryControllerRoleDefinitionId"],
+        assignment_id=temporary_role_ids["temporaryControllerRoleAssignmentId"],
         scope_id=_resource(plan, temporary["temporaryControllerScope"])["resourceId"],
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedOperatorControllerCanaryRole",
@@ -2271,12 +2297,30 @@ def _validate_lease_canaries(
         },
         "leaseCanaryEvidence.cleanupExpiryFallback",
     )
+    fallback_transitions = _exact_keys(
+        fallback["stateTransitions"],
+        {
+            "leaseId",
+            "acquiredAt",
+            "releaseIntentionallyOmitted",
+            "expiredAt",
+            "pollAttempts",
+            "finalLeaseState",
+            "finalLeaseStatus",
+            "finalLeaseDuration",
+        },
+        "leaseCanaryEvidence.cleanupExpiryFallback.stateTransitions",
+    )
     if (
         fallback["observationStatus"] != "directly-observed"
         or fallback["deadlineSeconds"]
         != context["model"]["constants"]["finiteLeaseSeconds"]
-        or not isinstance(fallback["stateTransitions"], Mapping)
-        or not fallback["stateTransitions"]
+        or fallback_transitions["releaseIntentionallyOmitted"] is not True
+        or type(fallback_transitions["pollAttempts"]) is not int
+        or fallback_transitions["pollAttempts"] < 1
+        or fallback_transitions["finalLeaseState"] != "expired"
+        or fallback_transitions["finalLeaseStatus"] != "unlocked"
+        or fallback_transitions["finalLeaseDuration"] != "fixed"
     ):
         fail("cleanup expiry-fallback canary is invalid")
     _hash(
@@ -2614,7 +2658,8 @@ def _validate_execution(
         started_at < context["notBefore"]
         or completed_at > context["expiresAt"]
         or completed_at < started_at
-        or (completed_at - started_at).total_seconds() > 1800
+        or (completed_at - started_at).total_seconds()
+        > BOOTSTRAP_MAX_AUTHORIZATION_SECONDS
     ):
         fail("execution receipt timestamps are outside the authorization window")
     if (

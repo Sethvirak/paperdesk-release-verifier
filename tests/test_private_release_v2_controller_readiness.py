@@ -68,6 +68,21 @@ class ControllerReadinessTests(unittest.TestCase):
         for text in (str(error), json.dumps(error.diagnostic)):
             for secret in (SECRET, "private-token", "203.0.113.19", "raw-message-secret", "<Error>"):
                 self.assertNotIn(secret, text)
+        records = error.diagnostic["attemptRecords"]
+        self.assertEqual(len(records), error.diagnostic["attempts"])
+        self.assertEqual(
+            [item["attempt"] for item in records],
+            list(range(1, error.diagnostic["attempts"] + 1)),
+        )
+        client_ids = [item["clientRequestId"] for item in records]
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in client_ids))
+        self.assertEqual(len(client_ids), len(set(client_ids)))
+        for item in records:
+            self.assertEqual(set(item), {
+                "attempt", "startedAt", "completedAt", "durationMs",
+                "clientRequestId", "status", "errorCode", "requestId",
+                "serverDate", "outcome",
+            })
 
     def assert_no_credential_or_role_snapshot(self, error):
         self.assertIsNone(error.diagnostic["credential"])
@@ -88,6 +103,9 @@ class ControllerReadinessTests(unittest.TestCase):
                 self.assertEqual(proof["sourceProjection"]["family"], "controller-lock-initial-empty-proof")
                 self.assertTrue(all(method == "GET" and url == transport.probes[ids[0]]["url"]
                                     for method, url, _ in session.requests))
+                request_ids = [item[2]["headers"]["x-ms-client-request-id"]
+                               for item in session.requests]
+                self.assertEqual(len(request_ids), len(set(request_ids)))
                 self.assertEqual(journal.records, [])
 
     def test_expiry_and_600_second_cap_clip_waits_without_writes(self):
@@ -99,16 +117,52 @@ class ControllerReadinessTests(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError) as error:
                     transport._prove_controller_lock_container_empty(ids)
                 self.assert_sanitized(error.exception)
-                self.assertEqual(error.exception.diagnostic["stopReason"],
-                                 "authorization-expired" if deadline == 37 else "readiness-timeout")
+                if deadline < bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS:
+                    self.assertEqual(error.exception.diagnostic["stopReason"], "expired-before-get")
+                    self.assertEqual(error.exception.diagnostic["attempts"], 0)
+                    self.assertEqual(self.current, NOW)
+                    self.assertEqual(session.requests, [])
+                    self.assertEqual(self.sleeps, [])
+                    self.assertEqual(journal.records, [])
+                    continue
+                self.assertEqual(error.exception.diagnostic["stopReason"], "readiness-timeout")
                 self.assertIsNone(error.exception.diagnostic["requestId"])
                 self.assertIsNone(error.exception.diagnostic["serverDate"])
                 self.assert_no_credential_or_role_snapshot(error.exception)
-                self.assertEqual((self.current - NOW).total_seconds(), deadline)
+                expected_elapsed = (
+                    deadline - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+                self.assertEqual((self.current - NOW).total_seconds(), expected_elapsed)
                 self.assertLessEqual(len(session.requests), 64)
                 self.assertTrue(all(0 < delay <= 15 for delay in self.sleeps))
+                self.assertEqual(
+                    error.exception.diagnostic["attemptRecords"][-1]["startedAt"],
+                    (NOW + dt.timedelta(
+                        seconds=deadline - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                )
                 self.assertTrue(all(item[0] == "GET" for item in session.requests))
                 self.assertEqual(journal.records, [])
+
+    def test_deadline_adjacent_final_get_can_validate_empty_container(self):
+        final_at = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+            - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        transport, session, journal, ids = self.make(
+            lambda _: empty() if self.current == final_at else denied()
+        )
+        proof = transport._prove_controller_lock_container_empty(ids)[0]
+        self.assertEqual(self.current, final_at)
+        self.assertEqual(proof["attempts"], len(session.requests))
+        request_ids = [item[2]["headers"]["x-ms-client-request-id"]
+                       for item in session.requests]
+        self.assertEqual(len(request_ids), len(set(request_ids)))
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in request_ids))
+        self.assertTrue(all(item[2]["deadline"] == NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        ) for item in session.requests))
+        self.assertEqual(journal.records, [])
 
     def test_invalid_response_is_terminal_and_diagnostics_do_not_leak(self):
         variants = [denied("AuthenticationFailed"), denied("raw-message-secret"), denied(status=401),
@@ -174,18 +228,24 @@ class ControllerReadinessTests(unittest.TestCase):
         self.assertIsNone(error.exception.diagnostic["status"])
         self.assertIsNone(error.exception.diagnostic["requestId"])
         self.assertIsNone(error.exception.diagnostic["serverDate"])
+        self.assertEqual(error.exception.diagnostic["attemptRecords"][-1]["outcome"],
+                         "transport-error")
+        self.assertIsNone(error.exception.diagnostic["attemptRecords"][-1]["status"])
         self.assert_no_credential_or_role_snapshot(error.exception)
         self.assertEqual(len(session.requests), 1)
         self.assertEqual(self.sleeps, [])
         self.assertEqual(journal.records, [])
 
     def test_zero_attempt_outside_authorization_window_has_no_response_metadata(self):
-        for offset in (-1, 1800):
+        for offset in (-1, bootstrap.MAX_AUTHORIZATION_SECONDS):
             with self.subTest(offset=offset):
                 transport, session, journal, ids = self.make(lambda _: empty())
                 self.current = NOW + dt.timedelta(seconds=offset)
                 transport.authorization["validity"]["notBefore"] = NOW.isoformat().replace("+00:00", "Z")
-                transport.authorization["validity"]["expiresAt"] = (NOW + dt.timedelta(seconds=1800)).isoformat().replace("+00:00", "Z")
+                transport.authorization["validity"]["expiresAt"] = (
+                    NOW
+                    + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
+                ).isoformat().replace("+00:00", "Z")
                 with self.assertRaises(bootstrap.ControllerReadinessError) as error:
                     transport._prove_controller_lock_container_empty(ids)
                 self.assert_sanitized(error.exception)

@@ -46,10 +46,19 @@ EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "execution must stop NO-GO until fresh reads prove all three exact locks restored and "
     "all related temporary access absent, and manual cleanup may be required."
 )
+EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
+    "I accept that process death after the bridge configuration or site-start request "
+    "can leave a consumed use ledger and durable unresolved mutation intent while the "
+    "bridge site remains changed or running. Recovery may require an exact site stop and "
+    "conditional restoration of the source-bound prestate under a separate explicit "
+    "authorization; every fresh apply must stop until that durable intent and live state "
+    "are fully resolved."
+)
 PHRASE = (
     "Authorize the exact one-shot PaperDesk V2 bootstrap plan. "
     + EXPECTED_STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
     + " " + EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE
+    + " " + EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE
 )
 
 
@@ -59,6 +68,34 @@ def stamp(value):
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+
+def build_retired_role_absence_projection(plan, observed_at):
+    empty_inventory_sha256 = bootstrap.sha256_bytes(
+        bootstrap.canonical_json_bytes({"value": []})
+    )
+    marker_inventory_sha256 = bootstrap._temporary_role_marker_inventory_sha256(
+        [
+            {
+                **request,
+                "status": 200,
+                "responseSha256": empty_inventory_sha256,
+            }
+            for request in bootstrap._temporary_role_marker_inventory_requests()
+        ]
+    )
+    return [
+        {
+            **request,
+            "status": 404,
+            "responseSha256": bootstrap.sha256_bytes(
+                request["url"].encode("utf-8")
+            ),
+            "temporaryRoleMarkerInventorySha256": marker_inventory_sha256,
+            "observedAt": observed_at,
+        }
+        for request in bootstrap._retired_temporary_role_absence_requests(plan)
+    ]
 
 
 def canonical_file(path, value):
@@ -147,6 +184,7 @@ def build_production_boundary_projection(plan):
 
 
 def build_projection(plan, package, *, adopt_operations=()):
+    plan = bootstrap.bind_temporary_role_ids(plan, AUTH_ID)
     base = (
         f"https://management.azure.com/subscriptions/{bootstrap.SUBSCRIPTION}/"
         "providers/Microsoft.Resources/deployments/bootstrap-probe"
@@ -164,8 +202,10 @@ def build_projection(plan, package, *, adopt_operations=()):
             "bridgePackageSize": package["size"],
         },
         "validity": {
-            "notBefore": stamp(NOW - dt.timedelta(minutes=2)),
-            "expiresAt": stamp(NOW + dt.timedelta(minutes=20)),
+            "notBefore": stamp(NOW),
+            "expiresAt": stamp(
+                NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
+            ),
         },
         "azure": {
             "tenantId": bootstrap.TENANT,
@@ -244,6 +284,7 @@ def build_projection(plan, package, *, adopt_operations=()):
             value.update({
                 "preAppSettings": {},
                 "preAppSettingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({})),
+                "preAppSettingsEtag": '"bridge-settings-pre"',
                 "bootstrapSelfTestStaticControl": bootstrap._bootstrap_self_test_static_control(
                     context_authorization
                 ),
@@ -441,6 +482,11 @@ def build_projection(plan, package, *, adopt_operations=()):
         "productionBoundaryObservation": {
             "probeIds": boundary_probe_ids,
             "sourceProjection": build_production_boundary_projection(plan),
+            "retiredTemporaryRoleAbsence": (
+                build_retired_role_absence_projection(
+                    plan, stamp(NOW - dt.timedelta(minutes=1))
+                )
+            ),
         },
     }
 
@@ -537,8 +583,10 @@ def build_authorization(plan, plan_sha, package, projection, receipt_directory):
             "maximumAgeSeconds": bootstrap.MAX_PREFLIGHT_AGE_SECONDS,
         },
         "validity": {
-            "notBefore": stamp(NOW - dt.timedelta(minutes=2)),
-            "expiresAt": stamp(NOW + dt.timedelta(minutes=20)),
+            "notBefore": stamp(NOW),
+            "expiresAt": stamp(
+                NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
+            ),
             "maximumLifetimeSeconds": bootstrap.MAX_AUTHORIZATION_SECONDS,
         },
         "confirmation": {
@@ -569,6 +617,7 @@ class _TerminalEvidenceFixture:
         adopt_operations=(),
     ):
         self.plan = plan
+        self.execution_plan = bootstrap.bind_temporary_role_ids(plan, AUTH_ID)
         self.plan_sha = plan_sha
         self.package = package
         self.projection = build_projection(
@@ -642,7 +691,7 @@ class _TerminalEvidenceFixture:
         }
 
     def temp_role(self, operation_id):
-        temporary = self.plan["temporaryAccess"]
+        temporary = self.execution_plan["temporaryAccess"]
         specs = {
             "addOwnedUploaderPackageRole": (
                 temporary["roleDefinitionId"],
@@ -676,6 +725,7 @@ class _TerminalEvidenceFixture:
         definition_id, assignment_id, scope_key, cleanup_key, data_actions = specs[
             operation_id
         ]
+        metadata = bootstrap._temporary_role_metadata(AUTH_ID, cleanup_key)
         scope = self.resources[scope_key]["resourceId"]
         definition_resource = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
@@ -696,8 +746,8 @@ class _TerminalEvidenceFixture:
                 "name": definition_id,
                 "type": "Microsoft.Authorization/roleDefinitions",
                 "properties": {
-                    "roleName": f"PaperDesk V2 temporary {cleanup_key}",
-                    "description": "Single-use bootstrap temporary role; exact cleanup required",
+                    "roleName": metadata["roleName"],
+                    "description": metadata["description"],
                     "type": "CustomRole",
                     "permissions": [
                         {
@@ -722,6 +772,7 @@ class _TerminalEvidenceFixture:
                     "condition": None,
                     "conditionVersion": None,
                     "delegatedManagedIdentityResourceId": None,
+                    "description": metadata["assignmentDescription"],
                 },
             },
         }
@@ -1037,13 +1088,13 @@ class _TerminalEvidenceFixture:
             "releaseStatus": 200,
             "identity": {"kind": "authorized-local-azure-account", "objectId": ACCOUNT_OBJECT},
             "fastLane": {"acquiredAt": stamp(NOW + dt.timedelta(minutes=2)), "renewedAt": [stamp(NOW + dt.timedelta(minutes=2, seconds=20))], "releasedAt": stamp(NOW + dt.timedelta(minutes=2, seconds=40)), "finalLeaseState": "available"},
-            "expiryFallback": {"leaseId": self.plan["temporaryAccess"]["controllerExpiryLeaseId"], "acquiredAt": stamp(NOW + dt.timedelta(minutes=3)), "releaseIntentionallyOmitted": True, "availableAt": stamp(NOW + dt.timedelta(minutes=4, seconds=1)), "pollAttempts": 3, "finalLeaseState": "available"},
+            "expiryFallback": {"leaseId": self.plan["temporaryAccess"]["controllerExpiryLeaseId"], "acquiredAt": stamp(NOW + dt.timedelta(minutes=3)), "releaseIntentionallyOmitted": True, "expiredAt": stamp(NOW + dt.timedelta(minutes=4, seconds=1)), "pollAttempts": 3, "finalLeaseState": "expired", "finalLeaseStatus": "unlocked", "finalLeaseDuration": "fixed"},
             "selfCleaned": True,
         }
         self.envelope(
             "exerciseControllerLeaseCanary",
             lease_body,
-            headers={"leaseState": "Available", "leaseStatus": "Unlocked"},
+            headers={"leaseState": "Expired", "leaseStatus": "Unlocked", "leaseDuration": "Fixed"},
         )
         controller_container_url = (
             "https://mdspdbak2608089c4e.blob.core.windows.net/"
@@ -1099,7 +1150,7 @@ class _TerminalEvidenceFixture:
         )
         self.envelope(
             "configureBridgeExactVersionedPackageAndCriticalSettings",
-            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
+            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "preAppSettingsEtag": configure_context["preAppSettingsEtag"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
         )
 
         def worm(operation_id):
@@ -1243,12 +1294,23 @@ class _TerminalEvidenceFixture:
                 elif (bootstrap._expected_deletion_lock_proof(operation_id) is not None
                       and "/roleassignments/" in target_url.lower()):
                     target_url = ("https://management.azure.com"
-                        + bootstrap._cleanup_assignment_resources(self.plan)[operation_id]
+                        + bootstrap._cleanup_assignment_resources(self.execution_plan)[operation_id]
                         + "?api-version=2022-04-01")
                 for occurrence in range(count):
                     intent_sequence = len(journal) + 1
                     intent_id = f"cloud-mutation-{intent_sequence:04d}"
                     recorded = NOW + dt.timedelta(milliseconds=intent_sequence * 10)
+                    is_storage = (
+                        (urllib.parse.urlsplit(target_url).hostname or "").lower()
+                        == "mdspdbak2608089c4e.blob.core.windows.net"
+                    )
+                    client_request_id = (
+                        self.guid(
+                            f"storage-client-request:{operation_id}:{target_url}:{occurrence}"
+                        )
+                        if is_storage
+                        else None
+                    )
                     intent = {
                         "sequence": intent_sequence,
                         "phase": "intent",
@@ -1261,10 +1323,14 @@ class _TerminalEvidenceFixture:
                         "requestBodySha256": self.digest(
                             f"{operation_id}:{target_url}:{occurrence}:request"
                         ),
+                        "clientRequestId": client_request_id,
                         "status": None,
                         "responseBodySha256": None,
                         "etag": None,
                         "versionId": None,
+                        "requestId": None,
+                        "serverDate": None,
+                        "storageErrorCode": None,
                         "recordedAt": stamp(recorded),
                     }
                     if "/providers/microsoft.authorization/locks/" in target_url.lower():
@@ -1304,6 +1370,21 @@ class _TerminalEvidenceFixture:
                             ),
                             "etag": versioned_headers.get("etag"),
                             "versionId": versioned_headers.get("versionId"),
+                            "requestId": (
+                                self.guid(
+                                    f"storage-service-request:{operation_id}:{target_url}:{occurrence}"
+                                )
+                                if is_storage
+                                else None
+                            ),
+                            "serverDate": (
+                                recorded.strftime(
+                                    "%a, %d %b %Y %H:%M:%S GMT"
+                                )
+                                if is_storage
+                                else None
+                            ),
+                            "storageErrorCode": "unknown" if is_storage else None,
                             "recordedAt": stamp(
                                 recorded + dt.timedelta(milliseconds=5)
                             ),
@@ -1730,6 +1811,14 @@ class _TerminalEvidenceFixture:
             "productionBoundary": {
                 "authorizedPreflightProjection": production_projection,
                 "postExecutionProjection": copy.deepcopy(production_projection),
+                "freshPreflightRetiredRoleAbsence": (
+                    build_retired_role_absence_projection(self.plan, stamp(NOW))
+                ),
+                "postExecutionRetiredRoleAbsence": (
+                    build_retired_role_absence_projection(
+                        self.plan, stamp(NOW + dt.timedelta(minutes=7))
+                    )
+                ),
                 "projectionsEqual": True,
                 "journaledProductionWriteCount": 0,
                 "acceptedContainerWriteJournal": [],
@@ -2659,6 +2748,9 @@ class FakeTransport:
             "removeOwnedOperatorControllerCanaryRole": "operator-controller-canary-role",
             "createControllerLeaseCanaryBlob": "controller-lease-canary-blob",
             "removeControllerLeaseCanaryBlob": "controller-lease-canary-blob",
+            "configureBridgeExactVersionedPackageAndCriticalSettings": (
+                bootstrap.BRIDGE_SETTINGS_CLEANUP_KEY
+            ),
             "startBridgeForBoundedCanary": "bounded-bridge-canary-start",
             "stopBridgeAfterBoundedCanary": "bounded-bridge-canary-start",
         }
@@ -2707,10 +2799,22 @@ class FakeTransport:
             "exerciseControllerLeaseCanary",
             "startBridgeForBoundedCanary",
         }
+        bridge_settings_owned = (
+            operation["id"]
+            == "configureBridgeExactVersionedPackageAndCriticalSettings"
+        )
         return {
             "operationId": operation["id"],
             "status": "removed-exact" if removed else "verified-exact" if read else "created",
-            "owned": operation.get("temporary") is True and not removed and not read and not self_cleaned,
+            "owned": (
+                bridge_settings_owned
+                or (
+                    operation.get("temporary") is True
+                    and not removed
+                    and not read
+                    and not self_cleaned
+                )
+            ),
             "cleanupKey": self.cleanup_keys.get(operation["id"]),
         }
 
@@ -2755,6 +2859,1617 @@ class BootstrapTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan, cls.plan_sha = bootstrap.load_plan()
         cls.package = bootstrap.build_package_descriptor()
+
+    def test_plan_rejects_consumed_temporary_role_ids(self):
+        expected_retired_specs = (
+            {
+                "scopeResourceKey": "packageContainer",
+                "definitionId": "d3021f37-75b7-5dad-84ce-8bf84dd11e93",
+                "assignmentId": "39989cff-44ef-596e-8b46-0a433bb5c0e2",
+            },
+            {
+                "scopeResourceKey": "signingKey",
+                "definitionId": "dba37aa5-3824-5c68-91ac-5f1e24e7aa9c",
+                "assignmentId": "9420cd85-94df-5156-99b7-9a011702c69e",
+            },
+            {
+                "scopeResourceKey": "activationFenceContainer",
+                "definitionId": "1c425126-8044-52d8-b4f5-6dac8d60b1e1",
+                "assignmentId": "bdfe78bb-909b-54df-86a0-1620898addf0",
+            },
+            {
+                "scopeResourceKey": "controllerLockContainer",
+                "definitionId": "fb109dbf-e475-5f97-8db3-3c1a94acf4b3",
+                "assignmentId": "2d607095-edff-533c-a2c4-0e6e9d631715",
+            },
+            {
+                "scopeResourceKey": "packageContainer",
+                "definitionId": "2c66d02c-0545-469e-8fd6-b3bf08b2050b",
+                "assignmentId": "9db51009-898e-44e9-bb80-dc955c62f746",
+            },
+            {
+                "scopeResourceKey": "signingKey",
+                "definitionId": "4b046f73-1755-446d-93a8-e3c3b545b611",
+                "assignmentId": "212e0903-81a0-41ea-a11e-c07e91235a81",
+            },
+            {
+                "scopeResourceKey": "activationFenceContainer",
+                "definitionId": "91668da3-228c-4db3-ab59-5c2b65cd44d7",
+                "assignmentId": "72b288cf-73cf-4496-9480-6161c972193b",
+            },
+            {
+                "scopeResourceKey": "controllerLockContainer",
+                "definitionId": "d57913de-def8-4495-b30e-9f1e1cca1943",
+                "assignmentId": "807769aa-af4e-493e-b28d-803c58f10a44",
+            },
+        )
+        self.assertEqual(
+            bootstrap.RETIRED_TEMPORARY_ROLE_SPECS, expected_retired_specs
+        )
+        expected_retired_ids = {
+            value
+            for spec in expected_retired_specs
+            for value in (spec["definitionId"], spec["assignmentId"])
+        }
+        self.assertEqual(
+            bootstrap.RETIRED_TEMPORARY_ROLE_IDS, expected_retired_ids
+        )
+        self.assertEqual(len(expected_retired_ids), 16)
+
+        self.assertFalse(
+            set(self.plan["temporaryAccess"]).intersection(
+                bootstrap.TEMPORARY_ROLE_ID_FIELDS
+            )
+        )
+        current_ids = list(
+            bootstrap.derive_temporary_role_ids(self.plan, AUTH_ID).values()
+        )
+        self.assertEqual(len(current_ids), len(set(current_ids)))
+        self.assertTrue(
+            set(current_ids).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
+        )
+        altered = copy.deepcopy(self.plan)
+        altered["temporaryAccess"].update(
+            bootstrap.derive_temporary_role_ids(self.plan, AUTH_ID)
+        )
+        altered["temporaryAccess"]["roleDefinitionId"] = sorted(
+            bootstrap.RETIRED_TEMPORARY_ROLE_IDS
+        )[0]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "retired-role-plan.json"
+            path.write_bytes(bootstrap.canonical_json_bytes(altered))
+            with (
+                mock.patch.object(bootstrap, "PLAN_PATH", path),
+                self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "reviewed plan must not embed reusable temporary role IDs",
+                ),
+            ):
+                bootstrap.load_plan()
+
+    def test_temporary_role_ids_are_deterministic_and_disjoint_per_authorization(self):
+        other_authorization_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        first = bootstrap.derive_temporary_role_ids(self.plan, AUTH_ID)
+        repeated = bootstrap.derive_temporary_role_ids(self.plan, AUTH_ID)
+        second = bootstrap.derive_temporary_role_ids(
+            self.plan, other_authorization_id
+        )
+        self.assertEqual(first, repeated)
+        self.assertEqual(set(first), set(bootstrap.TEMPORARY_ROLE_ID_FIELDS))
+        self.assertEqual(len(set(first.values())), 8)
+        self.assertEqual(len(set(second.values())), 8)
+        self.assertTrue(set(first.values()).isdisjoint(second.values()))
+        self.assertTrue(
+            set(first.values()).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
+        )
+        self.assertTrue(
+            set(second.values()).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
+        )
+        first_bound = bootstrap.bind_temporary_role_ids(self.plan, AUTH_ID)
+        second_bound = bootstrap.bind_temporary_role_ids(
+            self.plan, other_authorization_id
+        )
+        self.assertEqual(
+            [item["id"] for item in first_bound["resourceInventory"]],
+            [item["id"] for item in second_bound["resourceInventory"]],
+        )
+        self.assertEqual(
+            [item["id"] for item in first_bound["mutations"]],
+            [item["id"] for item in second_bound["mutations"]],
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "do not match the authorization"
+        ):
+            bootstrap.bind_temporary_role_ids(first_bound, other_authorization_id)
+
+    def test_residual_temporary_role_markers_fail_closed_in_exhaustive_inventories(self):
+        execution_plan = bootstrap.bind_temporary_role_ids(self.plan, AUTH_ID)
+        prior_authorization_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        prior_ids = bootstrap.derive_temporary_role_ids(
+            self.plan, prior_authorization_id
+        )
+        metadata = bootstrap._temporary_role_metadata(
+            prior_authorization_id, "uploader-package-role"
+        )
+        definition = {
+            "id": (
+                f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                + prior_ids["roleDefinitionId"]
+            ),
+            "properties": {
+                "roleName": metadata["roleName"],
+                "description": metadata["description"],
+            },
+        }
+        assignment = {
+            "properties": {
+                "description": metadata["assignmentDescription"],
+                "roleDefinitionId": definition["id"],
+            }
+        }
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "residual PaperDesk temporary role definition"
+        ):
+            bootstrap._reject_residual_temporary_role_definitions(
+                [definition], label="test definition inventory"
+            )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "residual PaperDesk temporary role assignment"
+        ):
+            bootstrap._reject_residual_temporary_role_assignments(
+                [assignment],
+                plan=execution_plan,
+                label="test assignment inventory",
+            )
+        orphan_without_marker = copy.deepcopy(assignment)
+        orphan_without_marker["properties"]["description"] = None
+        orphan_without_marker["properties"]["roleDefinitionId"] = (
+            f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            + execution_plan["temporaryAccess"]["roleDefinitionId"]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "residual PaperDesk temporary role assignment"
+        ):
+            bootstrap._reject_residual_temporary_role_assignments(
+                [orphan_without_marker],
+                plan=execution_plan,
+                label="test orphan assignment inventory",
+            )
+
+    def _temporary_role_transport_fixture(self, receipt):
+        projection = build_projection(self.plan, self.package)
+        authorization = build_authorization(
+            self.plan, self.plan_sha, self.package, projection, receipt
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=authorization,
+            plan=self.plan,
+            package=self.package,
+            preflight={"projection": projection},
+            clock=lambda: NOW,
+            sleep=lambda _delay: None,
+            session=mock.Mock(),
+        )
+        operation = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "addOwnedUploaderPackageRole"
+        )
+        definition_id = transport.plan["temporaryAccess"]["roleDefinitionId"]
+        definition_resource = (
+            f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+            f"Microsoft.Authorization/roleDefinitions/{definition_id}"
+        )
+        metadata = bootstrap._temporary_role_metadata(
+            AUTH_ID, "uploader-package-role"
+        )
+        definition = {
+            "id": definition_resource,
+            "name": definition_id,
+            "type": "Microsoft.Authorization/roleDefinitions",
+            "properties": {
+                "roleName": metadata["roleName"],
+                "description": metadata["description"],
+                "type": "CustomRole",
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": transport.plan["temporaryAccess"][
+                            "temporaryPackageDataActions"
+                        ],
+                        "notDataActions": [],
+                    }
+                ],
+                "assignableScopes": [
+                    f"/subscriptions/{bootstrap.SUBSCRIPTION}"
+                ],
+            },
+        }
+        return transport, operation, definition_resource, definition
+
+    def _bind_temporary_role_test_ledger(self, transport, receipt):
+        ledger = bootstrap.UseLedger(
+            directory=receipt,
+            authorization_id=AUTH_ID,
+            authorization_sha256=bootstrap.sha256_bytes(
+                bootstrap.canonical_json_bytes(transport.authorization)
+            ),
+            source_sha=MERGE,
+            plan_sha256=self.plan_sha,
+            claimed_at=stamp(NOW),
+        )
+        ledger.claim()
+        transport.bind_journal(ledger)
+        return ledger
+
+    def _temporary_package_assignment_document(self, transport, definition_resource):
+        assignment_id = transport.plan["temporaryAccess"]["roleAssignmentId"]
+        scope = next(
+            item["resourceId"]
+            for item in transport.plan["resourceInventory"]
+            if item["id"] == "packageContainer"
+        )
+        assignment_resource = (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            f"{assignment_id}"
+        )
+        metadata = bootstrap._temporary_role_metadata(
+            AUTH_ID, "uploader-package-role"
+        )
+        return assignment_resource, {
+            "id": assignment_resource,
+            "name": assignment_id,
+            "type": "Microsoft.Authorization/roleAssignments",
+            "properties": {
+                "principalId": transport.authorization["azure"]["accountObjectId"],
+                "principalType": "User",
+                "roleDefinitionId": definition_resource,
+                "description": metadata["assignmentDescription"],
+                "scope": scope,
+                "condition": None,
+                "conditionVersion": None,
+                "delegatedManagedIdentityResourceId": None,
+            },
+        }
+
+    def test_temporary_role_result_lost_is_provisionally_owned_and_compensated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            responses = iter(
+                [
+                    bootstrap._RestResponse(404, b"", {}),
+                    bootstrap._RestResponse(404, b"", {}),
+                    bootstrap._RestResponse(
+                        200, bootstrap.canonical_json_bytes(definition), {}
+                    ),
+                    bootstrap._RestResponse(404, b"", {}),
+                    bootstrap._RestResponse(404, b"", {}),
+                    bootstrap._RestResponse(404, b"", {}),
+                ]
+            )
+            transport._active_operation_id = operation["id"]
+            with (
+                mock.patch.object(
+                    transport,
+                    "_read_request_with_transport_retry",
+                    side_effect=lambda *_args, **_kwargs: next(responses),
+                ),
+                mock.patch.object(
+                    transport,
+                    "_mutation_request",
+                    side_effect=bootstrap._MutationOwnershipAmbiguity(
+                        "transport applied the PUT but lost its result"
+                    ),
+                ),
+                self.assertRaises(bootstrap.OwnedTemporaryMutationError) as raised,
+            ):
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["owned"])
+            self.assertTrue(proof["details"]["definitionAttempted"])
+            self.assertFalse(proof["details"]["definitionCreated"])
+            self.assertTrue(proof["details"]["definitionAmbiguous"])
+            state = {"proofs": {operation["id"]: proof}}
+
+            def absent_assignment(*_args, **_kwargs):
+                transport._last_guarded_assignment_was_present = False
+                return bootstrap._expected_deletion_lock_proof(
+                    "removeOwnedUploaderPackageRole"
+                )
+
+            with (
+                mock.patch.object(
+                    transport,
+                    "_read_request_with_transport_retry",
+                    side_effect=lambda *_args, **_kwargs: next(responses),
+                ),
+                mock.patch.object(
+                    transport,
+                    "_guarded_assignment_delete",
+                    side_effect=absent_assignment,
+                ),
+                mock.patch.object(
+                    transport, "_verify_cleanup_lock_inventory"
+                ),
+                mock.patch.object(transport, "_arm_delete") as delete,
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ),
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(operation, proof, state)
+            self.assertEqual(cleanup["status"], "removed-exact")
+            delete.assert_called_once_with(definition_resource, "2022-04-01")
+
+    def test_temporary_role_result_journal_failure_retains_provisional_ownership(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, _definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+
+            class AppliedSession:
+                def __init__(self):
+                    self.calls = []
+
+                def request(self, method, url, **kwargs):
+                    self.calls.append((method, url, kwargs))
+                    if method == "GET":
+                        return bootstrap._RestResponse(404, b"", {})
+                    return bootstrap._RestResponse(
+                        201,
+                        bootstrap.canonical_json_bytes(definition),
+                        {"ETag": '"created"'},
+                    )
+
+            transport.session = AppliedSession()
+            ledger = bootstrap.UseLedger(
+                directory=receipt,
+                authorization_id=AUTH_ID,
+                authorization_sha256=bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(transport.authorization)
+                ),
+                source_sha=MERGE,
+                plan_sha256=self.plan_sha,
+                claimed_at=stamp(NOW),
+            )
+            ledger.claim()
+            transport.bind_journal(ledger)
+            transport._active_operation_id = operation["id"]
+            with (
+                mock.patch.object(
+                    transport,
+                    "_record_mutation",
+                    side_effect=OSError("result journal fsync failed"),
+                ),
+                self.assertRaises(bootstrap.OwnedTemporaryMutationError) as raised,
+            ):
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["owned"])
+            self.assertTrue(proof["details"]["definitionAttempted"])
+            self.assertFalse(proof["details"]["definitionCreated"])
+            self.assertEqual(len(ledger.unresolved_intents()), 1)
+
+    def test_definition_500_then_late_exact_is_owned_and_removed_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            assignment_resource, _assignment = (
+                self._temporary_package_assignment_document(
+                    transport, definition_resource
+                )
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            assignment_url = transport._arm_url(
+                assignment_resource, "2022-04-01"
+            )
+
+            class Definition500Session:
+                def __init__(self):
+                    self.definition_gets = 0
+                    self.definition_present = False
+                    self.definition_pending = False
+                    self.calls = []
+
+                def request(self, method, url, **_kwargs):
+                    self.calls.append((method, url))
+                    if url == assignment_url and method == "GET":
+                        return bootstrap._RestResponse(404, b"", {})
+                    if url != definition_url:
+                        raise AssertionError(f"unexpected role URL: {url}")
+                    if method == "GET":
+                        self.definition_gets += 1
+                        if self.definition_pending and self.definition_gets >= 3:
+                            self.definition_present = True
+                        return (
+                            bootstrap._RestResponse(
+                                200,
+                                bootstrap.canonical_json_bytes(definition),
+                                {},
+                            )
+                            if self.definition_present
+                            else bootstrap._RestResponse(404, b"", {})
+                        )
+                    if method == "PUT":
+                        self.definition_pending = True
+                        return bootstrap._RestResponse(500, b"", {})
+                    if method == "DELETE":
+                        self.definition_present = False
+                        self.definition_pending = False
+                        return bootstrap._RestResponse(204, b"", {})
+                    raise AssertionError(f"unexpected role method: {method}")
+
+            current = [NOW]
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0, current[0] + dt.timedelta(seconds=seconds)
+            )
+            session = Definition500Session()
+            transport.session = session
+            self._bind_temporary_role_test_ledger(transport, receipt)
+            transport._active_operation_id = operation["id"]
+            with self.assertRaises(
+                bootstrap.OwnedTemporaryMutationError
+            ) as raised:
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["details"]["definitionAmbiguous"])
+            self.assertFalse(proof["details"]["definitionCreated"])
+            state = {"proofs": {operation["id"]: proof}}
+            with (
+                mock.patch.object(transport, "_verify_cleanup_lock_inventory"),
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ),
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(
+                    operation, proof, state
+                )
+            self.assertEqual(cleanup["status"], "removed-exact")
+            self.assertEqual(
+                [call for call in session.calls if call[0] == "DELETE"],
+                [("DELETE", definition_url)],
+            )
+
+    def test_assignment_500_then_late_exact_is_owned_and_removed_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            assignment_resource, assignment = (
+                self._temporary_package_assignment_document(
+                    transport, definition_resource
+                )
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            assignment_url = transport._arm_url(
+                assignment_resource, "2022-04-01"
+            )
+
+            class Assignment500Session:
+                def __init__(self):
+                    self.definition_present = False
+                    self.assignment_gets = 0
+                    self.assignment_pending = False
+                    self.assignment_present = False
+                    self.calls = []
+
+                def request(self, method, url, **_kwargs):
+                    self.calls.append((method, url))
+                    if url == definition_url:
+                        if method == "GET":
+                            return (
+                                bootstrap._RestResponse(
+                                    200,
+                                    bootstrap.canonical_json_bytes(definition),
+                                    {},
+                                )
+                                if self.definition_present
+                                else bootstrap._RestResponse(404, b"", {})
+                            )
+                        if method == "PUT":
+                            self.definition_present = True
+                            return bootstrap._RestResponse(201, b"", {})
+                        if method == "DELETE":
+                            self.definition_present = False
+                            return bootstrap._RestResponse(204, b"", {})
+                    if url == assignment_url:
+                        if method == "GET":
+                            self.assignment_gets += 1
+                            if self.assignment_pending and self.assignment_gets >= 3:
+                                self.assignment_present = True
+                            return (
+                                bootstrap._RestResponse(
+                                    200,
+                                    bootstrap.canonical_json_bytes(assignment),
+                                    {},
+                                )
+                                if self.assignment_present
+                                else bootstrap._RestResponse(404, b"", {})
+                            )
+                        if method == "PUT":
+                            self.assignment_pending = True
+                            return bootstrap._RestResponse(500, b"", {})
+                    raise AssertionError(f"unexpected role request: {method} {url}")
+
+            current = [NOW]
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0, current[0] + dt.timedelta(seconds=seconds)
+            )
+            session = Assignment500Session()
+            transport.session = session
+            self._bind_temporary_role_test_ledger(transport, receipt)
+            transport._active_operation_id = operation["id"]
+            with self.assertRaises(
+                bootstrap.OwnedTemporaryMutationError
+            ) as raised:
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["details"]["definitionCreated"])
+            self.assertTrue(proof["details"]["assignmentAmbiguous"])
+            self.assertFalse(proof["details"]["assignmentCreated"])
+            state = {"proofs": {operation["id"]: proof}}
+
+            def delete_exact_assignment(*_args, **_kwargs):
+                session.assignment_present = False
+                session.assignment_pending = False
+                transport._last_guarded_assignment_was_present = True
+                return bootstrap._expected_deletion_lock_proof(
+                    "removeOwnedUploaderPackageRole"
+                )
+
+            with (
+                mock.patch.object(
+                    transport,
+                    "_guarded_assignment_delete",
+                    side_effect=delete_exact_assignment,
+                ) as guarded_delete,
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ),
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(
+                    operation, proof, state
+                )
+            self.assertEqual(cleanup["status"], "removed-exact")
+            guarded_delete.assert_called_once()
+            self.assertEqual(
+                [call for call in session.calls if call[0] == "DELETE"],
+                [("DELETE", definition_url)],
+            )
+
+    def test_definition_201_stale_readback_settles_late_exact_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            assignment_resource, _assignment = (
+                self._temporary_package_assignment_document(
+                    transport, definition_resource
+                )
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            assignment_url = transport._arm_url(
+                assignment_resource, "2022-04-01"
+            )
+            current = [NOW]
+            visible_at = NOW + dt.timedelta(
+                seconds=bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+            alignment_jitter = dt.timedelta(milliseconds=1)
+
+            class Definition201StaleSession:
+                def __init__(self):
+                    self.pending = False
+                    self.present = False
+                    self.calls = []
+
+                def request(self, method, url, **kwargs):
+                    self.calls.append(
+                        (method, url, kwargs.get("deadline"), current[0])
+                    )
+                    if url == assignment_url and method == "GET":
+                        return bootstrap._RestResponse(404, b"", {})
+                    if url != definition_url:
+                        raise AssertionError(f"unexpected role URL: {url}")
+                    if method == "GET":
+                        if (
+                            self.pending
+                            and not self.present
+                            and kwargs.get("deadline")
+                            == visible_at
+                            and current[0] < visible_at
+                        ):
+                            # A long pre-boundary GET returns a stale 404. The
+                            # settlement loop must still reserve a new GET that
+                            # begins at the boundary.
+                            current[0] += dt.timedelta(
+                                seconds=(
+                                    bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                                    - 1
+                                )
+                            )
+                        if self.pending and current[0] >= visible_at:
+                            self.present = True
+                        return (
+                            bootstrap._RestResponse(
+                                200,
+                                bootstrap.canonical_json_bytes(definition),
+                                {},
+                            )
+                            if self.present
+                            else bootstrap._RestResponse(404, b"", {})
+                        )
+                    if method == "PUT":
+                        self.pending = True
+                        return bootstrap._RestResponse(201, b"", {})
+                    if method == "DELETE":
+                        self.pending = False
+                        self.present = False
+                        return bootstrap._RestResponse(204, b"", {})
+                    raise AssertionError(f"unexpected role method: {method}")
+
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0,
+                current[0]
+                + dt.timedelta(seconds=seconds)
+                + alignment_jitter,
+            )
+            session = Definition201StaleSession()
+            transport.session = session
+            self._bind_temporary_role_test_ledger(transport, receipt)
+            transport._active_operation_id = operation["id"]
+            with self.assertRaises(
+                bootstrap.OwnedTemporaryMutationError
+            ) as raised:
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["details"]["definitionCreated"])
+            self.assertFalse(proof["details"]["definitionReadbackExact"])
+            self.assertFalse(proof["details"]["assignmentAttempted"])
+            state = {"proofs": {operation["id"]: proof}}
+            with (
+                mock.patch.object(transport, "_verify_cleanup_lock_inventory"),
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ) as marker_proof,
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(
+                    operation, proof, state
+                )
+            self.assertEqual(cleanup["status"], "removed-exact")
+            self.assertEqual(
+                [call[:2] for call in session.calls if call[0] == "DELETE"],
+                [("DELETE", definition_url)],
+            )
+            self.assertTrue(
+                any(
+                    method == "GET"
+                    and url == definition_url
+                    and observed_at == visible_at + alignment_jitter
+                    and deadline
+                    == observed_at
+                    + dt.timedelta(
+                        seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                    for method, url, deadline, observed_at in session.calls
+                )
+            )
+            marker_proof.assert_called_once()
+
+    def test_assignment_201_stale_readback_settles_late_exact_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            assignment_resource, assignment = (
+                self._temporary_package_assignment_document(
+                    transport, definition_resource
+                )
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            assignment_url = transport._arm_url(
+                assignment_resource, "2022-04-01"
+            )
+            current = [NOW]
+            visible_at = NOW + dt.timedelta(
+                seconds=bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+
+            class Assignment201StaleSession:
+                def __init__(self):
+                    self.definition_present = False
+                    self.assignment_pending = False
+                    self.assignment_present = False
+                    self.calls = []
+
+                def request(self, method, url, **kwargs):
+                    self.calls.append((method, url, kwargs.get("deadline")))
+                    if url == definition_url:
+                        if method == "GET":
+                            return (
+                                bootstrap._RestResponse(
+                                    200,
+                                    bootstrap.canonical_json_bytes(definition),
+                                    {},
+                                )
+                                if self.definition_present
+                                else bootstrap._RestResponse(404, b"", {})
+                            )
+                        if method == "PUT":
+                            self.definition_present = True
+                            return bootstrap._RestResponse(201, b"", {})
+                        if method == "DELETE":
+                            self.definition_present = False
+                            return bootstrap._RestResponse(204, b"", {})
+                    if url == assignment_url:
+                        if method == "GET":
+                            if self.assignment_pending and current[0] >= visible_at:
+                                self.assignment_present = True
+                            return (
+                                bootstrap._RestResponse(
+                                    200,
+                                    bootstrap.canonical_json_bytes(assignment),
+                                    {},
+                                )
+                                if self.assignment_present
+                                else bootstrap._RestResponse(404, b"", {})
+                            )
+                        if method == "PUT":
+                            self.assignment_pending = True
+                            return bootstrap._RestResponse(201, b"", {})
+                    raise AssertionError(
+                        f"unexpected role request: {method} {url}"
+                    )
+
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0, current[0] + dt.timedelta(seconds=seconds)
+            )
+            session = Assignment201StaleSession()
+            transport.session = session
+            self._bind_temporary_role_test_ledger(transport, receipt)
+            transport._active_operation_id = operation["id"]
+            with self.assertRaises(
+                bootstrap.OwnedTemporaryMutationError
+            ) as raised:
+                transport._mutate_temporary_role_impl(operation["id"], {})
+            proof = raised.exception.proof
+            self.assertTrue(proof["details"]["definitionReadbackExact"])
+            self.assertTrue(proof["details"]["assignmentCreated"])
+            self.assertFalse(proof["details"]["assignmentReadbackExact"])
+            state = {"proofs": {operation["id"]: proof}}
+
+            def delete_exact_assignment(*_args, **_kwargs):
+                session.assignment_pending = False
+                session.assignment_present = False
+                transport._last_guarded_assignment_was_present = True
+                return bootstrap._expected_deletion_lock_proof(
+                    "removeOwnedUploaderPackageRole"
+                )
+
+            with (
+                mock.patch.object(
+                    transport,
+                    "_guarded_assignment_delete",
+                    side_effect=delete_exact_assignment,
+                ) as guarded_delete,
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ) as marker_proof,
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(
+                    operation, proof, state
+                )
+            self.assertEqual(cleanup["status"], "removed-exact")
+            guarded_delete.assert_called_once()
+            self.assertEqual(
+                [call[:2] for call in session.calls if call[0] == "DELETE"],
+                [("DELETE", definition_url)],
+            )
+            marker_proof.assert_called_once()
+
+    def test_pending_definition_final_get_cannot_enter_cleanup_reserve(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            assignment_resource, _assignment = (
+                self._temporary_package_assignment_document(
+                    transport, definition_resource
+                )
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            assignment_url = transport._arm_url(
+                assignment_resource, "2022-04-01"
+            )
+            start = transport._protected_role_deadline() - dt.timedelta(
+                seconds=(
+                    bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+                    + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                    + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+            )
+            current = [start]
+            boundary = start + dt.timedelta(
+                seconds=bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+            final_request_deadline = boundary + dt.timedelta(
+                seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
+
+            class SlowFinalSettlementSession:
+                def __init__(self):
+                    self.calls = []
+
+                def request(self, method, url, **kwargs):
+                    self.calls.append((method, url, kwargs.get("deadline")))
+                    if method != "GET":
+                        raise AssertionError("settlement issued a mutation")
+                    if url == assignment_url:
+                        return bootstrap._RestResponse(404, b"", {})
+                    if url != definition_url:
+                        raise AssertionError(f"unexpected role URL: {url}")
+                    if current[0] >= boundary:
+                        current[0] += dt.timedelta(
+                            seconds=(
+                                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                                + 1
+                            )
+                        )
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(definition),
+                            {},
+                        )
+                    return bootstrap._RestResponse(404, b"", {})
+
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0, current[0] + dt.timedelta(seconds=seconds)
+            )
+            session = SlowFinalSettlementSession()
+            transport.session = session
+            transport._active_protected_role_add = operation["id"]
+            proof = {
+                "operationId": operation["id"],
+                "status": "applied-readback-pending",
+                "owned": True,
+                "cleanupKey": "uploader-package-role",
+                "details": {
+                    "cleanupKey": "uploader-package-role",
+                    "definitionAttempted": True,
+                    "definitionCreated": False,
+                    "definitionReadbackExact": False,
+                    "definitionAmbiguous": True,
+                    "assignmentAttempted": False,
+                    "assignmentCreated": False,
+                    "assignmentReadbackExact": False,
+                },
+            }
+            state = {"proofs": {operation["id"]: proof}}
+            with (
+                mock.patch.object(transport, "_arm_delete") as delete,
+                self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "read-only response crossed the protected request deadline",
+                ),
+            ):
+                transport.compensate_temporary(operation, proof, state)
+            delete.assert_not_called()
+            self.assertEqual(
+                session.calls[-1][2],
+                final_request_deadline,
+            )
+            self.assertTrue(
+                all(
+                    deadline <= transport._protected_role_deadline()
+                    for _method, _url, deadline in session.calls
+                )
+            )
+            self.assertGreater(current[0], final_request_deadline)
+
+    def test_pending_definition_rejects_alignment_overshoot_beyond_slack(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            definition_url = transport._arm_url(
+                definition_resource, "2022-04-01"
+            )
+            current = [NOW]
+            settlement_boundary = NOW + dt.timedelta(
+                seconds=bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+            overshoot = dt.timedelta(
+                seconds=(
+                    bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                    + 0.001
+                )
+            )
+
+            class AbsentDefinitionSession:
+                def __init__(self):
+                    self.calls = []
+
+                def request(self, method, url, **kwargs):
+                    self.calls.append(
+                        (method, url, kwargs.get("deadline"), current[0])
+                    )
+                    if method != "GET" or url != definition_url:
+                        raise AssertionError(
+                            f"unexpected role request: {method} {url}"
+                        )
+                    return bootstrap._RestResponse(404, b"", {})
+
+            transport.clock = lambda: current[0]
+            transport.sleep = lambda seconds: current.__setitem__(
+                0,
+                current[0] + dt.timedelta(seconds=seconds) + overshoot,
+            )
+            session = AbsentDefinitionSession()
+            transport.session = session
+            transport._active_protected_role_add = operation["id"]
+            proof = {
+                "operationId": operation["id"],
+                "status": "applied-readback-pending",
+                "owned": True,
+                "cleanupKey": "uploader-package-role",
+                "details": {
+                    "cleanupKey": "uploader-package-role",
+                    "definitionAttempted": True,
+                    "definitionCreated": False,
+                    "definitionReadbackExact": False,
+                    "definitionAmbiguous": True,
+                    "assignmentAttempted": False,
+                    "assignmentCreated": False,
+                    "assignmentReadbackExact": False,
+                },
+            }
+            state = {"proofs": {operation["id"]: proof}}
+            with (
+                mock.patch.object(transport, "_arm_delete") as delete,
+                self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "settlement clock is invalid",
+                ),
+            ):
+                transport.compensate_temporary(operation, proof, state)
+            delete.assert_not_called()
+            self.assertTrue(session.calls)
+            self.assertTrue(
+                all(observed_at < settlement_boundary for *_, observed_at in session.calls)
+            )
+
+    def test_definition_409_412_and_200_are_unowned_and_never_deleted(self):
+        for status in (409, 412, 200):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder:
+                receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+                transport, operation, definition_resource, _definition = (
+                    self._temporary_role_transport_fixture(receipt)
+                )
+                definition_url = transport._arm_url(
+                    definition_resource, "2022-04-01"
+                )
+
+                class DefinitionStatusSession:
+                    def __init__(self):
+                        self.calls = []
+
+                    def request(self, method, url, **_kwargs):
+                        self.calls.append((method, url))
+                        if method == "GET" and url == definition_url:
+                            return bootstrap._RestResponse(404, b"", {})
+                        if method == "PUT" and url == definition_url:
+                            return bootstrap._RestResponse(status, b"", {})
+                        raise AssertionError(f"unexpected role request: {method} {url}")
+
+                session = DefinitionStatusSession()
+                transport.session = session
+                self._bind_temporary_role_test_ledger(transport, receipt)
+                transport._active_operation_id = operation["id"]
+                with self.assertRaises(bootstrap.BootstrapError) as raised:
+                    transport._mutate_temporary_role_impl(operation["id"], {})
+                self.assertNotIsInstance(
+                    raised.exception, bootstrap.OwnedTemporaryMutationError
+                )
+                self.assertNotIsInstance(
+                    raised.exception, bootstrap._MutationOwnershipAmbiguity
+                )
+                self.assertEqual(
+                    [call for call in session.calls if call[0] == "DELETE"], []
+                )
+
+    def test_assignment_409_412_and_200_preserve_unowned_assignment_and_definition(self):
+        for status in (409, 412, 200):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder:
+                receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+                transport, operation, definition_resource, definition = (
+                    self._temporary_role_transport_fixture(receipt)
+                )
+                assignment_resource, assignment = (
+                    self._temporary_package_assignment_document(
+                        transport, definition_resource
+                    )
+                )
+                definition_url = transport._arm_url(
+                    definition_resource, "2022-04-01"
+                )
+                assignment_url = transport._arm_url(
+                    assignment_resource, "2022-04-01"
+                )
+
+                class AssignmentStatusSession:
+                    def __init__(self):
+                        self.definition_present = False
+                        self.assignment_present = False
+                        self.calls = []
+
+                    def request(self, method, url, **_kwargs):
+                        self.calls.append((method, url))
+                        if url == definition_url:
+                            if method == "GET":
+                                return (
+                                    bootstrap._RestResponse(
+                                        200,
+                                        bootstrap.canonical_json_bytes(definition),
+                                        {},
+                                    )
+                                    if self.definition_present
+                                    else bootstrap._RestResponse(404, b"", {})
+                                )
+                            if method == "PUT":
+                                self.definition_present = True
+                                return bootstrap._RestResponse(201, b"", {})
+                        if url == assignment_url:
+                            if method == "GET":
+                                return (
+                                    bootstrap._RestResponse(
+                                        200,
+                                        bootstrap.canonical_json_bytes(assignment),
+                                        {},
+                                    )
+                                    if self.assignment_present
+                                    else bootstrap._RestResponse(404, b"", {})
+                                )
+                            if method == "PUT":
+                                # The explicit non-create response is modeled as
+                                # a concurrent exact assignment. This request
+                                # never owns it and cleanup must not delete it or
+                                # the referenced definition.
+                                self.assignment_present = True
+                                return bootstrap._RestResponse(status, b"", {})
+                        raise AssertionError(
+                            f"unexpected role request: {method} {url}"
+                        )
+
+                session = AssignmentStatusSession()
+                transport.session = session
+                self._bind_temporary_role_test_ledger(transport, receipt)
+                transport._active_operation_id = operation["id"]
+                with self.assertRaises(
+                    bootstrap.OwnedTemporaryMutationError
+                ) as raised:
+                    transport._mutate_temporary_role_impl(operation["id"], {})
+                proof = raised.exception.proof
+                self.assertTrue(proof["details"]["definitionCreated"])
+                self.assertFalse(proof["details"]["assignmentCreated"])
+                self.assertNotIn("assignmentAmbiguous", proof["details"])
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "unowned temporary role assignment is present",
+                ):
+                    transport.compensate_temporary(
+                        operation,
+                        proof,
+                        {"proofs": {operation["id"]: proof}},
+                    )
+                self.assertEqual(
+                    [call for call in session.calls if call[0] == "DELETE"], []
+                )
+                self.assertTrue(session.definition_present)
+                self.assertTrue(session.assignment_present)
+
+    def test_temporary_role_provisional_compensation_accepts_absence_and_rejects_third_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            receipt = Path(folder) / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+            transport, operation, _definition_resource, definition = (
+                self._temporary_role_transport_fixture(receipt)
+            )
+            proof = {
+                "operationId": operation["id"],
+                "status": "applied-readback-pending",
+                "owned": True,
+                "cleanupKey": "uploader-package-role",
+                "details": {
+                    "cleanupKey": "uploader-package-role",
+                    "definitionAttempted": True,
+                    "definitionCreated": False,
+                    "definitionAmbiguous": True,
+                    "assignmentAttempted": False,
+                    "assignmentCreated": False,
+                },
+            }
+            state = {"proofs": {operation["id"]: proof}}
+
+            def absent_assignment(*_args, **_kwargs):
+                transport._last_guarded_assignment_was_present = False
+                return bootstrap._expected_deletion_lock_proof(
+                    "removeOwnedUploaderPackageRole"
+                )
+
+            transport._active_protected_role_add = operation["id"]
+            absent_responses = iter(
+                [bootstrap._RestResponse(404, b"", {}) for _ in range(4)]
+            )
+            with (
+                mock.patch.object(
+                    bootstrap, "TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS", 0
+                ),
+                mock.patch.object(
+                    transport,
+                    "_read_request_with_transport_retry",
+                    side_effect=lambda *_args, **_kwargs: next(absent_responses),
+                ),
+                mock.patch.object(
+                    transport,
+                    "_guarded_assignment_delete",
+                    side_effect=absent_assignment,
+                ),
+                mock.patch.object(
+                    transport, "_verify_cleanup_lock_inventory"
+                ),
+                mock.patch.object(transport, "_arm_delete") as delete,
+                mock.patch.object(
+                    transport,
+                    "_prove_temporary_role_marker_inventories_absent",
+                    return_value="0" * 64,
+                ),
+                mock.patch.object(transport, "_prove_probe_ids", return_value=[]),
+            ):
+                cleanup = transport.compensate_temporary(operation, proof, state)
+            self.assertEqual(cleanup["status"], "removed-exact")
+            delete.assert_not_called()
+
+            drifted = copy.deepcopy(definition)
+            drifted["properties"]["description"] = "marker-drifted"
+            transport._active_protected_role_add = operation["id"]
+            drifted_responses = iter(
+                [
+                    bootstrap._RestResponse(
+                        200, bootstrap.canonical_json_bytes(drifted), {}
+                    ),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    bootstrap, "TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS", 0
+                ),
+                mock.patch.object(
+                    transport,
+                    "_read_request_with_transport_retry",
+                    side_effect=lambda *_args, **_kwargs: next(drifted_responses),
+                ),
+                mock.patch.object(
+                    transport,
+                    "_guarded_assignment_delete",
+                    side_effect=absent_assignment,
+                ),
+                mock.patch.object(
+                    transport, "_verify_cleanup_lock_inventory"
+                ),
+                mock.patch.object(transport, "_arm_delete") as delete,
+                self.assertRaisesRegex(bootstrap.BootstrapError, "third state"),
+            ):
+                transport.compensate_temporary(operation, proof, state)
+            delete.assert_not_called()
+
+    def _retired_role_gate_fixture(self):
+        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
+        retired_urls = []
+        for spec in bootstrap.RETIRED_TEMPORARY_ROLE_SPECS:
+            scope = resources[spec["scopeResourceKey"]]["resourceId"]
+            retired_urls.extend(
+                (
+                    (
+                        "definition",
+                        "https://management.azure.com/subscriptions/"
+                        f"{bootstrap.SUBSCRIPTION}/providers/"
+                        "Microsoft.Authorization/roleDefinitions/"
+                        f"{spec['definitionId']}?api-version=2022-04-01",
+                    ),
+                    (
+                        "assignment",
+                        "https://management.azure.com"
+                        f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+                        f"{spec['assignmentId']}?api-version=2022-04-01",
+                    ),
+                )
+            )
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+                self.present_urls = set()
+                self.marker_documents = {}
+
+            def request(self, method, url, **kwargs):
+                if method != "GET" or kwargs.get("body") is not None:
+                    raise AssertionError("retired-role gate lost its read-only shape")
+                marker_urls = {
+                    item["url"]
+                    for item in bootstrap._temporary_role_marker_inventory_requests()
+                }
+                if url in marker_urls:
+                    self.calls.append(url)
+                    return bootstrap._RestResponse(
+                        200,
+                        bootstrap.canonical_json_bytes(
+                            self.marker_documents.get(url, {"value": []})
+                        ),
+                        {"content-type": "application/json"},
+                    )
+                if url not in {item[1] for item in retired_urls}:
+                    raise AssertionError(f"unexpected retired-role gate URL: {url}")
+                self.calls.append(url)
+                status = 200 if url in self.present_urls else 404
+                return bootstrap._RestResponse(
+                    status=status,
+                    body=bootstrap.canonical_json_bytes(
+                        {
+                            "error": {
+                                "code": "RetiredRoleStillPresent"
+                                if status == 200
+                                else "NotFound"
+                            }
+                        }
+                    ),
+                    headers={"content-type": "application/json"},
+                )
+
+        session = Session()
+        preflight = {
+            "projection": {
+                "operationAdmissions": [],
+                "postconditionAdmissions": [],
+                "probes": [],
+                "productionBoundaryObservation": {
+                    "probeIds": [],
+                    "sourceProjection": {},
+                },
+            }
+        }
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization={
+                "authorizationId": AUTH_ID,
+                "validity": {
+                    "expiresAt": stamp(NOW + dt.timedelta(minutes=30))
+                }
+            },
+            plan=self.plan,
+            package={},
+            preflight=preflight,
+            clock=lambda: NOW,
+            session=session,
+        )
+        transport._collect_production_boundary = lambda: ({}, {})
+        return transport, session, retired_urls
+
+    def test_retired_temporary_role_gate_accepts_all_exact_404s(self):
+        transport, session, retired_urls = self._retired_role_gate_fixture()
+        self.assertEqual(len(retired_urls), 16)
+        self.assertEqual(len({url for _kind, url in retired_urls}), 16)
+
+        transport.collect_preflight(self.plan)
+
+        self.assertEqual(
+            session.calls,
+            [
+                item["url"]
+                for item in bootstrap._temporary_role_marker_inventory_requests()
+            ]
+            + [url for _kind, url in retired_urls],
+        )
+        self.assertEqual(
+            len(transport._retired_role_absence_preflight), len(retired_urls)
+        )
+        self.assertTrue(
+            all(
+                item["status"] == 404
+                for item in transport._retired_role_absence_preflight
+            )
+        )
+
+    def test_authorized_retired_role_absence_rejects_non_exact_projection(self):
+        base = build_projection(self.plan, self.package)
+        field = base["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ]
+        variants = {}
+        omitted = copy.deepcopy(base)
+        omitted["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ].pop()
+        variants["omitted-resource"] = omitted
+        duplicate = copy.deepcopy(base)
+        duplicate_field = duplicate["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ]
+        duplicate_field[1] = copy.deepcopy(duplicate_field[0])
+        variants["duplicate-resource"] = duplicate
+        replacement = copy.deepcopy(base)
+        replacement["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ][0]["url"] = field[1]["url"]
+        variants["replacement-resource"] = replacement
+        status_drift = copy.deepcopy(base)
+        status_drift["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ][0]["status"] = 200
+        variants["status-drift"] = status_drift
+        timestamp_drift = copy.deepcopy(base)
+        timestamp_drift["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ][0]["observedAt"] = stamp(NOW + dt.timedelta(seconds=1))
+        variants["timestamp-drift"] = timestamp_drift
+        missing_digest = copy.deepcopy(base)
+        del missing_digest["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ][0]["responseSha256"]
+        variants["missing-digest"] = missing_digest
+
+        for name, projection in variants.items():
+            with self.subTest(variant=name), tempfile.TemporaryDirectory() as folder:
+                authorization = build_authorization(
+                    self.plan,
+                    self.plan_sha,
+                    self.package,
+                    projection,
+                    Path(folder) / "receipt",
+                )
+                preflight = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"]["observedAt"],
+                    "projection": projection,
+                    "projectionSha256": authorization["observedPreflight"]["sha256"],
+                }
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, authorization, self.plan
+                    )
+
+    def test_any_retired_temporary_role_blocks_fresh_preflight(self):
+        for kind, present_url in self._retired_role_gate_fixture()[2]:
+            with self.subTest(kind=kind, url=present_url):
+                transport, session, _retired_urls = self._retired_role_gate_fixture()
+                session.present_urls.add(present_url)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    f"fresh preflight found a retired temporary role {kind}",
+                ):
+                    transport.collect_preflight(self.plan)
+                self.assertIn(present_url, session.calls)
+
+    def test_any_retired_temporary_role_reappearance_blocks_terminal_boundary(self):
+        for kind, present_url in self._retired_role_gate_fixture()[2]:
+            with self.subTest(kind=kind, url=present_url):
+                transport, session, _retired_urls = self._retired_role_gate_fixture()
+                transport.collect_preflight(self.plan)
+                session.calls.clear()
+                session.present_urls.add(present_url)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    f"terminal boundary found a retired temporary role {kind}",
+                ):
+                    transport.observe_production_boundary()
+                self.assertIn(present_url, session.calls)
+
+    def test_prior_authorization_marker_blocks_fresh_and_terminal_inventories(self):
+        prior_authorization_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        prior_metadata = bootstrap._temporary_role_metadata(
+            prior_authorization_id, "uploader-package-role"
+        )
+        marker_requests = {
+            item["kind"]: item["url"]
+            for item in bootstrap._temporary_role_marker_inventory_requests()
+        }
+        documents = [
+            (
+                "definitionInventory",
+                {
+                "value": [
+                    {
+                        "id": (
+                            f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+                            "Microsoft.Authorization/roleDefinitions/"
+                            "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+                        ),
+                        "properties": {
+                            "roleName": prior_metadata["roleName"],
+                            "description": prior_metadata["description"],
+                        },
+                    }
+                ]
+                },
+            )
+        ]
+        for kind, marker_url in marker_requests.items():
+            if not kind.startswith("assignmentInventory:"):
+                continue
+            scope_url = marker_url.split(
+                "/providers/Microsoft.Authorization/roleAssignments?", 1
+            )[0]
+            scope_resource_id = scope_url.removeprefix(
+                "https://management.azure.com"
+            )
+            documents.append(
+                (
+                    kind,
+                    {
+                        "value": [
+                            {
+                                "id": (
+                                    f"{scope_resource_id}/providers/"
+                                    "Microsoft.Authorization/roleAssignments/"
+                                    "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                                ),
+                                "properties": {
+                                    "description": prior_metadata[
+                                        "assignmentDescription"
+                                    ],
+                                    "roleDefinitionId": (
+                                        f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+                                        "Microsoft.Authorization/roleDefinitions/"
+                                        "ffffffff-ffff-4fff-8fff-ffffffffffff"
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                )
+            )
+        for phase in ("fresh", "terminal"):
+            for kind, document in documents:
+                with self.subTest(phase=phase, kind=kind):
+                    transport, session, _retired_urls = self._retired_role_gate_fixture()
+                    if phase == "terminal":
+                        transport.collect_preflight(self.plan)
+                        session.calls.clear()
+                    marker_url = marker_requests[kind]
+                    session.marker_documents[marker_url] = document
+                    residual_kind = (
+                        "definition" if kind == "definitionInventory" else "assignment"
+                    )
+                    with self.assertRaisesRegex(
+                        bootstrap.BootstrapError,
+                        f"residual PaperDesk temporary role {residual_kind}",
+                    ):
+                        if phase == "fresh":
+                            transport.collect_preflight(self.plan)
+                        else:
+                            transport.observe_production_boundary()
+                    self.assertIn(marker_url, session.calls)
+
+    def test_transport_terminal_source_builder_uses_raw_reviewed_plan(self):
+        transport, _session, _retired_urls = self._retired_role_gate_fixture()
+        raw_temporary = transport.reviewed_plan["temporaryAccess"]
+        bound_temporary = transport.plan["temporaryAccess"]
+        self.assertNotIn("roleDefinitionId", raw_temporary)
+        self.assertIn("roleDefinitionId", bound_temporary)
+        self.assertEqual(transport.reviewed_plan, self.plan)
+
+        transport.collect_preflight(self.plan)
+        transport.observe_production_boundary()
+        transport._package_readback_bytes = b"exact-package"
+        transport._validated_source_projections = []
+        state = {
+            "operationStatuses": {},
+            "operationObservedAt": {},
+            "postconditionProjections": [],
+            "productionBoundaryPostExecution": {},
+        }
+        with (
+            mock.patch.object(
+                transport,
+                "_journal_source_projection",
+                return_value={"mutationJournal": []},
+            ),
+            mock.patch.object(
+                bootstrap,
+                "build_terminal_source_evidence",
+                return_value={"status": "sentinel"},
+            ) as builder,
+        ):
+            result = transport.finalize_terminal_source_evidence(
+                state,
+                claimed_at=stamp(NOW),
+                observed_at=stamp(NOW + dt.timedelta(seconds=1)),
+            )
+
+        self.assertEqual(result, {"status": "sentinel"})
+        supplied_plan = builder.call_args.kwargs["plan"]
+        self.assertEqual(supplied_plan, self.plan)
+        self.assertNotIn("roleDefinitionId", supplied_plan["temporaryAccess"])
+
+    def test_plan_keeps_protected_role_lifecycles_non_overlapping(self):
+        mutation_ids = [item["id"] for item in self.plan["mutations"]]
+        expected_phase = [
+            "addOwnedOperatorControllerCanaryRole",
+            "proveControllerLockContainerEmpty",
+            "createControllerLeaseCanaryBlob",
+            "exerciseControllerLeaseCanary",
+            "removeControllerLeaseCanaryBlob",
+            "removeOwnedOperatorControllerCanaryRole",
+            "addOwnedUploaderPackageRole",
+            "uploadVersionedBridgePackage",
+            "removeOwnedUploaderPackageRole",
+            "addOwnedOperatorKeyReadRole",
+            "readBackExactSigningPublicJwk",
+            "removeOwnedOperatorKeyReadRole",
+            "addOwnedOperatorFenceBootstrapRole",
+            "createInitialIdleActivationFence",
+            "removeOwnedOperatorFenceBootstrapRole",
+        ]
+        self.assertEqual(
+            [item for item in mutation_ids if item in set(expected_phase)],
+            expected_phase,
+        )
+        active = None
+        maximum_active = 0
+        for mutation_id in mutation_ids:
+            if mutation_id in bootstrap.PROTECTED_ROLE_LIFECYCLES:
+                self.assertIsNone(active)
+                active = mutation_id
+            elif mutation_id in bootstrap.PROTECTED_ROLE_LIFECYCLES.values():
+                self.assertIsNotNone(active)
+                self.assertEqual(
+                    bootstrap.PROTECTED_ROLE_LIFECYCLES[active], mutation_id
+                )
+                active = None
+            maximum_active = max(maximum_active, int(active is not None))
+        self.assertIsNone(active)
+        self.assertEqual(maximum_active, 1)
 
     def test_existing_registry_role_metadata_is_canonical_without_authority_drift(self):
         definitions = bootstrap._custom_role_definition_specs(self.plan)
@@ -2919,12 +4634,19 @@ class BootstrapTests(unittest.TestCase):
         source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._mutate
         )
-        self.assertEqual(source.count("_if_match_etag("), 6)
+        self.assertEqual(source.count("_if_match_etag("), 7)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
 
     def test_bridge_conditional_writes_send_quoted_raw_arm_etags(self):
         projection = build_projection(self.plan, self.package)
+        configure_context = next(
+            item["context"]
+            for item in projection["operationAdmissions"]
+            if item["operationId"]
+            == "configureBridgeExactVersionedPackageAndCriticalSettings"
+        )
+        configure_context["preAppSettingsEtag"] = "1DD39E07D4DEF60"
         receipt = Path("C:/outside") / (
             f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
         )
@@ -3981,7 +5703,7 @@ class BootstrapTests(unittest.TestCase):
         projection = build_projection(self.plan, self.package)
         operation_id = "addOwnedUploaderPackageRole"
         definition_url = bootstrap._temporary_role_definition_readback_url(
-            operation_id, self.plan
+            operation_id, bootstrap.bind_temporary_role_ids(self.plan, AUTH_ID)
         )
         self.assertIsNotNone(definition_url)
         admission = next(
@@ -4061,6 +5783,12 @@ class BootstrapTests(unittest.TestCase):
     def test_deletion_lock_residual_acceptance_exact_reviewed_wording(self):
         self.assertEqual(bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE,
                          EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE)
+
+    def test_bridge_config_hard_death_acceptance_exact_reviewed_wording(self):
+        self.assertEqual(
+            bootstrap.BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE,
+            EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE,
+        )
 
     def test_previous_two_lock_confirmation_cannot_authorize_three_lock_plan(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -4539,6 +6267,15 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(applied[0], "claimAzureSingleUseAuthorization")
             self.assertEqual(applied[-1], "createSolePublisherFicToSignedBootstrapSource")
             self.assertEqual(result.status, "complete")
+            self.assertEqual(result.temporary_cleanup, [])
+            self.assertNotIn(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                [
+                    value
+                    for kind, value in transport.calls
+                    if kind == "compensate"
+                ],
+            )
             self.assertEqual(
                 result.terminal_bundle_path,
                 self.plan["evidenceOutputs"]["terminalBundlePath"],
@@ -4592,6 +6329,14 @@ class BootstrapTests(unittest.TestCase):
             apply_calls = [
                 value for kind, value in transport.calls if kind == "apply"
             ]
+            self.assertNotIn(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                [
+                    value
+                    for kind, value in transport.calls
+                    if kind == "compensate"
+                ],
+            )
 
             resumed = bootstrap.resume_local_finalization_from_snapshot(
                 plan=self.plan,
@@ -4634,6 +6379,14 @@ class BootstrapTests(unittest.TestCase):
             apply_calls = [
                 value for kind, value in transport.calls if kind == "apply"
             ]
+            self.assertNotIn(
+                "configureBridgeExactVersionedPackageAndCriticalSettings",
+                [
+                    value
+                    for kind, value in transport.calls
+                    if kind == "compensate"
+                ],
+            )
             resumed = bootstrap.resume_local_finalization_from_snapshot(
                 plan=self.plan,
                 plan_sha256=self.plan_sha,
@@ -4646,6 +6399,32 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(
                 [value for kind, value in transport.calls if kind == "apply"],
                 apply_calls,
+            )
+
+    def test_failure_before_terminal_source_snapshot_rolls_back_bridge_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, validated, preflight, projection, receipt = self.fixture(folder)
+            transport = FakeTransport(projection)
+            executor = self.executor(validated, preflight, transport)
+            with mock.patch.object(
+                bootstrap.UseLedger,
+                "persist_terminal_source_input",
+                side_effect=OSError("injected terminal-source fsync failure"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "terminal-source fsync failure"
+                ):
+                    executor.run()
+            self.assertFalse(
+                (receipt / "local-terminal-source-input.json").exists()
+            )
+            self.assertEqual(
+                [
+                    value
+                    for kind, value in transport.calls
+                    if kind == "compensate"
+                ],
+                ["configureBridgeExactVersionedPackageAndCriticalSettings"],
             )
 
     def test_local_finalization_resume_rejects_conflicting_prefix_bytes(self):
@@ -4789,7 +6568,9 @@ class BootstrapTests(unittest.TestCase):
                     self.requests = []
                     self.get_count = 0
 
-                def request(self, method, url, *, body=None, headers=None):
+                def request(
+                    self, method, url, *, body=None, headers=None, deadline=None
+                ):
                     self.requests.append(
                         (method, url, body, dict(headers or {}))
                     )
@@ -4974,7 +6755,9 @@ class BootstrapTests(unittest.TestCase):
                 def __init__(self):
                     self.requests = []
 
-                def request(self, method, url, *, body=None, headers=None):
+                def request(
+                    self, method, url, *, body=None, headers=None, deadline=None
+                ):
                     self.requests.append((method, url, body, dict(headers or {})))
                     if method == "GET":
                         return bootstrap._RestResponse(
@@ -5016,9 +6799,11 @@ class BootstrapTests(unittest.TestCase):
                 side_effect=OSError("simulated result fsync failure"),
             ):
                 with self.assertRaisesRegex(
-                    OSError, "simulated result fsync failure"
-                ):
+                    bootstrap._MutationOwnershipAmbiguity,
+                    "could not be durably journaled",
+                ) as raised:
                     transport._mutate(operation, {})
+            self.assertIsInstance(raised.exception.__cause__, OSError)
             unresolved = ledger.unresolved_intents()
             self.assertEqual(len(unresolved), 1)
             self.assertEqual(unresolved[0]["operationId"], operation["id"])
@@ -5064,6 +6849,80 @@ class BootstrapTests(unittest.TestCase):
                 ["addOwnedUploaderIpv4Rule"],
             )
 
+    def test_expiry_clipped_readiness_failure_compensates_before_expiry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, validated, preflight, projection, _ = self.fixture(folder)
+            transport = FakeTransport(projection)
+            current = [NOW]
+            original_apply = transport.apply_operation
+            original_compensate = transport.compensate_temporary
+
+            def apply(operation, state):
+                if operation["id"] == "addOwnedOperatorControllerCanaryRole":
+                    proof = original_apply(operation, state)
+                    current[0] = validated.expires_at - dt.timedelta(
+                        seconds=(
+                            bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                            + bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+                        )
+                    )
+                    return proof
+                if operation["id"] == "proveControllerLockContainerEmpty":
+                    transport.calls.append(("apply", operation["id"]))
+                    # The last GET begins before the work deadline and consumes
+                    # its entire CLI+HTTP request envelope.
+                    current[0] = validated.expires_at - dt.timedelta(
+                        seconds=(
+                            bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+                            + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        )
+                    )
+                    current[0] += dt.timedelta(
+                        seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                    raise bootstrap.ControllerReadinessError(
+                        "controller lock proof did not converge",
+                        elapsed_seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS,
+                        attempts=38,
+                        status=403,
+                        error_code="AuthorizationPermissionMismatch",
+                        stop_reason="authorization-expired",
+                    )
+                return original_apply(operation, state)
+
+            def compensate(operation, proof, state):
+                self.assertGreaterEqual(
+                    (validated.expires_at - current[0]).total_seconds(),
+                    bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS,
+                )
+                return original_compensate(operation, proof, state)
+
+            executor = bootstrap.BootstrapExecutor(
+                plan=self.plan,
+                plan_sha256=self.plan_sha,
+                package=self.package,
+                authorization=validated,
+                preflight=preflight,
+                transport=transport,
+                now=lambda: current[0],
+                source_validator=self.source,
+            )
+            with (
+                mock.patch.object(transport, "apply_operation", side_effect=apply),
+                mock.patch.object(
+                    transport, "compensate_temporary", side_effect=compensate
+                ),
+                self.assertRaises(bootstrap.ControllerReadinessError),
+            ):
+                executor.run()
+            self.assertEqual(
+                [value for kind, value in transport.calls if kind == "compensate"],
+                [
+                    "addOwnedOperatorControllerCanaryRole",
+                    "addOwnedUploaderIpv4Rule",
+                ],
+            )
+
     def test_failure_compensates_only_owned_temporary_state(self):
         with tempfile.TemporaryDirectory() as folder:
             _, validated, preflight, projection, _ = self.fixture(folder)
@@ -5074,10 +6933,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(
                 compensated,
                 [
-                    "addOwnedOperatorFenceBootstrapRole",
-                    "addOwnedOperatorKeyReadRole",
                     "addOwnedUploaderPackageRole",
-                    "addOwnedOperatorControllerCanaryRole",
                     "addOwnedUploaderIpv4Rule",
                 ],
             )
@@ -5118,6 +6974,16 @@ class BootstrapTests(unittest.TestCase):
                         raise bootstrap.ControllerReadinessError(
                             "controller lock proof did not converge",
                             elapsed_seconds=600, attempts=44, status=403, error_code=code,
+                            attempt_records=[{
+                                "attempt": 44,
+                                "startedAt": "2026-09-02T00:09:15.000Z",
+                                "completedAt": "2026-09-02T00:09:15.125Z",
+                                "durationMs": 125,
+                                "clientRequestId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                                "status": 403, "errorCode": code,
+                                "requestId": None, "serverDate": None,
+                                "outcome": "response", "rawResponse": secret,
+                            }],
                         )
                     return original_apply(operation, state)
 
@@ -5135,6 +7001,16 @@ class BootstrapTests(unittest.TestCase):
                     "attempts": 44, "status": 403, "errorCode": expected,
                     "stopReason": "unknown", "requestId": None, "serverDate": None,
                     "credential": None, "roleReadback": None,
+                    "attemptRecords": [{
+                        "attempt": 44,
+                        "startedAt": "2026-09-02T00:09:15.000Z",
+                        "completedAt": "2026-09-02T00:09:15.125Z",
+                        "durationMs": 125,
+                        "clientRequestId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                        "status": 403, "errorCode": expected,
+                        "requestId": None, "serverDate": None,
+                        "outcome": "response",
+                    }],
                 })
                 self.assertNotIn(secret.encode(), raw)
                 self.assertNotIn(b"private-token", raw)
@@ -5166,7 +7042,9 @@ class BootstrapTests(unittest.TestCase):
                 self.status = status
                 self.requests = []
 
-            def request(self, method, url, *, body=None, headers=None):
+            def request(
+                self, method, url, *, body=None, headers=None, deadline=None
+            ):
                 self.requests.append((method, url, body, dict(headers or {})))
                 return bootstrap._RestResponse(
                     self.status,
@@ -5188,7 +7066,7 @@ class BootstrapTests(unittest.TestCase):
                 "plan": {"sha256": self.plan_sha},
                 "validity": {
                     "notBefore": stamp(NOW - dt.timedelta(minutes=1)),
-                    "expiresAt": stamp(NOW + dt.timedelta(minutes=1)),
+                    "expiresAt": stamp(NOW + dt.timedelta(minutes=2)),
                 },
                 "singleUse": {
                     "azureClaimResourceId": (
@@ -5259,7 +7137,9 @@ class BootstrapTests(unittest.TestCase):
                     self.history_reads = 0
                     self.terminal_status = terminal_status
 
-                def request(self, method, url, *, body=None, headers=None):
+                def request(
+                    self, method, url, *, body=None, headers=None, deadline=None
+                ):
                     self.requests.append((method, url, body, dict(headers or {})))
                     response_headers = {"Content-Type": "application/json"}
                     if "/triggeredwebjobs/" in url and "/history?" in url:
@@ -5752,6 +7632,12 @@ class BootstrapTests(unittest.TestCase):
             production_boundary_post_execution=source["productionBoundary"][
                 "postExecutionProjection"
             ],
+            retired_role_absence_fresh_preflight=source["productionBoundary"][
+                "freshPreflightRetiredRoleAbsence"
+            ],
+            retired_role_absence_post_execution=source["productionBoundary"][
+                "postExecutionRetiredRoleAbsence"
+            ],
             claimed_at=stamp(NOW),
             observed_at=stamp(NOW + dt.timedelta(minutes=7)),
         )
@@ -5769,6 +7655,71 @@ class BootstrapTests(unittest.TestCase):
                 "directPackageBytesObservedByExecutor"
             ]
         )
+
+    def test_retired_role_absence_source_rejects_omission_duplicate_replacement_and_status_drift(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        source = fixture["sourceEvidence"]
+
+        def rejected(candidate):
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.validate_terminal_source_evidence(
+                    plan=self.plan,
+                    authorization=fixture["authorization"],
+                    preflight_projection=fixture["preflightProjection"],
+                    evidence=candidate,
+                )
+
+        for field in (
+            "freshPreflightRetiredRoleAbsence",
+            "postExecutionRetiredRoleAbsence",
+        ):
+            variants = {}
+            omitted = copy.deepcopy(source)
+            omitted["productionBoundary"][field].pop()
+            variants["omitted-resource"] = omitted
+            duplicate = copy.deepcopy(source)
+            duplicate["productionBoundary"][field][1] = copy.deepcopy(
+                duplicate["productionBoundary"][field][0]
+            )
+            variants["duplicate-resource"] = duplicate
+            replacement = copy.deepcopy(source)
+            replacement["productionBoundary"][field][0]["resourceId"] = (
+                "/subscriptions/"
+                + bootstrap.SUBSCRIPTION
+                + "/providers/Microsoft.Authorization/roleDefinitions/"
+                + "00000000-0000-4000-8000-000000000001"
+            )
+            variants["replacement-resource"] = replacement
+            status_drift = copy.deepcopy(source)
+            status_drift["productionBoundary"][field][0]["status"] = 200
+            variants["status-drift"] = status_drift
+            missing_digest = copy.deepcopy(source)
+            del missing_digest["productionBoundary"][field][0]["responseSha256"]
+            variants["missing-digest"] = missing_digest
+            missing_timestamp = copy.deepcopy(source)
+            del missing_timestamp["productionBoundary"][field][0]["observedAt"]
+            variants["missing-timestamp"] = missing_timestamp
+            for name, candidate in variants.items():
+                with self.subTest(field=field, variant=name):
+                    rejected(candidate)
+
+        missing_phase = copy.deepcopy(source)
+        del missing_phase["productionBoundary"][
+            "freshPreflightRetiredRoleAbsence"
+        ]
+        rejected(missing_phase)
+
+        swapped = copy.deepcopy(source)
+        boundary = swapped["productionBoundary"]
+        (
+            boundary["freshPreflightRetiredRoleAbsence"],
+            boundary["postExecutionRetiredRoleAbsence"],
+        ) = (
+            boundary["postExecutionRetiredRoleAbsence"],
+            boundary["freshPreflightRetiredRoleAbsence"],
+        )
+        rejected(swapped)
 
     def test_terminal_receipt_component_builder_uses_full_validated_source_universe(self):
         with tempfile.TemporaryDirectory() as folder:

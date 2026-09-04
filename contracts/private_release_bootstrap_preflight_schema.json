@@ -81,7 +81,7 @@
         "productionBoundaryObservation": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["probeIds", "sourceProjection"],
+          "required": ["probeIds", "sourceProjection", "retiredTemporaryRoleAbsence"],
           "properties": {
             "probeIds": {
               "type": "array",
@@ -99,6 +99,25 @@
                 "appSettingsSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "deploymentInventory": {"type": "array"},
                 "oneDeployInventory": {"type": "array"}
+              }
+            },
+            "retiredTemporaryRoleAbsence": {
+              "type": "array",
+              "minItems": 16,
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url", "resourceId", "kind", "status", "responseSha256", "temporaryRoleMarkerInventorySha256", "observedAt"],
+                "properties": {
+                  "url": {"type": "string", "minLength": 20, "maxLength": 2048},
+                  "resourceId": {"type": "string", "minLength": 20, "maxLength": 2048},
+                  "kind": {"enum": ["definition", "assignment"]},
+                  "status": {"const": 404},
+                  "responseSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "temporaryRoleMarkerInventorySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "observedAt": {"type": "string", "format": "date-time"}
+                }
               }
             }
           }

@@ -53,7 +53,7 @@ class CleanupSession:
     def arm(resource_id, version):
         return "https://management.azure.com" + resource_id + "?api-version=" + version
 
-    def request(self, method, url, *, body=None, headers=None):
+    def request(self, method, url, *, body=None, headers=None, deadline=None):
         self.requests.append((method, url, body))
         if method == "GET" and url == bootstrap._cleanup_lock_inventory_url():
             return response(200, {"value": list(self.locks.values())})
@@ -117,7 +117,15 @@ class CleanupTransportTests(unittest.TestCase):
             added = operation_id.replace("remove", "add", 1)
             role = fixture.temp_role(added)
             session = CleanupSession(role["assignment"], role["definition"])
-            state["proofs"][added] = {"details": {"cleanupKey": role["cleanupKey"]}}
+            state["proofs"][added] = {
+                "details": {
+                    "cleanupKey": role["cleanupKey"],
+                    "definitionCreated": True,
+                    "definitionReadbackExact": True,
+                    "assignmentCreated": True,
+                    "assignmentReadbackExact": True,
+                }
+            }
         else:
             resource_id = bootstrap._cleanup_assignment_resources(plan)[operation_id]
             assignment = {"id": resource_id, "name": resource_id.rsplit("/", 1)[-1],
@@ -144,6 +152,11 @@ class CleanupTransportTests(unittest.TestCase):
                 "postconditionAdmissions": [], "probes": [probe], "productionBoundaryObservation": {}}},
             session=session, clock=lambda: current[0], sleep=sleep)
         transport._active_operation_id = operation_id
+        if operation_id in TEMPORARY:
+            transport._active_protected_role_add = operation_id.replace(
+                "remove", "add", 1
+            )
+            transport._protected_work_deadline = transport._protected_role_deadline()
         journal = MemoryJournal()
         transport.bind_journal(journal)
         operation = next(item for item in plan["mutations"] if item["id"] == operation_id)
@@ -212,7 +225,7 @@ class CleanupTransportTests(unittest.TestCase):
 
     def test_principal_replacement_after_policy_read_stops_before_lock_delete(self):
         transport, session, _, operation, state, _, _ = self.make(TEMPORARY[0])
-        session.replace_on_read = 2
+        session.replace_on_read = 1
         with self.assertRaisesRegex(bootstrap.BootstrapError, "drifted"):
             transport._mutate(operation, state)
         self.assertEqual(session.mutations(), [])
@@ -269,6 +282,76 @@ class CleanupTransportTests(unittest.TestCase):
         self.assertEqual(session.mutations().count(("DELETE", session.definition_url)), 1)
         self.assertEqual(session.locks, session.original_locks)
         self.assertTrue(transport._protected_cleanup_blocked)
+
+    def test_modeled_cleanup_reserve_reaches_assignment_delete_before_expiry(self):
+        transport, session, _, operation, state, current, _ = self.make(TEMPORARY[0])
+        expiry = bootstrap.parse_time(
+            transport.authorization["validity"]["expiresAt"], "expiry"
+        )
+        current[0] = expiry - dt.timedelta(
+            seconds=bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+        )
+        real_request = session.request
+        assignment_delete_started = []
+        lock_delete_seen = [False]
+        lock_url = session.arm(
+            bootstrap._expected_deletion_lock_proof(operation["id"])["resourceId"],
+            "2016-09-01",
+        )
+
+        def bounded_request(method, url, **kwargs):
+            started = current[0]
+            deadline = kwargs.get("deadline")
+            if method == "DELETE" and url == session.assignment_url:
+                assignment_delete_started.append(started)
+            if method == "DELETE" and url == lock_url:
+                lock_delete_seen[0] = True
+            if (
+                method == "GET"
+                and url == lock_url
+                and lock_delete_seen[0]
+                and deadline is not None
+                and deadline < expiry
+                and started
+                < deadline
+                - dt.timedelta(
+                    seconds=bootstrap.cleanup_locks.LOCK_FINAL_OBSERVATION_SECONDS
+                )
+            ):
+                # ARM retains the exact deleted lock for the complete 120s
+                # propagation boundary.
+                result = response(200, session.original_locks[lock_url])
+            else:
+                result = real_request(method, url, **kwargs)
+            duration = bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            if (
+                method == "GET"
+                and url == lock_url
+                and lock_delete_seen[0]
+                and deadline is not None
+                and started
+                == deadline
+                - dt.timedelta(
+                    seconds=bootstrap.cleanup_locks.LOCK_FINAL_OBSERVATION_SECONDS
+                )
+            ):
+                # A response may use almost all of its reserved envelope; the
+                # strict deadline still requires it to finish before the bound.
+                duration -= 1
+            current[0] += dt.timedelta(
+                seconds=duration
+            )
+            return result
+
+        with mock.patch.object(session, "request", side_effect=bounded_request):
+            result = transport._mutate(operation, state)
+        self.assertTrue(result["assignmentRemoved"])
+        self.assertEqual(len(assignment_delete_started), 1)
+        self.assertGreaterEqual(
+            (expiry - assignment_delete_started[0]).total_seconds(),
+            bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS,
+        )
+        self.assertEqual(session.locks, session.original_locks)
 
     def test_third_state_restoration_never_overwrites_or_deletes_definition(self):
         transport, session, _, operation, state, _, _ = self.make(TEMPORARY[0])

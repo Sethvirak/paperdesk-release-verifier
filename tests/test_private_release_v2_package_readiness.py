@@ -34,15 +34,17 @@ class Session:
         self.repeat = repeat
         self.after_request = after_request
         self.requests = []
+        self.deadlines = []
 
-    def request(self, method, url, *, body=None, headers=None):
+    def request(self, method, url, *, body=None, headers=None, deadline=None):
         self.requests.append((method, url, body, headers))
+        self.deadlines.append(deadline)
         if self.after_request:
             self.after_request()
         response = self.responses[0] if self.repeat else self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
-        return response
+        return response() if callable(response) else response
 
 
 class MemoryJournal:
@@ -50,8 +52,11 @@ class MemoryJournal:
 
     def __init__(self):
         self.records = []
+        self.fail_result = False
 
     def append_cloud_mutation(self, value):
+        if self.fail_result and value.get("phase") == "result":
+            raise OSError("simulated Storage result-journal failure")
         self.records.append(copy.deepcopy(value))
         return Path(f"cloud-mutation-{len(self.records):04d}.json")
 
@@ -59,12 +64,12 @@ class MemoryJournal:
 class PackageReadinessTests(unittest.TestCase):
     def setUp(self):
         self.plan, self.plan_sha = bootstrap.load_plan()
-        self.operation = next(item for item in self.plan["mutations"] if item["id"] == OPERATION)
         self.body = b"exact authorized package fixture"
         self.package = {"sha256": bootstrap.sha256_bytes(self.body), "size": len(self.body)}
         self.current = NOW
         self.sleeps = []
         self.authorization = {
+            "authorizationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "source": {"mergedMain": {"commitSha": SOURCE}},
             "plan": {"sha256": self.plan_sha},
             "validity": {
@@ -72,6 +77,12 @@ class PackageReadinessTests(unittest.TestCase):
                 "expiresAt": stamp(NOW + dt.timedelta(minutes=30)),
             },
         }
+        self.plan = bootstrap.bind_temporary_role_ids(
+            self.plan, self.authorization["authorizationId"]
+        )
+        self.operation = next(
+            item for item in self.plan["mutations"] if item["id"] == OPERATION
+        )
         self.url = bootstrap._operation_readback_url(OPERATION, self.plan, self.authorization)
 
     def transport(self, responses, **session_options):
@@ -222,6 +233,29 @@ class PackageReadinessTests(unittest.TestCase):
                 self.assertEqual(journal.records[0]["phase"], "intent")
                 self.assertEqual(len(journal.records), 1 if isinstance(response, BaseException) else 2)
 
+    def test_result_journal_failure_preserves_storage_client_request_id_on_intent(self):
+        transport, session, journal = self.transport([
+            storage_error(404, "BlobNotFound"), self.created(),
+        ])
+        journal.fail_result = True
+        with self.assertRaises(bootstrap.StorageOperationError) as error:
+            self.upload(transport)
+        self.assertEqual(
+            error.exception.diagnostic["stopReason"], "result-journal-error"
+        )
+        self.assertEqual(error.exception.diagnostic["status"], 201)
+
+        self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
+        self.assertEqual(len(journal.records), 1)
+        intent = journal.records[0]
+        self.assertEqual(intent["phase"], "intent")
+        self.assertEqual(intent["operationId"], OPERATION)
+        self.assertTrue(bootstrap.GUID.fullmatch(intent["clientRequestId"]))
+        self.assertEqual(
+            intent["clientRequestId"],
+            session.requests[-1][3]["x-ms-client-request-id"],
+        )
+
     def test_ambiguous_read_fails_without_mutation(self):
         transport, session, journal = self.transport([bootstrap.BootstrapError("Azure REST transport failed closed")])
         with self.assertRaisesRegex(bootstrap.BootstrapError, "transport failed closed"):
@@ -241,12 +275,28 @@ class PackageReadinessTests(unittest.TestCase):
                                   reason, request_id=None, server_date=None,
                                   credential=None, role_readback=None):
         self.assertEqual(type(error).__name__, "PackageReadinessError")
-        self.assertEqual(error.diagnostic, {
+        diagnostic = dict(error.diagnostic)
+        records = diagnostic.pop("attemptRecords")
+        self.assertEqual(diagnostic, {
             "stage": "package-upload-readiness", "elapsedSeconds": elapsed,
             "attempts": attempts, "status": status, "errorCode": code,
             "stopReason": reason, "requestId": request_id, "serverDate": server_date,
             "credential": credential, "roleReadback": role_readback,
         })
+        self.assertEqual(len(records), attempts)
+        self.assertEqual([item["attempt"] for item in records], list(range(1, attempts + 1)))
+        client_ids = [item["clientRequestId"] for item in records]
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in client_ids))
+        self.assertEqual(len(client_ids), len(set(client_ids)))
+        for item in records:
+            self.assertEqual(set(item), {
+                "attempt", "startedAt", "completedAt", "durationMs",
+                "clientRequestId", "status", "errorCode", "requestId",
+                "serverDate", "outcome",
+            })
+            self.assertIsNotNone(item["startedAt"])
+            self.assertIsNotNone(item["completedAt"])
+            self.assertIsNotNone(item["durationMs"])
         rendered = str(error) + "".join(traceback.format_exception(error))
         for field in ("stage=", "elapsedSeconds=", "attempts=", "status=", "errorCode=",
                       "stopReason=", "requestId=", "serverDate="):
@@ -264,15 +314,153 @@ class PackageReadinessTests(unittest.TestCase):
                     transport, session, journal = self.transport([self.private_error(code=code)], repeat=True)
                     with self.assertRaises(bootstrap.BootstrapError) as error:
                         transport._prove_package_upload_ready(self.url)
+                    follow_on_reserve = (
+                        3 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                    if deadline < follow_on_reserve:
+                        self.assert_package_diagnostic(error.exception, attempts=0,
+                            status=None, code="unknown", elapsed=0, reason="expired-before-get")
+                        self.assertEqual(self.current, NOW)
+                        self.assertEqual(session.requests, [])
+                        self.assertEqual(self.sleeps, [])
+                        continue
+                    expected_elapsed = (
+                        deadline - follow_on_reserve
+                    )
                     self.assert_package_diagnostic(error.exception, attempts=len(session.requests),
-                        status=403, code=code, elapsed=deadline, reason="deadline")
-                    self.assertEqual((self.current - NOW).total_seconds(), deadline)
+                        status=403, code=code, elapsed=expected_elapsed, reason="deadline")
+                    self.assertEqual((self.current - NOW).total_seconds(), expected_elapsed)
                     self.assertLessEqual(len(session.requests), 64)
                     self.assertEqual(self.sleeps[:5], [1, 2, 4, 8, 15])
                     self.assertTrue(all(0 < seconds <= 15 for seconds in self.sleeps))
+                    self.assertEqual(
+                        error.exception.diagnostic["attemptRecords"][-1]["startedAt"],
+                        (NOW + dt.timedelta(
+                            seconds=deadline - follow_on_reserve
+                        )).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    )
                     self.assertTrue(all(method == "GET" and url == self.url and body is None
                                         for method, url, body, _ in session.requests))
                     self.assertEqual(journal.records, [])
+
+    def test_deadline_adjacent_final_get_can_observe_exact_absence(self):
+        final_at = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+            - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        response = lambda: (
+            storage_error(404, "BlobNotFound")
+            if self.current == final_at else self.private_error()
+        )
+        transport, session, journal = self.transport([response], repeat=True)
+        transport._prove_package_upload_ready(self.url)
+        self.assertEqual(self.current, final_at)
+        request_ids = [item[3]["x-ms-client-request-id"] for item in session.requests]
+        self.assertEqual(len(request_ids), len(set(request_ids)))
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in request_ids))
+        self.assertTrue(all(value == NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        ) for value in session.deadlines))
+        self.assertEqual(journal.records, [])
+
+    def test_full_final_get_envelope_preserves_role_cleanup_reserve(self):
+        work_deadline = NOW + dt.timedelta(minutes=30) - dt.timedelta(
+            seconds=bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+        )
+        readiness_deadline = work_deadline - dt.timedelta(
+            seconds=2 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        self.current = readiness_deadline - dt.timedelta(
+            seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+        def consume_full_request_envelope():
+            self.current += dt.timedelta(
+                seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
+
+        transport, session, journal = self.transport(
+            [self.private_error()], after_request=consume_full_request_envelope
+        )
+        transport._active_protected_role_add = "addOwnedUploaderPackageRole"
+        transport._protected_work_deadline = work_deadline
+        with self.assertRaises(bootstrap.PackageReadinessError) as error:
+            transport._prove_package_upload_ready(self.url)
+        self.assertEqual(error.exception.diagnostic["stopReason"], "expired-during-get")
+        self.assertEqual(session.deadlines, [readiness_deadline])
+        self.assertEqual(
+            (
+                bootstrap.parse_time(
+                    self.authorization["validity"]["expiresAt"], "expiresAt"
+                )
+                - self.current
+            ).total_seconds(),
+            (
+                bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+                + 2 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            ),
+        )
+        self.assertEqual(journal.records, [])
+
+    def test_protected_role_creation_cannot_enter_cleanup_reserve(self):
+        self.current = NOW + dt.timedelta(minutes=30) - dt.timedelta(
+            seconds=bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+        )
+        transport, session, journal = self.transport([])
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "insufficient authorization window before protected role creation",
+        ):
+            transport._begin_protected_role_lifecycle(
+                "addOwnedUploaderPackageRole"
+            )
+        self.assertEqual(session.requests, [])
+        self.assertEqual(journal.records, [])
+
+    def test_sequential_key_and_fence_roles_wait_for_exact_readiness(self):
+        key_url = bootstrap._operation_readback_url(
+            "readBackExactSigningPublicJwk", self.plan, self.authorization
+        )
+        key_denied = bootstrap._RestResponse(
+            403,
+            bootstrap.canonical_json_bytes({
+                "error": {
+                    "code": "Forbidden",
+                    "innererror": {"code": "ForbiddenByRbac"},
+                }
+            }),
+            {"Content-Type": "application/json"},
+        )
+        key_ready = bootstrap._RestResponse(200, b"{}", {})
+        transport, session, journal = self.transport([key_denied, key_ready])
+        transport._active_protected_role_add = "addOwnedOperatorKeyReadRole"
+        transport._protected_work_deadline = transport._protected_role_deadline()
+        self.assertIs(transport._read_signing_public_jwk_when_ready(key_url), key_ready)
+        self.assertEqual([item[0] for item in session.requests], ["GET", "GET"])
+        self.assertEqual(self.sleeps, [1])
+        self.assertEqual(journal.records, [])
+
+        self.current = NOW
+        self.sleeps = []
+        fence_url = bootstrap._operation_readback_url(
+            "createInitialIdleActivationFence", self.plan, self.authorization
+        )
+        transport, session, journal = self.transport([
+            storage_error(403, "AuthorizationPermissionMismatch"),
+            storage_error(404, "BlobNotFound"),
+        ])
+        transport._active_protected_role_add = "addOwnedOperatorFenceBootstrapRole"
+        transport._protected_work_deadline = transport._protected_role_deadline()
+        expected_deadline = min(
+            self.current
+            + dt.timedelta(seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+            transport._protected_work_deadline,
+        )
+        transport._prove_fence_blob_create_ready(fence_url)
+        self.assertEqual([item[0] for item in session.requests], ["GET", "GET"])
+        self.assertEqual(self.sleeps, [1])
+        self.assertTrue(all(item == expected_deadline for item in session.deadlines))
+        self.assertEqual(journal.records, [])
 
     def test_frozen_clock_stops_at_64_gets_with_safe_final_diagnostic(self):
         transport, session, journal = self.transport([self.private_error()], repeat=True)
@@ -385,8 +573,18 @@ class PackageReadinessTests(unittest.TestCase):
                 transport, session, journal = self.transport([storage_error(404, "BlobNotFound"), failure])
                 with self.assertRaises(bootstrap.BootstrapError) as error:
                     self.upload(transport)
-                self.assertNotEqual(type(error.exception).__name__, "PackageReadinessError")
-                self.assertFalse(hasattr(error.exception, "diagnostic"))
+                self.assertIsInstance(error.exception, bootstrap.StorageOperationError)
+                diagnostic = error.exception.diagnostic
+                self.assertEqual(diagnostic["operationId"], OPERATION)
+                self.assertEqual(diagnostic["method"], "PUT")
+                self.assertEqual(diagnostic["stopReason"], (
+                    "transport-error" if isinstance(failure, BaseException)
+                    else "unexpected-status"
+                ))
+                self.assertEqual(len(diagnostic["attemptRecords"]), 1)
+                self.assertTrue(bootstrap.GUID.fullmatch(
+                    diagnostic["attemptRecords"][0]["clientRequestId"]
+                ))
                 self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
                 self.assertEqual(len(journal.records), 1 if isinstance(failure, BaseException) else 2)
 
