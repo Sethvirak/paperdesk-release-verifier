@@ -1899,9 +1899,32 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 terminal["temporaryCleanup"][0]["status"], "removed-exact"
             )
 
+    def test_strict_storage_xml_accepts_only_one_optional_leading_utf8_bom(self):
+        payload = (
+            b'<?xml version="1.0" encoding="utf-8"?>'
+            b"<Error><Code>BlobNotFound</Code><Message>missing</Message></Error>"
+        )
+        for body in (payload, b"\xef\xbb\xbf" + payload):
+            with self.subTest(prefix="bom" if body != payload else "none"):
+                root = bootstrap._strict_storage_xml_root(body, "fixture")
+                self.assertEqual(root.tag, "Error")
+                self.assertEqual(root.findtext("Code"), "BlobNotFound")
+
+        rejected = (
+            b"\xef\xbb\xbf\xef\xbb\xbf" + payload,
+            b"<Error>\xef\xbb\xbf<Code>BlobNotFound</Code></Error>",
+            payload.decode("utf-8").encode("utf-16"),
+            b"\xef\xbb\xbf<!DOCTYPE Error><Error><Code>BlobNotFound</Code></Error>",
+        )
+        for body in rejected:
+            with self.subTest(body_sha256=bootstrap.sha256_bytes(body)):
+                with self.assertRaises(bootstrap._StrictStorageXmlError):
+                    bootstrap._strict_storage_xml_root(body, "fixture")
+
     def test_strict_empty_inventory_rejects_malformed_duplicate_and_paging(self):
         valid = (
-            b"<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>"
+            b"\xef\xbb\xbf<EnumerationResults><Blobs/><NextMarker/>"
+            b"</EnumerationResults>"
         )
         cases = {
             "malformed": b"<EnumerationResults><Blobs/><NextMarker>",
@@ -1923,6 +1946,10 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 "<EnumerationResults><Blobs>&empty;</Blobs>"
                 "<NextMarker>&empty;</NextMarker></EnumerationResults>"
             ).encode("utf-16"),
+            "double-utf8-bom": (
+                b"\xef\xbb\xbf\xef\xbb\xbf<EnumerationResults><Blobs/>"
+                b"<NextMarker/></EnumerationResults>"
+            ),
         }
 
         proof = bootstrap._strict_empty_controller_inventory(
@@ -1936,6 +1963,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         )
         self.assertEqual(proof["blobNames"], [])
         self.assertEqual(proof["nextMarker"], "")
+        self.assertEqual(proof["responseSha256"], bootstrap.sha256_bytes(valid))
 
         for name, body in cases.items():
             with self.subTest(name=name):

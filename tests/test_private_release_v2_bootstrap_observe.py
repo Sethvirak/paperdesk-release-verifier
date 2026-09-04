@@ -515,7 +515,7 @@ class FakeReadOnlySession:
             and request.url.endswith("/paperdesk-private-release-bridge.zip")
         ):
             status = 403
-            body = {"storageErrorCode": "AuthenticationFailed"}
+            body = {"storageErrorCode": "AuthorizationPermissionMismatch"}
         elif any(
             assignment.lower() in request.url.lower()
             for assignment in (
@@ -2126,6 +2126,35 @@ class ObserveTests(unittest.TestCase):
             with self.assertRaisesRegex(observe.ObserveError, "drifted"):
                 self.build(folder, FakeReadOnlySession(self.plan, drift=True))
 
+    def test_authentication_failure_is_not_admitted_as_temporary_storage_rbac(self):
+        class AuthenticationFailedPackageSession(FakeReadOnlySession):
+            def read(self, request):
+                response = super().read(request)
+                if (
+                    request.url.startswith(
+                        "https://mdspdbak2608089c4e.blob.core.windows.net/"
+                        "paperdesk-deployment-packages/v2/control/"
+                    )
+                    and request.url.endswith(
+                        "/paperdesk-private-release-bridge.zip"
+                    )
+                ):
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=403,
+                        headers=response.headers,
+                        body={"storageErrorCode": "AuthenticationFailed"},
+                    )
+                return response
+
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(
+                observe.ObserveError,
+                "package blob preflight is not blocked by temporary access",
+            ):
+                self.build(folder, AuthenticationFailedPackageSession(self.plan))
+
     def test_credential_shaped_observation_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaisesRegex(observe.ObserveError, "credential-shaped"):
@@ -3149,17 +3178,21 @@ class ObserveTests(unittest.TestCase):
         )
 
         class BinaryBlobSession:
-            def request(self, method, url):
-                self.requested = (method, url)
+            def request(self, method, url, *, headers=None):
+                self.requested = (method, url, headers)
                 return bootstrap._RestResponse(
                     status=404,
-                    body=b"<Error><Code>BlobNotFound</Code></Error>",
+                    body=b"\xef\xbb\xbf<Error><Code>BlobNotFound</Code></Error>",
                     headers={"Content-Type": "application/xml"},
                 )
 
         session = observe.AzureCliReadOnlySession()
         session._session = BinaryBlobSession()
         response = session.read(observe.ReadRequest("GET", blob_url))
+        self.assertEqual(
+            session._session.requested[2],
+            {"x-ms-version": "2023-11-03"},
+        )
         self.assertEqual(response.body, {"storageErrorCode": "BlobNotFound"})
         self.assertEqual(
             response.response_sha256,

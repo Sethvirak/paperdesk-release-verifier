@@ -219,10 +219,53 @@ class AzureCliExecutableTests(unittest.TestCase):
             headers = {key.lower(): value for key, value in request.header_items()}
             client_ids.append(headers["x-ms-client-request-id"])
             self.assertEqual(
+                headers["x-ms-version"], bootstrap.STORAGE_API_VERSION
+            )
+            self.assertEqual(
                 call.args[1], bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS
             )
         self.assertEqual(len(client_ids), len(set(client_ids)))
         self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in client_ids))
+
+    def test_storage_api_version_is_defaulted_and_drift_fails_before_credentials(self):
+        url = (
+            "https://mdspdbak2608089c4e.blob.core.windows.net/"
+            "controller-locks?restype=container"
+        )
+        exchange = mock.Mock(return_value=bootstrap._RestResponse(200, b"", {}))
+        session = bootstrap.AzureCliRestSession(
+            {"azure": {"accountObjectId": "b97bfa13-b375-4b27-93d7-141029dbc05b"}},
+            exchange_runner=exchange,
+        )
+        with mock.patch.object(session, "_token", return_value="synthetic-token"):
+            session.request("GET", url)
+        request_headers = {
+            key.lower(): value
+            for key, value in exchange.call_args.args[0].header_items()
+        }
+        self.assertEqual(
+            request_headers["x-ms-version"], bootstrap.STORAGE_API_VERSION
+        )
+
+        for headers in (
+            {"x-ms-version": "2021-01-01"},
+            {
+                "x-ms-version": bootstrap.STORAGE_API_VERSION,
+                "X-Ms-Version": bootstrap.STORAGE_API_VERSION,
+            },
+        ):
+            with self.subTest(headers=headers):
+                rejected = bootstrap.AzureCliRestSession(
+                    {"azure": {"accountObjectId": "b97bfa13-b375-4b27-93d7-141029dbc05b"}}
+                )
+                with (
+                    mock.patch.object(rejected, "_token") as token,
+                    self.assertRaisesRegex(
+                        bootstrap.BootstrapError, "Storage API version header is not exact"
+                    ),
+                ):
+                    rejected.request("GET", url, headers=headers)
+                token.assert_not_called()
 
     def test_storage_client_request_id_is_preserved_once_and_reuse_fails_closed(self):
         exchange = mock.Mock(return_value=bootstrap._RestResponse(200, b"", {}))

@@ -76,6 +76,7 @@ MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 AZURE_CLI_REQUEST_TIMEOUT_SECONDS = 45
 AZURE_REST_RESPONSE_TIMEOUT_SECONDS = 45
+STORAGE_API_VERSION = "2023-11-03"
 MAX_AZURE_REST_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_AZURE_REST_RESPONSE_HEADERS_BYTES = 256 * 1024
 TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS = 120
@@ -9962,14 +9963,20 @@ class _StrictStorageXmlError(BootstrapError):
 
 
 def _strict_storage_xml_root(body: bytes, label: str) -> ET.Element:
-    """Parse only strict UTF-8 Storage XML without DTD/entity expansion."""
+    """Parse strict UTF-8 Storage XML with at most one leading UTF-8 BOM."""
 
     if (
         not isinstance(body, bytes)
         or not body
-        or body.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"))
+        or body.startswith((b"\xff\xfe", b"\xfe\xff"))
         or b"\x00" in body
     ):
+        raise _StrictStorageXmlError(
+            f"{label} is not strict UTF-8 XML", unsafe=True
+        )
+    if body.startswith(b"\xef\xbb\xbf"):
+        body = body[3:]
+    if not body or body.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
         raise _StrictStorageXmlError(
             f"{label} is not strict UTF-8 XML", unsafe=True
         )
@@ -9981,7 +9988,7 @@ def _strict_storage_xml_root(body: bytes, label: str) -> ET.Element:
         ) from exc
     upper = text.upper()
     if (
-        text.startswith("\ufeff")
+        "\ufeff" in text
         or "\x00" in text
         or "<!DOCTYPE" in upper
         or "<!ENTITY" in upper
@@ -10341,6 +10348,18 @@ class AzureCliRestSession:
             fail("Azure REST request lacks a full credential and response envelope")
         client_request_id: str | None = None
         if resource == "https://storage.azure.com/":
+            supplied_versions = [
+                (key, value) for key, value in bound.items()
+                if key.lower() == "x-ms-version"
+            ]
+            if len(supplied_versions) > 1 or (
+                supplied_versions
+                and supplied_versions[0][1] != STORAGE_API_VERSION
+            ):
+                fail("Storage API version header is not exact")
+            for key, _ in supplied_versions:
+                del bound[key]
+            bound["x-ms-version"] = STORAGE_API_VERSION
             supplied = [
                 (key, value) for key, value in bound.items()
                 if key.lower() == "x-ms-client-request-id"
