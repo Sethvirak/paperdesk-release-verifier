@@ -586,7 +586,12 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                     self.validate(operation_id, altered, prior=prior)
 
     def _temporary_key_role_body(self):
-        temporary = self.plan["temporaryAccess"]
+        temporary = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )["temporaryAccess"]
+        metadata = bootstrap._temporary_role_metadata(
+            AUTHORIZATION_ID, "operator-key-read-role"
+        )
         definition_id = temporary["temporaryKeyReadRoleDefinitionId"]
         assignment_id = temporary["temporaryKeyReadRoleAssignmentId"]
         scope = self.resources["signingKey"]["resourceId"]
@@ -608,8 +613,8 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "name": definition_id,
                 "type": "Microsoft.Authorization/roleDefinitions",
                 "properties": {
-                    "roleName": "PaperDesk V2 temporary operator-key-read-role",
-                    "description": "Single-use bootstrap temporary role; exact cleanup required",
+                    "roleName": metadata["roleName"],
+                    "description": metadata["description"],
                     "type": "CustomRole",
                     "permissions": [
                         {
@@ -634,6 +639,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                     "condition": None,
                     "conditionVersion": None,
                     "delegatedManagedIdentityResourceId": None,
+                    "description": metadata["assignmentDescription"],
                 },
             },
         }
@@ -729,6 +735,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             "preAppSettingsSha256": bootstrap.sha256_bytes(
                 bootstrap.canonical_json_bytes(pre_settings)
             ),
+            "preAppSettingsEtag": '"bridge-settings-pre"',
         }
         control = bootstrap._bootstrap_self_test_control_from_projections(
             self.authorization, prior,
@@ -757,6 +764,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         body = {
             "preAppSettingsSha256": context["preAppSettingsSha256"],
+            "preAppSettingsEtag": context["preAppSettingsEtag"],
             "bootstrapSelfTestIssuedAt": control["issuedAt"],
             "bootstrapSelfTestExpiresAt": control["expiresAt"],
             "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired})),
@@ -776,6 +784,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         for field in (
             "preAppSettingsSha256",
+            "preAppSettingsEtag",
             "settingsSha256",
             "bootstrapSelfTestControlSha256",
         ):
@@ -1003,10 +1012,14 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             "method": "PUT",
             "targetUrl": url,
             "requestBodySha256": "5" * 64,
+            "clientRequestId": None,
             "status": None,
             "responseBodySha256": None,
             "etag": None,
             "versionId": None,
+            "requestId": None,
+            "serverDate": None,
+            "storageErrorCode": None,
             "recordedAt": stamp(OBSERVED_AT),
         }
         result = copy.deepcopy(intent)
@@ -1558,10 +1571,14 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             "method": "POST",
             "targetUrl": target,
             "requestBodySha256": "7" * 64,
+            "clientRequestId": None,
             "status": None,
             "responseBodySha256": None,
             "etag": None,
             "versionId": None,
+            "requestId": None,
+            "serverDate": None,
+            "storageErrorCode": None,
             "recordedAt": stamp(OBSERVED_AT),
         }
         result = copy.deepcopy(intent)

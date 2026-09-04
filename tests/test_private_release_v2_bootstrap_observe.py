@@ -32,6 +32,7 @@ PHRASE = (
     "Authorize the separately reviewed exact PaperDesk V2 bootstrap. "
     + bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
     + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
+    + " " + bootstrap.BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE
 )
 
 
@@ -131,7 +132,7 @@ class FakeReadOnlySession:
         opaque_secret=False,
         role_authority_drift=False,
     ):
-        self.plan = plan
+        self.plan = bootstrap.bind_temporary_role_ids(plan, AUTHORIZATION_ID)
         self.drift = drift
         self.credential = credential
         self.opaque_secret = opaque_secret
@@ -327,6 +328,22 @@ class FakeReadOnlySession:
                 "properties": {"state": "Stopped"},
             }
         elif request.url == (
+            "https://management.azure.com"
+            + self.resources["bridgeSite"]["resourceId"]
+            + "/config/appsettings/list?api-version=2025-03-01"
+        ):
+            status = 200
+            headers = {"ETag": '"bridge-settings-pre"'}
+            body = {
+                "id": (
+                    self.resources["bridgeSite"]["resourceId"]
+                    + "/config/appsettings"
+                ),
+                "name": "appsettings",
+                "type": "Microsoft.Web/sites/config",
+                "properties": {},
+            }
+        elif request.url == (
             "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/"
             "paperdesk-release-result-signing/versions?api-version=7.4"
         ):
@@ -415,6 +432,10 @@ class FakeReadOnlySession:
                     "temporaryControllerRoleDefinitionId",
                 )
             }
+            temporary_definition_ids.update(
+                str(spec["definitionId"]).lower()
+                for spec in bootstrap.RETIRED_TEMPORARY_ROLE_SPECS
+            )
             if definition_id in temporary_definition_ids:
                 status = 404
                 body = {}
@@ -695,7 +716,9 @@ class PackageWormDeletedTombstoneSession(FakeReadOnlySession):
     def __init__(self, plan):
         super().__init__(plan)
         self.url = bootstrap._operation_readback_url(
-            "lockPackageRetentionAt91Days", plan, {}
+            "lockPackageRetentionAt91Days",
+            self.plan,
+            {"authorizationId": AUTHORIZATION_ID},
         )
 
     def read(self, request):
@@ -784,6 +807,8 @@ class ObserveTests(unittest.TestCase):
                     "exactConfirmationText": (
                         bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
                         + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
+                        + " "
+                        + bootstrap.BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE
                     ),
                 },
             )
@@ -799,6 +824,54 @@ class ObserveTests(unittest.TestCase):
                     boundary["sourceProjection"], self.plan
                 ),
                 boundary["sourceProjection"],
+            )
+            retired_absence = boundary["retiredTemporaryRoleAbsence"]
+            preflight_schema = json.loads(
+                bootstrap.PREFLIGHT_SCHEMA_PATH.read_text(encoding="utf-8")
+            )
+            retired_schema = preflight_schema["properties"]["projection"][
+                "properties"
+            ]["productionBoundaryObservation"]["properties"][
+                "retiredTemporaryRoleAbsence"
+            ]
+            self.assertEqual(
+                len(retired_absence),
+                retired_schema["minItems"],
+            )
+            self.assertEqual(
+                len(retired_absence),
+                retired_schema["maxItems"],
+            )
+            item_schema = retired_schema["items"]
+            required_fields = set(item_schema["required"])
+            allowed_fields = set(item_schema["properties"])
+            for item in retired_absence:
+                self.assertEqual(set(item), required_fields)
+                self.assertEqual(set(item), allowed_fields)
+                self.assertRegex(
+                    item["temporaryRoleMarkerInventorySha256"],
+                    r"^[0-9a-f]{64}$",
+                )
+            self.assertEqual(
+                bootstrap._validate_retired_temporary_role_absence_projection(
+                    retired_absence,
+                    self.plan,
+                    label="test observer retired role absence",
+                    expected_observed_at=preflight["observedAt"],
+                ),
+                retired_absence,
+            )
+            expected_retired_requests = (
+                bootstrap._retired_temporary_role_absence_requests(self.plan)
+            )
+            self.assertEqual(
+                [
+                    request.url
+                    for request in session.requests
+                    if request.url
+                    in {item["url"] for item in expected_retired_requests}
+                ],
+                [item["url"] for item in expected_retired_requests],
             )
             serialized_projection = json.dumps(projection, sort_keys=True)
             self.assertNotIn("FIXTURE_SECRET_SETTING_NAME", serialized_projection)
@@ -835,6 +908,7 @@ class ObserveTests(unittest.TestCase):
                     admissions_by_id[operation_id]["context"],
                     {"executionDecision": "apply-exact"},
                 )
+
             role_admission = admissions_by_id["createCustomRoleDefinitions"]
             self.assertEqual(role_admission["status"], "owned-present")
             member_states = role_admission["context"]["memberStates"]
@@ -986,6 +1060,65 @@ class ObserveTests(unittest.TestCase):
             )
             self.assertEqual(validated_preflight, preflight)
             self.assertEqual(validated_digest, digest)
+
+    def test_authorization_phrase_hash_requires_bridge_hard_death_acceptance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+            authorization = self.promote_template(template)
+            self.assertEqual(
+                authorization["confirmation"]["phraseSha256"],
+                bootstrap.sha256_bytes(PHRASE.encode("utf-8")),
+            )
+            old_phrase = (
+                "Authorize the separately reviewed exact PaperDesk V2 bootstrap. "
+                + bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
+                + " "
+                + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
+            )
+            authorization["confirmation"]["phraseSha256"] = (
+                bootstrap.sha256_bytes(old_phrase.encode("utf-8"))
+            )
+            authorization_path = Path(folder) / "old-phrase-authorization.json"
+            observe.write_canonical(authorization_path, authorization)
+
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "bridge configuration hard-death recovery residuals",
+            ):
+                bootstrap.validate_authorization(
+                    authorization_path,
+                    plan=self.plan,
+                    plan_sha256=self.plan_sha,
+                    package=bootstrap.build_package_descriptor(),
+                    confirmation_phrase=old_phrase,
+                    now=NOW,
+                )
+
+    def test_read_only_observer_blocks_any_present_retired_role(self):
+        expected = bootstrap._retired_temporary_role_absence_requests(self.plan)
+
+        for present in expected:
+            with self.subTest(kind=present["kind"], resourceId=present["resourceId"]):
+                class PresentRetiredRoleSession(FakeReadOnlySession):
+                    def read(inner_self, request):
+                        response = super(PresentRetiredRoleSession, inner_self).read(
+                            request
+                        )
+                        if request.url == present["url"]:
+                            return observe.ReadResponse(
+                                method=request.method,
+                                url=request.url,
+                                status=200,
+                                headers={},
+                                body={"id": present["resourceId"]},
+                            )
+                        return response
+
+                with tempfile.TemporaryDirectory() as folder:
+                    with self.assertRaisesRegex(
+                        observe.ObserveError, "found a retired temporary role"
+                    ):
+                        self.build(folder, PresentRetiredRoleSession(self.plan))
 
     def test_exact_five_bridge_recovery_is_jointly_admitted_without_attach_write(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1797,7 +1930,9 @@ class ObserveTests(unittest.TestCase):
             session, preflight, _template = self.build(folder)
 
         class BoundaryRestSession:
-            def request(self, method, url, *, body=None, headers=None):
+            def request(
+                self, method, url, *, body=None, headers=None, deadline=None
+            ):
                 self.assert_request(method, url, body, headers)
                 envelope = session.envelopes[(method, url)]
                 return bootstrap._RestResponse(
@@ -1817,7 +1952,7 @@ class ObserveTests(unittest.TestCase):
                     raise AssertionError("production boundary read added unexpected headers")
 
         transport = bootstrap.AzureCliBootstrapTransport(
-            authorization={"azure": {}},
+            authorization={"authorizationId": AUTHORIZATION_ID, "azure": {}},
             plan=self.plan,
             package={},
             preflight=preflight,
@@ -2050,8 +2185,11 @@ class ObserveTests(unittest.TestCase):
                 self.build(folder, RetainedUploaderAclSession(self.plan))
 
     def test_retained_temporary_role_definition_blocks_fresh_observation(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
         definition_url = bootstrap._temporary_role_definition_readback_url(
-            "addOwnedUploaderPackageRole", self.plan
+            "addOwnedUploaderPackageRole", bound_plan
         )
         self.assertIsNotNone(definition_url)
 
@@ -2353,7 +2491,9 @@ class ObserveTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def request(self, method, url, *, body=None, headers=None):
+            def request(
+                self, method, url, *, body=None, headers=None, deadline=None
+            ):
                 self.calls.append((method, url, body, headers))
                 if len(self.calls) <= 2:
                     raise bootstrap.BootstrapError(
@@ -2420,7 +2560,9 @@ class ObserveTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def request(self, method, url, *, body=None, headers=None):
+            def request(
+                self, method, url, *, body=None, headers=None, deadline=None
+            ):
                 self.calls.append((method, url, body, headers))
                 if len(self.calls) <= 2:
                     raise bootstrap.BootstrapError(
@@ -2821,8 +2963,13 @@ class ObserveTests(unittest.TestCase):
             )
 
     def test_package_tombstone_preflight_digest_binds_response_etag_header(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
         url = bootstrap._operation_readback_url(
-            "lockPackageRetentionAt91Days", self.plan, {}
+            "lockPackageRetentionAt91Days",
+            bound_plan,
+            {"authorizationId": AUTHORIZATION_ID},
         )
         body = package_worm_deleted_tombstone(self.plan)
         encoded = bootstrap.canonical_json_bytes(body)
@@ -2857,7 +3004,9 @@ class ObserveTests(unittest.TestCase):
         self.assertNotEqual(without_etag, with_etag)
         self.assertIn(
             without_etag,
-            bootstrap._package_worm_deleted_tombstone_response_sha256s(self.plan),
+            bootstrap._package_worm_deleted_tombstone_response_sha256s(
+                bound_plan
+            ),
         )
 
         envelope = {

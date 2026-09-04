@@ -23,7 +23,7 @@ class Fixture:
         self.lock_url = locks.ARM_ROOT + self.spec["resourceId"] + "?api-version=2016-09-01"
         scope = self.spec["resourceId"].rsplit("/providers/Microsoft.Authorization/locks/", 1)[0]
         self.assignment = {
-            "id": scope + "/providers/Microsoft.Authorization/roleAssignments/39989cff-44ef-596e-8b46-0a433bb5c0e2",
+            "id": scope + "/providers/Microsoft.Authorization/roleAssignments/11111111-1111-4111-8111-111111111111",
             "properties": {"principalId": "operator", "roleDefinitionId": "exact-definition"},
         }
         self.expected = copy.deepcopy(self.assignment)
@@ -56,7 +56,7 @@ class Fixture:
             body=json.dumps(value or {}).encode(), headers={},
         )
 
-    def read(self, method, url):
+    def read(self, method, url, *, deadline=None):
         self.requests.append((method, url))
         if self.before_read:
             result = self.before_read(method, url)
@@ -223,6 +223,175 @@ class CleanupLockTests(unittest.TestCase):
             fixture.run()
         self.assertEqual(fixture.mutations, [])
 
+    def test_lock_poll_passes_deadline_and_preserves_assignment_delete_reserve(self):
+        fixture = Fixture()
+        original_read = fixture.read
+        bounded_poll_seen = []
+        lock_suspended = [False]
+        convergence_boundary = fixture.now + dt.timedelta(
+            seconds=locks.LOCK_CONVERGENCE_SECONDS
+        )
+        alignment_jitter = dt.timedelta(milliseconds=1)
+
+        def retain_until_boundary(method, url):
+            if method == "DELETE" and url == fixture.lock_url:
+                # Model ARM still returning the exact deleted lock throughout
+                # the full propagation window.
+                lock_suspended[0] = True
+                fixture.lock = fixture.lock_document()
+            elif method == "PUT" and url == fixture.lock_url:
+                lock_suspended[0] = False
+
+        fixture.after_mutation = retain_until_boundary
+
+        def bounded_read(method, url, *, deadline=None):
+            if (
+                deadline is not None
+                and url == fixture.lock_url
+                and lock_suspended[0]
+            ):
+                bounded_poll_seen.append((fixture.now, deadline))
+                if fixture.now >= convergence_boundary:
+                    fixture.lock = None
+            return original_read(method, url, deadline=deadline)
+
+        fixture.read = bounded_read
+        fixture.sleep = lambda seconds: setattr(
+            fixture,
+            "now",
+            fixture.now + dt.timedelta(seconds=seconds) + alignment_jitter,
+        )
+        proof = fixture.run()
+        self.assertTrue(bounded_poll_seen)
+        final_started, final_deadline = bounded_poll_seen[-1]
+        self.assertEqual(
+            final_started,
+            convergence_boundary + alignment_jitter,
+        )
+        self.assertEqual(
+            final_deadline - final_started,
+            dt.timedelta(seconds=locks.LOCK_FINAL_OBSERVATION_SECONDS),
+        )
+        self.assertTrue(proof["assignmentAbsent"])
+        self.assertEqual(
+            [(method, url) for method, url, *_ in fixture.mutations],
+            [
+                ("DELETE", fixture.lock_url),
+                ("DELETE", fixture.assignment_url),
+                ("PUT", fixture.lock_url),
+            ],
+        )
+        self.assertIsNone(fixture.assignment)
+        self.assertEqual(fixture.lock, fixture.lock_document())
+
+    def test_assignment_absence_uses_final_post_boundary_observation(self):
+        fixture = Fixture()
+        original_read = fixture.read
+        assignment_delete_seen = [False]
+        bounded_poll_seen = []
+        convergence_boundary = fixture.now + dt.timedelta(
+            seconds=locks.ASSIGNMENT_ABSENCE_SECONDS
+        )
+        alignment_jitter = dt.timedelta(milliseconds=1)
+
+        def retain_until_boundary(method, url):
+            if method == "DELETE" and url == fixture.assignment_url:
+                assignment_delete_seen[0] = True
+                fixture.pending_assignment_delete = False
+                fixture.assignment = copy.deepcopy(fixture.expected)
+
+        fixture.after_mutation = retain_until_boundary
+
+        def bounded_read(method, url, *, deadline=None):
+            if (
+                assignment_delete_seen[0]
+                and method == "GET"
+                and url == fixture.assignment_url
+                and deadline is not None
+            ):
+                bounded_poll_seen.append((fixture.now, deadline))
+                fixture.assignment = (
+                    None
+                    if fixture.now >= convergence_boundary
+                    else copy.deepcopy(fixture.expected)
+                )
+            return original_read(method, url, deadline=deadline)
+
+        fixture.read = bounded_read
+        fixture.sleep = lambda seconds: setattr(
+            fixture,
+            "now",
+            fixture.now + dt.timedelta(seconds=seconds) + alignment_jitter,
+        )
+        proof = fixture.run()
+        self.assertTrue(proof["assignmentAbsent"])
+        final_started, final_deadline = bounded_poll_seen[-1]
+        self.assertEqual(
+            final_deadline - final_started,
+            dt.timedelta(seconds=locks.LOCK_FINAL_OBSERVATION_SECONDS),
+        )
+        self.assertEqual(
+            final_started,
+            convergence_boundary + alignment_jitter,
+        )
+        self.assertEqual(
+            [(method, url) for method, url, *_ in fixture.mutations],
+            [
+                ("DELETE", fixture.lock_url),
+                ("DELETE", fixture.assignment_url),
+                ("PUT", fixture.lock_url),
+            ],
+        )
+        self.assertIsNone(fixture.assignment)
+        self.assertEqual(fixture.lock, fixture.lock_document())
+
+    def test_lock_poll_rejects_alignment_overshoot_beyond_slack(self):
+        fixture = Fixture()
+        original_read = fixture.read
+        lock_suspended = [False]
+        convergence_boundary = fixture.now + dt.timedelta(
+            seconds=locks.LOCK_CONVERGENCE_SECONDS
+        )
+        observed_starts = []
+        overshoot = dt.timedelta(
+            seconds=locks.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS + 0.001
+        )
+
+        def retain_deleted_lock(method, url):
+            if method == "DELETE" and url == fixture.lock_url:
+                lock_suspended[0] = True
+                fixture.lock = fixture.lock_document()
+
+        fixture.after_mutation = retain_deleted_lock
+
+        def bounded_read(method, url, *, deadline=None):
+            if (
+                lock_suspended[0]
+                and method == "GET"
+                and url == fixture.lock_url
+                and deadline is not None
+            ):
+                observed_starts.append(fixture.now)
+            return original_read(method, url, deadline=deadline)
+
+        fixture.read = bounded_read
+        fixture.sleep = lambda seconds: setattr(
+            fixture,
+            "now",
+            fixture.now + dt.timedelta(seconds=seconds) + overshoot,
+        )
+        with self.assertRaisesRegex(GuardFailure, "settlement clock is invalid"):
+            fixture.run()
+        self.assertTrue(observed_starts)
+        self.assertTrue(
+            all(start < convergence_boundary for start in observed_starts)
+        )
+        self.assertEqual(
+            [(method, url) for method, url, *_ in fixture.mutations],
+            [("DELETE", fixture.lock_url)],
+        )
+        self.assertEqual(fixture.assignment, fixture.expected)
+
     def test_changed_assignment_and_unknown_inherited_lock_fail_before_mutation(self):
         fixture = Fixture()
         fixture.assignment["properties"]["principalId"] = "other"
@@ -255,13 +424,14 @@ class CleanupLockTests(unittest.TestCase):
             fixture.run()
         self.assertEqual(fixture.mutations, [])
 
-    def test_assignment_created_during_absent_noop_inventory_fails_without_mutation(self):
+    def test_assignment_drift_during_absent_noop_inventory_fails_without_mutation(self):
         fixture = Fixture()
         fixture.assignment = None
         def inventory(operation, key):
             fixture.assignment = copy.deepcopy(fixture.expected)
+            fixture.assignment["properties"]["principalId"] = "other"
         fixture.inventory = inventory
-        with self.assertRaisesRegex(GuardFailure, "precondition changed"):
+        with self.assertRaisesRegex(GuardFailure, "changed assignment"):
             fixture.run()
         self.assertEqual(fixture.mutations, [])
 

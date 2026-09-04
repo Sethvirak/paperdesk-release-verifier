@@ -75,8 +75,8 @@ def reviewed_authorization(plan, plan_sha256):
     value["observedPreflight"]["observedAt"] = "2026-08-30T02:01:00.000Z"
     value["validity"] = {
         "notBefore": "2026-08-30T01:55:00.000Z",
-        "expiresAt": "2026-08-30T02:25:00.000Z",
-        "maximumLifetimeSeconds": 1800,
+        "expiresAt": "2026-08-30T02:55:00.000Z",
+        "maximumLifetimeSeconds": bootstrap.MAX_AUTHORIZATION_SECONDS,
     }
     return value
 
@@ -217,6 +217,21 @@ class CompleteReceiptBundleTests(unittest.TestCase):
                 "packageUploaderRole"
             ].update({"presentAfterCleanup": True})
         )
+
+    def test_temporary_role_ids_are_derived_from_authorization_not_receipt(self):
+        fixture = self.fresh()
+        bundle = copy.deepcopy(fixture["completeReceipt"]["bundle"])
+        other_ids = bootstrap.derive_temporary_role_ids(
+            fixture["plan"], "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        )
+        bundle["temporaryAccessCleanup"]["packageUploaderRole"].update(
+            {
+                "roleDefinitionId": other_ids["roleDefinitionId"],
+                "roleAssignmentId": other_ids["roleAssignmentId"],
+            }
+        )
+        with self.assertRaises(receipts.BootstrapReceiptError):
+            validate_bundle(fixture, bundle)
 
     def test_stale_terminal_time_fails(self):
         fixture = self.fresh()
@@ -631,6 +646,30 @@ class ReceiptByteBoundaryTests(unittest.TestCase):
 
 
 class ReviewedPlanDigestTests(unittest.TestCase):
+    def test_temporary_role_ids_are_unique_and_cross_contract_exact(self):
+        plan, _ = bootstrap.load_plan()
+        model = receipts.load_model()
+        constants = model["constants"]
+        self.assertEqual(
+            plan["temporaryAccess"]["temporaryRoleIdDerivation"],
+            constants["temporaryRoleIdDerivation"],
+        )
+        self.assertFalse(
+            set(plan["temporaryAccess"]).intersection(
+                bootstrap.TEMPORARY_ROLE_ID_FIELDS
+            )
+        )
+        all_ids = list(
+            bootstrap.derive_temporary_role_ids(
+                plan, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            ).values()
+        )
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in all_ids))
+        self.assertTrue(
+            set(all_ids).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
+        )
+
     def test_context_uses_exact_reviewed_plan_file_bytes(self):
         plan, plan_sha256 = bootstrap.load_plan()
         auth = reviewed_authorization(plan, plan_sha256)

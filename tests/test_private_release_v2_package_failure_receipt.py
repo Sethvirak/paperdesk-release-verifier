@@ -11,10 +11,7 @@ from tests import test_private_release_v2_bootstrap as fixtures
 SECRET = "Bearer package-receipt-private-token 203.0.113.51 raw-response-secret"
 OPERATION = "uploadVersionedBridgePackage"
 CLEANUP_ORDER = [
-    "addOwnedOperatorFenceBootstrapRole",
-    "addOwnedOperatorKeyReadRole",
     "addOwnedUploaderPackageRole",
-    "addOwnedOperatorControllerCanaryRole",
     "addOwnedUploaderIpv4Rule",
 ]
 
@@ -54,11 +51,25 @@ class PackageFailureReceiptTests(unittest.TestCase):
             role_readback = {"definitionSha256": SECRET, "assignmentSha256": SECRET} if hostile else {
                 "definitionSha256": "a" * 64, "assignmentSha256": "b" * 64,
             }
+            attempt_record = {
+                "attempt": SECRET if hostile else 43,
+                "startedAt": SECRET if hostile else "2026-09-02T00:09:15.000Z",
+                "completedAt": SECRET if hostile else "2026-09-02T00:09:15.125Z",
+                "durationMs": SECRET if hostile else 125,
+                "clientRequestId": SECRET if hostile else "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "status": SECRET if hostile else 403,
+                "errorCode": [] if hostile else code,
+                "requestId": request_id,
+                "serverDate": server_date,
+                "outcome": {} if hostile else "response",
+                "rawResponse": SECRET,
+            }
             failure = bootstrap.PackageReadinessError(
                 "package data-plane readiness did not converge before its deadline",
                 elapsed_seconds=600, attempts=43, status=403, error_code=code,
                 stop_reason="deadline", request_id=request_id, server_date=server_date,
                 credential=credential, role_readback=role_readback,
+                attempt_records=[attempt_record],
             )
 
             def apply(operation, state):
@@ -97,6 +108,18 @@ class PackageFailureReceiptTests(unittest.TestCase):
                 "serverDate": None if hostile else server_date,
                 "credential": None if hostile else credential,
                 "roleReadback": None if hostile else role_readback,
+                "attemptRecords": [{
+                    "attempt": None if hostile else 43,
+                    "startedAt": None if hostile else "2026-09-02T00:09:15.000Z",
+                    "completedAt": None if hostile else "2026-09-02T00:09:15.125Z",
+                    "durationMs": None if hostile else 125,
+                    "clientRequestId": None if hostile else "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "status": None if hostile else 403,
+                    "errorCode": "unknown" if hostile else code,
+                    "requestId": None if hostile else request_id,
+                    "serverDate": None if hostile else server_date,
+                    "outcome": "unknown" if hostile else "response",
+                }],
             })
             for value in (raw, consumed_raw):
                 for secret in (SECRET, "package-receipt-private-token", "203.0.113.51", "raw-response-secret"):
@@ -137,7 +160,7 @@ class PackageFailureReceiptTests(unittest.TestCase):
                 self.exercise_failure(hostile=hostile)
 
     def test_cleanup_failure_does_not_mask_package_diagnostic_or_claim_full_cleanup(self):
-        self.exercise_failure(hostile=True, failed_cleanup="addOwnedOperatorKeyReadRole")
+        self.exercise_failure(hostile=True, failed_cleanup="addOwnedUploaderPackageRole")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,10 @@ class CanaryTimingTests(unittest.TestCase):
         self.assertNotIn("expiresAt", static)
 
     def test_late_issuance_and_outer_expiry_clipping(self):
-        late = NOW + dt.timedelta(seconds=1000)
+        late = (
+            b.parse_time(self.auth["validity"]["expiresAt"], "expiry")
+            - dt.timedelta(seconds=600)
+        )
         timing = b._bootstrap_self_test_timing(self.auth, stamp(late))
         self.assertEqual(timing["issuedAt"], stamp(late))
         self.assertEqual(timing["expiresAt"], self.auth["validity"]["expiresAt"])
@@ -45,8 +48,13 @@ class CanaryTimingTests(unittest.TestCase):
         def advance():
             if expire_during_precondition:
                 self.current = b.parse_time(self.auth["validity"]["expiresAt"], "expiry")
+        pre_settings_etag = next(
+            item["context"]["preAppSettingsEtag"]
+            for item in f.projection["operationAdmissions"]
+            if item["operationId"] == CONFIGURE
+        )
         session = Session([
-            b._RestResponse(200, b.canonical_json_bytes({"properties": {}}), {"ETag": '"settings"'}),
+            b._RestResponse(200, b.canonical_json_bytes({"properties": {}}), {"ETag": pre_settings_etag}),
             put_error or b._RestResponse(200, b.canonical_json_bytes({"id": f.resources["bridgeSite"]["resourceId"]}), {}),
         ], after_request=advance)
         transport = b.AzureCliBootstrapTransport(authorization=self.auth, plan=f.plan, package=f.package,
@@ -71,7 +79,10 @@ class CanaryTimingTests(unittest.TestCase):
         result = transport._mutate(self.fixture.mutations[CONFIGURE], state)
         self.assertEqual([request[0] for request in session.requests], ["POST", "PUT"])
         self.assertEqual(result["bootstrapSelfTestIssuedAt"], stamp(self.current))
-        self.assertEqual(result["bootstrapSelfTestExpiresAt"], self.auth["validity"]["expiresAt"])
+        self.assertEqual(
+            result["bootstrapSelfTestExpiresAt"],
+            stamp(self.current + dt.timedelta(seconds=900)),
+        )
         self.assertEqual(result["settingsRequestBodySha256"], b.sha256_bytes(session.requests[-1][2]))
         self.assertEqual(len(journal.records), 2)
         for item in journal.records:

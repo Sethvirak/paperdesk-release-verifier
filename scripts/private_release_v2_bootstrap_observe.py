@@ -1322,6 +1322,8 @@ def _operation_admission(
             }
         )
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
+        if status != 200:
+            fail("bridge app-settings prestate is not one exact readable resource")
         settings = {} if status == 404 else _app_settings(envelope)
         if settings:
             fail(
@@ -1333,6 +1335,7 @@ def _operation_admission(
                 "preAppSettingsSha256": bootstrap.sha256_bytes(
                     bootstrap.canonical_json_bytes(settings)
                 ),
+                "preAppSettingsEtag": _etag(envelope, operation_id),
                 "bootstrapSelfTestStaticControl": (
                     bootstrap._bootstrap_self_test_static_control(authorization)
                 ),
@@ -1348,12 +1351,20 @@ def _operation_admission(
         ):
             fail(f"{operation_id} response is partial or paginated")
         if operation_id == "createCustomRoleDefinitions":
+            bootstrap._reject_residual_temporary_role_definitions(
+                values, label="preflight custom role-definition inventory"
+            )
             expected_specs = bootstrap._custom_role_definition_specs(plan)
             expected_by_resource_id = {
                 str(projection["id"]).lower(): (member_id, projection)
                 for member_id, projection in expected_specs.items()
             }
         else:
+            bootstrap._reject_residual_temporary_role_assignments(
+                values,
+                plan=plan,
+                label="preflight role-assignment inventory",
+            )
             resources = {item["id"]: item for item in plan["resourceInventory"]}
 
             def principal_id(principal: str) -> str:
@@ -1486,11 +1497,11 @@ def build_read_only_observation(
     if network.version != 4 or network.prefixlen != 32:
         fail("uploader IPv4 must be one exact /32")
 
-    plan, plan_sha256 = bootstrap.load_plan()
+    reviewed_plan, plan_sha256 = bootstrap.load_plan()
     package = bootstrap.build_package_descriptor()
     azure = _account(session)
     kernel = _authorization_kernel(
-        plan=plan,
+        plan=reviewed_plan,
         plan_sha256=plan_sha256,
         package=package,
         source=source,
@@ -1500,6 +1511,7 @@ def build_read_only_observation(
         observed_at=observed_at,
     )
     policy_authorization = _policy_authorization(kernel)
+    plan = bootstrap.bind_temporary_role_ids(reviewed_plan, authorization_id)
 
     probes: list[dict[str, Any]] = []
     admissions: list[dict[str, Any]] = []
@@ -1682,6 +1694,62 @@ def build_read_only_observation(
         elif isinstance(adopted, Mapping):
             dependency_facts[operation["id"]] = dict(adopted)
 
+    marker_inventory_projections: list[dict[str, Any]] = []
+    for request_spec in bootstrap._temporary_role_marker_inventory_requests(plan):
+        request = ReadRequest(method="GET", url=request_spec["url"])
+        envelope = _normalize_response(request, session.read(request))
+        if envelope["status"] != 200:
+            fail("read-only temporary role marker inventory is not readable")
+        document = _body_mapping(
+            envelope, f"read-only {request_spec['kind']}"
+        )
+        validated = bootstrap._validate_temporary_role_marker_inventory_document(
+            document,
+            kind=request_spec["kind"],
+            plan=plan,
+            label=f"read-only {request_spec['kind']}",
+        )
+        marker_inventory_projections.append(
+            {
+                **request_spec,
+                "status": 200,
+                "responseSha256": bootstrap.sha256_bytes(
+                    bootstrap.canonical_json_bytes(validated)
+                ),
+            }
+        )
+    marker_inventory_sha256 = bootstrap._temporary_role_marker_inventory_sha256(
+        marker_inventory_projections, plan
+    )
+
+    retired_role_absence: list[dict[str, Any]] = []
+    retired_observed_at = _stamp(observed_at)
+    for request_spec in bootstrap._retired_temporary_role_absence_requests(plan):
+        request = ReadRequest(method="GET", url=request_spec["url"])
+        envelope = _normalize_response(request, session.read(request))
+        if envelope["status"] != 404:
+            fail(
+                "read-only observation found a retired temporary role "
+                f"{request_spec['kind']}"
+            )
+        retired_role_absence.append(
+            {
+                **request_spec,
+                "status": 404,
+                "responseSha256": response_digest(envelope),
+                "temporaryRoleMarkerInventorySha256": marker_inventory_sha256,
+                "observedAt": retired_observed_at,
+            }
+        )
+    retired_role_absence = (
+        bootstrap._validate_retired_temporary_role_absence_projection(
+            retired_role_absence,
+            plan,
+            label="read-only retired temporary role absence",
+            expected_observed_at=retired_observed_at,
+        )
+    )
+
     production_documents: dict[str, Any] = {}
     production_probe_ids: list[str] = []
     for request_spec in bootstrap._production_boundary_requests(plan):
@@ -1699,6 +1767,7 @@ def build_read_only_observation(
         "sourceProjection": bootstrap._project_production_boundary_documents(
             production_documents, plan
         ),
+        "retiredTemporaryRoleAbsence": retired_role_absence,
     }
 
     postcondition_admissions: list[dict[str, Any]] = []
@@ -1753,6 +1822,7 @@ def build_read_only_observation(
             "exactConfirmationText": (
                 bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
                 + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
+                + " " + bootstrap.BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE
             ),
         },
         "ceremonyRequirements": [
@@ -1761,6 +1831,7 @@ def build_read_only_observation(
             "promote-proposedValidity-to-validity-within-freshness-window",
             "add-exact-confirmation-phrase-sha256",
             "include-exact-storage-acl-concurrency-residual-acceptance-in-confirmation",
+            "include-exact-bridge-config-hard-death-residual-acceptance-in-confirmation",
             "emit-separate-canonical-executable-authorization",
         ],
     }

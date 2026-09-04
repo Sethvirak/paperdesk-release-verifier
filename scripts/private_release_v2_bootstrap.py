@@ -36,6 +36,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 
 try:
@@ -69,16 +70,391 @@ TRUSTED_REVIEWERS = {
     "jecebella168-cmyk": 316989178,
     "jecebella169-cmyk": 322025901,
 }
-MAX_AUTHORIZATION_SECONDS = 1800
 MAX_PREFLIGHT_AGE_SECONDS = 300
 MAX_READBACK_CONVERGENCE_SECONDS = 120
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
+AZURE_CLI_REQUEST_TIMEOUT_SECONDS = 45
+AZURE_REST_RESPONSE_TIMEOUT_SECONDS = 45
+MAX_AZURE_REST_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_AZURE_REST_RESPONSE_HEADERS_BYTES = 256 * 1024
+TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS = 120
+CONTROLLER_CANARY_CREATE_SETTLEMENT_SECONDS = 120
+FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS = (
+    cleanup_locks.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+)
+STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS = (
+    AZURE_CLI_REQUEST_TIMEOUT_SECONDS + AZURE_REST_RESPONSE_TIMEOUT_SECONDS
+)
+# One active role cleanup uses six single-attempt Azure request envelopes
+# through assignment DELETE, one bounded lock-suspension convergence window,
+# one full final observation envelope after that boundary, and a 30-second
+# local journal margin. Exact executor-owned definition cleanup, lock
+# restoration, and deletion-absence readbacks may finish after expiry; they
+# cannot create new access.
+PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
+    6 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + cleanup_locks.LOCK_CONVERGENCE_SECONDS
+    + cleanup_locks.LOCK_FINAL_OBSERVATION_SECONDS
+    + 30
+)
+# After the create-only canary PUT, the nominal controller exercise and every
+# owned failure path use one staged window before protected-role cleanup:
+# acquire, renew, fast release, expiry acquire, an ambiguity release or finite
+# expiry observation, identity resolution when needed, conditional DELETE, one
+# safe DELETE replay, container inventory, exact blob absence, and a local
+# journal margin. Deadlines below bind every request to its own envelope.
+CONTROLLER_CANARY_LEASE_DURATION_SECONDS = 60
+CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
+    9 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + CONTROLLER_CANARY_LEASE_DURATION_SECONDS
+    + 30
+)
+# Account validation, fresh preflight, the durable claim, and all reviewed work
+# before the controller phase have one hard ten-minute budget. Controller role
+# admission then performs four exact reads, two create-only writes, and one
+# source readback before the data-plane propagation wait begins. FIC repin owns
+# a separate, unchanged 1,800-second contract.
+CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS = 600
+CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS = (
+    7 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+)
+CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS = (
+    CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS
+    + MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+    + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS
+    + PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+)
+MAX_AUTHORIZATION_SECONDS = (
+    CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS
+    + CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS
+)
+_AZURE_REST_EXCHANGE_CHILD = r"""
+import base64
+import json
+import sys
+import urllib.error
+import urllib.request
+
+MAX_BODY = 16 * 1024 * 1024
+MAX_HEADERS = 256 * 1024
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def emit(value):
+    sys.stdout.buffer.write(
+        json.dumps(value, ensure_ascii=True, allow_nan=False,
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+try:
+    payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    if set(payload) != {"method", "url", "body", "headers", "socketTimeout"}:
+        raise ValueError("invalid request envelope")
+    body_value = payload["body"]
+    body = None if body_value is None else base64.b64decode(body_value, validate=True)
+    headers = payload["headers"]
+    if not isinstance(headers, list) or any(
+        not isinstance(item, list) or len(item) != 2
+        or not all(isinstance(value, str) for value in item)
+        for item in headers
+    ):
+        raise ValueError("invalid request headers")
+    request = urllib.request.Request(
+        payload["url"], data=body, headers=dict(headers), method=payload["method"]
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()
+    )
+    response = None
+    try:
+        try:
+            response = opener.open(request, timeout=float(payload["socketTimeout"]))
+        except urllib.error.HTTPError as error:
+            response = error
+        status = int(response.status if hasattr(response, "status") else response.code)
+        response_body = response.read(MAX_BODY + 1)
+        response_headers = [
+            [str(key), str(value)] for key, value in response.headers.items()
+        ]
+    finally:
+        if response is not None:
+            response.close()
+    if sum(len(key) + len(value) for key, value in response_headers) > MAX_HEADERS:
+        raise ValueError("response headers are oversized")
+    emit({
+        "kind": "response",
+        "status": status,
+        "body": base64.b64encode(response_body).decode("ascii"),
+        "headers": response_headers,
+    })
+except Exception:
+    emit({"kind": "transport-error"})
+"""
+BRIDGE_SETTINGS_OWNER_OPERATION_ID = (
+    "configureBridgeExactVersionedPackageAndCriticalSettings"
+)
+BRIDGE_SETTINGS_CLEANUP_KEY = "bridge-app-settings-prestate"
+PROTECTED_ROLE_LIFECYCLES = {
+    "addOwnedOperatorControllerCanaryRole": "removeOwnedOperatorControllerCanaryRole",
+    "addOwnedUploaderPackageRole": "removeOwnedUploaderPackageRole",
+    "addOwnedOperatorKeyReadRole": "removeOwnedOperatorKeyReadRole",
+    "addOwnedOperatorFenceBootstrapRole": "removeOwnedOperatorFenceBootstrapRole",
+}
+PROTECTED_ROLE_CLEANUP_KEYS = frozenset({
+    "operator-controller-canary-role",
+    "uploader-package-role",
+    "operator-key-read-role",
+    "operator-fence-bootstrap-role",
+})
+TEMPORARY_CLEANUP_BY_OWNER = {
+    "addOwnedUploaderIpv4Rule": "removeOwnedUploaderIpv4Rule",
+    "addOwnedUploaderPackageRole": "removeOwnedUploaderPackageRole",
+    "addOwnedOperatorKeyReadRole": "removeOwnedOperatorKeyReadRole",
+    "addOwnedOperatorFenceBootstrapRole": "removeOwnedOperatorFenceBootstrapRole",
+    "addOwnedOperatorControllerCanaryRole": "removeOwnedOperatorControllerCanaryRole",
+    "createControllerLeaseCanaryBlob": "removeControllerLeaseCanaryBlob",
+}
+TEMPORARY_OWNER_BY_CLEANUP = {
+    cleanup_id: owner_id
+    for owner_id, cleanup_id in TEMPORARY_CLEANUP_BY_OWNER.items()
+}
+TEMPORARY_ROLE_ID_FIELDS = (
+    "roleDefinitionId",
+    "roleAssignmentId",
+    "temporaryKeyReadRoleDefinitionId",
+    "temporaryKeyReadRoleAssignmentId",
+    "temporaryFenceRoleDefinitionId",
+    "temporaryFenceRoleAssignmentId",
+    "temporaryControllerRoleDefinitionId",
+    "temporaryControllerRoleAssignmentId",
+)
+TEMPORARY_ROLE_ID_DERIVATION = {
+    "algorithm": "uuid5",
+    "namespace": "15a228ac-3249-535f-940d-d915c5ce4b70",
+    "nameTemplate": "{authorizationId}:{label}",
+    "labels": {
+        "roleDefinitionId": "package-role-definition",
+        "roleAssignmentId": "package-role-assignment",
+        "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
+        "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
+        "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
+        "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
+        "temporaryControllerRoleDefinitionId": "controller-canary-role-definition",
+        "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment",
+    },
+}
+TEMPORARY_ROLE_NAME_PREFIX = "PaperDesk V2 temporary "
+TEMPORARY_ROLE_MARKER_PREFIX = "paperdesk-private-release-v2-temporary:"
+RETIRED_TEMPORARY_ROLE_SPECS = (
+    {
+        "scopeResourceKey": "packageContainer",
+        "definitionId": "d3021f37-75b7-5dad-84ce-8bf84dd11e93",
+        "assignmentId": "39989cff-44ef-596e-8b46-0a433bb5c0e2",
+    },
+    {
+        "scopeResourceKey": "signingKey",
+        "definitionId": "dba37aa5-3824-5c68-91ac-5f1e24e7aa9c",
+        "assignmentId": "9420cd85-94df-5156-99b7-9a011702c69e",
+    },
+    {
+        "scopeResourceKey": "activationFenceContainer",
+        "definitionId": "1c425126-8044-52d8-b4f5-6dac8d60b1e1",
+        "assignmentId": "bdfe78bb-909b-54df-86a0-1620898addf0",
+    },
+    {
+        "scopeResourceKey": "controllerLockContainer",
+        "definitionId": "fb109dbf-e475-5f97-8db3-3c1a94acf4b3",
+        "assignmentId": "2d607095-edff-533c-a2c4-0e6e9d631715",
+    },
+    {
+        "scopeResourceKey": "packageContainer",
+        "definitionId": "2c66d02c-0545-469e-8fd6-b3bf08b2050b",
+        "assignmentId": "9db51009-898e-44e9-bb80-dc955c62f746",
+    },
+    {
+        "scopeResourceKey": "signingKey",
+        "definitionId": "4b046f73-1755-446d-93a8-e3c3b545b611",
+        "assignmentId": "212e0903-81a0-41ea-a11e-c07e91235a81",
+    },
+    {
+        "scopeResourceKey": "activationFenceContainer",
+        "definitionId": "91668da3-228c-4db3-ab59-5c2b65cd44d7",
+        "assignmentId": "72b288cf-73cf-4496-9480-6161c972193b",
+    },
+    {
+        "scopeResourceKey": "controllerLockContainer",
+        "definitionId": "d57913de-def8-4495-b30e-9f1e1cca1943",
+        "assignmentId": "807769aa-af4e-493e-b28d-803c58f10a44",
+    },
+)
+RETIRED_TEMPORARY_ROLE_IDS = frozenset(
+    value
+    for spec in RETIRED_TEMPORARY_ROLE_SPECS
+    for value in (spec["definitionId"], spec["assignmentId"])
+)
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+
+
+def _validate_temporary_role_id_derivation(plan: Mapping[str, Any]) -> Mapping[str, Any]:
+    temporary = plan.get("temporaryAccess")
+    if not isinstance(temporary, Mapping):
+        fail("bootstrap temporary access is invalid")
+    derivation = temporary.get("temporaryRoleIdDerivation")
+    if derivation != TEMPORARY_ROLE_ID_DERIVATION:
+        fail("bootstrap temporary role ID derivation contract drifted")
+    labels = derivation.get("labels") if isinstance(derivation, Mapping) else None
+    if (
+        not isinstance(labels, Mapping)
+        or set(labels) != set(TEMPORARY_ROLE_ID_FIELDS)
+        or len(set(labels.values())) != len(TEMPORARY_ROLE_ID_FIELDS)
+        or any(
+            not isinstance(label, str)
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", label) is None
+            for label in labels.values()
+        )
+    ):
+        fail("bootstrap temporary role derivation labels are invalid or duplicated")
+    return derivation
+
+
+def derive_temporary_role_ids(
+    plan: Mapping[str, Any], authorization_id: str
+) -> dict[str, str]:
+    """Derive one disjoint temporary-role ID set for one authorization."""
+
+    _guid(authorization_id, "temporary role authorization ID")
+    derivation = _validate_temporary_role_id_derivation(plan)
+    namespace = uuid.UUID(str(derivation["namespace"]))
+    labels = derivation["labels"]
+    derived = {
+        field: str(
+            uuid.uuid5(
+                namespace,
+                derivation["nameTemplate"].format(
+                    authorizationId=authorization_id, label=labels[field]
+                ),
+            )
+        )
+        for field in TEMPORARY_ROLE_ID_FIELDS
+    }
+    values = list(derived.values())
+    if (
+        any(GUID.fullmatch(value) is None for value in values)
+        or len(set(values)) != len(values)
+        or authorization_id in values
+        or not set(values).isdisjoint(RETIRED_TEMPORARY_ROLE_IDS)
+    ):
+        fail("derived temporary role IDs are invalid, duplicated, or retired")
+    return derived
+
+
+def bind_temporary_role_ids(
+    plan: Mapping[str, Any], authorization_id: str
+) -> dict[str, Any]:
+    """Return an in-memory execution plan with exact authorization-owned IDs."""
+
+    derived = derive_temporary_role_ids(plan, authorization_id)
+    bound = copy.deepcopy(dict(plan))
+    temporary = bound.get("temporaryAccess")
+    if not isinstance(temporary, dict):
+        fail("bootstrap temporary access is invalid")
+    present = set(temporary).intersection(TEMPORARY_ROLE_ID_FIELDS)
+    if present and (
+        present != set(TEMPORARY_ROLE_ID_FIELDS)
+        or any(temporary[field] != derived[field] for field in present)
+    ):
+        fail("in-memory temporary role IDs do not match the authorization")
+    temporary.update(derived)
+    return bound
+
+
+def _temporary_role_marker(authorization_id: str, cleanup_key: str) -> str:
+    _guid(authorization_id, "temporary role marker authorization ID")
+    if cleanup_key not in PROTECTED_ROLE_CLEANUP_KEYS:
+        fail("temporary role marker cleanup key is invalid")
+    return f"{TEMPORARY_ROLE_MARKER_PREFIX}{authorization_id}:{cleanup_key}"
+
+
+def _temporary_role_metadata(
+    authorization_id: str, cleanup_key: str
+) -> dict[str, str]:
+    marker = _temporary_role_marker(authorization_id, cleanup_key)
+    return {
+        "roleName": (
+            f"{TEMPORARY_ROLE_NAME_PREFIX}{authorization_id} {cleanup_key}"
+        ),
+        "description": marker,
+        "assignmentDescription": marker,
+    }
+
+
+def _reject_residual_temporary_role_definitions(
+    values: Any, *, label: str
+) -> None:
+    if not isinstance(values, list):
+        fail(f"{label} is not an exhaustive role-definition list")
+    for item in values:
+        if not isinstance(item, Mapping):
+            fail(f"{label} contains a non-object")
+        properties = item.get("properties")
+        if not isinstance(properties, Mapping):
+            fail(f"{label} contains a role definition without properties")
+        role_name = properties.get("roleName")
+        description = properties.get("description")
+        if (
+            isinstance(role_name, str)
+            and role_name.startswith(TEMPORARY_ROLE_NAME_PREFIX)
+        ) or (
+            isinstance(description, str)
+            and description.startswith(TEMPORARY_ROLE_MARKER_PREFIX)
+        ):
+            fail("a residual PaperDesk temporary role definition is present")
+
+
+def _reject_residual_temporary_role_assignments(
+    values: Any, *, plan: Mapping[str, Any], label: str
+) -> None:
+    if not isinstance(values, list):
+        fail(f"{label} is not an exhaustive role-assignment list")
+    temporary = plan.get("temporaryAccess")
+    current_definition_ids = {
+        str(temporary[field]).lower()
+        for field in (
+            "roleDefinitionId",
+            "temporaryKeyReadRoleDefinitionId",
+            "temporaryFenceRoleDefinitionId",
+            "temporaryControllerRoleDefinitionId",
+        )
+        if isinstance(temporary, Mapping) and isinstance(temporary.get(field), str)
+    }
+    forbidden_definition_ids = current_definition_ids | {
+        str(spec["definitionId"]).lower()
+        for spec in RETIRED_TEMPORARY_ROLE_SPECS
+    }
+    for item in values:
+        if not isinstance(item, Mapping):
+            fail(f"{label} contains a non-object")
+        properties = item.get("properties")
+        if not isinstance(properties, Mapping):
+            fail(f"{label} contains a role assignment without properties")
+        description = properties.get("description")
+        role_definition_id = str(properties.get("roleDefinitionId", ""))
+        definition_guid = role_definition_id.rstrip("/").rsplit("/", 1)[-1].lower()
+        if (
+            isinstance(description, str)
+            and description.startswith(TEMPORARY_ROLE_MARKER_PREFIX)
+        ) or definition_guid in forbidden_definition_ids:
+            fail("a residual PaperDesk temporary role assignment is present")
+
+
 GRAPH_APP_ROLE_ASSIGNMENT_ID = re.compile(r"^[A-Za-z0-9_-]{43}$")
 TEMPORARY_ACCESS_INACCESSIBLE_OPERATIONS = frozenset(
     {
@@ -106,6 +482,14 @@ DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "ambiguous transport, or journal failure can leave deletion protection absent; "
     "execution must stop NO-GO until fresh reads prove all three exact locks restored and "
     "all related temporary access absent, and manual cleanup may be required."
+)
+BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
+    "I accept that process death after the bridge configuration or site-start request "
+    "can leave a consumed use ledger and durable unresolved mutation intent while the "
+    "bridge site remains changed or running. Recovery may require an exact site stop and "
+    "conditional restoration of the source-bound prestate under a separate explicit "
+    "authorization; every fresh apply must stop until that durable intent and live state "
+    "are fully resolved."
 )
 
 
@@ -139,14 +523,15 @@ def _cleanup_assignment_resources(plan: Mapping[str, Any]) -> dict[str, str]:
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     temporary = plan["temporaryAccess"]
     result = {}
-    for operation_id, scope, field in (
-        ("removeOwnedUploaderPackageRole", "packageContainer", "roleAssignmentId"),
-        ("removeOwnedOperatorKeyReadRole", "signingKey", "temporaryKeyReadRoleAssignmentId"),
-        ("removeOwnedOperatorFenceBootstrapRole", "activationFenceContainer", "temporaryFenceRoleAssignmentId"),
-        ("removeOwnedOperatorControllerCanaryRole", "controllerLockContainer", "temporaryControllerRoleAssignmentId"),
-    ):
-        result[operation_id] = (resources[scope]["resourceId"]
-            + "/providers/Microsoft.Authorization/roleAssignments/" + temporary[field])
+    if all(field in temporary for field in TEMPORARY_ROLE_ID_FIELDS):
+        for operation_id, scope, field in (
+            ("removeOwnedUploaderPackageRole", "packageContainer", "roleAssignmentId"),
+            ("removeOwnedOperatorKeyReadRole", "signingKey", "temporaryKeyReadRoleAssignmentId"),
+            ("removeOwnedOperatorFenceBootstrapRole", "activationFenceContainer", "temporaryFenceRoleAssignmentId"),
+            ("removeOwnedOperatorControllerCanaryRole", "controllerLockContainer", "temporaryControllerRoleAssignmentId"),
+        ):
+            result[operation_id] = (resources[scope]["resourceId"]
+                + "/providers/Microsoft.Authorization/roleAssignments/" + temporary[field])
     legacy = plan["legacyPublisherRetirement"]
     result.update({
         "retireLegacyPublisherMutatorAssignment": legacy["roleAssignmentResourceIds"][0],
@@ -164,10 +549,20 @@ def _cleanup_lock_inventory_projection(document: Any, plan: Mapping[str, Any]) -
         or document.get("nextLink") not in (None, "") or not isinstance(document.get("value"), list)):
         fail("cleanup lock inventory is incomplete or paginated")
     targets = list(_cleanup_assignment_resources(plan).values())
-    for field in ("roleDefinitionId", "temporaryKeyReadRoleDefinitionId",
-                  "temporaryFenceRoleDefinitionId", "temporaryControllerRoleDefinitionId"):
-        targets.append(f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/"
-                       + plan["temporaryAccess"][field])
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    temporary = plan["temporaryAccess"]
+    # Lock inheritance depends on each temporary assignment's scope, not on its
+    # per-authorization assignment GUID.  Keeping the scope roots here lets the
+    # reviewed source plan be hashed before an authorization ID exists while a
+    # bound execution plan still proves the same complete lock inventory.
+    for scope_field in (
+        "scope",
+        "temporaryKeyReadScope",
+        "temporaryFenceScope",
+        "temporaryControllerScope",
+    ):
+        targets.append(resources[temporary[scope_field]]["resourceId"])
+    targets.append(f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions")
     expected = {item["resourceId"].lower(): item for item in cleanup_locks.REVIEWED_CLEANUP_LOCKS.values()}
     found = set()
     for item in document["value"]:
@@ -227,6 +622,104 @@ def _storage_response_correlation(request_id: Any, server_date: Any) -> dict[str
     return {"requestId": safe_request_id, "serverDate": safe_server_date}
 
 
+def _new_storage_client_request_id() -> str:
+    """Create the canonical correlation ID attached to one Storage request."""
+    request_id = str(uuid.uuid4())
+    if not GUID.fullmatch(request_id):  # pragma: no cover - uuid4 contract guard
+        fail("Storage client request ID generation failed closed")
+    return request_id
+
+
+def _safe_storage_attempt_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+        value,
+    ):
+        return None
+    try:
+        parsed = dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+    rendered = parsed.strftime("%Y-%m-%dT%H:%M:%S.") + f"{parsed.microsecond // 1000:03d}Z"
+    return value if rendered == value and parsed.microsecond % 1000 == 0 else None
+
+
+SAFE_STORAGE_ERROR_CODES = frozenset({
+    "AuthorizationFailure",
+    "AuthorizationPermissionMismatch",
+    "AuthenticationFailed",
+    "BlobNotFound",
+    "ContainerNotFound",
+    "BlobAlreadyExists",
+    "ConditionNotMet",
+    "LeaseAlreadyPresent",
+    "LeaseIdMissing",
+    "LeaseNotPresentWithBlobOperation",
+})
+
+
+def _safe_storage_attempt_records(value: Any) -> list[dict[str, Any]]:
+    """Copy at most 64 fixed-shape readiness records without request content."""
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in value[:64]:
+        if not isinstance(item, Mapping):
+            continue
+        attempt = item.get("attempt")
+        duration_ms = item.get("durationMs")
+        client_request_id = item.get("clientRequestId")
+        status = item.get("status")
+        error_code = item.get("errorCode")
+        outcome = item.get("outcome")
+        correlation = _storage_response_correlation(
+            item.get("requestId"), item.get("serverDate")
+        )
+        records.append({
+            "attempt": attempt if type(attempt) is int and 1 <= attempt <= 64 else None,
+            "startedAt": _safe_storage_attempt_timestamp(item.get("startedAt")),
+            "completedAt": _safe_storage_attempt_timestamp(item.get("completedAt")),
+            "durationMs": duration_ms if type(duration_ms) is int and 0 <= duration_ms <= (
+                MAX_STORAGE_DATA_PLANE_READINESS_SECONDS * 1000
+            ) else None,
+            "clientRequestId": client_request_id if isinstance(client_request_id, str)
+            and GUID.fullmatch(client_request_id) else None,
+            "status": status if type(status) is int and 100 <= status <= 599 else None,
+            "errorCode": error_code if isinstance(error_code, str)
+            and error_code in SAFE_STORAGE_ERROR_CODES else "unknown",
+            **correlation,
+            "outcome": outcome if isinstance(outcome, str) and outcome in {
+                "response", "transport-error"
+            } else "unknown",
+        })
+    return records
+
+
+def _storage_attempt_record(
+    *, attempt: int, started: dt.datetime, completed: dt.datetime,
+    client_request_id: str, status: int | None, error_code: str,
+    request_id: Any, server_date: Any, outcome: str,
+) -> dict[str, Any]:
+    duration_ms = round((completed - started).total_seconds() * 1000)
+    raw = {
+        "attempt": attempt,
+        "startedAt": started.astimezone(dt.timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
+        "completedAt": completed.astimezone(dt.timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
+        "durationMs": duration_ms,
+        "clientRequestId": client_request_id,
+        "status": status,
+        "errorCode": error_code,
+        "requestId": request_id,
+        "serverDate": server_date,
+        "outcome": outcome,
+    }
+    return _safe_storage_attempt_records([raw])[0]
+
+
 def _safe_storage_credential_diagnostic(value: Any) -> dict[str, Any] | None:
     """Metadata only; missing/invalid iat is not a new credential acceptance gate."""
     if not isinstance(value, Mapping):
@@ -277,6 +770,7 @@ class ControllerReadinessError(BootstrapError):
         request_id: str | None = None, server_date: str | None = None,
         credential: Mapping[str, Any] | None = None,
         role_readback: Mapping[str, Any] | None = None,
+        attempt_records: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         self.diagnostic = {
             "stage": "controller-lock-empty-proof",
@@ -291,8 +785,13 @@ class ControllerReadinessError(BootstrapError):
             **_storage_response_correlation(request_id, server_date),
             "credential": _safe_storage_credential_diagnostic(credential),
             "roleReadback": _safe_storage_role_diagnostic(role_readback),
+            "attemptRecords": _safe_storage_attempt_records(attempt_records),
         }
-        detail = " ".join(f"{key}={value}" for key, value in self.diagnostic.items())
+        detail = " ".join(
+            f"{key}={value}" for key, value in self.diagnostic.items()
+            if key != "attemptRecords"
+        )
+        detail += f" attemptRecordCount={len(self.diagnostic['attemptRecords'])}"
         super().__init__(f"{message}; {detail}")
 
 
@@ -317,6 +816,7 @@ class PackageReadinessError(BootstrapError):
         request_id: str | None = None, server_date: str | None = None,
         credential: Mapping[str, Any] | None = None,
         role_readback: Mapping[str, Any] | None = None,
+        attempt_records: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         self.diagnostic = {
             "stage": "package-upload-readiness",
@@ -328,8 +828,79 @@ class PackageReadinessError(BootstrapError):
             **_storage_response_correlation(request_id, server_date),
             "credential": _safe_storage_credential_diagnostic(credential),
             "roleReadback": _safe_storage_role_diagnostic(role_readback),
+            "attemptRecords": _safe_storage_attempt_records(attempt_records),
         }
-        detail = " ".join(f"{key}={value}" for key, value in self.diagnostic.items())
+        detail = " ".join(
+            f"{key}={value}" for key, value in self.diagnostic.items()
+            if key != "attemptRecords"
+        )
+        detail += f" attemptRecordCount={len(self.diagnostic['attemptRecords'])}"
+        super().__init__(f"{message}; {detail}")
+
+
+class StorageOperationError(BootstrapError):
+    """One bounded, sanitized diagnostic for a Storage write/readiness failure."""
+
+    OPERATIONS = frozenset({
+        "uploadVersionedBridgePackage",
+        "createInitialIdleActivationFence",
+        "createControllerLeaseCanaryBlob",
+        "exerciseControllerLeaseCanary",
+        "removeControllerLeaseCanaryBlob",
+    })
+    METHODS = frozenset({"GET", "PUT", "DELETE"})
+    ERROR_CODES = SAFE_STORAGE_ERROR_CODES
+    STOP_REASONS = frozenset({
+        "transport-error",
+        "unexpected-status",
+        "deadline",
+        "unsupported-response",
+        "result-journal-error",
+        "unsafe-xml",
+        "invalid-error-shape",
+        "error-code-mismatch",
+        "readiness-timeout",
+    })
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation_id: str,
+        method: str,
+        elapsed_seconds: float,
+        status: int | None,
+        error_code: str,
+        stop_reason: str,
+        request_id: str | None = None,
+        server_date: str | None = None,
+        attempt_records: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.diagnostic = {
+            "stage": "storage-operation",
+            "operationId": (
+                operation_id if operation_id in self.OPERATIONS else "unknown"
+            ),
+            "method": method if method in self.METHODS else "unknown",
+            "elapsedSeconds": round(max(0.0, elapsed_seconds), 3),
+            "status": (
+                status if type(status) is int and 100 <= status <= 599 else None
+            ),
+            "errorCode": (
+                error_code if error_code in self.ERROR_CODES else "unknown"
+            ),
+            "stopReason": (
+                stop_reason if stop_reason in self.STOP_REASONS else "unknown"
+            ),
+            **_storage_response_correlation(request_id, server_date),
+            "attemptRecords": _safe_storage_attempt_records(attempt_records),
+        }
+        detail = " ".join(
+            f"{key}={value}"
+            for key, value in self.diagnostic.items()
+            if key != "attemptRecords"
+        )
+        detail += f" attemptRecordCount={len(self.diagnostic['attemptRecords'])}"
         super().__init__(f"{message}; {detail}")
 
 
@@ -338,6 +909,18 @@ class OwnedTemporaryMutationError(BootstrapError):
 
     The provisional proof is retained so the executor can compensate the
     exact executor-owned mutation before surfacing the failure.
+    """
+
+    def __init__(self, message: str, proof: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.proof = dict(proof)
+
+
+class CleanupResolvedMutationError(BootstrapError):
+    """An ambiguous cleanup was safely replayed and fully proved absent.
+
+    The attempt must stop because the first durable intent remains unresolved;
+    the exact cleanup proof prevents executor compensation from replaying it.
     """
 
     def __init__(self, message: str, proof: Mapping[str, Any]) -> None:
@@ -574,6 +1157,7 @@ def _mutation_target_allowed(
 ) -> bool:
     """Bind every journaled mutating request to one reviewed target family."""
 
+    plan = bind_temporary_role_ids(plan, authorization_id)
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     parsed = urllib.parse.urlsplit(target_url)
     host = parsed.hostname or ""
@@ -918,6 +1502,7 @@ def _expected_terminal_mutation_targets(
     Unlocked projection that requires exactly one subsequent lock POST.
     """
 
+    plan = bind_temporary_role_ids(plan, authorization_id)
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     context = operation_contexts.get(operation_id)
     if not isinstance(context, Mapping):
@@ -1289,6 +1874,7 @@ def _validate_terminal_mutation_coverage(
 ) -> None:
     """Require every completed cloud write exactly once in the public journal."""
 
+    plan = bind_temporary_role_ids(plan, authorization_id)
     results_by_operation: dict[str, Counter[str]] = {
         item["id"]: Counter()
         for item in plan["mutations"]
@@ -1298,7 +1884,15 @@ def _validate_terminal_mutation_coverage(
         if item.get("phase") != "result":
             continue
         status = item.get("status")
-        if type(status) is not int or not 200 <= status <= 299:
+        exact_canary_absence = (
+            item.get("operationId") == "removeControllerLeaseCanaryBlob"
+            and status == 404
+            and item.get("storageErrorCode") == "BlobNotFound"
+        )
+        if (
+            type(status) is not int
+            or (not 200 <= status <= 299 and not exact_canary_absence)
+        ):
             fail("terminal mutation journal contains a non-success result")
         results_by_operation[str(item["operationId"])][
             _normalized_mutation_target(str(item["method"]), str(item["targetUrl"]))
@@ -1344,6 +1938,25 @@ def _validate_terminal_mutation_coverage(
                     expected_body = canonical_json_bytes({"properties": lock_proof["properties"]}) if item["method"] == "PUT" else b""
                     if item["requestBodySha256"] != sha256_bytes(expected_body):
                         fail("cleanup lock mutation body differs from exact reviewed protection")
+
+    result_positions: dict[str, list[int]] = {}
+    for index, item in enumerate(journal):
+        if item.get("phase") == "result":
+            result_positions.setdefault(str(item.get("operationId")), []).append(index)
+    for previous_remove, next_add in (
+        ("addOwnedUploaderIpv4Rule", "addOwnedOperatorControllerCanaryRole"),
+        (
+            "removeOwnedOperatorControllerCanaryRole",
+            "addOwnedUploaderPackageRole",
+        ),
+        ("removeOwnedUploaderPackageRole", "addOwnedOperatorKeyReadRole"),
+        ("removeOwnedOperatorKeyReadRole", "addOwnedOperatorFenceBootstrapRole"),
+        ("removeOwnedOperatorFenceBootstrapRole", "removeOwnedUploaderIpv4Rule"),
+    ):
+        previous = result_positions.get(previous_remove, [])
+        following = result_positions.get(next_add, [])
+        if not previous or not following or max(previous) >= min(following):
+            fail("protected temporary role journal lifecycles overlap or reorder")
 
     for operation_id in (
         "uploadVersionedBridgePackage",
@@ -1438,6 +2051,7 @@ def _sanitize_mutation_journal(
     }
     intents: dict[str, Mapping[str, Any]] = {}
     results: set[str] = set()
+    storage_intent_client_request_ids: set[str] = set()
     sanitized: list[dict[str, Any]] = []
     for sequence, value in enumerate(records, 1):
         if not isinstance(value, dict) or value.get("sequence") != sequence:
@@ -1451,6 +2065,7 @@ def _sanitize_mutation_journal(
             "method",
             "targetUrl",
             "requestBodySha256",
+            "clientRequestId",
             "authorizationSha256",
             "sourceSha",
             "planSha256",
@@ -1465,6 +2080,9 @@ def _sanitize_mutation_journal(
                 "responseBodySha256",
                 "etag",
                 "versionId",
+                "requestId",
+                "serverDate",
+                "storageErrorCode",
             }
         if set(value) != expected_keys or value.get("schemaVersion") != 1:
             fail("mutation journal record fields are not exact")
@@ -1505,6 +2123,19 @@ def _sanitize_mutation_journal(
         ):
             fail("mutation journal target is outside the source-owned operation contract")
         _sha256(value.get("requestBodySha256"), "mutation request body digest")
+        is_storage = (
+            (parsed.hostname or "").lower()
+            == "mdspdbak2608089c4e.blob.core.windows.net"
+        )
+        client_request_id = value.get("clientRequestId")
+        if (
+            (is_storage and (
+                not isinstance(client_request_id, str)
+                or not GUID.fullmatch(client_request_id)
+            ))
+            or (not is_storage and client_request_id is not None)
+        ):
+            fail("mutation journal Storage client request ID is invalid")
         if (
             value.get("authorizationSha256") != authorization_sha256
             or value.get("sourceSha") != source_sha
@@ -1518,7 +2149,14 @@ def _sanitize_mutation_journal(
         response_sha: str | None = None
         etag: str | None = None
         version_id: str | None = None
+        request_id: str | None = None
+        server_date: str | None = None
+        storage_error_code: str | None = None
         if phase == "intent":
+            if is_storage:
+                if client_request_id in storage_intent_client_request_ids:
+                    fail("mutation journal reuses a Storage client request ID")
+                storage_intent_client_request_ids.add(str(client_request_id))
             intent_id = f"cloud-mutation-{sequence:04d}"
             intents[intent_id] = value
         elif phase == "result":
@@ -1531,6 +2169,7 @@ def _sanitize_mutation_journal(
                 or value.get("method") != intent.get("method")
                 or value.get("targetUrl") != intent.get("targetUrl")
                 or value.get("requestBodySha256") != intent.get("requestBodySha256")
+                or value.get("clientRequestId") != intent.get("clientRequestId")
                 or value.get("temporary") is not intent.get("temporary")
             ):
                 fail("mutation result is not bound to one prior intent")
@@ -1548,6 +2187,24 @@ def _sanitize_mutation_journal(
                 not isinstance(version_id, str) or not 1 <= len(version_id) <= 512
             ):
                 fail("mutation result version ID is invalid")
+            request_id = value.get("requestId")
+            server_date = value.get("serverDate")
+            correlation = _storage_response_correlation(request_id, server_date)
+            storage_error_code = value.get("storageErrorCode")
+            if is_storage:
+                if (
+                    correlation["requestId"] != request_id
+                    or correlation["serverDate"] != server_date
+                    or storage_error_code
+                    not in StorageOperationError.ERROR_CODES | {"unknown"}
+                ):
+                    fail("mutation result Storage correlation is invalid")
+            elif (
+                request_id is not None
+                or server_date is not None
+                or storage_error_code is not None
+            ):
+                fail("non-Storage mutation contains Storage correlation")
             results.add(str(intent_id))
         else:
             fail("mutation journal phase is invalid")
@@ -1561,10 +2218,14 @@ def _sanitize_mutation_journal(
                 "method": method,
                 "targetUrl": target_url,
                 "requestBodySha256": value["requestBodySha256"],
+                "clientRequestId": client_request_id,
                 "status": status,
                 "responseBodySha256": response_sha,
                 "etag": etag,
                 "versionId": version_id,
+                "requestId": request_id,
+                "serverDate": server_date,
+                "storageErrorCode": storage_error_code,
                 "recordedAt": value["recordedAt"],
             }
         )
@@ -1613,15 +2274,20 @@ def _validate_sanitized_mutation_journal(
         "method",
         "targetUrl",
         "requestBodySha256",
+        "clientRequestId",
         "status",
         "responseBodySha256",
         "etag",
         "versionId",
+        "requestId",
+        "serverDate",
+        "storageErrorCode",
         "recordedAt",
     }
     intents: dict[str, Mapping[str, Any]] = {}
     intent_times: dict[str, dt.datetime] = {}
     completed: set[str] = set()
+    storage_intent_client_request_ids: set[str] = set()
     not_before = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
     expires_at = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
     if (execution_started_at is None) is not (execution_completed_at is None):
@@ -1656,6 +2322,19 @@ def _validate_sanitized_mutation_journal(
         ):
             fail("sanitized mutation journal target or operation classification drifted")
         _sha256(item["requestBodySha256"], "sanitized journal request digest")
+        parsed_target = urllib.parse.urlsplit(item["targetUrl"])
+        is_storage = (
+            (parsed_target.hostname or "").lower()
+            == "mdspdbak2608089c4e.blob.core.windows.net"
+        )
+        if (
+            (is_storage and (
+                not isinstance(item["clientRequestId"], str)
+                or not GUID.fullmatch(item["clientRequestId"])
+            ))
+            or (not is_storage and item["clientRequestId"] is not None)
+        ):
+            fail("sanitized journal Storage client request ID is invalid")
         observed = parse_time(item["recordedAt"], "sanitized journal timestamp")
         if not not_before <= observed <= expires_at:
             fail("sanitized mutation journal timestamp is outside authorization")
@@ -1674,9 +2353,17 @@ def _validate_sanitized_mutation_journal(
                 or item["responseBodySha256"] is not None
                 or item["etag"] is not None
                 or item["versionId"] is not None
+                or item["requestId"] is not None
+                or item["serverDate"] is not None
+                or item["storageErrorCode"] is not None
                 or intent_id in intents
             ):
                 fail("sanitized mutation intent is not exact")
+            if is_storage:
+                client_request_id = str(item["clientRequestId"])
+                if client_request_id in storage_intent_client_request_ids:
+                    fail("sanitized journal reuses a Storage client request ID")
+                storage_intent_client_request_ids.add(client_request_id)
             intents[intent_id] = item
             intent_times[intent_id] = observed
         elif item["phase"] == "result":
@@ -1692,6 +2379,7 @@ def _validate_sanitized_mutation_journal(
                         "method",
                         "targetUrl",
                         "requestBodySha256",
+                        "clientRequestId",
                     )
                 )
                 or type(item["status"]) is not int
@@ -1708,6 +2396,23 @@ def _validate_sanitized_mutation_journal(
                 or not 1 <= len(item["versionId"]) <= 512
             ):
                 fail("sanitized journal version ID is invalid")
+            correlation = _storage_response_correlation(
+                item["requestId"], item["serverDate"]
+            )
+            if is_storage:
+                if (
+                    correlation["requestId"] != item["requestId"]
+                    or correlation["serverDate"] != item["serverDate"]
+                    or item["storageErrorCode"]
+                    not in StorageOperationError.ERROR_CODES | {"unknown"}
+                ):
+                    fail("sanitized mutation Storage correlation is invalid")
+            elif (
+                item["requestId"] is not None
+                or item["serverDate"] is not None
+                or item["storageErrorCode"] is not None
+            ):
+                fail("sanitized non-Storage mutation has Storage correlation")
             completed.add(str(intent_id))
         else:
             fail("sanitized mutation journal phase is invalid")
@@ -1768,6 +2473,17 @@ def load_plan() -> tuple[dict[str, Any], str]:
         or plan["repository"] != REPOSITORY
     ):
         fail("bootstrap plan identity is not exact")
+    temporary = plan.get("temporaryAccess")
+    if not isinstance(temporary, Mapping):
+        fail("bootstrap temporary access is invalid")
+    _validate_temporary_role_id_derivation(plan)
+    if set(temporary).intersection(TEMPORARY_ROLE_ID_FIELDS):
+        fail("reviewed plan must not embed reusable temporary role IDs")
+    if (
+        temporary.get("leaseDurationSeconds")
+        != CONTROLLER_CANARY_LEASE_DURATION_SECONDS
+    ):
+        fail("bootstrap controller lease duration is invalid")
 
     azure = _exact_keys(
         plan["azure"],
@@ -1903,8 +2619,30 @@ def load_plan() -> tuple[dict[str, Any], str]:
         before("proveControllerLockContainerEmpty", later_temporary_access)
     before("createControllerLeaseCanaryBlob", "exerciseControllerLeaseCanary")
     before("exerciseControllerLeaseCanary", "removeControllerLeaseCanaryBlob")
+    before("proveControllerLockContainerEmpty", "createControllerLeaseCanaryBlob")
     before("createInitialIdleActivationFence", "removeOwnedUploaderIpv4Rule")
     before("removeControllerLeaseCanaryBlob", "removeOwnedOperatorControllerCanaryRole")
+    before("addOwnedUploaderPackageRole", "uploadVersionedBridgePackage")
+    before("uploadVersionedBridgePackage", "removeOwnedUploaderPackageRole")
+    before("addOwnedOperatorKeyReadRole", "readBackExactSigningPublicJwk")
+    before("readBackExactSigningPublicJwk", "removeOwnedOperatorKeyReadRole")
+    before("addOwnedOperatorFenceBootstrapRole", "createInitialIdleActivationFence")
+    before("createInitialIdleActivationFence", "removeOwnedOperatorFenceBootstrapRole")
+    active_protected_role: str | None = None
+    for mutation_id in mutation_ids:
+        if mutation_id in PROTECTED_ROLE_LIFECYCLES:
+            if active_protected_role is not None:
+                fail("protected temporary role lifecycles overlap")
+            active_protected_role = mutation_id
+        elif mutation_id in PROTECTED_ROLE_LIFECYCLES.values():
+            if (
+                active_protected_role is None
+                or PROTECTED_ROLE_LIFECYCLES[active_protected_role] != mutation_id
+            ):
+                fail("protected temporary role lifecycle removal is not exact")
+            active_protected_role = None
+    if active_protected_role is not None:
+        fail("protected temporary role lifecycle is not closed")
     before("configureBridgeExactVersionedPackageAndCriticalSettings", "startBridgeForBoundedCanary")
     before("removeOwnedUploaderPackageRole", "startBridgeForBoundedCanary")
     before("removeOwnedUploaderIpv4Rule", "startBridgeForBoundedCanary")
@@ -2314,6 +3052,14 @@ def _validate_authorization_document(
         fail("confirmation phrase does not explicitly accept the storage ACL and recovery residuals")
     if confirmation_phrase is not None and DELETION_LOCK_RESIDUAL_ACCEPTANCE not in confirmation_phrase:
         fail("confirmation phrase does not explicitly authorize exact deletion-lock suspension and recovery")
+    if (
+        confirmation_phrase is not None
+        and BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE not in confirmation_phrase
+    ):
+        fail(
+            "confirmation phrase does not explicitly accept bridge configuration "
+            "hard-death recovery residuals"
+        )
 
     single_use = _exact_keys(
         root["singleUse"],
@@ -2593,6 +3339,249 @@ def _production_boundary_requests(plan: Mapping[str, Any]) -> list[dict[str, str
             "url": f"{root}/extensions/onedeploy?api-version=2025-05-01",
         },
     ]
+
+
+def _retired_temporary_role_absence_requests(
+    plan: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Return the exact ordered retired role resources that must stay absent."""
+
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    requests: list[dict[str, str]] = []
+    for spec in RETIRED_TEMPORARY_ROLE_SPECS:
+        scope_key = str(spec["scopeResourceKey"])
+        scope = resources.get(scope_key, {}).get("resourceId")
+        if not isinstance(scope, str) or not scope.startswith(
+            f"/subscriptions/{SUBSCRIPTION}/"
+        ):
+            fail("retired temporary role scope is not source exact")
+        definition_id = _guid(
+            spec["definitionId"], "retired temporary role definition ID"
+        )
+        assignment_id = _guid(
+            spec["assignmentId"], "retired temporary role assignment ID"
+        )
+        for kind, resource_id in (
+            (
+                "definition",
+                f"/subscriptions/{SUBSCRIPTION}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{definition_id}",
+            ),
+            (
+                "assignment",
+                f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+                f"{assignment_id}",
+            ),
+        ):
+            requests.append(
+                {
+                    "kind": kind,
+                    "resourceId": resource_id,
+                    "url": (
+                        "https://management.azure.com"
+                        f"{resource_id}?api-version=2022-04-01"
+                    ),
+                }
+            )
+    if (
+        len(requests) != 2 * len(RETIRED_TEMPORARY_ROLE_SPECS)
+        or len({item["resourceId"].lower() for item in requests}) != len(requests)
+        or len({item["url"].lower() for item in requests}) != len(requests)
+    ):
+        fail("retired temporary role resource universe is not exact and unique")
+    return requests
+
+
+def _temporary_role_marker_inventory_requests(
+    plan: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    if plan is None:
+        plan = load_plan()[0]
+    resources = {item["id"]: item for item in plan["resourceInventory"]}
+    temporary = plan.get("temporaryAccess")
+    if not isinstance(temporary, Mapping):
+        fail("temporary role marker inventory lacks its source scopes")
+    scope_keys = [
+        temporary.get("scope"),
+        temporary.get("temporaryKeyReadScope"),
+        temporary.get("temporaryFenceScope"),
+        temporary.get("temporaryControllerScope"),
+    ]
+    if (
+        scope_keys
+        != [
+            "packageContainer",
+            "signingKey",
+            "activationFenceContainer",
+            "controllerLockContainer",
+        ]
+        or len(set(scope_keys)) != 4
+    ):
+        fail("temporary role marker inventory scopes are not source exact")
+    root = (
+        "https://management.azure.com/subscriptions/"
+        f"{SUBSCRIPTION}/providers/Microsoft.Authorization"
+    )
+    requests = [
+        {
+            "kind": "definitionInventory",
+            "url": (
+                f"{root}/roleDefinitions?api-version=2022-04-01&$filter="
+                "type%20eq%20%27CustomRole%27"
+            ),
+        }
+    ]
+    for scope_key in scope_keys:
+        scope = resources.get(scope_key, {}).get("resourceId")
+        if (
+            not isinstance(scope, str)
+            or not scope.startswith(f"/subscriptions/{SUBSCRIPTION}/")
+        ):
+            fail("temporary role assignment inventory scope is not source exact")
+        requests.append(
+            {
+                "kind": f"assignmentInventory:{scope_key}",
+                "url": (
+                    "https://management.azure.com"
+                    f"{scope}/providers/Microsoft.Authorization/roleAssignments"
+                    "?api-version=2022-04-01"
+                ),
+            }
+        )
+    if (
+        len(requests) != 5
+        or len({item["kind"] for item in requests}) != len(requests)
+        or len({item["url"].lower() for item in requests}) != len(requests)
+    ):
+        fail("temporary role marker inventory request universe is not exact")
+    return requests
+
+
+def _validate_temporary_role_marker_inventory_document(
+    document: Any,
+    *,
+    kind: str,
+    plan: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(document, Mapping)
+        or set(document) - {"value", "nextLink"}
+        or document.get("nextLink") not in {None, ""}
+        or not isinstance(document.get("value"), list)
+    ):
+        fail(f"{label} is partial, paginated, or malformed")
+    values = document["value"]
+    if kind == "definitionInventory":
+        _reject_residual_temporary_role_definitions(values, label=label)
+    elif kind in {
+        "assignmentInventory:packageContainer",
+        "assignmentInventory:signingKey",
+        "assignmentInventory:activationFenceContainer",
+        "assignmentInventory:controllerLockContainer",
+    }:
+        _reject_residual_temporary_role_assignments(
+            values, plan=plan, label=label
+        )
+    else:
+        fail("temporary role marker inventory kind is invalid")
+    return json.loads(canonical_json_bytes(document).decode("utf-8"))
+
+
+def _temporary_role_marker_inventory_sha256(
+    projections: Sequence[Mapping[str, Any]],
+    plan: Mapping[str, Any] | None = None,
+) -> str:
+    expected = _temporary_role_marker_inventory_requests(plan)
+    if (
+        not isinstance(projections, Sequence)
+        or isinstance(projections, (str, bytes, bytearray))
+        or len(projections) != len(expected)
+    ):
+        fail("temporary role marker inventory proof is incomplete")
+    canonical: list[dict[str, Any]] = []
+    for index, (projection, request) in enumerate(zip(projections, expected)):
+        item = dict(
+            _exact_keys(
+                projection,
+                {"kind", "url", "status", "responseSha256"},
+                f"temporary role marker inventory proof {index}",
+            )
+        )
+        if (
+            item["kind"] != request["kind"]
+            or item["url"] != request["url"]
+            or item["status"] != 200
+        ):
+            fail("temporary role marker inventory proof target is not exact")
+        _sha256(
+            item["responseSha256"],
+            f"temporary role marker inventory response digest {index}",
+        )
+        canonical.append(item)
+    return sha256_bytes(canonical_json_bytes(canonical))
+
+
+def _validate_retired_temporary_role_absence_projection(
+    value: Any,
+    plan: Mapping[str, Any],
+    *,
+    label: str,
+    expected_observed_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Validate one ordered eight-resource 404 absence projection."""
+
+    expected = _retired_temporary_role_absence_requests(plan)
+    if not isinstance(value, list) or len(value) != len(expected):
+        fail(f"{label} is incomplete")
+    validated: list[dict[str, Any]] = []
+    for index, (candidate, request) in enumerate(zip(value, expected)):
+        item = dict(
+            _exact_keys(
+                candidate,
+                {
+                    "url",
+                    "resourceId",
+                    "kind",
+                    "status",
+                    "responseSha256",
+                    "temporaryRoleMarkerInventorySha256",
+                    "observedAt",
+                },
+                f"{label} item {index}",
+            )
+        )
+        if (
+            item["url"] != request["url"]
+            or item["resourceId"] != request["resourceId"]
+            or item["kind"] != request["kind"]
+            or type(item["status"]) is not int
+            or item["status"] != 404
+        ):
+            fail(f"{label} resource order or 404 state is not exact")
+        _sha256(item["responseSha256"], f"{label} response digest {index}")
+        _sha256(
+            item["temporaryRoleMarkerInventorySha256"],
+            f"{label} marker inventory digest {index}",
+        )
+        parse_time(item["observedAt"], f"{label} observedAt {index}")
+        if (
+            expected_observed_at is not None
+            and item["observedAt"] != expected_observed_at
+        ):
+            fail(f"{label} timestamp is not bound to its observation")
+        validated.append(item)
+    marker_digests = {
+        item["temporaryRoleMarkerInventorySha256"] for item in validated
+    }
+    if (
+        len({item["resourceId"].lower() for item in validated}) != len(validated)
+        or len({item["url"].lower() for item in validated}) != len(validated)
+        or len(marker_digests) != 1
+    ):
+        fail(f"{label} contains a duplicate retired role resource")
+    return json.loads(canonical_json_bytes(validated).decode("utf-8"))
 
 
 def _production_boundary_digest_document(
@@ -3526,6 +4515,9 @@ def _operation_readback_url(
     plan: Mapping[str, Any],
     authorization: Mapping[str, Any],
 ) -> str:
+    authorization_id = authorization.get("authorizationId")
+    if isinstance(authorization_id, str) and GUID.fullmatch(authorization_id):
+        plan = bind_temporary_role_ids(plan, authorization_id)
     resources = {item["id"]: item for item in plan["resourceInventory"]}
 
     def arm(resource_id: str, api_version: str, suffix: str = "") -> str:
@@ -3590,17 +4582,28 @@ def _operation_readback_url(
             return url
         filter_value = "type eq 'CustomRole'"
         return f"{url}&$filter={urllib.parse.quote(filter_value, safe='()')}"
-    temporary_role_operations = {
-        "addOwnedUploaderPackageRole": (plan["temporaryAccess"]["scope"], plan["temporaryAccess"]["roleAssignmentId"]),
-        "removeOwnedUploaderPackageRole": (plan["temporaryAccess"]["scope"], plan["temporaryAccess"]["roleAssignmentId"]),
-        "addOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadScope"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
-        "removeOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadScope"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
-        "addOwnedOperatorFenceBootstrapRole": (plan["temporaryAccess"]["temporaryFenceScope"], plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]),
-        "removeOwnedOperatorFenceBootstrapRole": (plan["temporaryAccess"]["temporaryFenceScope"], plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]),
-        "addOwnedOperatorControllerCanaryRole": (plan["temporaryAccess"]["temporaryControllerScope"], plan["temporaryAccess"]["temporaryControllerRoleAssignmentId"]),
-        "removeOwnedOperatorControllerCanaryRole": (plan["temporaryAccess"]["temporaryControllerScope"], plan["temporaryAccess"]["temporaryControllerRoleAssignmentId"]),
+    temporary_role_operation_ids = {
+        "addOwnedUploaderPackageRole",
+        "removeOwnedUploaderPackageRole",
+        "addOwnedOperatorKeyReadRole",
+        "removeOwnedOperatorKeyReadRole",
+        "addOwnedOperatorFenceBootstrapRole",
+        "removeOwnedOperatorFenceBootstrapRole",
+        "addOwnedOperatorControllerCanaryRole",
+        "removeOwnedOperatorControllerCanaryRole",
     }
-    if operation_id in temporary_role_operations:
+    if operation_id in temporary_role_operation_ids:
+        temporary = plan["temporaryAccess"]
+        temporary_role_operations = {
+            "addOwnedUploaderPackageRole": (temporary["scope"], temporary["roleAssignmentId"]),
+            "removeOwnedUploaderPackageRole": (temporary["scope"], temporary["roleAssignmentId"]),
+            "addOwnedOperatorKeyReadRole": (temporary["temporaryKeyReadScope"], temporary["temporaryKeyReadRoleAssignmentId"]),
+            "removeOwnedOperatorKeyReadRole": (temporary["temporaryKeyReadScope"], temporary["temporaryKeyReadRoleAssignmentId"]),
+            "addOwnedOperatorFenceBootstrapRole": (temporary["temporaryFenceScope"], temporary["temporaryFenceRoleAssignmentId"]),
+            "removeOwnedOperatorFenceBootstrapRole": (temporary["temporaryFenceScope"], temporary["temporaryFenceRoleAssignmentId"]),
+            "addOwnedOperatorControllerCanaryRole": (temporary["temporaryControllerScope"], temporary["temporaryControllerRoleAssignmentId"]),
+            "removeOwnedOperatorControllerCanaryRole": (temporary["temporaryControllerScope"], temporary["temporaryControllerRoleAssignmentId"]),
+        }
         scope_key, assignment_id = temporary_role_operations[operation_id]
         scope = resources[scope_key]["resourceId"]
         return arm(f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_id}", "2022-04-01")
@@ -3695,6 +4698,9 @@ def _validator_contract(
     plan: Mapping[str, Any],
     authorization: Mapping[str, Any],
 ) -> dict[str, Any]:
+    authorization_id = authorization.get("authorizationId")
+    if isinstance(authorization_id, str) and GUID.fullmatch(authorization_id):
+        plan = bind_temporary_role_ids(plan, authorization_id)
     resource_map = {item["id"]: item for item in plan["resourceInventory"]}
     if validator_id.startswith("operation:"):
         operation_id = validator_id.split(":", 1)[1]
@@ -4081,6 +5087,7 @@ def _validate_operation_source_projection(
     operation_context: Mapping[str, Any] | None = None,
     runtime_facts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     projection = dict(
         _exact_keys(
             value,
@@ -4126,7 +5133,7 @@ def _validate_operation_source_projection(
     _sha256(projection["responseSha256"], f"{operation_id} response digest")
     headers = projection["headers"]
     if not isinstance(headers, dict) or not set(headers).issubset(
-        {"etag", "versionId", "leaseState", "leaseStatus"}
+        {"etag", "versionId", "leaseState", "leaseStatus", "leaseDuration"}
     ):
         fail(f"{operation_id} retained response headers are not exact")
     for name, item in headers.items():
@@ -4619,6 +5626,9 @@ def _validate_operation_source_projection(
         definition_id, assignment_id, scope_key, cleanup_key, data_actions = temp_specs[
             operation_id
         ]
+        metadata = _temporary_role_metadata(
+            authorization["authorizationId"], cleanup_key
+        )
         scope = resources[scope_key]["resourceId"]
         definition_resource = (
             f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/"
@@ -4632,8 +5642,8 @@ def _validate_operation_source_projection(
             "name": definition_id,
             "type": "Microsoft.Authorization/roleDefinitions",
             "properties": {
-                "roleName": f"PaperDesk V2 temporary {cleanup_key}",
-                "description": "Single-use bootstrap temporary role; exact cleanup required",
+                "roleName": metadata["roleName"],
+                "description": metadata["description"],
                 "type": "CustomRole",
                 "permissions": [
                     {
@@ -4663,6 +5673,7 @@ def _validate_operation_source_projection(
                 "condition": None,
                 "conditionVersion": None,
                 "delegatedManagedIdentityResourceId": None,
+                "description": metadata["assignmentDescription"],
             },
         }
         if (
@@ -4896,9 +5907,11 @@ def _validate_operation_source_projection(
                 "leaseId",
                 "acquiredAt",
                 "releaseIntentionallyOmitted",
-                "availableAt",
+                "expiredAt",
                 "pollAttempts",
                 "finalLeaseState",
+                "finalLeaseStatus",
+                "finalLeaseDuration",
             },
             "controller lease expiry fallback",
         )
@@ -4916,12 +5929,12 @@ def _validate_operation_source_projection(
         fallback_acquired = parse_time(
             fallback["acquiredAt"], "controller expiry lease acquiredAt"
         )
-        fallback_available = parse_time(
-            fallback["availableAt"], "controller expiry lease availableAt"
+        fallback_expired = parse_time(
+            fallback["expiredAt"], "controller expiry lease expiredAt"
         )
         auth_start = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
         auth_end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
-        ordered = [acquired_at, *renewed_at, released_at, fallback_acquired, fallback_available]
+        ordered = [acquired_at, *renewed_at, released_at, fallback_acquired, fallback_expired]
         if (
             body["url"] != expected_url
             or body["leaseId"] != temporary["controllerLeaseId"]
@@ -4939,9 +5952,12 @@ def _validate_operation_source_projection(
             or fallback["releaseIntentionallyOmitted"] is not True
             or type(fallback["pollAttempts"]) is not int
             or fallback["pollAttempts"] < 1
-            or fallback["finalLeaseState"] != "available"
-            or headers.get("leaseState", "").lower() != "available"
+            or fallback["finalLeaseState"] != "expired"
+            or fallback["finalLeaseStatus"] != "unlocked"
+            or fallback["finalLeaseDuration"] != "fixed"
+            or headers.get("leaseState", "").lower() != "expired"
             or headers.get("leaseStatus", "").lower() != "unlocked"
+            or headers.get("leaseDuration", "").lower() != "fixed"
             or ordered != sorted(ordered)
             or not auth_start <= ordered[0] <= ordered[-1] <= auth_end
         ):
@@ -4949,6 +5965,7 @@ def _validate_operation_source_projection(
     elif family == "app-settings-digest-only":
         required = {
             "preAppSettingsSha256",
+            "preAppSettingsEtag",
             "settingsSha256",
             "bootstrapSelfTestControlSha256",
             "bootstrapSelfTestIssuedAt",
@@ -4989,6 +6006,7 @@ def _validate_operation_source_projection(
             or body["preAppSettingsSha256"]
             != sha256_bytes(canonical_json_bytes(context["preAppSettings"]))
             or body["settingsSha256"] != expected_settings_sha
+            or body["preAppSettingsEtag"] != context.get("preAppSettingsEtag")
             or body["settingsRequestBodySha256"] != sha256_bytes(canonical_json_bytes({"properties": desired}))
             or body["bootstrapSelfTestControlSha256"] != expected_control_sha
             or body["packageUrl"] != package_url
@@ -6140,6 +7158,7 @@ def _validate_postcondition_source_projection(
 ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
     """Purely validate one postcondition using exact operation and journal facts."""
 
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     postcondition = next(
         (item for item in plan["postconditions"] if item["id"] == postcondition_id),
         None,
@@ -6427,6 +7446,8 @@ def build_terminal_source_evidence(
     mutation_journal: Sequence[Mapping[str, Any]],
     package_readback_bytes: bytes | bytearray,
     production_boundary_post_execution: Mapping[str, Any],
+    retired_role_absence_fresh_preflight: Sequence[Mapping[str, Any]],
+    retired_role_absence_post_execution: Sequence[Mapping[str, Any]],
     claimed_at: str,
     observed_at: str,
 ) -> dict[str, Any]:
@@ -6452,6 +7473,7 @@ def build_terminal_source_evidence(
     ):
         fail("terminal package readback bytes are not the exact authorized package")
 
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     admissions = preflight_projection.get("operationAdmissions")
     if not isinstance(admissions, list):
@@ -6833,6 +7855,16 @@ def build_terminal_source_evidence(
     production_after = _validate_production_boundary_projection(
         production_boundary_post_execution, plan
     )
+    retired_absence_fresh = _validate_retired_temporary_role_absence_projection(
+        list(retired_role_absence_fresh_preflight),
+        plan,
+        label="fresh preflight retired temporary role absence",
+    )
+    retired_absence_terminal = _validate_retired_temporary_role_absence_projection(
+        list(retired_role_absence_post_execution),
+        plan,
+        label="post-execution retired temporary role absence",
+    )
     accepted_gate = {
         "status": "deferred-required-post-s2",
         "requiredAfter": "separately-authorized-publisher-fic-repin",
@@ -6939,6 +7971,8 @@ def build_terminal_source_evidence(
         "productionBoundary": {
             "authorizedPreflightProjection": production_before,
             "postExecutionProjection": production_after,
+            "freshPreflightRetiredRoleAbsence": retired_absence_fresh,
+            "postExecutionRetiredRoleAbsence": retired_absence_terminal,
             "projectionsEqual": production_before == production_after,
             "journaledProductionWriteCount": 0,
             "acceptedContainerWriteJournal": [],
@@ -6949,7 +7983,7 @@ def build_terminal_source_evidence(
         "observedAt": observed_at,
     }
     return validate_terminal_source_evidence(
-        plan=plan,
+        plan=reviewed_plan,
         authorization=authorization,
         preflight_projection=preflight_projection,
         evidence=evidence,
@@ -7032,6 +8066,7 @@ def validate_terminal_source_evidence(
         != authorization["observedPreflight"]["sha256"]
     ):
         fail("terminal source evidence identity, plan, or preflight binding is invalid")
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     observed_at = parse_time(source["observedAt"], "terminal source evidence observedAt")
     not_before = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
     expires_at = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
@@ -7142,6 +8177,7 @@ def validate_terminal_source_evidence(
     ):
         fail("terminal operation projection universe is incomplete")
     validated_operations: dict[str, Mapping[str, Any]] = {}
+    operation_observed_times: list[dt.datetime] = []
     for index, (item, mutation) in enumerate(
         zip(all_values, expected_all_operations)
     ):
@@ -7155,6 +8191,7 @@ def validate_terminal_source_evidence(
         stamp = parse_time(entry["observedAt"], f"{mutation['id']} observedAt")
         if not claimed_at <= stamp <= observed_at:
             fail("terminal operation observation is outside actual execution")
+        operation_observed_times.append(stamp)
         validated_operations[mutation["id"]] = (
             _validate_operation_source_projection(
                 entry["sourceProjection"],
@@ -7274,6 +8311,8 @@ def validate_terminal_source_evidence(
         {
             "authorizedPreflightProjection",
             "postExecutionProjection",
+            "freshPreflightRetiredRoleAbsence",
+            "postExecutionRetiredRoleAbsence",
             "projectionsEqual",
             "journaledProductionWriteCount",
             "acceptedContainerWriteJournal",
@@ -7307,15 +8346,58 @@ def validate_terminal_source_evidence(
     after_boundary = _validate_production_boundary_projection(after_boundary, plan)
     if before_boundary != expected_authorized_boundary:
         fail("production boundary prestate is not the exact authorized observation")
+    authorized_retired_absence = _validate_retired_temporary_role_absence_projection(
+        preflight_projection["productionBoundaryObservation"][
+            "retiredTemporaryRoleAbsence"
+        ],
+        plan,
+        label="authorized preflight retired temporary role absence",
+        expected_observed_at=authorization["observedPreflight"]["observedAt"],
+    )
+    sanitized_authorized_retired_absence = source[
+        "authorizedPreflightProjection"
+    ]["productionBoundaryObservation"]["retiredTemporaryRoleAbsence"]
+    if sanitized_authorized_retired_absence != authorized_retired_absence:
+        fail("terminal source lost the authorized retired role absence proof")
+    fresh_retired_absence = _validate_retired_temporary_role_absence_projection(
+        boundary["freshPreflightRetiredRoleAbsence"],
+        plan,
+        label="fresh preflight retired temporary role absence",
+    )
+    terminal_retired_absence = _validate_retired_temporary_role_absence_projection(
+        boundary["postExecutionRetiredRoleAbsence"],
+        plan,
+        label="post-execution retired temporary role absence",
+    )
+    fresh_times = {
+        parse_time(
+            item["observedAt"],
+            "fresh preflight retired temporary role absence observedAt",
+        )
+        for item in fresh_retired_absence
+    }
+    terminal_times = {
+        parse_time(
+            item["observedAt"],
+            "post-execution retired temporary role absence observedAt",
+        )
+        for item in terminal_retired_absence
+    }
+    claimed_at = parse_time(claim["claimedAt"], "terminal execution claimedAt")
+    if (
+        len(fresh_times) != 1
+        or len(terminal_times) != 1
+        or not not_before <= next(iter(fresh_times)) <= claimed_at
+        or not max(operation_observed_times) <= next(iter(terminal_times)) <= observed_at
+    ):
+        fail("retired temporary role absence phases or timestamps are not exact")
     boundary_journal = _validate_sanitized_mutation_journal(
         boundary["mutationJournal"],
         plan=plan,
         authorization=authorization,
         operation_projections=validated_all_operations,
         operation_contexts=operation_contexts,
-        execution_started_at=parse_time(
-            claim["claimedAt"], "terminal execution claimedAt"
-        ),
+        execution_started_at=claimed_at,
         execution_completed_at=observed_at,
     )
     if validated_journal is not None and boundary_journal != validated_journal:
@@ -7608,6 +8690,7 @@ def build_terminal_receipt_components(
     model, _model_raw = load_json(EVIDENCE_MODEL_PATH)
     if not isinstance(model, Mapping):
         fail("terminal evidence model is not one object")
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     operations = _terminal_source_operation_map(source)
 
@@ -8053,6 +9136,7 @@ def _operation_context_policy(
         observed_fields |= {
             "preAppSettings",
             "preAppSettingsSha256",
+            "preAppSettingsEtag",
             "bootstrapSelfTestStaticControl",
         }
     elif operation_id in {"createCustomRoleDefinitions", "createExactRoleAssignments"}:
@@ -8157,6 +9241,9 @@ def _validate_operation_context(
     authorization: Mapping[str, Any],
 ) -> dict[str, Any]:
     plan, _ = load_plan()
+    authorization_id = authorization.get("authorizationId")
+    if isinstance(authorization_id, str) and GUID.fullmatch(authorization_id):
+        plan = bind_temporary_role_ids(plan, authorization_id)
     policy = _operation_context_policy(operation_id, plan, authorization)
     decision = value.get("executionDecision")
     if decision == "adopt-pending-execution-empty-proof":
@@ -8339,6 +9426,11 @@ def _validate_operation_context(
                 )
             )
             or context["preAppSettingsSha256"] != sha256_bytes(canonical_json_bytes(settings))
+            or _if_match_etag(
+                context.get("preAppSettingsEtag"),
+                "authorized bridge app-settings prestate ETag",
+            )
+            != context.get("preAppSettingsEtag")
             or context["bootstrapSelfTestStaticControl"]
             != _bootstrap_self_test_static_control(authorization)
         ):
@@ -8370,6 +9462,7 @@ def validate_preflight_evidence(
     authorization: Mapping[str, Any],
     plan: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    plan = bind_temporary_role_ids(plan, authorization["authorizationId"])
     document = _exact_keys(
         value,
         {"schemaVersion", "status", "observedAt", "projection", "projectionSha256"},
@@ -8753,7 +9846,7 @@ def validate_preflight_evidence(
         fail("postcondition admissions are not in exact plan order")
     production_boundary = _exact_keys(
         projection["productionBoundaryObservation"],
-        {"probeIds", "sourceProjection"},
+        {"probeIds", "sourceProjection", "retiredTemporaryRoleAbsence"},
         "production boundary observation",
     )
     boundary_specs = _production_boundary_requests(plan)
@@ -8784,6 +9877,12 @@ def validate_preflight_evidence(
             fail("production boundary read is not one exact dedicated preflight probe")
     _validate_production_boundary_projection(
         production_boundary["sourceProjection"], plan
+    )
+    _validate_retired_temporary_role_absence_projection(
+        production_boundary["retiredTemporaryRoleAbsence"],
+        plan,
+        label="authorized preflight retired temporary role absence",
+        expected_observed_at=document["observedAt"],
     )
     projection_digest = sha256_bytes(canonical_json_bytes(document["projection"]))
     if (
@@ -8851,6 +9950,75 @@ class _RestResponse:
     status: int
     body: bytes
     headers: Mapping[str, str]
+    client_request_id: str | None = None
+
+
+class _StrictStorageXmlError(BootstrapError):
+    """A Storage XML body is either unsafe encoded input or malformed XML."""
+
+    def __init__(self, message: str, *, unsafe: bool) -> None:
+        super().__init__(message)
+        self.unsafe = unsafe
+
+
+def _strict_storage_xml_root(body: bytes, label: str) -> ET.Element:
+    """Parse only strict UTF-8 Storage XML without DTD/entity expansion."""
+
+    if (
+        not isinstance(body, bytes)
+        or not body
+        or body.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"))
+        or b"\x00" in body
+    ):
+        raise _StrictStorageXmlError(
+            f"{label} is not strict UTF-8 XML", unsafe=True
+        )
+    try:
+        text = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise _StrictStorageXmlError(
+            f"{label} is not strict UTF-8 XML", unsafe=True
+        ) from exc
+    upper = text.upper()
+    if (
+        text.startswith("\ufeff")
+        or "\x00" in text
+        or "<!DOCTYPE" in upper
+        or "<!ENTITY" in upper
+    ):
+        raise _StrictStorageXmlError(
+            f"{label} contains an unsafe XML declaration", unsafe=True
+        )
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise _StrictStorageXmlError(
+            f"{label} is malformed XML", unsafe=False
+        ) from exc
+
+
+class _LateRestResponse(BootstrapError):
+    """A bounded HTTP response arrived at or after its absolute deadline."""
+
+    def __init__(self, response: _RestResponse) -> None:
+        super().__init__("Azure REST response crossed the request deadline")
+        self.response = response
+
+
+class _RestTransportAmbiguity(BootstrapError):
+    """One request may have reached Azure but has no complete response."""
+
+
+class _RestTotalTimeout(_RestTransportAmbiguity):
+    """The killable one-request exchange exceeded its total wall-clock budget."""
+
+
+class _MutationOwnershipAmbiguity(BootstrapError):
+    """A durable mutation intent has an applied or possibly-applied outcome."""
+
+    def __init__(self, message: str, response: _RestResponse | None = None) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -8879,14 +10047,118 @@ class AzureCliRestSession:
         authorization: Mapping[str, Any],
         *,
         clock: Callable[[], dt.datetime] | None = None,
+        exchange_runner: (
+            Callable[[urllib.request.Request, float], _RestResponse] | None
+        ) = None,
     ) -> None:
         self.authorization = authorization
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self._tokens: dict[str, tuple[str, int]] = {}
         self._token_issued_at: dict[str, int | None] = {}
         self._storage_credential_observation: dict[str, Any] | None = None
-        self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect()
+        self._storage_client_request_ids: set[str] = set()
+        self._exchange_runner = exchange_runner or self._run_exchange_subprocess
+
+    @staticmethod
+    def _run_exchange_subprocess(
+        request: urllib.request.Request, timeout: float
+    ) -> _RestResponse:
+        """Run exactly one killable urllib exchange under a monotonic total cap."""
+
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise _RestTotalTimeout("Azure REST total response deadline expired")
+        monotonic_deadline = time.monotonic() + float(timeout)
+        payload = {
+            "method": request.get_method(),
+            "url": request.full_url,
+            "body": (
+                None
+                if request.data is None
+                else base64.b64encode(request.data).decode("ascii")
+            ),
+            "headers": [list(item) for item in request.header_items()],
+            "socketTimeout": float(timeout),
+        }
+        encoded = canonical_json_bytes(payload)
+        remaining = monotonic_deadline - time.monotonic()
+        if remaining <= 0:
+            raise _RestTotalTimeout("Azure REST total response deadline expired")
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", _AZURE_REST_EXCHANGE_CHILD],
+                input=encoded,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run kills and waits for this sole child before raising;
+            # no stale request process can later race exact compensation.
+            raise _RestTotalTimeout(
+                "Azure REST total response deadline expired"
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed"
+            ) from exc
+        if (
+            completed.returncode != 0
+            or not completed.stdout
+            or len(completed.stdout) > 32 * 1024 * 1024
+            or len(completed.stderr) > 1024 * 1024
+        ):
+            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+        try:
+            document = json.loads(
+                completed.stdout.decode("utf-8"),
+                object_pairs_hook=_duplicate_safe_pairs,
+                parse_constant=lambda value: fail(
+                    f"invalid JSON constant: {value}"
+                ),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed"
+            ) from exc
+        if document == {"kind": "transport-error"}:
+            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+        if not isinstance(document, Mapping) or set(document) != {
+            "kind",
+            "status",
+            "body",
+            "headers",
+        }:
+            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+        status = document["status"]
+        body_value = document["body"]
+        header_items = document["headers"]
+        if (
+            document["kind"] != "response"
+            or type(status) is not int
+            or not 100 <= status <= 599
+            or not isinstance(body_value, str)
+            or not isinstance(header_items, list)
+            or any(
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(value, str) for value in item)
+                for item in header_items
+            )
+            or sum(len(item[0]) + len(item[1]) for item in header_items)
+            > MAX_AZURE_REST_RESPONSE_HEADERS_BYTES
+        ):
+            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+        try:
+            response_body = base64.b64decode(body_value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed"
+            ) from exc
+        return _RestResponse(
+            status=status,
+            body=response_body,
+            headers={key: value for key, value in header_items},
         )
 
     @staticmethod
@@ -8905,7 +10177,7 @@ class AzureCliRestSession:
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=45,
+                timeout=AZURE_CLI_REQUEST_TIMEOUT_SECONDS,
                 text=True,
                 encoding="utf-8",
             )
@@ -9038,6 +10310,7 @@ class AzureCliRestSession:
         *,
         body: bytes | None = None,
         headers: Mapping[str, str] | None = None,
+        deadline: dt.datetime | None = None,
     ) -> _RestResponse:
         try:
             parsed = urllib.parse.urlsplit(url)
@@ -9056,25 +10329,72 @@ class AzureCliRestSession:
         ):
             fail("Azure REST request is outside the exact host/method boundary")
         bound = dict(headers or {})
-        bound["Authorization"] = "Bearer " + self._token(resource)
+        if deadline is not None and (
+            not isinstance(deadline, dt.datetime) or deadline.utcoffset() is None
+        ):
+            fail("Azure REST request deadline is invalid")
+        if deadline is not None and (
+            self.clock()
+            + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+            > deadline
+        ):
+            fail("Azure REST request lacks a full credential and response envelope")
+        client_request_id: str | None = None
+        if resource == "https://storage.azure.com/":
+            supplied = [
+                (key, value) for key, value in bound.items()
+                if key.lower() == "x-ms-client-request-id"
+            ]
+            if len(supplied) > 1:
+                fail("Storage client request ID header is ambiguous")
+            if supplied:
+                client_request_id = supplied[0][1]
+                if (
+                    not isinstance(client_request_id, str)
+                    or not GUID.fullmatch(client_request_id)
+                ):
+                    fail("Storage client request ID is invalid")
+            else:
+                client_request_id = _new_storage_client_request_id()
+            if client_request_id in self._storage_client_request_ids:
+                fail("Storage client request ID was reused")
+            for key, _ in supplied:
+                del bound[key]
+            bound["x-ms-client-request-id"] = client_request_id
+            self._storage_client_request_ids.add(client_request_id)
+        token = self._token(resource)
+        response_timeout = float(AZURE_REST_RESPONSE_TIMEOUT_SECONDS)
+        if deadline is not None:
+            remaining = (deadline - self.clock()).total_seconds()
+            if remaining <= 0:
+                fail("Azure REST request deadline expired after credential acquisition")
+            response_timeout = min(response_timeout, remaining)
+        bound["Authorization"] = "Bearer " + token
         bound.setdefault("Accept", "application/json")
         if body is not None:
             bound.setdefault("Content-Length", str(len(body)))
         request = urllib.request.Request(url, data=body, headers=bound, method=method)
         try:
-            with self._opener.open(request, timeout=45) as response:
-                response_body = response.read(16 * 1024 * 1024 + 1)
-                status = response.status
-                response_headers = dict(response.headers)
-        except urllib.error.HTTPError as error:
-            response_body = error.read(16 * 1024 * 1024 + 1)
-            status = error.code
-            response_headers = dict(error.headers)
+            response = self._exchange_runner(request, response_timeout)
+        except (_RestTotalTimeout, _RestTransportAmbiguity):
+            raise
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise BootstrapError("Azure REST transport failed closed") from exc
-        if len(response_body) > 16 * 1024 * 1024:
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed"
+            ) from exc
+        if not isinstance(response, _RestResponse):
+            fail("Azure REST exchange runner returned an invalid response")
+        if len(response.body) > MAX_AZURE_REST_RESPONSE_BYTES:
             fail("Azure REST response exceeded the bounded size")
-        return _RestResponse(status, response_body, response_headers)
+        result = _RestResponse(
+            response.status,
+            response.body,
+            dict(response.headers),
+            client_request_id=client_request_id,
+        )
+        if deadline is not None and self.clock() >= deadline:
+            raise _LateRestResponse(result)
+        return result
 
 
 def _response_sha256(response: _RestResponse) -> str:
@@ -9121,8 +10441,12 @@ def _strict_empty_controller_inventory(
     ):
         fail("controller lock initial inventory is not one bounded XML response")
     try:
-        root = ET.fromstring(response.body)
-    except ET.ParseError as exc:
+        root = _strict_storage_xml_root(
+            response.body, "controller lock initial inventory"
+        )
+    except _StrictStorageXmlError as exc:
+        if exc.unsafe:
+            fail("controller lock initial inventory is not one bounded XML response")
         raise BootstrapError("controller lock initial inventory XML is invalid") from exc
     if root.tag != "EnumerationResults":
         fail("controller lock initial inventory root is not exact")
@@ -9307,10 +10631,47 @@ def _package_blob_error_projection(
         ),
         "",
     )
-    matches = re.findall(rb"<Code>([A-Za-z0-9]+)</Code>", response.body)
-    if "xml" not in content_type.lower() or len(matches) != 1:
+    if (
+        "xml" not in content_type.lower()
+        or not response.body
+        or len(response.body) > 65536
+    ):
         fail("storage blob error response is not one exact XML error")
-    code = matches[0].decode("ascii")
+    try:
+        root = _strict_storage_xml_root(
+            response.body, "storage blob error response"
+        )
+    except _StrictStorageXmlError as exc:
+        raise BootstrapError(
+            "storage blob error response is not one exact XML error"
+        ) from exc
+    children = list(root)
+    if (
+        root.tag != "Error"
+        or root.attrib
+        or (root.text or "").strip()
+        or [child.tag for child in children].count("Code") != 1
+        or [child.tag for child in children].count("Message") > 1
+        or any(
+            child.tag not in {"Code", "Message"}
+            or child.attrib
+            or list(child)
+            or (child.tail or "").strip()
+            for child in children
+        )
+    ):
+        fail("storage blob error response is not one exact XML error")
+    code = root.findtext("Code") or ""
+    header_code = next(
+        (
+            value
+            for key, value in response.headers.items()
+            if key.lower() == "x-ms-error-code"
+        ),
+        None,
+    )
+    if header_code is not None and header_code != code:
+        fail("storage blob error header and XML code disagree")
     allowed = {
         "AuthenticationFailed",
         "AuthorizationFailure",
@@ -9506,13 +10867,26 @@ class AzureCliBootstrapTransport:
         session: AzureCliRestSession | None = None,
     ) -> None:
         self.authorization = authorization
-        self.plan = plan
+        authorization_id = str(authorization["authorizationId"])
+        reviewed_plan, _reviewed_plan_sha256 = load_plan()
+        provided_execution_plan = bind_temporary_role_ids(plan, authorization_id)
+        expected_execution_plan = bind_temporary_role_ids(
+            reviewed_plan, authorization_id
+        )
+        if canonical_json_bytes(provided_execution_plan) != canonical_json_bytes(
+            expected_execution_plan
+        ):
+            fail("Azure transport received a plan outside the reviewed source contract")
+        self.reviewed_plan = reviewed_plan
+        self.plan = expected_execution_plan
         self.package = package
         self.preflight = preflight
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.sleep = sleep
         self.session = session or AzureCliRestSession(authorization, clock=self.clock)
-        self.resources = {item["id"]: item for item in plan["resourceInventory"]}
+        self.resources = {
+            item["id"]: item for item in self.plan["resourceInventory"]
+        }
         self.admissions = {
             item["operationId"]: item
             for item in preflight["projection"]["operationAdmissions"]
@@ -9530,8 +10904,179 @@ class AzureCliBootstrapTransport:
         self._fresh_projection: Mapping[str, Any] | None = None
         self._ledger: UseLedger | None = None
         self._active_operation_id: str | None = None
+        self._active_protected_role_add: str | None = None
+        self._protected_work_deadline: dt.datetime | None = None
         self._validated_source_projections: dict[str, Mapping[str, Any]] = {}
         self._package_readback_bytes: bytes | None = None
+        self._retired_role_absence_preflight: list[dict[str, Any]] | None = None
+        self._retired_role_absence_terminal: list[dict[str, Any]] | None = None
+
+    def _authorization_expiry(self) -> dt.datetime:
+        return parse_time(
+            self.authorization["validity"]["expiresAt"], "authorization expiresAt"
+        )
+
+    def _protected_role_deadline(self, extra_reserve_seconds: int = 0) -> dt.datetime:
+        return self._authorization_expiry() - dt.timedelta(
+            seconds=(
+                PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+                + extra_reserve_seconds
+            )
+        )
+
+    def _controller_canary_fast_acquire_deadline(self) -> dt.datetime:
+        return self._controller_canary_create_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_fast_renew_deadline(self) -> dt.datetime:
+        return self._controller_canary_fast_acquire_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_release_deadline(self) -> dt.datetime:
+        return self._controller_canary_fast_renew_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_expiry_acquire_deadline(self) -> dt.datetime:
+        return self._controller_canary_release_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_expiry_release_deadline(self) -> dt.datetime:
+        return self._controller_canary_expiry_acquire_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_lease_expiry_deadline(self) -> dt.datetime:
+        return self._controller_canary_expiry_release_deadline() + dt.timedelta(
+            seconds=CONTROLLER_CANARY_LEASE_DURATION_SECONDS
+        )
+
+    def _controller_canary_identity_resolution_deadline(self) -> dt.datetime:
+        return self._controller_canary_lease_expiry_deadline()
+
+    def _controller_canary_blob_delete_deadline(self) -> dt.datetime:
+        return self._controller_canary_identity_resolution_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_blob_delete_retry_deadline(self) -> dt.datetime:
+        return self._controller_canary_blob_delete_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_inventory_deadline(self) -> dt.datetime:
+        return self._controller_canary_blob_delete_retry_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_final_probe_deadline(self) -> dt.datetime:
+        return self._controller_canary_inventory_deadline() + dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_create_deadline(self) -> dt.datetime:
+        return self._protected_role_deadline(
+            CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS
+        )
+
+    def _controller_canary_readiness_deadline(self) -> dt.datetime:
+        return self._controller_canary_create_deadline() - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+
+    def _controller_canary_role_admission_start_deadline(self) -> dt.datetime:
+        return self._controller_canary_readiness_deadline() - dt.timedelta(
+            seconds=(
+                MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                + CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS
+            )
+        )
+
+    def _require_full_request_envelope(
+        self, deadline: dt.datetime | None, label: str
+    ) -> None:
+        if deadline is not None and (
+            self.clock()
+            + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+            > deadline
+        ):
+            fail(f"protected cleanup reserve would be consumed before {label}")
+
+    def _begin_protected_role_lifecycle(self, operation_id: str) -> None:
+        if operation_id not in PROTECTED_ROLE_LIFECYCLES:
+            fail("protected temporary role add is not source-bound")
+        if getattr(self, "_active_protected_role_add", None) is not None:
+            fail("protected temporary role lifecycles overlap at runtime")
+        # Every create/readback subcall finishes before a full ambiguous-create
+        # settlement window and the protected assignment-delete reserve.  Once
+        # the add proof is exact, apply_operation expands the work deadline to
+        # the ordinary protected-role boundary.
+        deadline = self._protected_role_deadline(
+            TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        if self.clock() >= deadline:
+            fail("insufficient authorization window before protected role creation")
+        if (
+            operation_id == "addOwnedOperatorControllerCanaryRole"
+            and self.clock()
+            >= self._controller_canary_role_admission_start_deadline()
+        ):
+            fail("insufficient authorization window before controller role admission")
+        self._active_protected_role_add = operation_id
+        self._protected_work_deadline = deadline
+
+    def _enter_controller_canary_phase(self) -> None:
+        if (
+            getattr(self, "_active_protected_role_add", None)
+            != "addOwnedOperatorControllerCanaryRole"
+        ):
+            fail("controller canary phase lacks its exact protected role")
+        deadline = self._controller_canary_create_deadline()
+        if self.clock() >= deadline:
+            fail("insufficient authorization window before controller canary creation")
+        self._protected_work_deadline = deadline
+
+    def _finish_protected_role_lifecycle(self, operation_id: str) -> None:
+        if (
+            getattr(self, "_active_protected_role_add", None) is None
+            or PROTECTED_ROLE_LIFECYCLES[self._active_protected_role_add]
+            != operation_id
+        ):
+            fail("protected temporary role removal does not match the active lifecycle")
+        self._active_protected_role_add = None
+        self._protected_work_deadline = None
+
+    def _request_deadline(self) -> dt.datetime | None:
+        if getattr(self, "_active_protected_role_add", None) is None:
+            return None
+        operation_id = self._active_operation_id or ""
+        if operation_id.startswith("removeOwned"):
+            # Protected assignment DELETE authorization is checked immediately
+            # around the guarded mutation. Later absence/restoration reads may
+            # finish after expiry without authorizing a new mutation.
+            return None
+        if operation_id == "removeControllerLeaseCanaryBlob":
+            return self._controller_canary_final_probe_deadline()
+        return self._protected_work_deadline
+
+    def _sleep_before_deadline(
+        self,
+        seconds: float,
+        label: str,
+        *,
+        deadline: dt.datetime | None = None,
+    ) -> None:
+        deadline = deadline or self._request_deadline()
+        if deadline is not None and (
+            self.clock() + dt.timedelta(seconds=seconds) > deadline
+        ):
+            fail(f"protected cleanup reserve would be consumed before {label}")
+        self.sleep(seconds)
 
     def bind_journal(self, ledger: "UseLedger") -> None:
         self._ledger = ledger
@@ -9573,6 +11118,10 @@ class AzureCliBootstrapTransport:
             item for item in self.plan["mutations"]
             if item["id"] == self._active_operation_id
         )
+        correlation = _storage_response_correlation(
+            self._header(response, "x-ms-request-id"),
+            self._header(response, "Date"),
+        )
         self._ledger.append_cloud_mutation(
             {
                 "schemaVersion": 1,
@@ -9583,10 +11132,26 @@ class AzureCliBootstrapTransport:
                 "method": method,
                 "targetUrl": url,
                 "requestBodySha256": sha256_bytes(request_body or b""),
+                "clientRequestId": response.client_request_id,
                 "status": response.status,
                 "responseBodySha256": sha256_bytes(response.body),
                 "etag": self._header(response, "ETag"),
                 "versionId": self._header(response, "x-ms-version-id"),
+                "requestId": (
+                    correlation["requestId"]
+                    if response.client_request_id is not None
+                    else None
+                ),
+                "serverDate": (
+                    correlation["serverDate"]
+                    if response.client_request_id is not None
+                    else None
+                ),
+                "storageErrorCode": (
+                    self._storage_error_code(response)
+                    if response.client_request_id is not None
+                    else None
+                ),
                 "authorizationSha256": sha256_bytes(canonical_json_bytes(self.authorization)),
                 "sourceSha": self.authorization["source"]["mergedMain"]["commitSha"],
                 "planSha256": self.authorization["plan"]["sha256"],
@@ -9594,6 +11159,122 @@ class AzureCliBootstrapTransport:
                 "recordedAt": self.clock().astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             }
         )
+
+    @staticmethod
+    def _storage_error_code(response: _RestResponse) -> str:
+        if (
+            not 400 <= response.status <= 599
+            or len(response.body) > 65536
+        ):
+            return "unknown"
+        try:
+            root = _strict_storage_xml_root(
+                response.body, "Storage mutation error response"
+            )
+        except _StrictStorageXmlError:
+            return "unknown"
+        children = list(root)
+        if (
+            root.tag != "Error"
+            or root.attrib
+            or (root.text or "").strip()
+            or [child.tag for child in children].count("Code") != 1
+            or any(
+                child.tag not in {"Code", "Message"}
+                or child.attrib
+                or list(child)
+                or (child.tail or "").strip()
+                for child in children
+            )
+        ):
+            return "unknown"
+        code = root.findtext("Code") or "unknown"
+        header_code = AzureCliBootstrapTransport._header(
+            response, "x-ms-error-code"
+        )
+        if header_code is not None and header_code != code:
+            return "unknown"
+        return code if code in StorageOperationError.ERROR_CODES else "unknown"
+
+    def _storage_operation_failure(
+        self,
+        *,
+        operation_id: str,
+        method: str,
+        started: dt.datetime,
+        completed: dt.datetime,
+        client_request_id: str,
+        response: _RestResponse | None,
+        stop_reason: str,
+    ) -> StorageOperationError:
+        status = response.status if response is not None else None
+        error_code = (
+            self._storage_error_code(response)
+            if response is not None
+            else "unknown"
+        )
+        request_id = (
+            self._header(response, "x-ms-request-id")
+            if response is not None
+            else None
+        )
+        server_date = (
+            self._header(response, "Date") if response is not None else None
+        )
+        attempt = _storage_attempt_record(
+            attempt=1,
+            started=started,
+            completed=completed,
+            client_request_id=client_request_id,
+            status=status,
+            error_code=error_code,
+            request_id=request_id,
+            server_date=server_date,
+            outcome=("transport-error" if response is None else "response"),
+        )
+        return StorageOperationError(
+            "Storage operation failed closed",
+            operation_id=operation_id,
+            method=method,
+            elapsed_seconds=(completed - started).total_seconds(),
+            status=status,
+            error_code=error_code,
+            stop_reason=stop_reason,
+            request_id=request_id,
+            server_date=server_date,
+            attempt_records=[attempt],
+        )
+
+    def _require_storage_write_identity(
+        self, response: _RestResponse, operation_id: str
+    ) -> tuple[str, str]:
+        try:
+            etag = self._header(response, "ETag")
+            version_id = self._header(response, "x-ms-version-id")
+            _quoted_etag(etag, f"{operation_id} Storage ETag")
+            if (
+                not isinstance(version_id, str)
+                or not 1 <= len(version_id) <= 512
+            ):
+                fail(f"{operation_id} Storage version ID is invalid")
+            return etag, version_id
+        except BootstrapError:
+            client_request_id = response.client_request_id
+            if (
+                not isinstance(client_request_id, str)
+                or not GUID.fullmatch(client_request_id)
+            ):
+                raise
+            observed = self.clock()
+            raise self._storage_operation_failure(
+                operation_id=operation_id,
+                method="PUT",
+                started=observed,
+                completed=observed,
+                client_request_id=client_request_id,
+                response=response,
+                stop_reason="unsupported-response",
+            ) from None
 
     def _mutation_request(
         self,
@@ -9604,6 +11285,9 @@ class AzureCliBootstrapTransport:
         headers: Mapping[str, str] | None = None,
         expected: set[int],
         cleanup: bool = False,
+        deadline: dt.datetime | None = None,
+        intent_callback: Callable[[], None] | None = None,
+        ambiguous_server_error: bool = False,
     ) -> _RestResponse:
         if self._ledger is None or self._active_operation_id is None:
             fail("cloud mutation occurred before the durable journal was bound")
@@ -9614,16 +11298,50 @@ class AzureCliBootstrapTransport:
         cleanup_operation = (
             operation["kind"].startswith("temporary-remove")
         )
+        expires = self._authorization_expiry()
         if not cleanup and not cleanup_operation:
             now = self.clock()
             not_before = parse_time(
                 self.authorization["validity"]["notBefore"], "authorization notBefore"
             )
-            expires = parse_time(
-                self.authorization["validity"]["expiresAt"], "authorization expiresAt"
-            )
             if not not_before <= now < expires:
                 fail("authorization expired before a cloud mutation subcall")
+        request_deadline = deadline or self._request_deadline()
+        if not cleanup and not cleanup_operation:
+            request_deadline = (
+                expires
+                if request_deadline is None
+                else min(request_deadline, expires)
+            )
+        self._require_full_request_envelope(
+            request_deadline, "cloud mutation request"
+        )
+        request_headers = dict(headers or {})
+        parsed = urllib.parse.urlsplit(url)
+        is_storage = (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower()
+            == "mdspdbak2608089c4e.blob.core.windows.net"
+        )
+        client_request_id: str | None = None
+        if is_storage:
+            supplied = [
+                (key, value)
+                for key, value in request_headers.items()
+                if key.lower() == "x-ms-client-request-id"
+            ]
+            if len(supplied) > 1:
+                fail("Storage mutation client request ID is ambiguous")
+            if supplied:
+                client_request_id = supplied[0][1]
+                if (
+                    not isinstance(client_request_id, str)
+                    or not GUID.fullmatch(client_request_id)
+                ):
+                    fail("Storage mutation client request ID is invalid")
+            else:
+                client_request_id = _new_storage_client_request_id()
+                request_headers["x-ms-client-request-id"] = client_request_id
         intent_path = self._ledger.append_cloud_mutation(
             {
                 "schemaVersion": 1,
@@ -9633,6 +11351,7 @@ class AzureCliBootstrapTransport:
                 "method": method,
                 "targetUrl": url,
                 "requestBodySha256": sha256_bytes(body or b""),
+                "clientRequestId": client_request_id,
                 "authorizationSha256": sha256_bytes(canonical_json_bytes(self.authorization)),
                 "sourceSha": self.authorization["source"]["mergedMain"]["commitSha"],
                 "planSha256": self.authorization["plan"]["sha256"],
@@ -9641,10 +11360,153 @@ class AzureCliBootstrapTransport:
             }
         )
         intent_id = intent_path.stem
-        response = self.session.request(method, url, body=body, headers=headers)
-        self._record_mutation(method, url, response, body, intent_id)
-        if response.status not in expected:
+        if intent_callback is not None:
+            intent_callback()
+        request_kwargs: dict[str, Any] = {
+            "body": body,
+            "headers": request_headers or None,
+        }
+        if request_deadline is not None:
+            request_kwargs["deadline"] = request_deadline
+        request_started = self.clock()
+
+        def record_result(observed_response: _RestResponse) -> None:
+            try:
+                self._record_mutation(
+                    method, url, observed_response, body, intent_id
+                )
+            except Exception as journal_error:
+                if is_storage and client_request_id is not None:
+                    raise self._storage_operation_failure(
+                        operation_id=self._active_operation_id or "unknown",
+                        method=method,
+                        started=request_started,
+                        completed=self.clock(),
+                        client_request_id=(
+                            observed_response.client_request_id
+                            or client_request_id
+                        ),
+                        response=observed_response,
+                        stop_reason="result-journal-error",
+                    ) from journal_error
+                if observed_response.status in expected or (
+                    ambiguous_server_error
+                    and 500 <= observed_response.status <= 599
+                ):
+                    raise _MutationOwnershipAmbiguity(
+                        "mutation response with a possibly applied outcome could not "
+                        "be durably journaled",
+                        observed_response,
+                    ) from journal_error
+                raise
+
+        try:
+            response = self.session.request(method, url, **request_kwargs)
+        except _LateRestResponse as late_response:
+            response = late_response.response
+            if (
+                is_storage
+                and client_request_id is not None
+                and response.client_request_id is None
+            ):
+                response = dataclasses.replace(
+                    response, client_request_id=client_request_id
+                )
+            record_result(response)
+            if is_storage and client_request_id is not None:
+                raise self._storage_operation_failure(
+                    operation_id=self._active_operation_id,
+                    method=method,
+                    started=request_started,
+                    completed=self.clock(),
+                    client_request_id=(
+                        response.client_request_id or client_request_id
+                    ),
+                    response=response,
+                    stop_reason="deadline",
+                ) from None
+            if response.status in expected or (
+                ambiguous_server_error and 500 <= response.status <= 599
+            ):
+                raise _MutationOwnershipAmbiguity(
+                    "mutation response with a possibly applied outcome crossed the "
+                    "protected request deadline",
+                    response,
+                ) from None
             fail(f"mutation request returned unexpected HTTP status {response.status}")
+        except _RestTransportAmbiguity as transport_error:
+            if is_storage and client_request_id is not None:
+                raise self._storage_operation_failure(
+                    operation_id=self._active_operation_id,
+                    method=method,
+                    started=request_started,
+                    completed=self.clock(),
+                    client_request_id=client_request_id,
+                    response=None,
+                    stop_reason="deadline"
+                    if isinstance(transport_error, _RestTotalTimeout)
+                    else "transport-error",
+                ) from None
+            raise _MutationOwnershipAmbiguity(
+                "mutation transport outcome is ambiguous"
+            ) from transport_error
+        except Exception:
+            if is_storage and client_request_id is not None:
+                raise self._storage_operation_failure(
+                    operation_id=self._active_operation_id,
+                    method=method,
+                    started=request_started,
+                    completed=self.clock(),
+                    client_request_id=client_request_id,
+                    response=None,
+                    stop_reason="transport-error",
+                ) from None
+            raise
+        if (
+            is_storage
+            and client_request_id is not None
+            and response.client_request_id is None
+        ):
+            response = dataclasses.replace(
+                response, client_request_id=client_request_id
+            )
+        record_result(response)
+        if ambiguous_server_error and 500 <= response.status <= 599:
+            raise _MutationOwnershipAmbiguity(
+                "mutation returned a server error after a possibly applied create",
+                response,
+            )
+        if response.status not in expected:
+            if is_storage and client_request_id is not None:
+                raise self._storage_operation_failure(
+                    operation_id=self._active_operation_id,
+                    method=method,
+                    started=request_started,
+                    completed=self.clock(),
+                    client_request_id=(
+                        response.client_request_id or client_request_id
+                    ),
+                    response=response,
+                    stop_reason="unexpected-status",
+                )
+            fail(f"mutation request returned unexpected HTTP status {response.status}")
+        if request_deadline is not None and self.clock() >= request_deadline:
+            if is_storage and client_request_id is not None:
+                raise self._storage_operation_failure(
+                    operation_id=self._active_operation_id,
+                    method=method,
+                    started=request_started,
+                    completed=self.clock(),
+                    client_request_id=(
+                        response.client_request_id or client_request_id
+                    ),
+                    response=response,
+                    stop_reason="deadline",
+                )
+            raise _MutationOwnershipAmbiguity(
+                "accepted mutation response crossed the protected request deadline",
+                response,
+            )
         return response
 
     @staticmethod
@@ -9926,6 +11788,7 @@ class AzureCliBootstrapTransport:
         url: str,
         *,
         body: bytes | None = None,
+        deadline: dt.datetime | None = None,
     ) -> _RestResponse:
         """Retry only exact read-only transport failures before mutation.
 
@@ -9952,11 +11815,28 @@ class AzureCliBootstrapTransport:
         ):
             fail("read-only retry helper received a mutation-capable request")
         delays: tuple[float | None, ...] = (0.5, 1.0, None)
+        request_deadline = deadline or self._request_deadline()
         for delay in delays:
             try:
-                return self.session.request(method, url, body=body)
+                self._require_full_request_envelope(
+                    request_deadline, "read-only request"
+                )
+                request_kwargs: dict[str, Any] = {"body": body}
+                if request_deadline is not None:
+                    request_kwargs["deadline"] = request_deadline
+                try:
+                    response = self.session.request(method, url, **request_kwargs)
+                except _LateRestResponse as late_response:
+                    response = late_response.response
+                if request_deadline is not None and self.clock() >= request_deadline:
+                    fail("read-only response crossed the protected request deadline")
+                return response
             except BootstrapError as error:
                 if str(error) != "Azure REST transport failed closed" or delay is None:
+                    raise
+                if request_deadline is not None and (
+                    self.clock() + dt.timedelta(seconds=delay) >= request_deadline
+                ):
                     raise
                 self.sleep(delay)
         raise AssertionError("unreachable read-only retry loop")
@@ -10014,6 +11894,7 @@ class AzureCliBootstrapTransport:
             "versionId": self._header(response, "x-ms-version-id"),
             "leaseState": self._header(response, "x-ms-lease-state"),
             "leaseStatus": self._header(response, "x-ms-lease-status"),
+            "leaseDuration": self._header(response, "x-ms-lease-duration"),
         }
         headers = {key: value for key, value in headers.items() if value is not None}
 
@@ -10226,6 +12107,7 @@ class AzureCliBootstrapTransport:
                 key: facts.get(key)
                 for key in (
                     "preAppSettingsSha256",
+                    "preAppSettingsEtag",
                     "settingsSha256",
                     "bootstrapSelfTestControlSha256",
                     "bootstrapSelfTestIssuedAt",
@@ -10338,6 +12220,18 @@ class AzureCliBootstrapTransport:
             )
             if not isinstance(proof, Mapping):
                 fail("controller lock empty readback lacks its canonical proof")
+        elif (
+            contract.get("operationId") == "removeControllerLeaseCanaryBlob"
+            and response.status == 404
+        ):
+            absence = _package_blob_error_projection(
+                expected["method"], expected["url"], response
+            )
+            if (
+                absence is None
+                or absence.get("storageErrorCode") != "BlobNotFound"
+            ):
+                fail("controller canary final absence is not exact BlobNotFound")
         elif expected_body_sha is not None:
             if (
                 expected["url"] != contract.get("expectedUrl")
@@ -10492,6 +12386,9 @@ class AzureCliBootstrapTransport:
                     or runtime_facts is None
                 ):
                     fail("custom role-definition inventory is partial")
+                _reject_residual_temporary_role_definitions(
+                    values, label="custom role-definition mutation readback inventory"
+                )
                 expected_definitions = _custom_role_definition_specs(self.plan)
                 relevant: dict[str, Mapping[str, Any]] = {}
                 for item in values:
@@ -10528,6 +12425,11 @@ class AzureCliBootstrapTransport:
                     or len(expected_list) != len(self.plan["roleMatrix"])
                 ):
                     fail("role-assignment inventory is partial")
+                _reject_residual_temporary_role_assignments(
+                    values,
+                    plan=self.plan,
+                    label="role-assignment mutation readback inventory",
+                )
                 expected_by_id = {
                     str(item.get("id", "")).lower(): item
                     for item in expected_list
@@ -10816,6 +12718,11 @@ class AzureCliBootstrapTransport:
                     != self.authorization["azure"]["accountObjectId"]
                     or str(properties.get("roleDefinitionId", "")).lower()
                     != str(runtime_facts.get("definitionResourceId", "")).lower()
+                    or properties.get("description")
+                    != _temporary_role_marker(
+                        self.authorization["authorizationId"],
+                        str(runtime_facts.get("cleanupKey")),
+                    )
                     or properties.get("condition") is not None
                     or properties.get("delegatedManagedIdentityResourceId") is not None
                 ):
@@ -10899,11 +12806,17 @@ class AzureCliBootstrapTransport:
                     or expiry_fallback.get("leaseId")
                     != self.plan["temporaryAccess"]["controllerExpiryLeaseId"]
                     or expiry_fallback.get("releaseIntentionallyOmitted") is not True
-                    or expiry_fallback.get("finalLeaseState") != "available"
+                    or expiry_fallback.get("finalLeaseState") != "expired"
+                    or expiry_fallback.get("finalLeaseStatus") != "unlocked"
+                    or expiry_fallback.get("finalLeaseDuration") != "fixed"
                     or str(self._header(response, "x-ms-lease-state") or "").lower()
-                    != "available"
+                    != "expired"
+                    or str(self._header(response, "x-ms-lease-status") or "").lower()
+                    != "unlocked"
+                    or str(self._header(response, "x-ms-lease-duration") or "").lower()
+                    != "fixed"
                 ):
-                    fail("controller lock lease canary did not release to Available")
+                    fail("controller lock lease canary did not prove natural finite expiry")
             elif operation_id == "startBridgeForBoundedCanary":
                 if (
                     runtime_facts is None
@@ -10989,7 +12902,22 @@ class AzureCliBootstrapTransport:
                 self.authorization["validity"]["notBefore"],
                 "authorization notBefore",
             )
-            deadline = min(expires, started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS))
+            protected_cleanup_readback = (
+                self._active_operation_id in PROTECTED_ROLE_LIFECYCLES.values()
+            )
+            request_deadline = self._request_deadline()
+            if protected_cleanup_readback:
+                # Assignment/definition absence and restored-lock evidence are
+                # read-only and may converge after authorization expiry.
+                deadline = started + dt.timedelta(
+                    seconds=MAX_READBACK_CONVERGENCE_SECONDS
+                )
+            else:
+                deadline = min(
+                    expires,
+                    request_deadline or expires,
+                    started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS),
+                )
             while attempts < 64:
                 before_request = self.clock()
                 if before_request < not_before or before_request >= deadline:
@@ -11000,6 +12928,7 @@ class AzureCliBootstrapTransport:
                     expected["method"],
                     expected["url"],
                     body=b"" if expected["method"] == "POST" else None,
+                    deadline=deadline,
                 )
                 after_response = self.clock()
                 if after_response >= deadline:
@@ -11035,6 +12964,284 @@ class AzureCliBootstrapTransport:
                 fail(f"{label} readback did not converge: {probe_id}: {detail}")
         return proofs
 
+    def _protected_readiness_deadline(
+        self,
+        started: dt.datetime,
+        label: str,
+        *,
+        follow_on_request_envelopes: int = 0,
+    ) -> dt.datetime:
+        work_deadline = self._request_deadline() or self._authorization_expiry()
+        work_deadline -= dt.timedelta(
+            seconds=(
+                follow_on_request_envelopes
+                * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
+        )
+        deadline = min(
+            self._authorization_expiry(),
+            work_deadline,
+            started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+        )
+        if started > deadline - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        ):
+            fail(f"{label} has no request window before the cleanup reserve")
+        return deadline
+
+    def _prove_fence_blob_create_ready(self, url: str) -> None:
+        expected_url = _operation_readback_url(
+            "createInitialIdleActivationFence", self.plan, self.authorization
+        )
+        if (
+            getattr(self, "_active_protected_role_add", None)
+            != "addOwnedOperatorFenceBootstrapRole"
+            or url != expected_url
+        ):
+            fail("activation-fence readiness is not bound to its exact role and target")
+        started = self.clock()
+        attempts = 0
+        last_status: int | None = None
+        last_error_code = "unknown"
+        last_request_id: str | None = None
+        last_server_date: str | None = None
+        attempt_records: list[dict[str, Any]] = []
+
+        def fail_readiness(message: str, reason: str) -> None:
+            raise StorageOperationError(
+                message,
+                operation_id="createInitialIdleActivationFence",
+                method="GET",
+                elapsed_seconds=(self.clock() - started).total_seconds(),
+                status=last_status,
+                error_code=last_error_code,
+                stop_reason=reason,
+                request_id=last_request_id,
+                server_date=last_server_date,
+                attempt_records=attempt_records,
+            ) from None
+
+        deadline = self._protected_readiness_deadline(
+            started,
+            "activation-fence readiness",
+            follow_on_request_envelopes=2,
+        )
+        final_request_at = deadline - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        for attempt in range(1, 65):
+            attempts = attempt
+            now = self.clock()
+            if now > final_request_at:
+                fail_readiness(
+                    "activation-fence readiness expired before exact absence",
+                    "readiness-timeout",
+                )
+            client_request_id = _new_storage_client_request_id()
+            try:
+                response = self.session.request(
+                    "GET",
+                    url,
+                    headers={
+                        "x-ms-version": "2023-11-03",
+                        "Accept": "application/xml",
+                        "x-ms-client-request-id": client_request_id,
+                    },
+                    deadline=deadline,
+                )
+            except _LateRestResponse as late_response:
+                response = late_response.response
+            except Exception:
+                completed = self.clock()
+                attempt_records.append(
+                    _storage_attempt_record(
+                        attempt=attempt,
+                        started=now,
+                        completed=completed,
+                        client_request_id=client_request_id,
+                        status=None,
+                        error_code="unknown",
+                        request_id=None,
+                        server_date=None,
+                        outcome="transport-error",
+                    )
+                )
+                fail_readiness(
+                    "activation-fence readiness transport failed closed",
+                    "transport-error",
+                )
+            observed = self.clock()
+            last_status = response.status
+            last_error_code = "unknown"
+            last_request_id = self._header(response, "x-ms-request-id")
+            last_server_date = self._header(response, "Date")
+            attempt_records.append(
+                _storage_attempt_record(
+                    attempt=attempt,
+                    started=now,
+                    completed=observed,
+                    client_request_id=client_request_id,
+                    status=response.status,
+                    error_code="unknown",
+                    request_id=last_request_id,
+                    server_date=last_server_date,
+                    outcome="response",
+                )
+            )
+            if observed >= deadline:
+                fail_readiness(
+                    "activation-fence readiness expired during GET", "deadline"
+                )
+            try:
+                if response.status not in {403, 404}:
+                    fail("activation-fence readiness returned an unsupported status")
+                content_type = self._header(response, "Content-Type")
+                if (
+                    len(response.body) > 65536
+                    or not isinstance(content_type, str)
+                    or "xml" not in content_type.lower()
+                ):
+                    fail("activation-fence readiness error XML is unsafe or oversized")
+                try:
+                    document = _strict_storage_xml_root(
+                        response.body, "activation-fence readiness error"
+                    )
+                except _StrictStorageXmlError as exc:
+                    fail_readiness(
+                        "activation-fence readiness error XML is unsafe or oversized"
+                        if exc.unsafe
+                        else "activation-fence readiness error XML is malformed",
+                        "unsafe-xml" if exc.unsafe else "malformed-xml",
+                    )
+                children = list(document)
+                if (
+                    document.tag != "Error"
+                    or document.attrib
+                    or (document.text or "").strip()
+                    or [child.tag for child in children].count("Code") != 1
+                    or [child.tag for child in children].count("Message") > 1
+                    or any(
+                        child.tag not in {"Code", "Message"}
+                        or child.attrib
+                        or list(child)
+                        or (child.tail or "").strip()
+                        for child in children
+                    )
+                ):
+                    fail("activation-fence readiness error XML is not exact")
+                candidate_code = document.findtext("Code")
+                header_code = self._header(response, "x-ms-error-code")
+                if header_code is not None and header_code != candidate_code:
+                    fail(
+                        "activation-fence readiness error header and XML code disagree"
+                    )
+                error = _package_blob_error_projection("GET", url, response)
+                code = error.get("storageErrorCode") if error is not None else None
+            except StorageOperationError:
+                raise
+            except BootstrapError:
+                fail_readiness(
+                    "activation-fence readiness response failed exact validation",
+                    "unsupported-response",
+                )
+            last_error_code = code if isinstance(code, str) else "unknown"
+            attempt_records[-1]["errorCode"] = last_error_code
+            if response.status == 404:
+                if code != "BlobNotFound":
+                    fail_readiness(
+                        "activation-fence readiness 404 is not exact BlobNotFound",
+                        "unsupported-response",
+                    )
+                return
+            if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
+                fail_readiness(
+                    "activation-fence readiness 403 is not recognized RBAC propagation",
+                    "unsupported-response",
+                )
+            if attempt == 64 or observed >= final_request_at:
+                fail_readiness(
+                    "activation-fence readiness did not converge before its deadline",
+                    "readiness-timeout",
+                )
+            delay = min(
+                float(2 ** min(attempt - 1, 4)),
+                15.0,
+                (final_request_at - observed).total_seconds(),
+            )
+            self._sleep_before_deadline(delay, "activation-fence readiness retry")
+        fail_readiness(
+            "activation-fence readiness exceeded bounded attempts",
+            "readiness-timeout",
+        )
+
+    def _read_signing_public_jwk_when_ready(self, url: str) -> _RestResponse:
+        expected_url = _operation_readback_url(
+            "readBackExactSigningPublicJwk", self.plan, self.authorization
+        )
+        if (
+            getattr(self, "_active_protected_role_add", None)
+            != "addOwnedOperatorKeyReadRole"
+            or url != expected_url
+        ):
+            fail("signing-key readiness is not bound to its exact role and target")
+        started = self.clock()
+        deadline = self._protected_readiness_deadline(
+            started,
+            "signing-key readiness",
+            follow_on_request_envelopes=1,
+        )
+        final_request_at = deadline - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        for attempt in range(1, 65):
+            now = self.clock()
+            if now > final_request_at:
+                fail("signing-key readiness expired before exact read access")
+            try:
+                response = self.session.request("GET", url, deadline=deadline)
+            except _LateRestResponse as late_response:
+                response = late_response.response
+            except Exception:
+                # A transport-ambiguous Key Vault GET is not replayed.
+                fail("signing-key readiness transport failed closed")
+            observed = self.clock()
+            if observed >= deadline:
+                fail("signing-key readiness expired during GET")
+            if response.status == 200:
+                return response
+            if response.status != 403 or len(response.body) > 65536:
+                fail("signing-key readiness returned an unsupported response")
+            try:
+                document = json.loads(
+                    response.body.decode("utf-8"),
+                    object_pairs_hook=_duplicate_safe_pairs,
+                    parse_constant=lambda value: fail(
+                        f"invalid JSON constant in Key Vault readiness: {value}"
+                    ),
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise BootstrapError(
+                    "signing-key readiness error is not exact JSON"
+                ) from exc
+            error = document.get("error") if isinstance(document, Mapping) else None
+            inner = error.get("innererror") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(error, Mapping)
+                or error.get("code") != "Forbidden"
+                or not isinstance(inner, Mapping)
+                or inner.get("code") != "ForbiddenByRbac"
+            ):
+                fail("signing-key readiness 403 is not recognized RBAC propagation")
+            if attempt == 64 or observed >= final_request_at:
+                fail("signing-key readiness did not converge before its deadline")
+            delay = min(
+                float(2 ** min(attempt - 1, 4)),
+                15.0,
+                (final_request_at - observed).total_seconds(),
+            )
+            self._sleep_before_deadline(delay, "signing-key readiness retry")
+        fail("signing-key readiness exceeded bounded attempts")
+
     def _prove_package_upload_ready(self, url: str) -> None:
         """Wait for exact-target read access and absence, never retry a write.
 
@@ -11049,6 +13256,7 @@ class AzureCliBootstrapTransport:
         last_request_id: str | None = None
         last_server_date: str | None = None
         last_credential: dict[str, Any] | None = None
+        attempt_records: list[dict[str, Any]] = []
         role_readback = self._storage_role_readback_snapshot("addOwnedUploaderPackageRole")
 
         def fail_readiness(message: str, reason: str) -> None:
@@ -11058,6 +13266,7 @@ class AzureCliBootstrapTransport:
                 stop_reason=reason, request_id=last_request_id,
                 server_date=last_server_date,
                 credential=last_credential, role_readback=role_readback,
+                attempt_records=attempt_records,
             ) from None
 
         try:
@@ -11080,26 +13289,50 @@ class AzureCliBootstrapTransport:
                 fail("invalid authorization interval")
         except (BootstrapError, KeyError, TypeError):
             fail_readiness("package readiness authorization window is invalid", "invalid-authorization-window")
+        work_deadline = self._request_deadline() or expires
+        readiness_deadline = work_deadline - dt.timedelta(
+            seconds=2 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
         deadline = min(
             expires,
+            readiness_deadline,
             started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+        )
+        final_request_at = deadline - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
         while attempts < 64:
             now = self.clock()
-            if now < not_before or now >= deadline:
+            if now < not_before or now > final_request_at:
                 fail_readiness(
                     "package data-plane readiness authorization or convergence window expired",
                     "expired-before-get" if attempts == 0 else "deadline",
                 )
             attempts += 1
+            client_request_id = _new_storage_client_request_id()
+            request_started = now
             try:
                 response = self.session.request(
                     "GET", url,
-                    headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
+                    headers={
+                        "x-ms-version": "2023-11-03",
+                        "Accept": "application/xml",
+                        "x-ms-client-request-id": client_request_id,
+                    },
+                    deadline=deadline,
                 )
+            except _LateRestResponse as late_response:
+                response = late_response.response
             except Exception:
                 # Do not retry an ambiguous request or copy exception text.
                 # The last safely observed response remains diagnostic only.
+                completed = self.clock()
+                attempt_records.append(_storage_attempt_record(
+                    attempt=attempts, started=request_started, completed=completed,
+                    client_request_id=client_request_id, status=None,
+                    error_code="unknown", request_id=None, server_date=None,
+                    outcome="transport-error",
+                ))
                 fail_readiness("package readiness transport failed closed", "transport-error")
             observed = self.clock()
             last_status = response.status
@@ -11107,6 +13340,12 @@ class AzureCliBootstrapTransport:
             last_request_id = self._header(response, "x-ms-request-id")
             last_server_date = self._header(response, "Date")
             last_credential = self._storage_credential_snapshot()
+            attempt_records.append(_storage_attempt_record(
+                attempt=attempts, started=request_started, completed=observed,
+                client_request_id=client_request_id, status=response.status,
+                error_code="unknown", request_id=last_request_id,
+                server_date=last_server_date, outcome="response",
+            ))
             if observed >= deadline:
                 fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
             if response.status not in {403, 404}:
@@ -11114,15 +13353,20 @@ class AzureCliBootstrapTransport:
             content_type = self._header(response, "Content-Type")
             if (
                 len(response.body) > 65536
-                or b"<!DOCTYPE" in response.body.upper()
-                or b"<!ENTITY" in response.body.upper()
                 or not isinstance(content_type, str) or "xml" not in content_type.lower()
             ):
                 fail_readiness("package readiness error XML is unsafe or oversized", "unsafe-xml")
             try:
-                document = ET.fromstring(response.body)
-            except ET.ParseError:
-                fail_readiness("package readiness error XML is malformed", "malformed-xml")
+                document = _strict_storage_xml_root(
+                    response.body, "package readiness error"
+                )
+            except _StrictStorageXmlError as exc:
+                fail_readiness(
+                    "package readiness error XML is unsafe or oversized"
+                    if exc.unsafe
+                    else "package readiness error XML is malformed",
+                    "unsafe-xml" if exc.unsafe else "malformed-xml",
+                )
             children = list(document)
             if (
                 document.tag != "Error" or document.attrib
@@ -11142,6 +13386,7 @@ class AzureCliBootstrapTransport:
                 fail_readiness("package readiness error header and XML code disagree", "error-code-mismatch")
             if candidate_code in PackageReadinessError.ERROR_CODES:
                 last_code = candidate_code
+                attempt_records[-1]["errorCode"] = candidate_code
             try:
                 error = _package_blob_error_projection("GET", url, response)
             except BootstrapError:
@@ -11160,10 +13405,14 @@ class AzureCliBootstrapTransport:
                 fail_readiness("package readiness 403 is not recognized authorization propagation", "unsupported-denial")
             if attempts == 64:
                 fail_readiness("package data-plane readiness exceeded bounded attempts", "attempt-limit")
-            remaining = (deadline - self.clock()).total_seconds()
-            if remaining <= 0:
+            wait_started = self.clock()
+            if wait_started >= final_request_at:
                 fail_readiness("package data-plane readiness did not converge before its deadline", "deadline")
-            delay = min(float(2 ** min(attempts - 1, 4)), 15.0, remaining)
+            delay = min(
+                float(2 ** min(attempts - 1, 4)),
+                15.0,
+                (final_request_at - wait_started).total_seconds(),
+            )
             self.sleep(delay)
         fail_readiness("package data-plane readiness exceeded bounded attempts", "attempt-limit")
 
@@ -11177,6 +13426,7 @@ class AzureCliBootstrapTransport:
         last_request_id: str | None = None
         last_server_date: str | None = None
         last_credential: dict[str, Any] | None = None
+        attempt_records: list[dict[str, Any]] = []
         role_readback = self._storage_role_readback_snapshot("addOwnedOperatorControllerCanaryRole")
 
         def fail_readiness(message: str, reason: str) -> None:
@@ -11186,6 +13436,7 @@ class AzureCliBootstrapTransport:
                 attempts=attempts, status=last_status, error_code=last_code,
                 stop_reason=reason, request_id=last_request_id, server_date=last_server_date,
                 credential=last_credential, role_readback=role_readback,
+                attempt_records=attempt_records,
             ) from None
 
         if len(ids) != 1:
@@ -11213,26 +13464,57 @@ class AzureCliBootstrapTransport:
                 fail("invalid authorization interval")
         except (BootstrapError, KeyError, TypeError):
             fail_readiness("controller lock proof authorization window is invalid", "invalid-authorization-window")
+        work_deadline = self._request_deadline() or expires
+        if (
+            getattr(self, "_active_protected_role_add", None)
+            == "addOwnedOperatorControllerCanaryRole"
+        ):
+            # The empty proof must finish one full Storage request envelope
+            # before the canary create cutoff.  A late successful GET therefore
+            # cannot consume the only envelope available to the create-only PUT.
+            work_deadline = min(
+                work_deadline,
+                self._controller_canary_readiness_deadline(),
+            )
         deadline = min(
             expires,
+            work_deadline,
             started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+        )
+        final_request_at = deadline - dt.timedelta(
+            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
         while attempts < 64:
             before_request = self.clock()
-            if before_request < not_before or before_request >= deadline:
+            if before_request < not_before or before_request > final_request_at:
                 reason = ("expired-before-get" if attempts == 0 else
-                          "authorization-expired" if before_request >= expires else "readiness-timeout")
+                           "authorization-expired" if before_request >= expires else "readiness-timeout")
                 fail_readiness("authorization or convergence window expired before empty-container proof", reason)
             attempts += 1
+            client_request_id = _new_storage_client_request_id()
             try:
                 response = self.session.request(
                     "GET",
                     expected["url"],
-                    headers={"x-ms-version": "2023-11-03", "Accept": "application/xml"},
+                    headers={
+                        "x-ms-version": "2023-11-03",
+                        "Accept": "application/xml",
+                        "x-ms-client-request-id": client_request_id,
+                    },
+                    deadline=deadline,
                 )
+            except _LateRestResponse as late_response:
+                response = late_response.response
             except Exception:
                 # No transport exception text or body enters diagnostics, and
                 # an ambiguous GET is not replayed by this readiness loop.
+                completed = self.clock()
+                attempt_records.append(_storage_attempt_record(
+                    attempt=attempts, started=before_request, completed=completed,
+                    client_request_id=client_request_id, status=None,
+                    error_code="unknown", request_id=None, server_date=None,
+                    outcome="transport-error",
+                ))
                 fail_readiness("controller lock proof transport failed closed", "transport-error")
             observed = self.clock()
             last_status = response.status
@@ -11240,19 +13522,30 @@ class AzureCliBootstrapTransport:
             last_request_id = self._header(response, "x-ms-request-id")
             last_server_date = self._header(response, "Date")
             last_credential = self._storage_credential_snapshot()
+            attempt_records.append(_storage_attempt_record(
+                attempt=attempts, started=before_request, completed=observed,
+                client_request_id=client_request_id, status=response.status,
+                error_code="unknown", request_id=last_request_id,
+                server_date=last_server_date, outcome="response",
+            ))
             if observed >= deadline:
                 fail_readiness("authorization or convergence window expired during empty-container proof", "expired-during-get")
             if response.status == 403:
                 if (
                     len(response.body) > 65536
-                    or b"<!DOCTYPE" in response.body.upper()
-                    or b"<!ENTITY" in response.body.upper()
                 ):
                     fail_readiness("controller lock proof error XML is unsafe or oversized", "unsafe-xml")
                 try:
-                    document = ET.fromstring(response.body)
-                except ET.ParseError:
-                    fail_readiness("controller lock proof error XML is malformed", "malformed-xml")
+                    document = _strict_storage_xml_root(
+                        response.body, "controller lock proof error"
+                    )
+                except _StrictStorageXmlError as exc:
+                    fail_readiness(
+                        "controller lock proof error XML is unsafe or oversized"
+                        if exc.unsafe
+                        else "controller lock proof error XML is malformed",
+                        "unsafe-xml" if exc.unsafe else "malformed-xml",
+                    )
                 children = list(document)
                 if (
                     document.tag != "Error" or document.attrib
@@ -11273,6 +13566,7 @@ class AzureCliBootstrapTransport:
                 if candidate_code in {"AuthorizationFailure", "AuthorizationPermissionMismatch",
                                       "AuthenticationFailed", "BlobNotFound"}:
                     last_code = candidate_code
+                    attempt_records[-1]["errorCode"] = candidate_code
                 try:
                     error = _package_blob_error_projection("GET", expected["url"], response)
                 except BootstrapError:
@@ -11285,9 +13579,18 @@ class AzureCliBootstrapTransport:
                     fail_readiness("controller lock proof 403 is not recognized RBAC propagation", "unsupported-denial")
                 if attempts >= 64:
                     fail_readiness("controller lock proof RBAC access did not converge", "attempt-limit")
+                if observed >= final_request_at:
+                    reason = (
+                        "authorization-expired" if deadline == expires
+                        else "readiness-timeout"
+                    )
+                    fail_readiness(
+                        "authorization or convergence window expired before empty-container proof",
+                        reason,
+                    )
                 delay = min(
                     float(2 ** min(attempts - 1, 4)), 15.0,
-                    (deadline - observed).total_seconds(),
+                    (final_request_at - observed).total_seconds(),
                 )
                 self.sleep(delay)
                 continue
@@ -11334,8 +13637,14 @@ class AzureCliBootstrapTransport:
         fail_readiness("controller lock proof exceeded the bounded attempts", "attempt-limit")
 
     def collect_preflight(self, plan: Mapping[str, Any]) -> Mapping[str, Any]:
-        if plan is not self.plan and canonical_json_bytes(plan) != canonical_json_bytes(self.plan):
+        candidate = bind_temporary_role_ids(
+            plan, self.authorization["authorizationId"]
+        )
+        if canonical_json_bytes(candidate) != canonical_json_bytes(self.plan):
             fail("Azure transport received a different plan")
+        self._retired_role_absence_preflight = (
+            self._prove_retired_temporary_roles_absent("fresh preflight")
+        )
         projection = json.loads(canonical_json_bytes(self.preflight["projection"]))
         boundary_ids = set(
             projection["productionBoundaryObservation"]["probeIds"]
@@ -11352,6 +13661,65 @@ class AzureCliBootstrapTransport:
         ] = boundary_projection
         self._fresh_projection = projection
         return projection
+
+    def _prove_temporary_role_marker_inventories_absent(
+        self, label: str
+    ) -> str:
+        marker_projections: list[dict[str, Any]] = []
+        for request in _temporary_role_marker_inventory_requests(self.plan):
+            response = self._read_request_with_transport_retry("GET", request["url"])
+            if response.status != 200 or len(response.body) > 16 * 1024 * 1024:
+                fail(f"{label} temporary role marker inventory is not readable")
+            document = self._json_response(
+                response, {200}, f"{label} {request['kind']}"
+            )
+            validated = _validate_temporary_role_marker_inventory_document(
+                document,
+                kind=request["kind"],
+                plan=self.plan,
+                label=f"{label} {request['kind']}",
+            )
+            marker_projections.append(
+                {
+                    **request,
+                    "status": 200,
+                    "responseSha256": sha256_bytes(
+                        canonical_json_bytes(validated)
+                    ),
+                }
+            )
+        return _temporary_role_marker_inventory_sha256(
+            marker_projections, self.plan
+        )
+
+    def _prove_retired_temporary_roles_absent(
+        self, label: str
+    ) -> list[dict[str, Any]]:
+        marker_inventory_sha256 = (
+            self._prove_temporary_role_marker_inventories_absent(label)
+        )
+        observations: list[dict[str, Any]] = []
+        for request in _retired_temporary_role_absence_requests(self.plan):
+            response = self._read_request_with_transport_retry("GET", request["url"])
+            if response.status != 404 or len(response.body) > 65536:
+                fail(
+                    f"{label} found a retired temporary role {request['kind']}; "
+                    "manual cleanup and fresh authorization are required"
+                )
+            observations.append(
+                {
+                    **request,
+                    "status": 404,
+                    "responseSha256": sha256_bytes(response.body),
+                    "temporaryRoleMarkerInventorySha256": marker_inventory_sha256,
+                }
+            )
+        observed_at = self._timestamp(self.clock())
+        for item in observations:
+            item["observedAt"] = observed_at
+        return _validate_retired_temporary_role_absence_projection(
+            observations, self.plan, label=f"{label} retired temporary role absence"
+        )
 
     def _collect_production_boundary(
         self,
@@ -11383,6 +13751,9 @@ class AzureCliBootstrapTransport:
         )
 
     def observe_production_boundary(self) -> Mapping[str, Any]:
+        self._retired_role_absence_terminal = (
+            self._prove_retired_temporary_roles_absent("terminal boundary")
+        )
         projection, _ = self._collect_production_boundary()
         return projection
 
@@ -11414,6 +13785,7 @@ class AzureCliBootstrapTransport:
         *,
         headers: Mapping[str, str] | None = None,
         expected: set[int] = {200, 201},
+        intent_callback: Callable[[], None] | None = None,
     ) -> Mapping[str, Any]:
         body_bytes = canonical_json_bytes(body)
         response = self._mutation_request(
@@ -11422,6 +13794,7 @@ class AzureCliBootstrapTransport:
             body=body_bytes,
             headers={"Content-Type": "application/json", **dict(headers or {})},
             expected=expected,
+            intent_callback=intent_callback,
         )
         result = dict(self._json_response(response, expected, "ARM PUT"))
         etag = self._header(response, "ETag")
@@ -11429,16 +13802,259 @@ class AzureCliBootstrapTransport:
             result["_responseEtag"] = etag
         return result
 
-    def _arm_delete(self, resource_id: str, api_version: str) -> None:
+    def _arm_delete(
+        self,
+        resource_id: str,
+        api_version: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         url = self._arm_url(resource_id, api_version)
-        self._mutation_request("DELETE", url, expected={200, 202, 204})
+        self._mutation_request(
+            "DELETE", url, headers=headers, expected={200, 202, 204}
+        )
+
+    def _read_bridge_app_settings_once(
+        self, *, label: str
+    ) -> tuple[dict[str, str], str]:
+        site = self.resources["bridgeSite"]
+        response = self.session.request(
+            "POST",
+            self._arm_url(
+                site["resourceId"], "2025-03-01", "/config/appsettings/list"
+            ),
+            body=b"",
+        )
+        document = self._json_response(response, {200}, label)
+        settings = document.get("properties")
+        if not isinstance(settings, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in settings.items()
+        ):
+            fail(f"{label} is not one exact string map")
+        etag = _if_match_etag(
+            self._header(response, "ETag") or document.get("etag"),
+            f"{label} ETag",
+        )
+        return dict(settings), etag
+
+    def _ensure_bridge_stopped_for_settings_rollback(self) -> Mapping[str, Any]:
+        site = self.resources["bridgeSite"]
+        response = self.session.request(
+            "GET", self._arm_url(site["resourceId"], "2025-03-01")
+        )
+        document = self._json_response(
+            response, {200}, "bridge settings rollback state read"
+        )
+        properties = document.get("properties")
+        state_name = properties.get("state") if isinstance(properties, Mapping) else None
+        if (
+            str(document.get("id", "")).lower()
+            != site["resourceId"].lower()
+            or document.get("name") != site["name"]
+            or state_name not in {"Stopped", "Running", "Starting", "Stopping"}
+        ):
+            fail("bridge settings rollback state is not exact")
+        if state_name == "Stopped":
+            return {
+                "attempts": 1,
+                "observedAt": self._timestamp(self.clock()),
+                "resourceId": site["resourceId"],
+                "state": "Stopped",
+            }
+        previous_operation_id = self._active_operation_id
+        self._active_operation_id = "startBridgeForBoundedCanary"
+        try:
+            self._mutation_request(
+                "POST",
+                self._arm_url(site["resourceId"], "2025-03-01", "/stop"),
+                body=b"",
+                expected={200, 202},
+                cleanup=True,
+            )
+        finally:
+            self._active_operation_id = previous_operation_id
+        return self._wait_for_site_state(
+            site_resource_id=site["resourceId"],
+            expected_state="Stopped",
+            allow_expired_cleanup=True,
+        )
+
+    def _restore_owned_bridge_app_settings(
+        self,
+        proof: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if (
+            proof.get("operationId") != BRIDGE_SETTINGS_OWNER_OPERATION_ID
+            or proof.get("owned") is not True
+            or proof.get("cleanupKey") != BRIDGE_SETTINGS_CLEANUP_KEY
+        ):
+            fail("bridge settings compensation is not exact executor-owned state")
+        details = proof.get("details")
+        if not isinstance(details, Mapping):
+            fail("bridge settings compensation lacks its mutation facts")
+        context = self._admission_context(BRIDGE_SETTINGS_OWNER_OPERATION_ID)
+        pre_settings = context.get("preAppSettings")
+        if (
+            not isinstance(pre_settings, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in pre_settings.items()
+            )
+            or context.get("preAppSettingsSha256")
+            != sha256_bytes(canonical_json_bytes(pre_settings))
+            or details.get("preAppSettingsSha256")
+            != context.get("preAppSettingsSha256")
+            or details.get("preAppSettingsEtag")
+            != context.get("preAppSettingsEtag")
+        ):
+            fail("bridge settings compensation prestate is not authorization-bound")
+        _if_match_etag(
+            context.get("preAppSettingsEtag"),
+            "bridge settings owned prestate ETag",
+        )
+        control = details.get("bootstrapSelfTestControl")
+        if not isinstance(control, Mapping):
+            fail("bridge settings compensation lacks its exact canary control")
+        control_bytes = canonical_json_bytes(control)
+        upload = self._proof_detail(state, "uploadVersionedBridgePackage")
+        expected_package_url = (
+            f"{upload.get('url')}?versionid="
+            + urllib.parse.quote(str(upload.get("versionId")), safe="")
+        )
+        desired = dict(pre_settings)
+        desired.update(
+            {
+                "WEBSITE_RUN_FROM_PACKAGE": expected_package_url,
+                "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": self.resources[
+                    "registryReaderIdentity"
+                ]["resourceId"],
+                "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
+                "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": control_bytes.decode(
+                    "utf-8"
+                ),
+            }
+        )
+        desired_sha = sha256_bytes(canonical_json_bytes(desired))
+        if (
+            details.get("packageUrl") != expected_package_url
+            or details.get("packageVersionId") != upload.get("versionId")
+            or details.get("settingsSha256") != desired_sha
+            or details.get("settingsRequestBodySha256")
+            != sha256_bytes(canonical_json_bytes({"properties": desired}))
+            or details.get("bootstrapSelfTestControlSha256")
+            != sha256_bytes(control_bytes)
+            or details.get("bootstrapSelfTestIssuedAt") != control.get("issuedAt")
+            or details.get("bootstrapSelfTestExpiresAt") != control.get("expiresAt")
+        ):
+            fail("bridge settings compensation desired state is not exact")
+
+        stopped = self._ensure_bridge_stopped_for_settings_rollback()
+        current, current_etag = self._read_bridge_app_settings_once(
+            label="bridge settings rollback precondition"
+        )
+        pre_sha = sha256_bytes(canonical_json_bytes(pre_settings))
+        current_sha = sha256_bytes(canonical_json_bytes(current))
+        if current == pre_settings and current_sha == pre_sha:
+            return {
+                "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
+                "rollbackMutationIssued": False,
+                "preAppSettingsSha256": pre_sha,
+                "desiredSettingsSha256": desired_sha,
+                "finalSettingsSha256": current_sha,
+                "finalSettingsEtag": current_etag,
+                "bridgeStopped": dict(stopped),
+            }
+        if current != desired or current_sha != desired_sha:
+            fail(
+                "bridge settings rollback found a concurrent third state; "
+                "manual recovery is required"
+            )
+
+        site = self.resources["bridgeSite"]
+        self._mutation_request(
+            "PUT",
+            self._arm_url(
+                site["resourceId"] + "/config/appsettings", "2025-03-01"
+            ),
+            body=canonical_json_bytes({"properties": pre_settings}),
+            headers={"Content-Type": "application/json", "If-Match": current_etag},
+            expected={200},
+            cleanup=True,
+        )
+        final_settings, final_etag = self._read_bridge_app_settings_once(
+            label="bridge settings rollback final readback"
+        )
+        final_sha = sha256_bytes(canonical_json_bytes(final_settings))
+        if final_settings != pre_settings or final_sha != pre_sha:
+            fail("bridge settings rollback final readback is not exact")
+        return {
+            "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
+            "rollbackMutationIssued": True,
+            "preAppSettingsSha256": pre_sha,
+            "desiredSettingsSha256": desired_sha,
+            "finalSettingsSha256": final_sha,
+            "finalSettingsEtag": final_etag,
+            "bridgeStopped": dict(stopped),
+        }
 
     def _verify_cleanup_lock_inventory(self, operation_id: str, expected_lock_key: str | None) -> None:
         if cleanup_locks.applicable_cleanup_lock(operation_id) != expected_lock_key:
             fail("cleanup lock binding is not exact")
-        response = self._read_request_with_transport_retry("GET", _cleanup_lock_inventory_url())
+        reader = (
+            self._cleanup_read_request_once
+            if operation_id in PROTECTED_ROLE_LIFECYCLES.values()
+            else self._read_request_with_transport_retry
+        )
+        response = reader("GET", _cleanup_lock_inventory_url())
         document = self._json_response(response, {200}, "cleanup lock inventory")
         _cleanup_lock_inventory_projection(document, self.plan)
+
+    def _cleanup_read_request_once(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None = None,
+        deadline: dt.datetime | None = None,
+    ) -> _RestResponse:
+        if method != "GET" or body is not None:
+            fail("protected cleanup single-attempt reader received a non-GET request")
+        authorization_deadline = self._authorization_expiry()
+        request_deadline = (
+            authorization_deadline
+            if deadline is None
+            else min(authorization_deadline, deadline)
+        )
+        if self.clock() >= request_deadline:
+            fail("authorization expired before protected cleanup guard read")
+        self._require_full_request_envelope(
+            request_deadline, "protected cleanup guard read"
+        )
+        try:
+            response = self.session.request(
+                method, url, deadline=request_deadline
+            )
+        except _LateRestResponse as late_response:
+            response = late_response.response
+        if self.clock() >= request_deadline:
+            fail("protected cleanup guard read crossed authorization expiry")
+        return response
+
+    def _cleanup_read_request_after_expiry(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None = None,
+        deadline: dt.datetime | None = None,
+    ) -> _RestResponse:
+        if method != "GET" or body is not None:
+            fail("protected post-delete reader received a non-GET request")
+        request_kwargs = {} if deadline is None else {"deadline": deadline}
+        return self.session.request(method, url, **request_kwargs)
 
     def _require_cleanup_delete_window(self, operation_id: str) -> None:
         # A pre-existing protection lock is not executor-owned temporary state.
@@ -11448,38 +14064,53 @@ class AzureCliBootstrapTransport:
                 < parse_time(self.authorization["validity"]["expiresAt"], "expiresAt")):
             fail("authorization expired before protected assignment deletion")
 
-    def _guarded_assignment_delete(self, operation_id: str, resource_id: str,
-                                   authorized_projection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _guarded_assignment_delete(
+        self,
+        operation_id: str,
+        resource_id: str,
+        authorized_projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if getattr(self, "_protected_cleanup_blocked", False):
             fail("protected cleanup is NO-GO; fresh authorization is required")
         try:
-            return self._guarded_assignment_delete_impl(operation_id, resource_id, authorized_projection)
+            return self._guarded_assignment_delete_impl(
+                operation_id,
+                resource_id,
+                authorized_projection,
+            )
         except BaseException:
             # The guard's already-entered finally is the sole restoration attempt.
             # Executor compensation must not become an implicit mutation retry.
             self._protected_cleanup_blocked = True
             raise
 
-    def _guarded_assignment_delete_impl(self, operation_id: str, resource_id: str,
-                                       authorized_projection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _guarded_assignment_delete_impl(
+        self,
+        operation_id: str,
+        resource_id: str,
+        authorized_projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if _cleanup_assignment_resources(self.plan).get(operation_id) != resource_id:
             fail("guarded assignment deletion target is not source-bound")
         assignment_url = self._arm_url(resource_id, "2022-04-01")
-        before = self._read_request_with_transport_retry("GET", assignment_url)
         expected_assignment = {"id": resource_id}
         def project_assignment(document):
             if str(document.get("id", "")).lower() != resource_id.lower():
                 fail("guarded assignment precondition ID drifted")
             return {**_project_role_assignment(document), "id": resource_id}
-        if before.status != 404:
-            document = self._json_response(before, {200}, "guarded assignment precondition")
-            expected_assignment = project_assignment(document)
         if operation_id.startswith("removeOwned"):
-            expected_assignment = ({**dict(authorized_projection), "id": resource_id}
-                                   if authorized_projection is not None else {"id": resource_id})
-            if before.status == 200 and project_assignment(document) != expected_assignment:
-                fail("temporary assignment drifted after its authorized cleanup precondition")
+            expected_assignment = (
+                {**dict(authorized_projection), "id": resource_id}
+                if authorized_projection is not None
+                else {"id": resource_id}
+            )
         else:
+            before = self._read_request_with_transport_retry("GET", assignment_url)
+            if before.status != 404:
+                document = self._json_response(
+                    before, {200}, "guarded assignment precondition"
+                )
+                expected_assignment = project_assignment(document)
             # A fresh GET supplies evidence, never new deletion authority. Legacy
             # targets remain bound to the exact authorization-time preflight.
             admission = self.admissions[operation_id]
@@ -11501,19 +14132,40 @@ class AzureCliBootstrapTransport:
                 fail("guarded restoration is not the exact original lock")
             if not restore:
                 self._require_cleanup_delete_window(operation_id)
+            mutation_headers = (
+                {"Content-Type": "application/json"}
+                if body is not None
+                else {}
+            )
             return self._mutation_request(method, url, body=body,
-                headers={"Content-Type": "application/json"} if body is not None else None,
-                expected=expected, cleanup=restore)
+                headers=mutation_headers or None,
+                expected=expected, cleanup=restore,
+                deadline=None if restore else self._authorization_expiry())
 
         guard = cleanup_locks.CleanupLockGuard(
-            read_request=self._read_request_with_transport_retry,
+            read_request=(
+                self._cleanup_read_request_once
+                if operation_id in PROTECTED_ROLE_LIFECYCLES.values()
+                else self._read_request_with_transport_retry
+            ),
             mutate_request=mutate,
             verify_lock_inventory=self._verify_cleanup_lock_inventory,
             clock=self.clock, sleep=self.sleep, fail=fail,
             require_live_authorization=lambda: self._require_cleanup_delete_window(operation_id),
+            post_delete_read_request=(
+                self._cleanup_read_request_after_expiry
+                if operation_id in PROTECTED_ROLE_LIFECYCLES.values()
+                else self._read_request_with_transport_retry
+            ),
         )
-        return guard.delete_assignment(operation_id=operation_id, assignment_url=assignment_url,
-            expected_assignment_projection=expected_assignment, project_assignment=project_assignment)
+        result = guard.delete_assignment(
+            operation_id=operation_id,
+            assignment_url=assignment_url,
+            expected_assignment_projection=expected_assignment,
+            project_assignment=project_assignment,
+        )
+        self._last_guarded_assignment_was_present = guard.assignment_was_present
+        return result
 
     def _prove_adopted_assignment_lock(self, operation_id: str) -> dict[str, Any]:
         key = cleanup_locks.applicable_cleanup_lock(operation_id)
@@ -12158,6 +14810,12 @@ class AzureCliBootstrapTransport:
             blob = f"v2/control/{source_sha}/paperdesk-private-release-bridge.zip"
             url = f"{self.STORAGE_ROOT}/{self.resources['packageContainer']['name']}/{blob}"
             self._prove_package_upload_ready(url)
+            package_write_deadline = (
+                self._request_deadline() or self._authorization_expiry()
+            )
+            package_write_deadline -= dt.timedelta(
+                seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
             response = self._mutation_request(
                 "PUT",
                 url,
@@ -12170,11 +14828,11 @@ class AzureCliBootstrapTransport:
                     "x-ms-meta-sha256": self.package["sha256"],
                 },
                 expected={201},
+                deadline=package_write_deadline,
             )
-            etag = self._header(response, "ETag")
-            version_id = self._header(response, "x-ms-version-id")
-            if not etag or not version_id:
-                fail("versioned bridge package response lacks ETag/version")
+            etag, version_id = self._require_storage_write_identity(
+                response, operation_id
+            )
             return {
                 "blob": blob,
                 "etag": etag,
@@ -12247,13 +14905,22 @@ class AzureCliBootstrapTransport:
             current = self._json_response(current_response, {200}, "bridge app-settings precondition")
             current_settings = current.get("properties")
             current_etag = self._header(current_response, "ETag") or current.get("etag")
+            authorized_pre_settings_etag = _if_match_etag(
+                context.get("preAppSettingsEtag"),
+                "authorized bridge app-settings precondition ETag",
+            )
             if (
                 not isinstance(current_settings, dict)
                 or current_settings != context["preAppSettings"]
                 or sha256_bytes(canonical_json_bytes(current_settings))
                 != context["preAppSettingsSha256"]
+                or _if_match_etag(
+                    current_etag, "bridge app-settings precondition ETag"
+                )
+                != authorized_pre_settings_etag
             ):
                 fail("bridge app settings drifted after authorization")
+            pre_settings_etag = authorized_pre_settings_etag
             self_test_control = _bootstrap_self_test_control(
                 self.authorization, state, issued_at=self._timestamp(self.clock())
             )
@@ -12265,20 +14932,12 @@ class AzureCliBootstrapTransport:
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
                 "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": self_test_control_bytes.decode("utf-8"),
             })
-            result = self._arm_put(
-                site["resourceId"] + "/config/appsettings",
-                "2025-03-01",
-                {"properties": desired},
-                headers={
-                    "If-Match": _if_match_etag(
-                        current_etag, "bridge app-settings precondition ETag"
-                    )
-                },
-            )
-            return {
-                "resourceId": result.get("id"),
+            details = {
+                "resourceId": site["resourceId"] + "/config/appsettings",
+                "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
                 "settingsSha256": sha256_bytes(canonical_json_bytes(desired)),
                 "preAppSettingsSha256": context["preAppSettingsSha256"],
+                "preAppSettingsEtag": pre_settings_etag,
                 "packageUrl": expected_url,
                 "packageVersionId": upload["versionId"],
                 "bootstrapSelfTestControl": self_test_control,
@@ -12289,11 +14948,40 @@ class AzureCliBootstrapTransport:
                     self_test_control_bytes
                 ),
             }
+            intent_durable = False
+
+            def mark_intent_durable() -> None:
+                nonlocal intent_durable
+                intent_durable = True
+
+            try:
+                result = self._arm_put(
+                    site["resourceId"] + "/config/appsettings",
+                    "2025-03-01",
+                    {"properties": desired},
+                    headers={"If-Match": pre_settings_etag},
+                    intent_callback=mark_intent_durable,
+                )
+            except BaseException as exc:
+                if intent_durable:
+                    raise OwnedTemporaryMutationError(
+                        "bridge app-settings PUT stopped after its durable intent",
+                        {
+                            "operationId": operation_id,
+                            "status": "applied-readback-pending",
+                            "owned": True,
+                            "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
+                            "details": details,
+                        },
+                    ) from exc
+                raise
+            details["resourceId"] = result.get("id")
+            return details
 
         if operation_id == "readBackExactSigningPublicJwk":
             key = self._proof_detail(state, "createSigningKeyVersion")
             url = key["keyUriWithVersion"] + "?api-version=7.4"
-            response = self.session.request("GET", url)
+            response = self._read_signing_public_jwk_when_ready(url)
             document = self._json_response(response, {200}, "Key Vault public key readback")
             value = document.get("key")
             attributes = document.get("attributes")
@@ -12344,6 +15032,13 @@ class AzureCliBootstrapTransport:
                 }
             )
             url = self.resources["activationFenceBlob"]["resourceId"]
+            self._prove_fence_blob_create_ready(url)
+            fence_write_deadline = (
+                self._request_deadline() or self._authorization_expiry()
+            )
+            fence_write_deadline -= dt.timedelta(
+                seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
             response = self._mutation_request(
                 "PUT",
                 url,
@@ -12356,10 +15051,20 @@ class AzureCliBootstrapTransport:
                     "x-ms-meta-sha256": sha256_bytes(body),
                 },
                 expected={201},
+                deadline=fence_write_deadline,
             )
-            return {"url": url, "etag": self._header(response, "ETag"), "versionId": self._header(response, "x-ms-version-id"), "sha256": sha256_bytes(body)}
+            etag, version_id = self._require_storage_write_identity(
+                response, operation_id
+            )
+            return {
+                "url": url,
+                "etag": etag,
+                "versionId": version_id,
+                "sha256": sha256_bytes(body),
+            }
 
         if operation_id == "createControllerLeaseCanaryBlob":
+            self._enter_controller_canary_phase()
             blob = self.plan["temporaryAccess"]["controllerCanaryBlobTemplate"].replace(
                 "${authorization.authorizationId}", self.authorization["authorizationId"]
             )
@@ -12376,30 +15081,141 @@ class AzureCliBootstrapTransport:
                     "planSha256": self.authorization["plan"]["sha256"],
                 }
             )
-            response = self._mutation_request(
-                "PUT",
-                url,
-                body=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-ms-blob-type": "BlockBlob",
-                    "x-ms-version": "2023-11-03",
-                    "If-None-Match": "*",
-                    "x-ms-meta-sha256": sha256_bytes(body),
-                },
-                expected={201},
-            )
-            etag = self._header(response, "ETag")
-            version_id = self._header(response, "x-ms-version-id")
-            _quoted_etag(etag, "controller canary blob ETag")
-            if not isinstance(version_id, str) or not version_id:
-                fail("controller canary blob lacks an exact version ID")
-            return {
+            base_details = {
                 "url": url,
-                "etag": etag,
-                "versionId": version_id,
                 "sha256": sha256_bytes(body),
                 "cleanupKey": "controller-lease-canary-blob",
+            }
+            try:
+                response = self._mutation_request(
+                    "PUT",
+                    url,
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-ms-blob-type": "BlockBlob",
+                        "x-ms-version": "2023-11-03",
+                        "If-None-Match": "*",
+                        "x-ms-meta-sha256": sha256_bytes(body),
+                    },
+                    expected={201},
+                )
+                etag, version_id = self._require_storage_write_identity(
+                    response, operation_id
+                )
+            except BaseException as primary_error:
+                ambiguous_status = (
+                    primary_error.diagnostic.get("status")
+                    if isinstance(primary_error, StorageOperationError)
+                    else None
+                )
+                if (
+                    not isinstance(primary_error, StorageOperationError)
+                    or not (
+                        ambiguous_status is None
+                        or 200 <= ambiguous_status <= 299
+                        or 500 <= ambiguous_status <= 599
+                    )
+                ):
+                    # A concrete conditional-write denial proves this request
+                    # did not create the object.  Never infer ownership from a
+                    # later exact-looking GET of pre-existing state.
+                    raise
+                # The conditional PUT may have reached Storage even when its
+                # response or local result-journal append failed.  Resolve the
+                # exact object once under the next reserved request envelope.
+                # Any third state remains provisionally owned so compensation
+                # cannot silently leave a canary that blocks the empty proof.
+                provisional_details = dict(base_details)
+                observation: _RestResponse | None = None
+                observation_late = False
+                observation_deadline = (
+                    self._controller_canary_fast_acquire_deadline()
+                )
+                observation_client_request_id = _new_storage_client_request_id()
+                try:
+                    self._require_full_request_envelope(
+                        observation_deadline,
+                        "ambiguous controller canary create observation",
+                    )
+                    try:
+                        observation = self.session.request(
+                            "GET",
+                            url,
+                            headers={
+                                "x-ms-version": "2023-11-03",
+                                "Accept": "application/json",
+                                "x-ms-client-request-id": observation_client_request_id,
+                            },
+                            deadline=observation_deadline,
+                        )
+                    except _LateRestResponse as late_response:
+                        observation = late_response.response
+                        observation_late = True
+                    if (
+                        observation.client_request_id is None
+                        and GUID.fullmatch(observation_client_request_id)
+                    ):
+                        observation = dataclasses.replace(
+                            observation,
+                            client_request_id=observation_client_request_id,
+                        )
+                    if self.clock() >= observation_deadline:
+                        observation_late = True
+                    if observation.status == 200:
+                        if (
+                            observation.body != body
+                            or self._header(observation, "x-ms-meta-sha256")
+                            != base_details["sha256"]
+                            or str(self._header(observation, "x-ms-blob-type") or "")
+                            != "BlockBlob"
+                            or str(self._header(observation, "Content-Type") or "")
+                            .split(";", 1)[0]
+                            .strip()
+                            .lower()
+                            != "application/json"
+                        ):
+                            fail("ambiguous controller canary create readback drifted")
+                        observed_etag, observed_version_id = (
+                            self._require_storage_write_identity(
+                                observation, operation_id
+                            )
+                        )
+                        provisional_details.update(
+                            {
+                                "etag": observed_etag,
+                                "versionId": observed_version_id,
+                            }
+                        )
+                    elif observation.status == 404 and not observation_late:
+                        absence = _package_blob_error_projection(
+                            "GET", url, observation
+                        )
+                        if absence.get("storageErrorCode") != "BlobNotFound":
+                            fail(
+                                "ambiguous controller canary create absence is not exact"
+                            )
+                    else:
+                        fail("ambiguous controller canary create could not be resolved")
+                except OwnedTemporaryMutationError:
+                    raise
+                except BaseException:
+                    pass
+                provisional = {
+                    "operationId": operation_id,
+                    "status": "applied-readback-pending",
+                    "owned": True,
+                    "cleanupKey": base_details["cleanupKey"],
+                    "details": provisional_details,
+                }
+                raise OwnedTemporaryMutationError(
+                    "controller canary create is ambiguous and requires exact compensation",
+                    provisional,
+                ) from primary_error
+            return {
+                **base_details,
+                "etag": etag,
+                "versionId": version_id,
             }
 
         if operation_id == "exerciseControllerLeaseCanary":
@@ -12419,7 +15235,9 @@ class AzureCliBootstrapTransport:
                     timespec="milliseconds"
                 ).replace("+00:00", "Z")
 
-            def release(candidate: str) -> tuple[int, str]:
+            def release(
+                candidate: str, *, deadline: dt.datetime
+            ) -> tuple[int, str]:
                 response = self._mutation_request(
                     "PUT",
                     query_url,
@@ -12431,15 +15249,38 @@ class AzureCliBootstrapTransport:
                     },
                     expected={200},
                     cleanup=True,
+                    deadline=deadline,
                 )
                 return response.status, observed_stamp()
 
+            def release_or_expire(
+                candidate: str,
+                *,
+                release_deadline: dt.datetime,
+                expiry_deadline: dt.datetime,
+            ) -> tuple[int, str]:
+                try:
+                    return release(candidate, deadline=release_deadline)
+                except BaseException:
+                    # A release can be ambiguous after the request reached
+                    # Storage. The lease is source-fixed at 60 seconds, so
+                    # consume that bounded fallback before blob compensation.
+                    self._sleep_before_deadline(
+                        duration,
+                        "controller lease finite-expiry fallback",
+                        deadline=expiry_deadline,
+                    )
+                    raise
+
+            fast_acquire_attempted = False
             fast_acquired = False
             fast_acquired_at = None
             fast_renewed_at: list[str] = []
             fast_release_status = None
             fast_released_at = None
+            fast_primary_error: BaseException | None = None
             try:
+                fast_acquire_attempted = True
                 self._mutation_request(
                     "PUT",
                     query_url,
@@ -12451,6 +15292,7 @@ class AzureCliBootstrapTransport:
                         "x-ms-lease-action": "acquire",
                     },
                     expected={201},
+                    deadline=self._controller_canary_fast_acquire_deadline(),
                 )
                 fast_acquired = True
                 fast_acquired_at = observed_stamp()
@@ -12465,11 +15307,31 @@ class AzureCliBootstrapTransport:
                             "x-ms-lease-id": lease_id,
                         },
                         expected={200},
+                        deadline=self._controller_canary_fast_renew_deadline(),
                     )
                     fast_renewed_at.append(observed_stamp())
+            except BaseException as exc:
+                fast_primary_error = exc
             finally:
-                if fast_acquired:
-                    fast_release_status, fast_released_at = release(lease_id)
+                if fast_acquire_attempted:
+                    try:
+                        fast_release_status, fast_released_at = release_or_expire(
+                            lease_id,
+                            release_deadline=(
+                                self._controller_canary_release_deadline()
+                            ),
+                            expiry_deadline=(
+                                self._controller_canary_expiry_acquire_deadline()
+                            ),
+                        )
+                    except BaseException as cleanup_error:
+                        if fast_primary_error is not None:
+                            raise BootstrapError(
+                                "controller fast lease failed and exact cleanup also failed"
+                            ) from fast_primary_error
+                        raise cleanup_error
+            if fast_primary_error is not None:
+                raise fast_primary_error
 
             expiry_acquired_at = None
             try:
@@ -12484,6 +15346,7 @@ class AzureCliBootstrapTransport:
                         "x-ms-lease-action": "acquire",
                     },
                     expected={201},
+                    deadline=self._controller_canary_expiry_acquire_deadline(),
                 )
                 expiry_acquired_at = observed_stamp()
             except BaseException:
@@ -12492,32 +15355,106 @@ class AzureCliBootstrapTransport:
                 # ID is deterministic, so cleanup first attempts an exact
                 # release and then relies on finite expiry if release fails.
                 try:
-                    release(expiry_lease_id)
+                    release_or_expire(
+                        expiry_lease_id,
+                        release_deadline=(
+                            self._controller_canary_expiry_release_deadline()
+                        ),
+                        expiry_deadline=(
+                            self._controller_canary_lease_expiry_deadline()
+                        ),
+                    )
                 except BaseException:
                     pass
                 raise
 
-            available_at = None
+            expired_at = None
             attempts = 0
             maximum_attempts = duration // 2 + 20
-            while attempts < maximum_attempts:
-                attempts += 1
-                response = self.session.request(
-                    "GET",
-                    url,
-                    headers={"x-ms-version": "2023-11-03"},
+            try:
+                # Wait one complete finite lease before the final observation;
+                # the following GET still owns a full request envelope.
+                self._sleep_before_deadline(
+                    duration,
+                    "controller finite lease expiry",
+                    deadline=(
+                        self._controller_canary_lease_expiry_deadline()
+                        - dt.timedelta(
+                            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        )
+                    ),
                 )
-                if response.status != 200:
-                    fail("controller lease expiry readback failed")
-                state_name = str(self._header(response, "x-ms-lease-state") or "").lower()
-                if state_name == "available":
-                    available_at = observed_stamp()
-                    break
-                if state_name not in {"leased", "breaking", "broken", "expired"}:
-                    fail("controller lease expiry reached an unknown state")
-                self.sleep(2.0)
-            if available_at is None:
-                fail("controller lease did not reach Available after finite expiry")
+                while attempts < maximum_attempts:
+                    attempts += 1
+                    request_kwargs: dict[str, Any] = {
+                        "headers": {"x-ms-version": "2023-11-03"}
+                    }
+                    request_deadline = (
+                        self._controller_canary_lease_expiry_deadline()
+                    )
+                    self._require_full_request_envelope(
+                        request_deadline,
+                        "controller lease expiry readback",
+                    )
+                    if request_deadline is not None:
+                        request_kwargs["deadline"] = request_deadline
+                    try:
+                        response = self.session.request(
+                            "GET", url, **request_kwargs
+                        )
+                    except _LateRestResponse as late_response:
+                        response = late_response.response
+                    if (
+                        request_deadline is not None
+                        and self.clock() >= request_deadline
+                    ):
+                        fail("controller lease expiry readback crossed its deadline")
+                    if response.status != 200:
+                        fail("controller lease expiry readback failed")
+                    state_name = str(
+                        self._header(response, "x-ms-lease-state") or ""
+                    ).lower()
+                    status_name = str(
+                        self._header(response, "x-ms-lease-status") or ""
+                    ).lower()
+                    duration_name = str(
+                        self._header(response, "x-ms-lease-duration") or ""
+                    ).lower()
+                    if state_name == "expired":
+                        if status_name != "unlocked" or duration_name != "fixed":
+                            fail(
+                                "controller lease expiry terminal headers are not exact"
+                            )
+                        expired_at = observed_stamp()
+                        break
+                    if state_name not in {"leased", "breaking", "broken"}:
+                        fail("controller lease expiry reached an unknown state")
+                    self._sleep_before_deadline(
+                        2.0,
+                        "controller lease expiry poll",
+                        deadline=(
+                            self._controller_canary_lease_expiry_deadline()
+                            - dt.timedelta(
+                                seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                            )
+                        ),
+                    )
+                if expired_at is None:
+                    fail("controller lease did not reach Expired after finite expiry")
+            except BaseException:
+                try:
+                    release_or_expire(
+                        expiry_lease_id,
+                        release_deadline=(
+                            self._controller_canary_expiry_release_deadline()
+                        ),
+                        expiry_deadline=(
+                            self._controller_canary_lease_expiry_deadline()
+                        ),
+                    )
+                except BaseException:
+                    pass
+                raise
             return {
                 "url": url,
                 "leaseId": lease_id,
@@ -12535,68 +15472,297 @@ class AzureCliBootstrapTransport:
                     "leaseId": expiry_lease_id,
                     "acquiredAt": expiry_acquired_at,
                     "releaseIntentionallyOmitted": True,
-                    "availableAt": available_at,
+                    "expiredAt": expired_at,
                     "pollAttempts": attempts,
-                    "finalLeaseState": "available",
+                    "finalLeaseState": "expired",
+                    "finalLeaseStatus": "unlocked",
+                    "finalLeaseDuration": "fixed",
                 },
                 "selfCleaned": True,
             }
 
         if operation_id == "removeControllerLeaseCanaryBlob":
             created = self._proof_detail(state, "createControllerLeaseCanaryBlob")
-            response = self._mutation_request(
-                "DELETE",
-                created["url"],
-                body=None,
-                headers={
+            cleanup_etag = created.get("etag")
+            cleanup_identity_was_known = cleanup_etag is not None
+            cleanup_resolved_after_ambiguity = False
+            delete_status = 404
+            if cleanup_etag is None:
+                expected_body = canonical_json_bytes(
+                    {
+                        "schemaVersion": 1,
+                        "mode": "controller-lock-finite-lease-canary",
+                        "authorizationId": self.authorization["authorizationId"],
+                        "sourceSha": source_sha,
+                        "planSha256": self.authorization["plan"]["sha256"],
+                    }
+                )
+                identity_deadline = (
+                    self._controller_canary_identity_resolution_deadline()
+                )
+                settlement_started = self.clock()
+                settlement_deadline = settlement_started + dt.timedelta(
+                    seconds=CONTROLLER_CANARY_CREATE_SETTLEMENT_SECONDS
+                )
+                settlement_observation_deadline = (
+                    settlement_deadline
+                    + dt.timedelta(
+                        seconds=(
+                            FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                            + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        )
+                    )
+                )
+                if (
+                    settlement_observation_deadline
+                    > identity_deadline
+                ):
+                    fail(
+                        "controller canary cleanup lacks its full create-settlement "
+                        "and identity-resolution window; manual recovery is required"
+                    )
+                previous = settlement_started
+                for attempt in range(64):
+                    before = self.clock()
+                    if (
+                        before < previous
+                        or before
+                        > settlement_deadline
+                        + dt.timedelta(
+                            seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        )
+                    ):
+                        fail("controller canary create-settlement clock is invalid")
+                    if (
+                        before < settlement_deadline
+                        and before
+                        + dt.timedelta(
+                            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        )
+                        >= settlement_deadline
+                    ):
+                        self._sleep_before_deadline(
+                            (settlement_deadline - before).total_seconds(),
+                            "controller canary final create-settlement observation",
+                            deadline=settlement_deadline,
+                        )
+                        aligned = self.clock()
+                        if (
+                            aligned < settlement_deadline
+                            or aligned
+                            > settlement_deadline
+                            + dt.timedelta(
+                                seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                            )
+                        ):
+                            fail(
+                                "controller canary create-settlement clock is invalid"
+                            )
+                        before = aligned
+                    final_observation = before >= settlement_deadline
+                    identity_request_deadline = (
+                        before
+                        + dt.timedelta(
+                            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        )
+                        if final_observation
+                        else settlement_deadline
+                    )
+                    if identity_request_deadline > identity_deadline:
+                        fail(
+                            "controller canary cleanup lacks its final identity "
+                            "request envelope; manual recovery is required"
+                        )
+                    self._require_full_request_envelope(
+                        identity_request_deadline,
+                        "controller canary cleanup identity resolution",
+                    )
+                    identity_client_request_id = _new_storage_client_request_id()
+                    try:
+                        identity_response = self.session.request(
+                            "GET",
+                            created["url"],
+                            headers={
+                                "x-ms-version": "2023-11-03",
+                                "Accept": "application/json",
+                                "x-ms-client-request-id": identity_client_request_id,
+                            },
+                            deadline=identity_request_deadline,
+                        )
+                    except _LateRestResponse as late_response:
+                        identity_response = late_response.response
+                    after = self.clock()
+                    if after < before or after >= identity_request_deadline:
+                        fail(
+                            "controller canary cleanup identity resolution crossed "
+                            "its deadline"
+                        )
+                    if identity_response.status == 404:
+                        absence = _package_blob_error_projection(
+                            "GET", created["url"], identity_response
+                        )
+                        if (
+                            absence is None
+                            or absence.get("storageErrorCode") != "BlobNotFound"
+                        ):
+                            fail("controller canary cleanup identity 404 is not exact")
+                        if final_observation:
+                            break
+                        if after >= settlement_deadline:
+                            fail(
+                                "controller canary pre-boundary identity observation "
+                                "crossed its settlement boundary"
+                            )
+                    elif identity_response.status == 200:
+                        if (
+                            identity_response.body != expected_body
+                            or created.get("sha256") != sha256_bytes(expected_body)
+                            or self._header(identity_response, "x-ms-meta-sha256")
+                            != sha256_bytes(expected_body)
+                            or str(
+                                self._header(identity_response, "x-ms-blob-type") or ""
+                            )
+                            != "BlockBlob"
+                            or str(
+                                self._header(identity_response, "Content-Type") or ""
+                            )
+                            .split(";", 1)[0]
+                            .strip()
+                            .lower()
+                            != "application/json"
+                        ):
+                            fail("controller canary cleanup identity readback drifted")
+                        cleanup_etag, _ = self._require_storage_write_identity(
+                            identity_response, "createControllerLeaseCanaryBlob"
+                        )
+                        cleanup_identity_was_known = True
+                        break
+                    else:
+                        fail("controller canary cleanup identity is unresolved")
+                    if attempt == 63:
+                        fail("controller canary create-settlement attempt bound expired")
+                    remaining = (settlement_deadline - after).total_seconds()
+                    if remaining <= 0:
+                        fail("controller canary create-settlement clock is invalid")
+                    self._sleep_before_deadline(
+                        min(15, remaining),
+                        "controller canary create-settlement poll",
+                        deadline=settlement_deadline,
+                    )
+                    previous = after
+            if cleanup_etag is not None:
+                delete_headers = {
                     "x-ms-version": "2023-11-03",
                     "If-Match": _if_match_etag(
-                        created["etag"], "controller canary cleanup ETag"
+                        cleanup_etag, "controller canary cleanup ETag"
                     ),
                     "x-ms-delete-snapshots": "include",
-                },
-                expected={202},
-            )
+                }
+                try:
+                    response = self._mutation_request(
+                        "DELETE",
+                        created["url"],
+                        body=None,
+                        headers=delete_headers,
+                        expected={202, 404},
+                        deadline=self._controller_canary_blob_delete_deadline(),
+                    )
+                except StorageOperationError as first_delete_error:
+                    diagnostic = first_delete_error.diagnostic
+                    if (
+                        not cleanup_identity_was_known
+                        or diagnostic.get("status") not in {None, 202, 404}
+                        or diagnostic.get("stopReason")
+                        not in {
+                            "transport-error",
+                            "deadline",
+                            "result-journal-error",
+                        }
+                    ):
+                        raise
+                    # The authorization-specific blob and exact If-Match make
+                    # one replay safe: applied DELETE becomes exact
+                    # BlobNotFound; a request that never reached Storage gets
+                    # the original 202.  No definitive denial is replayed.
+                    response = self._mutation_request(
+                        "DELETE",
+                        created["url"],
+                        body=None,
+                        headers=delete_headers,
+                        expected={202, 404},
+                        deadline=(
+                            self._controller_canary_blob_delete_retry_deadline()
+                        ),
+                    )
+                    cleanup_resolved_after_ambiguity = True
+                delete_status = response.status
+                if response.status == 404:
+                    if self._storage_error_code(response) != "BlobNotFound":
+                        fail("controller canary cleanup 404 is not exact BlobNotFound")
             container_url = (
                 f"{self.STORAGE_ROOT}/{self.resources['controllerLockContainer']['name']}"
             )
             list_url = container_url + "?restype=container&comp=list"
-            inventory_response = self.session.request(
-                "GET",
-                list_url,
-                headers={"x-ms-version": "2023-11-03"},
-            )
-            if inventory_response.status != 200 or len(inventory_response.body) > 1_000_000:
-                fail("controller lock post-canary inventory could not be read exactly")
-            try:
-                root = ET.fromstring(inventory_response.body)
-            except ET.ParseError as exc:
-                raise BootstrapError("controller lock post-canary inventory XML is invalid") from exc
-            blobs_node = root.find("Blobs")
-            next_marker_node = root.find("NextMarker")
-            if blobs_node is None or next_marker_node is None:
-                fail("controller lock post-canary inventory XML is incomplete")
-            blob_names = [
-                str(node.text or "")
-                for node in blobs_node.findall("Blob/Name")
-            ]
-            if any(not name for name in blob_names) or blob_names != sorted(set(blob_names)):
-                fail("controller lock post-canary blob inventory is invalid")
-            inventory = {
-                "containerUrl": container_url,
-                "listUrl": list_url,
-                "httpStatus": inventory_response.status,
-                "blobNames": blob_names,
-                "blobCount": len(blob_names),
-                "nextMarker": str(next_marker_node.text or ""),
+            request_kwargs: dict[str, Any] = {
+                "headers": {"x-ms-version": "2023-11-03"}
             }
-            if blob_names or inventory["nextMarker"]:
-                fail("controller lock container is not empty after canary cleanup")
+            request_deadline = self._controller_canary_inventory_deadline()
+            self._require_full_request_envelope(
+                request_deadline, "controller post-delete inventory"
+            )
+            request_kwargs["deadline"] = request_deadline
+            try:
+                inventory_response = self.session.request(
+                    "GET", list_url, **request_kwargs
+                )
+            except _LateRestResponse as late_response:
+                inventory_response = late_response.response
+            if self.clock() >= request_deadline:
+                fail("controller post-delete inventory crossed its deadline")
+            create_projection = self._validated_source_projections.get(
+                "createPrivateControllerLockContainer"
+            )
+            private_posture = (
+                create_projection.get("projection")
+                if isinstance(create_projection, Mapping)
+                else None
+            )
+            create_context = self.admissions[
+                "createPrivateControllerLockContainer"
+            ]["context"]
+            if not isinstance(private_posture, Mapping):
+                fail("controller post-canary inventory lacks exact private ARM posture")
+            strict_inventory = _strict_empty_controller_inventory(
+                inventory_response,
+                plan=self.plan,
+                observed_at=self._timestamp(self.clock()),
+                private_container_posture=private_posture,
+                controller_container_decision=str(
+                    create_context.get("executionDecision")
+                ),
+            )
+            inventory = {
+                key: strict_inventory[key]
+                for key in (
+                    "containerUrl",
+                    "listUrl",
+                    "httpStatus",
+                    "blobNames",
+                    "blobCount",
+                    "nextMarker",
+                )
+            }
+            # apply_operation/compensate_temporary performs the reviewed REMOVE
+            # desired probe immediately after this return.  That sole probe owns
+            # the final request envelope and exact BlobNotFound validation.
             return {
                 "url": created["url"],
                 "cleanupKey": "controller-lease-canary-blob",
-                "deleteStatus": response.status,
+                "deleteStatus": delete_status,
                 "controllerLockInventory": inventory,
+                "_cleanupResolvedAfterAmbiguity": (
+                    cleanup_resolved_after_ambiguity
+                ),
             }
 
         if operation_id == "startBridgeForBoundedCanary":
@@ -12808,12 +15974,15 @@ class AzureCliBootstrapTransport:
             data_actions = self.plan["temporaryAccess"]["temporaryControllerDataActions"]
         else:
             fail("temporary role operation is unknown")
+        metadata = _temporary_role_metadata(
+            self.authorization["authorizationId"], cleanup_key
+        )
         definition_resource = f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/{definition_id}"
         assignment_resource = f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_id}"
         definition_body = {
             "properties": {
-                "roleName": f"PaperDesk V2 temporary {cleanup_key}",
-                "description": "Single-use bootstrap temporary role; exact cleanup required",
+                "roleName": metadata["roleName"],
+                "description": metadata["description"],
                 "type": "CustomRole",
                 "permissions": [
                     {
@@ -12836,6 +16005,7 @@ class AzureCliBootstrapTransport:
                 "principalId": self.authorization["azure"]["accountObjectId"],
                 "principalType": principal_type,
                 "roleDefinitionId": definition_resource,
+                "description": metadata["assignmentDescription"],
             }
         }
         expected_assignment_projection = {
@@ -12843,7 +16013,9 @@ class AzureCliBootstrapTransport:
             "name": assignment_id,
             "type": "Microsoft.Authorization/roleAssignments",
             "properties": {
-                **assignment_body["properties"],
+                "principalId": assignment_body["properties"]["principalId"],
+                "principalType": assignment_body["properties"]["principalType"],
+                "roleDefinitionId": assignment_body["properties"]["roleDefinitionId"],
                 "scope": scope,
                 "condition": None,
                 "conditionVersion": None,
@@ -12853,9 +16025,17 @@ class AzureCliBootstrapTransport:
 
         exact_readbacks: dict[str, Mapping[str, Any]] = {}
 
-        def read_exact(resource_id: str, expected_body: Mapping[str, Any], label: str) -> str:
+        def read_exact(
+            resource_id: str,
+            expected_body: Mapping[str, Any],
+            label: str,
+            *,
+            deadline: dt.datetime | None = None,
+        ) -> str:
             response = self._read_request_with_transport_retry(
-                "GET", self._arm_url(resource_id, "2022-04-01")
+                "GET",
+                self._arm_url(resource_id, "2022-04-01"),
+                deadline=deadline,
             )
             if response.status == 404:
                 return "absent"
@@ -12881,51 +16061,74 @@ class AzureCliBootstrapTransport:
             else:
                 if _project_role_assignment(document) != expected_assignment_projection:
                     fail(f"{label} differs from the source-authorized assignment")
+                if properties.get("description") != expected.get("description"):
+                    fail(f"{label} marker differs from the source-authorized assignment")
                 projection = {
                     "principalId": properties.get("principalId"),
                     "principalType": properties.get("principalType"),
                     "roleDefinitionId": properties.get("roleDefinitionId"),
+                    "description": properties.get("description"),
                 }
-                exact_readbacks[resource_id.lower()] = _project_role_assignment(document)
+                assignment_projection = _project_role_assignment(document)
+                assignment_projection["properties"]["description"] = properties.get(
+                    "description"
+                )
+                exact_readbacks[resource_id.lower()] = assignment_projection
             if projection != expected:
                 fail(f"{label} is a third state")
             return "exact"
 
         if add:
+            self._begin_protected_role_lifecycle(operation_id)
             details: dict[str, Any] = {
                 "cleanupKey": cleanup_key,
                 "assignmentResourceId": assignment_resource,
                 "definitionResourceId": definition_resource,
+                "definitionAttempted": False,
                 "definitionCreated": False,
+                "definitionReadbackExact": False,
+                "assignmentAttempted": False,
                 "assignmentCreated": False,
+                "assignmentReadbackExact": False,
             }
+            pending_create: str | None = None
             try:
                 if read_exact(definition_resource, definition_body, "temporary role definition precondition") != "absent":
                     fail("temporary role definition already exists; recovery authorization is required")
+                details["definitionAttempted"] = True
+                pending_create = "definition"
                 definition_response = self._mutation_request(
                     "PUT",
                     self._arm_url(definition_resource, "2022-04-01"),
                     body=canonical_json_bytes(definition_body),
                     headers={"Content-Type": "application/json", "If-None-Match": "*"},
                     expected={201},
+                    ambiguous_server_error=True,
                 )
                 details["definitionCreated"] = True
+                pending_create = None
                 details["definitionEtag"] = self._header(definition_response, "ETag")
                 if read_exact(definition_resource, definition_body, "temporary role definition readback") != "exact":
                     fail("temporary role definition readback is not exact")
+                details["definitionReadbackExact"] = True
                 if read_exact(assignment_resource, assignment_body, "temporary role assignment precondition") != "absent":
                     fail("temporary role assignment already exists; recovery authorization is required")
+                details["assignmentAttempted"] = True
+                pending_create = "assignment"
                 assignment_response = self._mutation_request(
                     "PUT",
                     self._arm_url(assignment_resource, "2022-04-01"),
                     body=canonical_json_bytes(assignment_body),
                     headers={"Content-Type": "application/json", "If-None-Match": "*"},
                     expected={201},
+                    ambiguous_server_error=True,
                 )
                 details["assignmentCreated"] = True
+                pending_create = None
                 details["assignmentEtag"] = self._header(assignment_response, "ETag")
                 if read_exact(assignment_resource, assignment_body, "temporary role assignment readback") != "exact":
                     fail("temporary role assignment readback is not exact")
+                details["assignmentReadbackExact"] = True
                 details["definitionProjection"] = exact_readbacks[
                     definition_resource.lower()
                 ]
@@ -12934,7 +16137,14 @@ class AzureCliBootstrapTransport:
                 ]
                 return details
             except BaseException as exc:
-                if details["definitionCreated"] or details["assignmentCreated"]:
+                if isinstance(exc, _MutationOwnershipAmbiguity) and pending_create:
+                    details[f"{pending_create}Ambiguous"] = True
+                if (
+                    details["definitionCreated"]
+                    or details["assignmentCreated"]
+                    or details.get("definitionAmbiguous") is True
+                    or details.get("assignmentAmbiguous") is True
+                ):
                     provisional = {
                         "operationId": operation_id,
                         "status": "applied-readback-pending",
@@ -12949,21 +16159,203 @@ class AzureCliBootstrapTransport:
                 raise
 
         add_operation_id = operation_id.replace("remove", "add", 1)
+        if getattr(self, "_active_protected_role_add", None) != add_operation_id:
+            fail("protected temporary role cleanup is not the active lifecycle")
         add_details = self._proof_detail(state, add_operation_id)
         if add_details.get("cleanupKey") != cleanup_key:
             fail("temporary role cleanup is not bound to its owned add proof")
-        assignment_state = read_exact(
-            assignment_resource, assignment_body, "temporary role assignment cleanup precondition"
+
+        def settle_ambiguous_create(
+            resource_id: str,
+            expected_body: Mapping[str, Any],
+            label: str,
+        ) -> str:
+            previous = self.clock()
+            settlement_boundary = previous + dt.timedelta(
+                seconds=TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+            hard_deadline = self._protected_role_deadline()
+            if (
+                settlement_boundary
+                + dt.timedelta(
+                    seconds=(
+                        FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                )
+                > hard_deadline
+            ):
+                fail(
+                    f"{label} lacks a full settlement window and final request "
+                    "envelope before the cleanup reserve; "
+                    "manual recovery is required"
+                )
+            for attempt in range(64):
+                before = self.clock()
+                if before < previous or before >= hard_deadline:
+                    fail(f"{label} settlement clock is invalid")
+                if before > settlement_boundary + dt.timedelta(
+                    seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                ):
+                    fail(f"{label} settlement clock is invalid")
+                if (
+                    before < settlement_boundary
+                    and before
+                    + dt.timedelta(
+                        seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                    >= settlement_boundary
+                ):
+                    # A request begun just before the settlement boundary can
+                    # return a stale 404 after a late create commits. Preserve
+                    # the final envelope for a GET begun at the boundary.
+                    self.sleep(
+                        (settlement_boundary - before).total_seconds()
+                    )
+                    aligned = self.clock()
+                    if (
+                        aligned < settlement_boundary
+                        or aligned
+                        > settlement_boundary
+                        + dt.timedelta(
+                            seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        )
+                    ):
+                        fail(f"{label} settlement clock is invalid")
+                    before = aligned
+                final_observation = before >= settlement_boundary
+                request_deadline = (
+                    before
+                    + dt.timedelta(
+                        seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                    if final_observation
+                    else settlement_boundary
+                )
+                if request_deadline > hard_deadline:
+                    fail(
+                        f"{label} lacks its final request envelope before the "
+                        "cleanup reserve; manual recovery is required"
+                    )
+                observed_state = read_exact(
+                    resource_id,
+                    expected_body,
+                    label,
+                    deadline=request_deadline,
+                )
+                after = self.clock()
+                if after < before or after >= request_deadline:
+                    fail(f"{label} settlement crossed its bounded window")
+                if observed_state == "exact":
+                    return "exact"
+                if final_observation:
+                    return "absent"
+                if after >= settlement_boundary:
+                    fail(
+                        f"{label} pre-boundary observation crossed its "
+                        "settlement boundary"
+                    )
+                if attempt == 63:
+                    fail(f"{label} settlement attempt bound expired")
+                self.sleep(
+                    min(15, (settlement_boundary - after).total_seconds())
+                )
+                previous = after
+            raise AssertionError("unreachable temporary role settlement loop")
+
+        assignment_created = add_details.get("assignmentCreated") is True
+        assignment_ambiguous = add_details.get("assignmentAmbiguous") is True
+        definition_created = add_details.get("definitionCreated") is True
+        definition_ambiguous = add_details.get("definitionAmbiguous") is True
+        assignment_visibility_pending = assignment_ambiguous or (
+            assignment_created
+            and add_details.get("assignmentReadbackExact") is not True
         )
-        deletion_lock = self._guarded_assignment_delete(
-            operation_id, assignment_resource,
-            expected_assignment_projection if assignment_state == "exact" else None,
+        definition_visibility_pending = definition_ambiguous or (
+            definition_created
+            and add_details.get("definitionReadbackExact") is not True
         )
-        definition_state = read_exact(
-            definition_resource, definition_body, "temporary role definition cleanup precondition"
+        any_visibility_pending = (
+            assignment_visibility_pending or definition_visibility_pending
         )
+
+        # A definition create can become visible after an ambiguous response or
+        # a stale first readback.  Settle it before spending any of its reserved
+        # window on assignment absence or lock-inventory work.  An ambiguous
+        # definition PUT necessarily precedes every assignment attempt.
+        settled_definition_state: str | None = None
+        if definition_visibility_pending:
+            settled_definition_state = settle_ambiguous_create(
+                definition_resource,
+                definition_body,
+                "pending temporary role definition visibility",
+            )
+
+        if assignment_created and not assignment_visibility_pending:
+            assignment_precondition = "exact"
+        elif assignment_visibility_pending:
+            assignment_precondition = settle_ambiguous_create(
+                assignment_resource,
+                assignment_body,
+                "pending temporary role assignment visibility",
+            )
+        else:
+            assignment_precondition = read_exact(
+                assignment_resource,
+                assignment_body,
+                "temporary role assignment cleanup precondition",
+            )
+        if assignment_precondition == "exact" and not (
+            assignment_created or assignment_ambiguous
+        ):
+            fail(
+                "unowned temporary role assignment is present; manual recovery is required"
+            )
+        if assignment_precondition == "exact":
+            deletion_lock = self._guarded_assignment_delete(
+                operation_id,
+                assignment_resource,
+                expected_assignment_projection,
+            )
+            assignment_state = (
+                "exact"
+                if getattr(self, "_last_guarded_assignment_was_present", None) is True
+                else "absent"
+            )
+        else:
+            expected_lock = _expected_deletion_lock_proof(operation_id)
+            if expected_lock is None:
+                fail("temporary role cleanup lacks its reviewed deletion lock")
+            self._verify_cleanup_lock_inventory(
+                operation_id,
+                cleanup_locks.applicable_cleanup_lock(operation_id),
+            )
+            deletion_lock = expected_lock
+            assignment_state = "absent"
+
+        if settled_definition_state is not None:
+            definition_state = settled_definition_state
+        else:
+            definition_state = read_exact(
+                definition_resource,
+                definition_body,
+                "temporary role definition cleanup precondition",
+            )
+        if definition_state == "exact" and not (
+            definition_created or definition_ambiguous
+        ):
+            fail(
+                "unowned temporary role definition is present; manual recovery is required"
+            )
         if definition_state == "exact":
-            self._arm_delete(definition_resource, "2022-04-01")
+            # Authorization 2022-04-01 does not define ETag/If-Match for role
+            # deletion.  Ownership is instead bound to the per-authorization
+            # GUID and the exact source marker/full projection above.  A third
+            # state is never deleted.
+            self._arm_delete(
+                definition_resource,
+                "2022-04-01",
+            )
         # Azure RBAC deletion readback can converge well after a successful DELETE.
         # Retry only exact read-only observations, never the mutation itself.
         previous = self.clock()
@@ -12985,6 +16377,10 @@ class AzureCliBootstrapTransport:
             previous = after
         if read_exact(assignment_resource, assignment_body, "temporary role assignment final absence") != "absent":
             fail("temporary role assignment reappeared during cleanup")
+        if any_visibility_pending:
+            self._prove_temporary_role_marker_inventories_absent(
+                "pending-visibility temporary role cleanup final boundary"
+            )
         return {
             "cleanupKey": cleanup_key,
             "assignmentResourceId": assignment_resource,
@@ -13046,6 +16442,8 @@ class AzureCliBootstrapTransport:
                 details["readbackProjections"] = [
                     item["sourceProjection"] for item in readbacks
                 ]
+                if operation["id"] in PROTECTED_ROLE_LIFECYCLES:
+                    self._protected_work_deadline = self._protected_role_deadline()
                 return {
                     "operationId": operation["id"],
                     "status": "verified-exact",
@@ -13053,6 +16451,9 @@ class AzureCliBootstrapTransport:
                     "details": details,
                 }
             details = dict(self._mutate(operation, state))
+            cleanup_resolved_after_ambiguity = bool(
+                details.pop("_cleanupResolvedAfterAmbiguity", False)
+            )
             try:
                 readbacks = self._prove_probe_ids(
                     admission["desiredProbeIds"],
@@ -13066,7 +16467,13 @@ class AzureCliBootstrapTransport:
                 if _expected_deletion_lock_proof(operation["id"]) is not None:
                     self._protected_cleanup_blocked = True
                 cleanup_key = details.get("cleanupKey")
-                if operation.get("temporary") is True and cleanup_key:
+                if cleanup_key and (
+                    (
+                        operation["id"] in TEMPORARY_CLEANUP_BY_OWNER
+                        and operation.get("temporary") is True
+                    )
+                    or operation["id"] == BRIDGE_SETTINGS_OWNER_OPERATION_ID
+                ):
                     provisional = {
                         "operationId": operation["id"],
                         "status": "applied-readback-pending",
@@ -13085,6 +16492,19 @@ class AzureCliBootstrapTransport:
                 raise
         finally:
             self._active_operation_id = None
+        if cleanup_resolved_after_ambiguity:
+            cleanup_key = details.get("cleanupKey")
+            raise CleanupResolvedMutationError(
+                "controller canary cleanup resolved an ambiguous DELETE; "
+                "the consumed attempt must stop",
+                {
+                    "operationId": operation["id"],
+                    "status": "cleanup-resolved-failure",
+                    "owned": False,
+                    "cleanupKey": cleanup_key,
+                    "details": details,
+                },
+            )
         if operation["kind"].startswith(("delete-", "remove-", "temporary-remove")):
             status = "removed-exact"
         elif operation["kind"].startswith(("create-", "azure-global-create", "azure-ad-create")):
@@ -13095,11 +16515,19 @@ class AzureCliBootstrapTransport:
             status = "applied-exact"
         cleanup_key = details.get("cleanupKey")
         self_cleaned = details.get("selfCleaned") is True
+        if operation["id"] in PROTECTED_ROLE_LIFECYCLES.values():
+            self._finish_protected_role_lifecycle(operation["id"])
         return {
             "operationId": operation["id"],
             "status": status,
             "owned": (
-                operation.get("temporary") is True
+                (
+                    operation["id"] == BRIDGE_SETTINGS_OWNER_OPERATION_ID
+                    or (
+                        operation["id"] in TEMPORARY_CLEANUP_BY_OWNER
+                        and operation.get("temporary") is True
+                    )
+                )
                 and status != "verified-exact"
                 and not self_cleaned
             ),
@@ -13113,15 +16541,22 @@ class AzureCliBootstrapTransport:
         proof: Mapping[str, Any],
         state: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        mapping = {
-            "addOwnedUploaderIpv4Rule": "removeOwnedUploaderIpv4Rule",
-            "addOwnedUploaderPackageRole": "removeOwnedUploaderPackageRole",
-            "addOwnedOperatorKeyReadRole": "removeOwnedOperatorKeyReadRole",
-            "addOwnedOperatorFenceBootstrapRole": "removeOwnedOperatorFenceBootstrapRole",
-            "addOwnedOperatorControllerCanaryRole": "removeOwnedOperatorControllerCanaryRole",
-            "createControllerLeaseCanaryBlob": "removeControllerLeaseCanaryBlob",
-        }
-        cleanup_id = mapping.get(operation["id"])
+        if operation.get("id") == BRIDGE_SETTINGS_OWNER_OPERATION_ID:
+            self._active_operation_id = BRIDGE_SETTINGS_OWNER_OPERATION_ID
+            try:
+                details = dict(
+                    self._restore_owned_bridge_app_settings(proof, state)
+                )
+            finally:
+                self._active_operation_id = None
+            return {
+                "operationId": BRIDGE_SETTINGS_OWNER_OPERATION_ID,
+                "status": "removed-exact",
+                "owned": True,
+                "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
+                "details": details,
+            }
+        cleanup_id = TEMPORARY_CLEANUP_BY_OWNER.get(operation["id"])
         if cleanup_id is None or proof.get("owned") is not True:
             fail("temporary compensation is not exact executor-owned state")
         cleanup_operation = next(
@@ -13132,9 +16567,6 @@ class AzureCliBootstrapTransport:
         self._active_operation_id = cleanup_id
         try:
             details = dict(self._mutate(cleanup_operation, state))
-        finally:
-            self._active_operation_id = None
-        try:
             self._prove_probe_ids(
                 self.admissions[cleanup_id]["desiredProbeIds"],
                 f"{cleanup_id} compensation",
@@ -13144,8 +16576,12 @@ class AzureCliBootstrapTransport:
             if _expected_deletion_lock_proof(cleanup_id) is not None:
                 self._protected_cleanup_blocked = True
             raise
+        finally:
+            self._active_operation_id = None
         if details.get("cleanupKey") != proof.get("cleanupKey"):
             fail("temporary compensation cleanup key drifted")
+        if cleanup_id in PROTECTED_ROLE_LIFECYCLES.values():
+            self._finish_protected_role_lifecycle(cleanup_id)
         return {
             "operationId": operation["id"],
             "status": "removed-exact",
@@ -13221,6 +16657,10 @@ class AzureCliBootstrapTransport:
 
         if self._package_readback_bytes is None:
             fail("terminal evidence lacks an in-memory exact package readback")
+        if self._retired_role_absence_preflight is None:
+            fail("terminal evidence lacks the fresh preflight retired role proof")
+        if self._retired_role_absence_terminal is None:
+            fail("terminal evidence lacks the post-execution retired role proof")
         statuses = state.get("operationStatuses")
         observed = state.get("operationObservedAt")
         postconditions = state.get("postconditionProjections")
@@ -13234,7 +16674,7 @@ class AzureCliBootstrapTransport:
             fail("terminal executor state is incomplete")
         journal = self._journal_source_projection()["mutationJournal"]
         return build_terminal_source_evidence(
-            plan=self.plan,
+            plan=self.reviewed_plan,
             authorization=self.authorization,
             preflight_projection=self.preflight["projection"],
             operation_projections=self._validated_source_projections,
@@ -13244,6 +16684,12 @@ class AzureCliBootstrapTransport:
             mutation_journal=journal,
             package_readback_bytes=self._package_readback_bytes,
             production_boundary_post_execution=production_after,
+            retired_role_absence_fresh_preflight=(
+                self._retired_role_absence_preflight
+            ),
+            retired_role_absence_post_execution=(
+                self._retired_role_absence_terminal
+            ),
             claimed_at=claimed_at,
             observed_at=observed_at,
         )
@@ -14074,6 +17520,7 @@ def assemble_and_persist_terminal_evidence(
     started_at: str,
     completed_at: str,
     now: dt.datetime,
+    on_terminal_source_persisted: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Build, validate, snapshot, and persist the exact terminal evidence set.
 
@@ -14102,6 +17549,8 @@ def assemble_and_persist_terminal_evidence(
         source_evidence=source,
     )
     ledger.persist_terminal_source_input(terminal_source_input)
+    if on_terminal_source_persisted is not None:
+        on_terminal_source_persisted()
     components = build_terminal_receipt_components(
         plan=plan,
         authorization=authorization,
@@ -14513,8 +17962,16 @@ class BootstrapExecutor:
             inspections[operation["id"]] = dict(proof)
         state["operationInspections"] = inspections
 
+        claim_time = self.now()
+        if (
+            self.authorization.expires_at - claim_time
+        ).total_seconds() <= CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS:
+            fail(
+                "insufficient remaining authorization budget before the "
+                "single-use claim"
+            )
         claimed_at = (
-            current.astimezone(dt.timezone.utc)
+            claim_time.astimezone(dt.timezone.utc)
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z")
         )
@@ -14542,6 +17999,34 @@ class BootstrapExecutor:
                 if operation["kind"] == "local-create-only-canonical-evidence":
                     continue
                 require_live_authorization(f"mutation {operation['id']}")
+                active_protected = [
+                    pair
+                    for pair in temporary_owned
+                    if pair[1].get("cleanupKey") in PROTECTED_ROLE_CLEANUP_KEYS
+                ]
+                if (
+                    operation["id"] in PROTECTED_ROLE_LIFECYCLES
+                    and active_protected
+                ):
+                    fail("executor would overlap protected temporary role lifecycles")
+                cleanup_owner_id = TEMPORARY_OWNER_BY_CLEANUP.get(operation["id"])
+                retired_owned: list[
+                    tuple[Mapping[str, Any], Mapping[str, Any]]
+                ] = []
+                if cleanup_owner_id is not None:
+                    retired_owned = [
+                        pair
+                        for pair in temporary_owned
+                        if pair[0].get("id") == cleanup_owner_id
+                    ]
+                    # An explicit one-shot cleanup owns the terminal outcome
+                    # once attempted.  Never replay it during compensation if
+                    # its response or readback later proves ambiguous.
+                    temporary_owned = [
+                        pair
+                        for pair in temporary_owned
+                        if pair[0].get("id") != cleanup_owner_id
+                    ]
                 try:
                     proof = self.transport.apply_operation(operation, state)
                 except OwnedTemporaryMutationError as owned_error:
@@ -14549,6 +18034,41 @@ class BootstrapExecutor:
                     state["proofs"][operation["id"]] = provisional
                     temporary_owned.append((operation, provisional))
                     raise BootstrapError(str(owned_error)) from owned_error
+                except CleanupResolvedMutationError as resolved_error:
+                    resolved = dict(resolved_error.proof)
+                    state["proofs"][operation["id"]] = resolved
+                    for retired_operation, retired_proof in retired_owned:
+                        cleanup_proofs.append(
+                            {
+                                "operationId": retired_operation["id"],
+                                "status": "removed-exact",
+                                "owned": True,
+                                "cleanupKey": retired_proof.get("cleanupKey"),
+                            }
+                        )
+                    raise
+                except BaseException as operation_error:
+                    for retired_operation, retired_proof in retired_owned:
+                        if (
+                            retired_operation.get("id")
+                            == "createControllerLeaseCanaryBlob"
+                        ):
+                            # Conditional canary cleanup is safely replayable:
+                            # exact If-Match DELETE accepts either 202 or exact
+                            # BlobNotFound, then re-proves inventory and blob
+                            # absence.  Keep it owned after any ambiguous step.
+                            temporary_owned.append(
+                                (retired_operation, retired_proof)
+                            )
+                        else:
+                            cleanup_proofs.append(
+                                {
+                                    "operationId": retired_operation["id"],
+                                    "status": "cleanup-failed",
+                                    "errorType": type(operation_error).__name__,
+                                }
+                            )
+                    raise
                 if (
                     not isinstance(proof, Mapping)
                     or proof.get("operationId") != operation["id"]
@@ -14556,12 +18076,26 @@ class BootstrapExecutor:
                 ):
                     fail(f"mutation readback is not exact: {operation['id']}")
                 proof = dict(proof)
+                if operation["id"] == BRIDGE_SETTINGS_OWNER_OPERATION_ID and (
+                    proof.get("owned") is not True
+                    or proof.get("cleanupKey") != BRIDGE_SETTINGS_CLEANUP_KEY
+                ):
+                    fail("bridge app settings did not retain exact rollback ownership")
                 state["proofs"][operation["id"]] = proof
                 state["operationStatuses"][operation["id"]] = proof["status"]
                 state["operationObservedAt"][operation["id"]] = timestamp_now()
                 applied.append(operation["id"])
-                if operation.get("temporary") is True and proof.get("owned") is True:
+                if proof.get("owned") is True and (
+                    operation.get("temporary") is True
+                    or operation["id"] == BRIDGE_SETTINGS_OWNER_OPERATION_ID
+                ):
                     temporary_owned.append((operation, proof))
+                    if len({
+                        str(pair[1].get("cleanupKey"))
+                        for pair in temporary_owned
+                        if pair[1].get("cleanupKey") in PROTECTED_ROLE_CLEANUP_KEYS
+                    }) > 1:
+                        fail("executor owns overlapping protected temporary roles")
                 if proof.get("status") == "removed-exact" and proof.get("cleanupKey"):
                     temporary_owned = [
                         pair for pair in temporary_owned
@@ -14597,7 +18131,18 @@ class BootstrapExecutor:
             ):
                 fail("production boundary drifted during bootstrap execution")
             state["productionBoundaryPostExecution"] = final_production_boundary
-            if temporary_owned:
+            bridge_settings_owned = [
+                pair
+                for pair in temporary_owned
+                if pair[0].get("id") == BRIDGE_SETTINGS_OWNER_OPERATION_ID
+                and pair[1].get("cleanupKey") == BRIDGE_SETTINGS_CLEANUP_KEY
+            ]
+            other_owned = [
+                pair
+                for pair in temporary_owned
+                if pair not in bridge_settings_owned
+            ]
+            if other_owned or len(bridge_settings_owned) != 1:
                 fail("executor-owned temporary state remains after nominal execution")
             completed_moment = self.now()
             if not (
@@ -14617,6 +18162,21 @@ class BootstrapExecutor:
                 observed_at=completed_at,
             )
             package_readback_bytes = self.transport.terminal_package_readback_bytes()
+
+            def retire_bridge_settings_after_terminal_source_snapshot() -> None:
+                nonlocal temporary_owned
+                matches = [
+                    pair
+                    for pair in temporary_owned
+                    if pair[0].get("id") == BRIDGE_SETTINGS_OWNER_OPERATION_ID
+                    and pair[1].get("cleanupKey") == BRIDGE_SETTINGS_CLEANUP_KEY
+                ]
+                if len(matches) != 1:
+                    fail("bridge settings ownership retirement is not exact")
+                temporary_owned = [
+                    pair for pair in temporary_owned if pair not in matches
+                ]
+
             terminal_evidence = assemble_and_persist_terminal_evidence(
                 ledger=ledger,
                 plan=self.plan,
@@ -14627,7 +18187,12 @@ class BootstrapExecutor:
                 started_at=claimed_at,
                 completed_at=completed_at,
                 now=completed_moment,
+                on_terminal_source_persisted=(
+                    retire_bridge_settings_after_terminal_source_snapshot
+                ),
             )
+            if temporary_owned:
+                fail("executor-owned state survived terminal source persistence")
             terminal_status = "complete"
             result = BootstrapResult(
                 status="complete",
@@ -14687,7 +18252,14 @@ class BootstrapExecutor:
                 "failureType": None if failure is None else type(failure).__name__,
                 "consumed": True,
             }
-            if isinstance(failure, (ControllerReadinessError, PackageReadinessError)):
+            if isinstance(
+                failure,
+                (
+                    ControllerReadinessError,
+                    PackageReadinessError,
+                    StorageOperationError,
+                ),
+            ):
                 terminal["failureDiagnostic"] = dict(failure.diagnostic)
             # The authorization-specific directory and single-use-state.json
             # are the durable consumed boundary.  Terminal evidence is useful,
