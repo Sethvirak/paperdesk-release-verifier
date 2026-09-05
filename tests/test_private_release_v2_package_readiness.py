@@ -206,9 +206,11 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual([item[0] for item in session.requests], ["GET"])
         self.assertEqual(journal.records, [])
 
-    def test_authorization_expiry_and_600_second_cap_bound_only_gets(self):
+    def test_authorization_expiry_and_package_cap_bound_only_gets(self):
         self.assertEqual(bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS, 600)
-        for expiry_seconds in (3, 1800):
+        self.assertEqual(bootstrap.MAX_PACKAGE_READINESS_SECONDS, 1890)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 3900)
+        for expiry_seconds in (3, 1800, 3900):
             with self.subTest(expiry_seconds=expiry_seconds):
                 self.current = NOW
                 self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=expiry_seconds))
@@ -217,7 +219,7 @@ class PackageReadinessTests(unittest.TestCase):
                     self.upload(transport)
                 self.assertLessEqual(len(session.requests), 64)
                 self.assertTrue(all(item[0] == "GET" for item in session.requests))
-                self.assertLessEqual((self.current - NOW).total_seconds(), min(expiry_seconds, 600))
+                self.assertLessEqual((self.current - NOW).total_seconds(), min(expiry_seconds, 1890))
                 self.assertEqual(journal.records, [])
 
     def test_put_error_and_transport_ambiguity_are_never_replayed(self):
@@ -331,8 +333,8 @@ class PackageReadinessTests(unittest.TestCase):
                         status=403, code=code, elapsed=expected_elapsed, reason="deadline")
                     self.assertEqual((self.current - NOW).total_seconds(), expected_elapsed)
                     self.assertLessEqual(len(session.requests), 64)
-                    self.assertEqual(self.sleeps[:5], [1, 2, 4, 8, 15])
-                    self.assertTrue(all(0 < seconds <= 15 for seconds in self.sleeps))
+                    self.assertEqual(self.sleeps[:5], [1, 2, 4, 8, 16])
+                    self.assertTrue(all(0 < seconds <= 32 for seconds in self.sleeps))
                     self.assertEqual(
                         error.exception.diagnostic["attemptRecords"][-1]["startedAt"],
                         (NOW + dt.timedelta(
@@ -344,8 +346,9 @@ class PackageReadinessTests(unittest.TestCase):
                     self.assertEqual(journal.records, [])
 
     def test_deadline_adjacent_final_get_can_observe_exact_absence(self):
+        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=3900))
         final_at = NOW + dt.timedelta(
-            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+            seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
             - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
         response = lambda: (
@@ -359,7 +362,7 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(len(request_ids), len(set(request_ids)))
         self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in request_ids))
         self.assertTrue(all(value == NOW + dt.timedelta(
-            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+            seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
         ) for value in session.deadlines))
         self.assertEqual(journal.records, [])
 
@@ -532,7 +535,7 @@ class PackageReadinessTests(unittest.TestCase):
             code="AuthorizationPermissionMismatch", elapsed=0, reason="attempt-limit")
         self.assertEqual(len(session.requests), 64)
         self.assertEqual(len(self.sleeps), 63)
-        self.assertTrue(all(0 < seconds <= 15 for seconds in self.sleeps))
+        self.assertTrue(all(0 < seconds <= 32 for seconds in self.sleeps))
         self.assertTrue(all(item[0] == "GET" and item[1] == self.url for item in session.requests))
         self.assertEqual(journal.records, [])
 
@@ -604,6 +607,7 @@ class PackageReadinessTests(unittest.TestCase):
                 self.assertEqual(journal.records, [])
 
     def test_late_blob_not_found_retains_status_but_cannot_admit_put(self):
+        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=780))
         def expire():
             self.current = NOW + dt.timedelta(seconds=600)
 
@@ -627,6 +631,27 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(session.requests[-1][3]["If-None-Match"], "*")
         self.assertEqual(len(journal.records), 2)
         self.assertEqual(result["versionId"], "version-1")
+
+    def test_package_propagation_after_ten_minutes_admits_one_put(self):
+        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=3900))
+        ready_at = NOW + dt.timedelta(minutes=20)
+        def response():
+            if session.requests[-1][0] == "PUT":
+                return self.created()
+            if self.current < ready_at:
+                return self.private_error()
+            return storage_error(404, "BlobNotFound")
+        transport, session, journal = self.transport([response], repeat=True)
+        transport._active_protected_role_add = "addOwnedUploaderPackageRole"
+        transport._protected_work_deadline = transport._protected_role_deadline()
+        self.upload(transport)
+        self.assertGreaterEqual(self.current, ready_at)
+        self.assertLessEqual(len(session.requests) - 1, 64)
+        self.assertEqual([item[0] for item in session.requests].count("PUT"), 1)
+        self.assertEqual(session.requests[-1][3]["If-None-Match"], "*")
+        self.assertEqual(len(journal.records), 2)
+        self.assertGreater((bootstrap.parse_time(self.authorization["validity"]["expiresAt"], "expiry") - self.current).total_seconds(),
+                           bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS)
 
     def test_failed_put_is_not_reclassified_as_retryable_readiness(self):
         for failure in (self.private_error(), bootstrap.BootstrapError("PUT transport failed closed")):

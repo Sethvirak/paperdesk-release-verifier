@@ -296,6 +296,15 @@ run-from-package and the exact versioned package are the activation mechanism.
 
 ## Key and authorization proof
 
+Package-upload readiness alone permits an exact-target GET at up to 30 minutes,
+plus its 90-second request envelope, to accommodate the upper propagation
+allowance documented by [Azure Storage](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
+Its exponential backoff caps at 32 seconds and 64 GET attempts. The unchanged
+65-minute authorization and protected cleanup deadline can shorten that window;
+the wait never borrows cleanup time. Only exact `BlobNotFound` admits one
+create-only PUT. Other readiness windows remain unchanged. A longer wait does
+not establish propagation as the cause of a denial or guarantee convergence.
+
 Bootstrap public-key readiness reads the exact version URI from the validated
 `createSigningKeyVersion` projection while the dedicated temporary key-read role
 is active. The separate version-list readback remains an inventory check; its

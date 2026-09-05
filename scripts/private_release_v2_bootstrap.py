@@ -87,6 +87,9 @@ FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS = (
 STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS = (
     AZURE_CLI_REQUEST_TIMEOUT_SECONDS + AZURE_REST_RESPONSE_TIMEOUT_SECONDS
 )
+# Permit an exact package readiness GET at thirty minutes plus its full request
+# envelope. Authorization and protected cleanup still impose earlier deadlines.
+MAX_PACKAGE_READINESS_SECONDS = 1800 + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
 # One active role cleanup uses six single-attempt Azure request envelopes
 # through assignment DELETE, one bounded lock-suspension convergence window,
 # one full final observation envelope after that boundary, and a 30-second
@@ -13419,7 +13422,7 @@ class AzureCliBootstrapTransport:
         deadline = min(
             expires,
             readiness_deadline,
-            started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+            started + dt.timedelta(seconds=MAX_PACKAGE_READINESS_SECONDS),
         )
         final_request_at = deadline - dt.timedelta(
             seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
@@ -13532,8 +13535,8 @@ class AzureCliBootstrapTransport:
             if wait_started >= final_request_at:
                 fail_readiness("package data-plane readiness did not converge before its deadline", "deadline")
             delay = min(
-                float(2 ** min(attempts - 1, 4)),
-                15.0,
+                float(2 ** min(attempts - 1, 5)),
+                32.0,
                 (final_request_at - wait_started).total_seconds(),
             )
             self.sleep(delay)
