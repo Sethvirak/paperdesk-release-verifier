@@ -1344,7 +1344,6 @@ def _operation_admission(
                 "preAppSettingsSha256": bootstrap.sha256_bytes(
                     bootstrap.canonical_json_bytes(settings)
                 ),
-                "preAppSettingsEtag": _etag(envelope, operation_id),
                 "bootstrapSelfTestStaticControl": (
                     bootstrap._bootstrap_self_test_static_control(authorization)
                 ),
@@ -1827,7 +1826,7 @@ def build_read_only_observation(
         "proposedValidity": kernel["proposedValidity"],
         "singleUse": kernel["singleUse"],
         "requiredResidualRiskAcceptance": {
-            "id": "temporary-storage-ip-rules-and-recovery-residuals",
+            "id": "temporary-storage-lock-and-bridge-config-residuals",
             "exactConfirmationText": (
                 bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
                 + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
@@ -1840,6 +1839,7 @@ def build_read_only_observation(
             "promote-proposedValidity-to-validity-within-freshness-window",
             "add-exact-confirmation-phrase-sha256",
             "include-exact-storage-acl-concurrency-residual-acceptance-in-confirmation",
+            "include-exact-bridge-app-settings-concurrency-residual-acceptance-in-confirmation",
             "include-exact-bridge-config-hard-death-residual-acceptance-in-confirmation",
             "emit-separate-canonical-executable-authorization",
         ],

@@ -485,12 +485,18 @@ DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "all related temporary access absent, and manual cleanup may be required."
 )
 BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
-    "I accept that process death after the bridge configuration or site-start request "
-    "can leave a consumed use ledger and durable unresolved mutation intent while the "
-    "bridge site remains changed or running. Recovery may require an exact site stop and "
-    "conditional restoration of the source-bound prestate under a separate explicit "
-    "authorization; every fresh apply must stop until that durable intent and live state "
-    "are fully resolved."
+    "I accept that App Service App Settings exposes no supported conditional ETag, so "
+    "the exact full-map configuration PUT and any restoration "
+    "cannot atomically exclude an out-of-band administrator write between their final "
+    "pre-read and PUT. I also accept that process death after the bridge configuration "
+    "or site-start request can leave a consumed use ledger and durable unresolved "
+    "mutation intent while the bridge site remains changed or running. Each settings "
+    "mutation is issued at most once without retry, and definite success requires exact "
+    "full-map digest readback. The executor never deliberately overwrites a third state "
+    "observed by its final pre-read or rollback classification; recovery may require an "
+    "exact site stop and separately authorized source-bound prestate restoration, and "
+    "every fresh apply must stop until that durable intent and live state are fully "
+    "resolved."
 )
 
 
@@ -3058,8 +3064,8 @@ def _validate_authorization_document(
         and BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE not in confirmation_phrase
     ):
         fail(
-            "confirmation phrase does not explicitly accept bridge configuration "
-            "hard-death recovery residuals"
+            "confirmation phrase does not explicitly accept bridge App Settings "
+            "concurrency and hard-death recovery residuals"
         )
 
     single_use = _exact_keys(
@@ -5966,7 +5972,6 @@ def _validate_operation_source_projection(
     elif family == "app-settings-digest-only":
         required = {
             "preAppSettingsSha256",
-            "preAppSettingsEtag",
             "settingsSha256",
             "bootstrapSelfTestControlSha256",
             "bootstrapSelfTestIssuedAt",
@@ -6007,7 +6012,6 @@ def _validate_operation_source_projection(
             or body["preAppSettingsSha256"]
             != sha256_bytes(canonical_json_bytes(context["preAppSettings"]))
             or body["settingsSha256"] != expected_settings_sha
-            or body["preAppSettingsEtag"] != context.get("preAppSettingsEtag")
             or body["settingsRequestBodySha256"] != sha256_bytes(canonical_json_bytes({"properties": desired}))
             or body["bootstrapSelfTestControlSha256"] != expected_control_sha
             or body["packageUrl"] != package_url
@@ -9137,7 +9141,6 @@ def _operation_context_policy(
         observed_fields |= {
             "preAppSettings",
             "preAppSettingsSha256",
-            "preAppSettingsEtag",
             "bootstrapSelfTestStaticControl",
         }
     elif operation_id in {"createCustomRoleDefinitions", "createExactRoleAssignments"}:
@@ -9427,11 +9430,6 @@ def _validate_operation_context(
                 )
             )
             or context["preAppSettingsSha256"] != sha256_bytes(canonical_json_bytes(settings))
-            or _if_match_etag(
-                context.get("preAppSettingsEtag"),
-                "authorized bridge app-settings prestate ETag",
-            )
-            != context.get("preAppSettingsEtag")
             or context["bootstrapSelfTestStaticControl"]
             != _bootstrap_self_test_static_control(authorization)
         ):
@@ -12126,7 +12124,6 @@ class AzureCliBootstrapTransport:
                 key: facts.get(key)
                 for key in (
                     "preAppSettingsSha256",
-                    "preAppSettingsEtag",
                     "settingsSha256",
                     "bootstrapSelfTestControlSha256",
                     "bootstrapSelfTestIssuedAt",
@@ -13851,11 +13848,8 @@ class AzureCliBootstrapTransport:
             for key, value in settings.items()
         ):
             fail(f"{label} is not one exact string map")
-        etag = _if_match_etag(
-            self._header(response, "ETag") or document.get("etag"),
-            f"{label} ETag",
-        )
-        return dict(settings), etag
+        exact = dict(settings)
+        return exact, sha256_bytes(canonical_json_bytes(exact))
 
     def _ensure_bridge_stopped_for_settings_rollback(self) -> Mapping[str, Any]:
         site = self.resources["bridgeSite"]
@@ -13925,14 +13919,8 @@ class AzureCliBootstrapTransport:
             != sha256_bytes(canonical_json_bytes(pre_settings))
             or details.get("preAppSettingsSha256")
             != context.get("preAppSettingsSha256")
-            or details.get("preAppSettingsEtag")
-            != context.get("preAppSettingsEtag")
         ):
             fail("bridge settings compensation prestate is not authorization-bound")
-        _if_match_etag(
-            context.get("preAppSettingsEtag"),
-            "bridge settings owned prestate ETag",
-        )
         control = details.get("bootstrapSelfTestControl")
         if not isinstance(control, Mapping):
             fail("bridge settings compensation lacks its exact canary control")
@@ -13971,11 +13959,10 @@ class AzureCliBootstrapTransport:
             fail("bridge settings compensation desired state is not exact")
 
         stopped = self._ensure_bridge_stopped_for_settings_rollback()
-        current, current_etag = self._read_bridge_app_settings_once(
+        current, current_sha = self._read_bridge_app_settings_once(
             label="bridge settings rollback precondition"
         )
         pre_sha = sha256_bytes(canonical_json_bytes(pre_settings))
-        current_sha = sha256_bytes(canonical_json_bytes(current))
         if current == pre_settings and current_sha == pre_sha:
             return {
                 "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
@@ -13983,7 +13970,6 @@ class AzureCliBootstrapTransport:
                 "preAppSettingsSha256": pre_sha,
                 "desiredSettingsSha256": desired_sha,
                 "finalSettingsSha256": current_sha,
-                "finalSettingsEtag": current_etag,
                 "bridgeStopped": dict(stopped),
             }
         if current != desired or current_sha != desired_sha:
@@ -13999,14 +13985,13 @@ class AzureCliBootstrapTransport:
                 site["resourceId"] + "/config/appsettings", "2025-03-01"
             ),
             body=canonical_json_bytes({"properties": pre_settings}),
-            headers={"Content-Type": "application/json", "If-Match": current_etag},
+            headers={"Content-Type": "application/json"},
             expected={200},
             cleanup=True,
         )
-        final_settings, final_etag = self._read_bridge_app_settings_once(
+        final_settings, final_sha = self._read_bridge_app_settings_once(
             label="bridge settings rollback final readback"
         )
-        final_sha = sha256_bytes(canonical_json_bytes(final_settings))
         if final_settings != pre_settings or final_sha != pre_sha:
             fail("bridge settings rollback final readback is not exact")
         return {
@@ -14015,7 +14000,6 @@ class AzureCliBootstrapTransport:
             "preAppSettingsSha256": pre_sha,
             "desiredSettingsSha256": desired_sha,
             "finalSettingsSha256": final_sha,
-            "finalSettingsEtag": final_etag,
             "bridgeStopped": dict(stopped),
         }
 
@@ -14916,30 +14900,6 @@ class AzureCliBootstrapTransport:
             expected_url = f"{upload['url']}?versionid={urllib.parse.quote(str(upload['versionId']), safe='') }"
             reader_id = self.resources["registryReaderIdentity"]["resourceId"]
             site = self.resources["bridgeSite"]
-            current_response = self.session.request(
-                "POST",
-                self._arm_url(site["resourceId"], "2025-03-01", "/config/appsettings/list"),
-                body=b"",
-            )
-            current = self._json_response(current_response, {200}, "bridge app-settings precondition")
-            current_settings = current.get("properties")
-            current_etag = self._header(current_response, "ETag") or current.get("etag")
-            authorized_pre_settings_etag = _if_match_etag(
-                context.get("preAppSettingsEtag"),
-                "authorized bridge app-settings precondition ETag",
-            )
-            if (
-                not isinstance(current_settings, dict)
-                or current_settings != context["preAppSettings"]
-                or sha256_bytes(canonical_json_bytes(current_settings))
-                != context["preAppSettingsSha256"]
-                or _if_match_etag(
-                    current_etag, "bridge app-settings precondition ETag"
-                )
-                != authorized_pre_settings_etag
-            ):
-                fail("bridge app settings drifted after authorization")
-            pre_settings_etag = authorized_pre_settings_etag
             self_test_control = _bootstrap_self_test_control(
                 self.authorization, state, issued_at=self._timestamp(self.clock())
             )
@@ -14956,7 +14916,6 @@ class AzureCliBootstrapTransport:
                 "cleanupKey": BRIDGE_SETTINGS_CLEANUP_KEY,
                 "settingsSha256": sha256_bytes(canonical_json_bytes(desired)),
                 "preAppSettingsSha256": context["preAppSettingsSha256"],
-                "preAppSettingsEtag": pre_settings_etag,
                 "packageUrl": expected_url,
                 "packageVersionId": upload["versionId"],
                 "bootstrapSelfTestControl": self_test_control,
@@ -14967,6 +14926,17 @@ class AzureCliBootstrapTransport:
                     self_test_control_bytes
                 ),
             }
+            # Microsoft.Web exposes no supported conditional App Settings ETag.
+            # Construct the exact request first, then make the final full-map
+            # digest check immediately before the durable intent and one PUT.
+            current_settings, current_sha = self._read_bridge_app_settings_once(
+                label="bridge app-settings precondition"
+            )
+            if (
+                current_settings != context["preAppSettings"]
+                or current_sha != context["preAppSettingsSha256"]
+            ):
+                fail("bridge app settings drifted after authorization")
             intent_durable = False
 
             def mark_intent_durable() -> None:
@@ -14978,7 +14948,6 @@ class AzureCliBootstrapTransport:
                     site["resourceId"] + "/config/appsettings",
                     "2025-03-01",
                     {"properties": desired},
-                    headers={"If-Match": pre_settings_etag},
                     intent_callback=mark_intent_durable,
                 )
             except BaseException as exc:

@@ -319,14 +319,16 @@ the exact permanent prefix remains for fresh observation and adopt-exact resume
 under a newly reviewed authorization, receipt directory, claim, and temporary
 resource IDs. A consumed or expired authorization is never reused.
 The authorization-specific bridge App Settings remain executor-owned after
-their single conditional PUT. The authorization binds both the complete
-preflight settings map and its strong ETag; the final pre-PUT read must match
-both. A later failure before the validated terminal
+their single no-retry full-map PUT. The authorization binds the complete
+preflight settings map and its canonical digest; the final pre-PUT read must
+match both. App Service exposes no supported conditional App Settings ETag, so
+subscription/resource-group Owners remain an explicit out-of-band concurrency
+boundary. A later failure before the validated terminal
 source input is durably persisted first proves the bridge Stopped, reads the
 complete current settings map once, and restores the exact preflight map only
 when the current map is either the preflight state or the exact authorized
-desired state. Restoration uses the current strong ETag in one conditional PUT
-and one exact readback. An ambiguous restoration is not replayed, and a third
+desired state. Restoration uses one no-retry full-map PUT and one exact digest
+readback. An ambiguous restoration is not replayed, and a third
 state is left untouched for explicit operator recovery. Once the durable
 terminal source input exists, settings ownership is retired because local-only
 finalization reconstructs the same success evidence without another Azure read.
@@ -406,8 +408,8 @@ only after every reversible proof has passed and only when the authorization
 explicitly names those mutations. The current production routing projection is
 observed but not changed during bootstrap.
 
-The canary's maximum 15-minute lifetime starts just in time after the final
-settings precondition read, rather than at preflight preparation. Its expiry
+The canary's maximum 15-minute lifetime starts just before the final settings
+precondition read, rather than at preflight preparation. Its expiry
 is still clipped to the unchanged outer bootstrap authorization. Retained
 issuance/expiry timestamps reconstruct the exact control and settings digests
 and bind to the single settings-PUT journal entry. The control is never refreshed
@@ -436,23 +438,29 @@ python -B scripts/private_release_v2_bootstrap.py apply \
   --preflight /external/bootstrap-preflight.json
 ```
 
-The exact authorization confirmation also accepts the hard process-death
-residual at the bridge configuration boundary:
+The exact authorization confirmation also accepts the App Settings concurrency
+and hard process-death residuals at the bridge configuration boundary:
 
-> I accept that process death after the bridge configuration or site-start
-> request can leave a consumed use ledger and durable unresolved mutation
-> intent while the bridge site remains changed or running. Recovery may require
-> an exact site stop and conditional restoration of the source-bound prestate
-> under a separate explicit authorization; every fresh apply must stop until
-> that durable intent and live state are fully resolved.
+> I accept that App Service App Settings exposes no supported conditional ETag,
+> so the exact full-map configuration PUT and any restoration cannot atomically
+> exclude an out-of-band administrator write
+> between their final pre-read and PUT. I also accept that process death after
+> the bridge configuration or site-start request can leave a consumed use ledger
+> and durable unresolved mutation intent while the bridge site remains changed
+> or running. Each settings mutation is issued at most once without retry, and
+> definite success requires exact full-map digest readback. The executor never
+> deliberately overwrites a third state observed by its final pre-read or
+> rollback classification; recovery may require an exact site stop and separately
+> authorized source-bound prestate restoration, and every fresh apply must stop
+> until that durable intent and live state are fully resolved.
 
 This is a manual operator recovery boundary. Preserve the consumed receipt
 directory and mutation journal. Do not run a fresh observation or apply while
 the intent is unresolved. Under a separately reviewed recovery authorization,
 first prove or restore the exact Stopped site state, then read the complete App
-Settings map. Restore the source-bound preflight map with the live strong ETag
-only when the map is the exact desired state from the consumed authorization;
-an exact prestate needs no settings write, and any third state must remain
+Settings map. Restore the source-bound preflight map with one no-retry full-map
+PUT only when the map is the exact desired state from the consumed authorization;
+an exact prestate needs no settings write, and any observed third state must remain
 untouched for investigation. A fresh bootstrap observation may start only after
 the durable intent and both live states have been reconciled.
 

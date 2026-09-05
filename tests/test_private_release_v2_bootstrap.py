@@ -47,12 +47,18 @@ EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "all related temporary access absent, and manual cleanup may be required."
 )
 EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
-    "I accept that process death after the bridge configuration or site-start request "
-    "can leave a consumed use ledger and durable unresolved mutation intent while the "
-    "bridge site remains changed or running. Recovery may require an exact site stop and "
-    "conditional restoration of the source-bound prestate under a separate explicit "
-    "authorization; every fresh apply must stop until that durable intent and live state "
-    "are fully resolved."
+    "I accept that App Service App Settings exposes no supported conditional ETag, so "
+    "the exact full-map configuration PUT and any restoration "
+    "cannot atomically exclude an out-of-band administrator write between their final "
+    "pre-read and PUT. I also accept that process death after the bridge configuration "
+    "or site-start request can leave a consumed use ledger and durable unresolved "
+    "mutation intent while the bridge site remains changed or running. Each settings "
+    "mutation is issued at most once without retry, and definite success requires exact "
+    "full-map digest readback. The executor never deliberately overwrites a third state "
+    "observed by its final pre-read or rollback classification; recovery may require an "
+    "exact site stop and separately authorized source-bound prestate restoration, and "
+    "every fresh apply must stop until that durable intent and live state are fully "
+    "resolved."
 )
 PHRASE = (
     "Authorize the exact one-shot PaperDesk V2 bootstrap plan. "
@@ -284,7 +290,6 @@ def build_projection(plan, package, *, adopt_operations=()):
             value.update({
                 "preAppSettings": {},
                 "preAppSettingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({})),
-                "preAppSettingsEtag": '"bridge-settings-pre"',
                 "bootstrapSelfTestStaticControl": bootstrap._bootstrap_self_test_static_control(
                     context_authorization
                 ),
@@ -1150,7 +1155,7 @@ class _TerminalEvidenceFixture:
         )
         self.envelope(
             "configureBridgeExactVersionedPackageAndCriticalSettings",
-            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "preAppSettingsEtag": configure_context["preAppSettingsEtag"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
+            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
         )
 
         def worm(operation_id):
@@ -4616,7 +4621,7 @@ class BootstrapTests(unittest.TestCase):
                     {},
                 )
 
-    def test_if_match_etag_serialization_is_strict_and_used_everywhere(self):
+    def test_if_match_etag_serialization_remains_strict_for_supported_resources(self):
         self.assertEqual(
             bootstrap._if_match_etag("1DD39E07D4DEF60", "raw ARM ETag"),
             '"1DD39E07D4DEF60"',
@@ -4634,11 +4639,11 @@ class BootstrapTests(unittest.TestCase):
         source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._mutate
         )
-        self.assertEqual(source.count("_if_match_etag("), 7)
+        self.assertEqual(source.count("_if_match_etag("), 5)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
 
-    def test_bridge_conditional_writes_send_quoted_raw_arm_etags(self):
+    def test_supported_bridge_resource_write_uses_etag_but_app_settings_uses_no_fake_cas(self):
         projection = build_projection(self.plan, self.package)
         configure_context = next(
             item["context"]
@@ -4646,7 +4651,6 @@ class BootstrapTests(unittest.TestCase):
             if item["operationId"]
             == "configureBridgeExactVersionedPackageAndCriticalSettings"
         )
-        configure_context["preAppSettingsEtag"] = "1DD39E07D4DEF60"
         receipt = Path("C:/outside") / (
             f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
         )
@@ -4776,10 +4780,7 @@ class BootstrapTests(unittest.TestCase):
             ) as arm_put,
         ):
             transport._mutate(configure, state)
-        self.assertEqual(
-            arm_put.call_args.kwargs["headers"]["If-Match"],
-            '"1DD39E07D4DEF60"',
-        )
+        self.assertNotIn("headers", arm_put.call_args.kwargs)
 
     def test_recovered_exact_five_attachment_is_get_proved_without_patch(self):
         with tempfile.TemporaryDirectory() as folder:

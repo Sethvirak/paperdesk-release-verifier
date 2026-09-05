@@ -735,7 +735,6 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             "preAppSettingsSha256": bootstrap.sha256_bytes(
                 bootstrap.canonical_json_bytes(pre_settings)
             ),
-            "preAppSettingsEtag": '"bridge-settings-pre"',
         }
         control = bootstrap._bootstrap_self_test_control_from_projections(
             self.authorization, prior,
@@ -764,7 +763,6 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         body = {
             "preAppSettingsSha256": context["preAppSettingsSha256"],
-            "preAppSettingsEtag": context["preAppSettingsEtag"],
             "bootstrapSelfTestIssuedAt": control["issuedAt"],
             "bootstrapSelfTestExpiresAt": control["expiresAt"],
             "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired})),
@@ -784,7 +782,6 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         for field in (
             "preAppSettingsSha256",
-            "preAppSettingsEtag",
             "settingsSha256",
             "bootstrapSelfTestControlSha256",
         ):

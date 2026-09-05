@@ -86,11 +86,17 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         )
 
     @staticmethod
-    def settings_response(settings, etag):
+    def settings_response(settings, etag=None, *, body_etag=None):
+        document = {"properties": settings}
+        if body_etag is not None:
+            document["etag"] = body_etag
+        headers = {"Content-Type": "application/json"}
+        if etag is not None:
+            headers["ETag"] = etag
         return bootstrap._RestResponse(
             200,
-            bootstrap.canonical_json_bytes({"properties": settings}),
-            {"Content-Type": "application/json", "ETag": etag},
+            bootstrap.canonical_json_bytes(document),
+            headers,
         )
 
     def bridge_state(self):
@@ -150,13 +156,6 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             }
         )
         return desired
-
-    def preflight_bridge_settings_etag(self):
-        return next(
-            item["context"]["preAppSettingsEtag"]
-            for item in self.fixture.projection["operationAdmissions"]
-            if item["operationId"] == CONFIGURE
-        )
 
     def bridge_transport(self, responses, *, clock=None, journal=None):
         session = Session(responses)
@@ -1456,10 +1455,15 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 ],
             )
 
-    def test_configure_rejects_same_map_with_changed_preflight_etag(self):
+    def test_configure_rejects_pre_read_map_and_digest_drift_without_put(self):
         state = self.bridge_state()
         transport, session = self.bridge_transport(
-            [self.settings_response({}, '"same-map-new-etag"')]
+            [
+                self.settings_response(
+                    {"OUT_OF_BAND_SETTING": "drifted"},
+                    body_etag='"irrelevant-body-etag"',
+                )
+            ]
         )
 
         with self.assertRaisesRegex(
@@ -1470,6 +1474,66 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(
             [request[0] for request in session.requests], ["POST"]
         )
+        self.assertEqual(
+            [request for request in session.requests if request[0] == "PUT"],
+            [],
+        )
+
+    def test_configure_ignores_missing_weak_and_body_etags_and_puts_once(self):
+        bridge = self.fixture.resources["bridgeSite"]
+        settings_variants = (
+            ("missing", self.settings_response({})),
+            ("weak-header", self.settings_response({}, 'W/"weak"')),
+            (
+                "body-only",
+                self.settings_response({}, body_etag='"body-only"'),
+            ),
+        )
+        for label, pre_read in settings_variants:
+            with self.subTest(etag=label):
+                state = self.bridge_state()
+                transport, session = self.bridge_transport(
+                    [
+                        pre_read,
+                        bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {
+                                    "id": bridge["resourceId"]
+                                    + "/config/appsettings",
+                                    "etag": '"response-body-only"',
+                                }
+                            ),
+                            {"ETag": 'W/"response-header"'},
+                        ),
+                    ]
+                )
+
+                details = transport._mutate(
+                    self.fixture.mutations[CONFIGURE], state
+                )
+
+                settings_puts = [
+                    request
+                    for request in session.requests
+                    if request[0] == "PUT"
+                    and request[1].endswith(
+                        "/config/appsettings?api-version=2025-03-01"
+                    )
+                ]
+                self.assertEqual(len(settings_puts), 1)
+                self.assertNotIn("If-Match", settings_puts[0][3])
+                desired = self.desired_bridge_settings(details)
+                self.assertEqual(
+                    settings_puts[0][2],
+                    bootstrap.canonical_json_bytes({"properties": desired}),
+                )
+                self.assertEqual(
+                    bootstrap.sha256_bytes(
+                        bootstrap.canonical_json_bytes(desired)
+                    ),
+                    details["settingsSha256"],
+                )
 
     def test_configure_result_journal_failure_is_owned_and_exactly_rolled_back(self):
         class FailFirstResultJournal(MemoryJournal):
@@ -1484,20 +1548,20 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 return super().append_cloud_mutation(value)
 
         journal = FailFirstResultJournal()
-        pre_etag = self.preflight_bridge_settings_etag()
-        desired_etag = '"bridge-settings-desired"'
-        restored_etag = '"bridge-settings-restored"'
         bridge = self.fixture.resources["bridgeSite"]
         state = self.bridge_state()
         transport, session = self.bridge_transport(
             [
-                self.settings_response({}, pre_etag),
+                self.settings_response({}, 'W/"ignored-pre-read"'),
                 bootstrap._RestResponse(
                     200,
                     bootstrap.canonical_json_bytes(
-                        {"id": bridge["resourceId"] + "/config/appsettings"}
+                        {
+                            "id": bridge["resourceId"] + "/config/appsettings",
+                            "etag": '"ignored-put-body-etag"',
+                        }
                     ),
-                    {"ETag": desired_etag},
+                    {},
                 ),
             ],
             journal=journal,
@@ -1511,7 +1575,6 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(
             proof["cleanupKey"], bootstrap.BRIDGE_SETTINGS_CLEANUP_KEY
         )
-        self.assertEqual(proof["details"]["preAppSettingsEtag"], pre_etag)
         desired = self.desired_bridge_settings(proof["details"])
         session.responses.extend(
             [
@@ -1526,15 +1589,18 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                     ),
                     {},
                 ),
-                self.settings_response(desired, desired_etag),
+                self.settings_response(desired, 'W/"ignored-desired"'),
                 bootstrap._RestResponse(
                     200,
                     bootstrap.canonical_json_bytes(
-                        {"id": bridge["resourceId"] + "/config/appsettings"}
+                        {
+                            "id": bridge["resourceId"] + "/config/appsettings",
+                            "etag": '"ignored-rollback-body-etag"',
+                        }
                     ),
-                    {"ETag": restored_etag},
+                    {},
                 ),
-                self.settings_response({}, restored_etag),
+                self.settings_response({}, body_etag='"ignored-final"'),
             ]
         )
 
@@ -1544,6 +1610,10 @@ class ControllerCanaryFailureTests(unittest.TestCase):
 
         self.assertEqual(cleanup["status"], "removed-exact")
         self.assertTrue(cleanup["details"]["rollbackMutationIssued"])
+        self.assertEqual(
+            cleanup["details"]["finalSettingsSha256"],
+            bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({})),
+        )
         settings_puts = [
             request
             for request in session.requests
@@ -1552,8 +1622,9 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             )
         ]
         self.assertEqual(len(settings_puts), 2)
-        self.assertEqual(settings_puts[0][3]["If-Match"], pre_etag)
-        self.assertEqual(settings_puts[1][3]["If-Match"], desired_etag)
+        self.assertTrue(
+            all("If-Match" not in request[3] for request in settings_puts)
+        )
         self.assertEqual(
             settings_puts[1][2],
             bootstrap.canonical_json_bytes({"properties": {}}),
@@ -1570,9 +1641,6 @@ class ControllerCanaryFailureTests(unittest.TestCase):
     def test_configure_expiry_crossing_is_journaled_then_rolled_back_after_expiry(self):
         current = [NOW]
         bridge = self.fixture.resources["bridgeSite"]
-        pre_etag = self.preflight_bridge_settings_etag()
-        desired_etag = '"bridge-settings-desired"'
-        restored_etag = '"bridge-settings-restored"'
         state = self.bridge_state()
 
         def late_put():
@@ -1584,12 +1652,12 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 bootstrap.canonical_json_bytes(
                     {"id": bridge["resourceId"] + "/config/appsettings"}
                 ),
-                {"ETag": desired_etag},
+                {},
             )
 
         journal = MemoryJournal()
         transport, session = self.bridge_transport(
-            [self.settings_response({}, pre_etag), late_put],
+            [self.settings_response({}, body_etag='"ignored-pre-read"'), late_put],
             clock=lambda: current[0],
             journal=journal,
         )
@@ -1621,9 +1689,9 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                     ),
                     {},
                 ),
-                self.settings_response(desired, desired_etag),
-                bootstrap._RestResponse(200, b"{}", {"ETag": restored_etag}),
-                self.settings_response({}, restored_etag),
+                self.settings_response(desired, 'W/"ignored-desired"'),
+                bootstrap._RestResponse(200, b"{}", {}),
+                self.settings_response({}, body_etag='"ignored-final"'),
             ]
         )
 
@@ -1642,16 +1710,15 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             )
         )
         self.assertIsNone(session.deadlines[rollback_put_index])
+        self.assertNotIn("If-Match", session.requests[rollback_put_index][3])
 
     def test_configure_cleanup_accepts_exact_prestate_without_a_second_put(self):
         bridge = self.fixture.resources["bridgeSite"]
-        pre_etag = self.preflight_bridge_settings_etag()
-        desired_etag = '"bridge-settings-desired"'
         state = self.bridge_state()
         transport, session = self.bridge_transport(
             [
-                self.settings_response({}, pre_etag),
-                bootstrap._RestResponse(200, b"{}", {"ETag": desired_etag}),
+                self.settings_response({}, body_etag='"ignored-pre-read"'),
+                bootstrap._RestResponse(200, b"{}", {"ETag": 'W/"ignored"'}),
             ]
         )
         details = transport._mutate(self.fixture.mutations[CONFIGURE], state)
@@ -1675,7 +1742,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                     ),
                     {},
                 ),
-                self.settings_response({}, pre_etag),
+                self.settings_response({}),
             ]
         )
 
@@ -1688,16 +1755,20 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             len([request for request in session.requests if request[0] == "PUT"]),
             1,
         )
+        configure_put = next(
+            request for request in session.requests if request[0] == "PUT"
+        )
+        self.assertNotIn("If-Match", configure_put[3])
 
     def test_configure_cleanup_refuses_concurrent_third_state(self):
         bridge = self.fixture.resources["bridgeSite"]
-        pre_etag = self.preflight_bridge_settings_etag()
-        desired_etag = '"bridge-settings-desired"'
         state = self.bridge_state()
         transport, session = self.bridge_transport(
             [
-                self.settings_response({}, pre_etag),
-                bootstrap._RestResponse(200, b"{}", {"ETag": desired_etag}),
+                self.settings_response({}),
+                bootstrap._RestResponse(
+                    200, b"{}", {"ETag": 'W/"ignored-put"'}
+                ),
             ]
         )
         details = transport._mutate(self.fixture.mutations[CONFIGURE], state)
@@ -1723,7 +1794,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 ),
                 self.settings_response(
                     {"CONCURRENT_OWNER": "must-not-overwrite"},
-                    '"concurrent-settings"',
+                    body_etag='"ignored-third-state"',
                 ),
             ]
         )
@@ -1740,13 +1811,11 @@ class ControllerCanaryFailureTests(unittest.TestCase):
 
     def test_configure_cleanup_does_not_retry_an_ambiguous_rollback_put(self):
         bridge = self.fixture.resources["bridgeSite"]
-        pre_etag = self.preflight_bridge_settings_etag()
-        desired_etag = '"bridge-settings-desired"'
         state = self.bridge_state()
         transport, session = self.bridge_transport(
             [
-                self.settings_response({}, pre_etag),
-                bootstrap._RestResponse(200, b"{}", {"ETag": desired_etag}),
+                self.settings_response({}, 'W/"ignored-pre-read"'),
+                bootstrap._RestResponse(200, b"{}", {}),
             ]
         )
         details = transport._mutate(self.fixture.mutations[CONFIGURE], state)
@@ -1771,7 +1840,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                     ),
                     {},
                 ),
-                self.settings_response(desired, desired_etag),
+                self.settings_response(desired, body_etag='"ignored-desired"'),
                 RuntimeError("simulated ambiguous rollback PUT"),
             ]
         )
@@ -1785,6 +1854,10 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             len([request for request in session.requests if request[0] == "PUT"]),
             2,
         )
+        rollback_put = [
+            request for request in session.requests if request[0] == "PUT"
+        ][1]
+        self.assertNotIn("If-Match", rollback_put[3])
         self.assertEqual(session.responses, [])
 
     def test_expiry_after_configure_rolls_back_owned_settings_before_failure(self):
