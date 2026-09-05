@@ -429,7 +429,6 @@ class FakeReadOnlySession:
                     "roleDefinitionId",
                     "temporaryKeyReadRoleDefinitionId",
                     "temporaryFenceRoleDefinitionId",
-                    "temporaryControllerRoleDefinitionId",
                 )
             }
             temporary_definition_ids.update(
@@ -486,6 +485,9 @@ class FakeReadOnlySession:
                         "assignableScopes": ["/"],
                     },
                 }
+                if definition_id == bootstrap.CONTROLLER_BUILTIN_ROLE_ID:
+                    body["properties"]["roleName"] = "Storage Blob Data Contributor"
+                    body["properties"]["permissions"] = copy.deepcopy(bootstrap.CONTROLLER_BUILTIN_PERMISSIONS)
         elif "/providers/Microsoft.Authorization/roleDefinitions?" in request.url:
             status = 200
             definitions = bootstrap._custom_role_definition_specs(self.plan)

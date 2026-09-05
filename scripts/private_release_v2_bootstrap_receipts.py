@@ -1470,12 +1470,11 @@ def _validate_temporary_role(
         "freshReadbackSha256",
         "observedAt",
     }
-    if custom_definition:
-        keys |= {
-            "roleDefinitionCreatedByAuthorization",
-            "roleDefinitionRemoved",
-            "roleDefinitionPresentAfterCleanup",
-        }
+    keys |= {
+        "roleDefinitionCreatedByAuthorization",
+        "roleDefinitionRemoved",
+        "roleDefinitionPresentAfterCleanup",
+    }
     role = _exact_keys(value, keys, label)
     if (
         role["roleDefinitionId"] != definition_id
@@ -1498,6 +1497,12 @@ def _validate_temporary_role(
         or role["roleDefinitionPresentAfterCleanup"] is not False
     ):
         fail(f"{label} custom role definition is not proven absent")
+    if not custom_definition and (
+        role["roleDefinitionCreatedByAuthorization"] is not False
+        or role["roleDefinitionRemoved"] is not False
+        or role["roleDefinitionPresentAfterCleanup"] is not True
+    ):
+        fail(f"{label} built-in definition was not preserved")
     fresh_sha = _hash(
         role["freshReadbackSha256"], f"{label}.freshReadbackSha256"
     )
@@ -1657,7 +1662,7 @@ def _validate_temporary_cleanup(
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedOperatorControllerCanaryRole",
         remove_mutation_id="removeOwnedOperatorControllerCanaryRole",
-        custom_definition=True,
+        custom_definition=False,
         started_at=started_at,
         completed_at=completed_at,
         derived_absence_sha256=(

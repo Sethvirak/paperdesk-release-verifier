@@ -352,11 +352,18 @@
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
         "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
-        "temporaryControllerRoleDefinitionId": "controller-canary-role-definition",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
       }
     },
-    "roleDefinitionProjection": "authorization-specific-custom-add-and-read-only-then-delete",
+    "roleDefinitionProjection": "authorization-specific-custom-except-read-only-controller-builtin",
+    "temporaryControllerRole": {
+      "definitionId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+      "definitionKind": "BuiltInRole",
+      "definitionLifecycle": "read-only-preserved",
+      "assignmentLifecycle": "authorization-specific-create-and-delete",
+      "scope": "controllerLockContainer",
+      "projection": "fresh-full-canonical-preflight-projection"
+    },
     "temporaryPackageDataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"],
     "scope": "packageContainer",
     "principal": "${authorization.azure.accountObjectId}",
@@ -375,7 +382,7 @@
     "activationFenceLeaseId": "c28f7730-431d-5c52-b885-8e43154d1ddb",
     "leaseDurationSeconds": 60,
     "leaseRenewals": 1,
-    "cleanup": "remove-only-exact-ip-rule-package-assignment-key-read-definition-assignment-fence-definition-assignment-controller-canary-blob-definition-and-assignment-created-by-this-authorization"
+    "cleanup": "remove-only-owned-ip-rule-custom-role-definitions-and-assignments-controller-canary-blob-and-controller-assignment-preserve-controller-builtin-definition"
   },
   "deletionProtection": {
     "locks": {

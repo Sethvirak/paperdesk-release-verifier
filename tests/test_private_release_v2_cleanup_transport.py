@@ -96,6 +96,8 @@ class CleanupSession:
                         return response(404)
                 return response(200, self.definition)
             if method == "DELETE":
+                if self.definition["properties"]["type"] == "BuiltInRole":
+                    raise AssertionError("Built-in role definition must never be deleted")
                 if self.definition_failure:
                     return response(self.definition_failure)
                 self.definition_deleted = True
@@ -120,7 +122,7 @@ class CleanupTransportTests(unittest.TestCase):
             state["proofs"][added] = {
                 "details": {
                     "cleanupKey": role["cleanupKey"],
-                    "definitionCreated": True,
+                    "definitionCreated": role["definitionCreated"],
                     "definitionReadbackExact": True,
                     "assignmentCreated": True,
                     "assignmentReadbackExact": True,
@@ -151,6 +153,8 @@ class CleanupTransportTests(unittest.TestCase):
                 "context": {"executionDecision": "apply-exact"}, "probeIds": [probe["id"]]}],
                 "postconditionAdmissions": [], "probes": [probe], "productionBoundaryObservation": {}}},
             session=session, clock=lambda: current[0], sleep=sleep)
+        if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+            transport.admissions[operation_id]["context"]["builtInRoleDefinitionProjection"] = copy.deepcopy(role["definition"])
         transport._active_operation_id = operation_id
         if operation_id in TEMPORARY:
             transport._active_protected_role_add = operation_id.replace(
@@ -168,11 +172,28 @@ class CleanupTransportTests(unittest.TestCase):
                 transport, session, journal, operation, state, _, _ = self.make(operation_id)
                 result = transport._mutate(operation, state)
                 lock = session.arm(bootstrap._expected_deletion_lock_proof(operation_id)["resourceId"], "2016-09-01")
-                self.assertEqual(session.mutations(), [("DELETE", lock), ("DELETE", session.assignment_url),
-                    ("PUT", lock), ("DELETE", session.definition_url)])
+                expected_mutations = [("DELETE", lock), ("DELETE", session.assignment_url), ("PUT", lock)]
+                if operation_id not in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+                    expected_mutations.append(("DELETE", session.definition_url))
+                self.assertEqual(session.mutations(), expected_mutations)
                 self.assertEqual(result["deletionLock"], bootstrap._expected_deletion_lock_proof(operation_id))
                 self.assertEqual(session.locks, session.original_locks)
-                self.assertEqual(len(journal.records), 8)
+                self.assertEqual(len(journal.records), 2 * len(expected_mutations))
+
+    def test_controller_definition_drift_stops_after_assignment_removal_and_lock_restoration(self):
+        operation_id = "removeOwnedOperatorControllerCanaryRole"
+        transport, session, _, operation, state, _, _ = self.make(operation_id)
+        session.definition["properties"]["permissions"][0]["dataActions"].append("unreviewed/action")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "authorization-bound built-in"):
+            transport._mutate(operation, state)
+        self.assertIsNone(session.assignment)
+        self.assertEqual(session.locks, session.original_locks)
+        self.assertEqual([method for method, _ in session.mutations()], ["DELETE", "DELETE", "PUT"])
+        self.assertFalse(session.definition_deleted)
+        requests = list(session.requests)
+        with self.assertRaises(bootstrap.BootstrapError):
+            transport._mutate(operation, state)
+        self.assertEqual(session.requests, requests)
 
     def test_definition_absence_delay_retries_only_get_after_single_delete(self):
         transport, session, _, operation, state, _, sleeps = self.make(TEMPORARY[0])

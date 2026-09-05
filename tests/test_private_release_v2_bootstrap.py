@@ -157,6 +157,9 @@ def build_builtin_role_definition_projections(plan):
                 "assignableScopes": ["/"],
             },
         }
+    controller = result[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]["properties"]
+    controller["roleName"] = "Storage Blob Data Contributor"
+    controller["permissions"] = copy.deepcopy(bootstrap.CONTROLLER_BUILTIN_PERMISSIONS)
     return result
 
 
@@ -286,6 +289,8 @@ def build_projection(plan, package, *, adopt_operations=()):
             value.update({"uploaderIpv4": "203.0.113.10/32", "preNetworkAcls": copy.deepcopy(base_acl)})
         elif operation_id == "removeOwnedUploaderIpv4Rule":
             value.update({"uploaderIpv4": "203.0.113.10/32", "restoreNetworkAcls": copy.deepcopy(base_acl)})
+        elif operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+            value["builtInRoleDefinitionProjection"] = build_builtin_role_definition_projections(plan)[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]
         elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
             value.update({
                 "preAppSettings": {},
@@ -385,7 +390,7 @@ def build_projection(plan, package, *, adopt_operations=()):
                     "method": "GET",
                     "url": temporary_definition_url,
                     "requestBodySha256": None,
-                    "status": 404,
+                    "status": 200 if operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS else 404,
                     "responseSha256": bootstrap.sha256_bytes(
                         f"pre-temporary-definition-{index}".encode()
                     ),
@@ -740,7 +745,7 @@ class _TerminalEvidenceFixture:
             f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
             f"{assignment_id}"
         )
-        return {
+        result = {
             "definitionResourceId": definition_resource,
             "assignmentResourceId": assignment_resource,
             "definitionCreated": True,
@@ -782,6 +787,11 @@ class _TerminalEvidenceFixture:
             },
         }
 
+        if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+            result["definitionCreated"] = False
+            result["definition"] = build_builtin_role_definition_projections(self.plan)[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]
+        return result
+
     def temp_cleanup(self, operation_id):
         add_by_remove = {
             "removeOwnedUploaderPackageRole": "addOwnedUploaderPackageRole",
@@ -790,7 +800,7 @@ class _TerminalEvidenceFixture:
             "removeOwnedOperatorControllerCanaryRole": "addOwnedOperatorControllerCanaryRole",
         }
         added = self.operations[add_by_remove[operation_id]]["projection"]
-        return {
+        result = {
             "cleanupKey": added["cleanupKey"],
             "assignmentResourceId": added["assignmentResourceId"],
             "definitionResourceId": added["definitionResourceId"],
@@ -806,6 +816,15 @@ class _TerminalEvidenceFixture:
                 "absent": True,
             },
         }
+
+        if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+            result["definitionRemoved"] = False
+            del result["definitionAbsenceProjection"]
+            result["definitionPreservationProjection"] = {
+                "resourceId": added["definitionResourceId"], "present": True,
+                "projection": copy.deepcopy(added["definition"]),
+            }
+        return result
 
     def site_state(self, state, observed_at):
         resource = self.resources["bridgeSite"]
@@ -2960,10 +2979,11 @@ class BootstrapTests(unittest.TestCase):
             self.plan, other_authorization_id
         )
         self.assertEqual(first, repeated)
-        self.assertEqual(set(first), set(bootstrap.TEMPORARY_ROLE_ID_FIELDS))
+        self.assertEqual(set(first), set(bootstrap.TEMPORARY_ROLE_ID_FIELDS) | {"temporaryControllerRoleDefinitionId"})
         self.assertEqual(len(set(first.values())), 8)
         self.assertEqual(len(set(second.values())), 8)
-        self.assertTrue(set(first.values()).isdisjoint(second.values()))
+        self.assertEqual(set(first.values()) & set(second.values()), {bootstrap.CONTROLLER_BUILTIN_ROLE_ID})
+        self.assertTrue({first[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS}.isdisjoint(second[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS))
         self.assertTrue(
             set(first.values()).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
         )
@@ -7756,7 +7776,8 @@ class BootstrapTests(unittest.TestCase):
             "operatorControllerRole",
         ):
             self.assertTrue(temporary[name]["createdByAuthorization"])
-            self.assertTrue(temporary[name]["roleDefinitionCreatedByAuthorization"])
+            self.assertEqual(temporary[name]["roleDefinitionCreatedByAuthorization"], name != "operatorControllerRole")
+            self.assertEqual(temporary[name]["roleDefinitionPresentAfterCleanup"], name == "operatorControllerRole")
         self.assertEqual(
             components["activationFenceBootstrap"]["leaseState"], "Available"
         )
