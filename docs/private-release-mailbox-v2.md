@@ -83,6 +83,20 @@ and the exact App Settings list POST, then create-only writes a canonical
 preflight and a deliberately non-executable authorization template. It never
 promotes the template, supplies a confirmation phrase, or mutates Azure.
 
+The concrete observer overlaps independent reads with at most four workers.
+Each worker has a separate REST session, token cache and Storage request-ID
+set; Azure CLI credential calls are serialized. Source-derived operation URLs
+are validated before their batch starts, response bindings and admission
+dependencies are still checked in canonical order, and a failed worker stops
+further reads in the batch while in-flight reads drain. Individual HTTP/CLI
+limits and read-only retry rules are unchanged; credential-queue time counts
+against the original observation age. Production App Settings still pass through
+their dedicated in-memory redaction before evidence is emitted. The timestamp
+remains the start of observation, so batching neither resets the five-minute
+freshness window nor changes authorization validity. Variable provider latency
+or a slow approval can still make a preparation expire. This pool is never
+used by the mutation executor.
+
 After independent review and a separate authorization ceremony, the operator
 runs `private_release_v2_bootstrap.py apply --authorization <canonical-auth>
 --preflight <canonical-preflight>` and supplies the exact confirmation phrase on
