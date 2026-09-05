@@ -13495,7 +13495,15 @@ class AzureCliBootstrapTransport:
         deadline = min(
             expires,
             work_deadline,
-            started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+            # Preserve the full readiness interval before reserving the final
+            # Storage request envelope below.
+            started
+            + dt.timedelta(
+                seconds=(
+                    MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                    + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+            ),
         )
         final_request_at = deadline - dt.timedelta(
             seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS

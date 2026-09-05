@@ -108,7 +108,7 @@ class ControllerReadinessTests(unittest.TestCase):
                 self.assertEqual(len(request_ids), len(set(request_ids)))
                 self.assertEqual(journal.records, [])
 
-    def test_expiry_and_600_second_cap_clip_waits_without_writes(self):
+    def test_expiry_and_600_second_readiness_window_clip_waits_without_writes(self):
         for deadline in (37, 600):
             with self.subTest(deadline=deadline):
                 transport, session, journal, ids = self.make(lambda _: denied())
@@ -129,17 +129,15 @@ class ControllerReadinessTests(unittest.TestCase):
                 self.assertIsNone(error.exception.diagnostic["requestId"])
                 self.assertIsNone(error.exception.diagnostic["serverDate"])
                 self.assert_no_credential_or_role_snapshot(error.exception)
-                expected_elapsed = (
-                    deadline - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-                )
+                expected_elapsed = deadline
                 self.assertEqual((self.current - NOW).total_seconds(), expected_elapsed)
                 self.assertLessEqual(len(session.requests), 64)
                 self.assertTrue(all(0 < delay <= 15 for delay in self.sleeps))
                 self.assertEqual(
                     error.exception.diagnostic["attemptRecords"][-1]["startedAt"],
-                    (NOW + dt.timedelta(
-                        seconds=deadline - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-                    )).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    (NOW + dt.timedelta(seconds=deadline))
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
                 )
                 self.assertTrue(all(item[0] == "GET" for item in session.requests))
                 self.assertEqual(journal.records, [])
@@ -147,7 +145,6 @@ class ControllerReadinessTests(unittest.TestCase):
     def test_deadline_adjacent_final_get_can_validate_empty_container(self):
         final_at = NOW + dt.timedelta(
             seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
-            - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
         transport, session, journal, ids = self.make(
             lambda _: empty() if self.current == final_at else denied()
@@ -160,7 +157,10 @@ class ControllerReadinessTests(unittest.TestCase):
         self.assertEqual(len(request_ids), len(set(request_ids)))
         self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in request_ids))
         self.assertTrue(all(item[2]["deadline"] == NOW + dt.timedelta(
-            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+            seconds=(
+                bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
         ) for item in session.requests))
         self.assertEqual(journal.records, [])
 
@@ -193,9 +193,14 @@ class ControllerReadinessTests(unittest.TestCase):
         self.assertEqual(session.requests, [])
         self.assertEqual(journal.records, [])
 
-    def test_slow_response_at_expiry_cannot_be_accepted(self):
+    def test_slow_response_at_readiness_envelope_deadline_cannot_be_accepted(self):
         def slow(_):
-            self.current = NOW + dt.timedelta(seconds=600)
+            self.current = NOW + dt.timedelta(
+                seconds=(
+                    bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                    + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+            )
             return empty()
         transport, session, journal, ids = self.make(slow)
         with self.assertRaises(bootstrap.BootstrapError) as error:
