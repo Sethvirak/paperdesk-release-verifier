@@ -417,10 +417,68 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(session.requests, [])
         self.assertEqual(journal.records, [])
 
-    def test_sequential_key_and_fence_roles_wait_for_exact_readiness(self):
-        key_url = bootstrap._operation_readback_url(
+    def test_key_jwk_mutation_reads_admitted_version_not_version_inventory(self):
+        key_uri = "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/" + "c" * 32
+        jwk = {"kid": key_uri, "kty": "RSA", "n": "fixture", "e": "AQAB", "key_ops": ["sign", "verify"]}
+        response = bootstrap._RestResponse(200, bootstrap.canonical_json_bytes({
+            "key": jwk, "attributes": {"enabled": True},
+        }), {})
+        transport, session, journal = self.transport([response])
+        transport.admissions["readBackExactSigningPublicJwk"] = {"context": {"executionDecision": "apply-exact"}}
+        transport._active_protected_role_add = "addOwnedOperatorKeyReadRole"
+        transport._protected_work_deadline = transport._protected_role_deadline()
+        transport._validated_source_projections["createSigningKeyVersion"] = {
+            "projection": {"keyUriWithVersion": key_uri}
+        }
+        state = {"proofs": {"createSigningKeyVersion": {
+            "details": {"keyUriWithVersion": key_uri},
+        }}}
+        result = transport._mutate({"id": "readBackExactSigningPublicJwk"}, state)
+        self.assertEqual(result["kid"], key_uri)
+        self.assertEqual([(x[0], x[1]) for x in session.requests], [("GET", key_uri + "?api-version=7.4")])
+        self.assertTrue(all(x is not None for x in session.deadlines))
+        self.assertEqual(journal.records, [])
+        self.assertTrue(bootstrap._operation_readback_url(
             "readBackExactSigningPublicJwk", self.plan, self.authorization
-        )
+        ).endswith("/versions?api-version=7.4"))
+
+    def test_key_readiness_rejects_unbound_targets_before_http(self):
+        key_uri = "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/" + "c" * 32
+        exact = key_uri + "?api-version=7.4"
+        variants = [
+            (None, exact, "addOwnedOperatorKeyReadRole"),
+            ({}, exact, "addOwnedOperatorKeyReadRole"),
+            ({"projection": {"keyUriWithVersion": key_uri}}, exact, None),
+            ({"projection": {"keyUriWithVersion": key_uri}}, exact, "addOwnedUploaderPackageRole"),
+        ]
+        for target in (
+            key_uri.replace("c" * 32, "d" * 32) + "?api-version=7.4",
+            key_uri.rsplit("/", 1)[0] + "/versions?api-version=7.4",
+            key_uri.rsplit("/", 1)[0] + "?api-version=7.4",
+            exact + "&extra=1", exact + "#fragment",
+        ):
+            variants.append(({"projection": {"keyUriWithVersion": key_uri}}, target, "addOwnedOperatorKeyReadRole"))
+        for invalid in (
+            key_uri.replace("kv-mds-sea-9c4e0d0d", "other-vault"),
+            key_uri.replace("paperdesk-release-result-signing", "other-key"),
+            key_uri.replace("c" * 32, "versions"),
+            key_uri + "/extra", key_uri + "?extra=1", 17,
+        ):
+            variants.append(({"projection": {"keyUriWithVersion": invalid}}, str(invalid) + "?api-version=7.4", "addOwnedOperatorKeyReadRole"))
+        for source, target, role in variants:
+            with self.subTest(source=source, target=target, role=role):
+                transport, session, journal = self.transport([])
+                transport._active_protected_role_add = role
+                if source is not None:
+                    transport._validated_source_projections["createSigningKeyVersion"] = source
+                with self.assertRaisesRegex(bootstrap.BootstrapError, "not bound to its exact role and target"):
+                    transport._read_signing_public_jwk_when_ready(target)
+                self.assertEqual(session.requests, [])
+                self.assertEqual(journal.records, [])
+
+    def test_sequential_key_and_fence_roles_wait_for_exact_readiness(self):
+        key_uri = "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/" + "c" * 32
+        key_url = key_uri + "?api-version=7.4"
         key_denied = bootstrap._RestResponse(
             403,
             bootstrap.canonical_json_bytes({
@@ -433,6 +491,9 @@ class PackageReadinessTests(unittest.TestCase):
         )
         key_ready = bootstrap._RestResponse(200, b"{}", {})
         transport, session, journal = self.transport([key_denied, key_ready])
+        transport._validated_source_projections["createSigningKeyVersion"] = {
+            "projection": {"keyUriWithVersion": key_uri}
+        }
         transport._active_protected_role_add = "addOwnedOperatorKeyReadRole"
         transport._protected_work_deadline = transport._protected_role_deadline()
         self.assertIs(transport._read_signing_public_jwk_when_ready(key_url), key_ready)
