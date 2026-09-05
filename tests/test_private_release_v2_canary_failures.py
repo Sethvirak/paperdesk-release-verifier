@@ -920,7 +920,6 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                         {
                             "x-ms-lease-state": "expired",
                             "x-ms-lease-status": "unlocked",
-                            "x-ms-lease-duration": "fixed",
                         },
                     )
                 raise AssertionError(
@@ -1041,6 +1040,75 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             bootstrap.CONTROLLER_CANARY_LEASE_DURATION_SECONDS, sleeps
         )
 
+    def test_expiry_source_evidence_binds_optional_duration_to_retained_header(self):
+        self.fixture.build_operations()
+        operation_id = "exerciseControllerLeaseCanary"
+        original = self.fixture.operations[operation_id]
+        for duration in (None, "fixed"):
+            with self.subTest(duration=duration):
+                evidence = copy.deepcopy(original)
+                evidence["projection"]["expiryFallback"]["finalLeaseDuration"] = duration
+                if duration is not None:
+                    evidence["headers"]["leaseDuration"] = "Fixed"
+                bootstrap._validate_operation_source_projection(
+                    evidence, operation_id=operation_id, plan=self.plan,
+                    authorization=self.authorization, prior=self.fixture.operations,
+                )
+                evidence["projection"]["expiryFallback"]["finalLeaseDuration"] = (
+                    "fixed" if duration is None else None
+                )
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_operation_source_projection(
+                        evidence, operation_id=operation_id, plan=self.plan,
+                        authorization=self.authorization, prior=self.fixture.operations,
+                    )
+
+    def lease_expiry_transport(self, final_headers):
+        current = [NOW]
+        sleeps = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            current[0] += dt.timedelta(seconds=seconds)
+        responses = [bootstrap._RestResponse(status, b"", {}) for status in (201, 200, 200, 201)]
+        responses += [bootstrap._RestResponse(200, b"", final_headers), bootstrap._RestResponse(200, b"", {})]
+        transport, session, journal = self.transport(responses, "exerciseControllerLeaseCanary",
+            clock=lambda: current[0], sleep=sleep)
+        transport._active_protected_role_add = "addOwnedOperatorControllerCanaryRole"
+        state = {"proofs": {CREATE: {"details": {
+            "url": self.create_contract["expectedUrl"], "etag": ETAG,
+            "sha256": bootstrap.sha256_bytes(self.canary_body()),
+            "cleanupKey": "controller-lease-canary-blob",
+        }}}}
+        return transport, session, state, sleeps
+
+    def test_expired_unlocked_accepts_omitted_or_fixed_duration_without_inventing_header(self):
+        for duration in (None, "fixed"):
+            with self.subTest(duration=duration):
+                headers = {"x-ms-lease-state": "expired", "x-ms-lease-status": "unlocked"}
+                if duration is not None:
+                    headers["x-ms-lease-duration"] = duration
+                transport, session, state, sleeps = self.lease_expiry_transport(headers)
+                result = transport._mutate(self.fixture.mutations["exerciseControllerLeaseCanary"], state)
+                self.assertEqual(result["expiryFallback"]["finalLeaseDuration"], duration)
+                self.assertEqual(result["expiryFallback"]["finalLeaseState"], "expired")
+                self.assertEqual(result["expiryFallback"]["finalLeaseStatus"], "unlocked")
+                self.assertEqual(sleeps, [bootstrap.CONTROLLER_CANARY_LEASE_DURATION_SECONDS])
+                self.assertEqual(len(session.requests), 5)
+
+    def test_expiry_rejects_malformed_duration_and_non_unlocked_status(self):
+        cases = [
+            {"x-ms-lease-state": "expired", "x-ms-lease-status": "unlocked", "x-ms-lease-duration": value}
+            for value in ("infinite", "", "unexpected")
+        ]
+        cases += [{"x-ms-lease-state": "expired", "x-ms-lease-status": value} for value in ("locked", "")]
+        cases += [{"x-ms-lease-state": "expired"}]
+        for headers in cases:
+            with self.subTest(headers=headers):
+                transport, session, state, _ = self.lease_expiry_transport(headers)
+                with self.assertRaisesRegex(bootstrap.BootstrapError, "terminal headers are not exact"):
+                    transport._mutate(self.fixture.mutations["exerciseControllerLeaseCanary"], state)
+                self.assertEqual(len(session.requests), 6)
+
     def test_finite_lease_poll_preserves_a_second_get_envelope(self):
         current = [NOW]
         sleeps = []
@@ -1075,7 +1143,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                             "x-ms-lease-status": (
                                 "locked" if state_name == "leased" else "unlocked"
                             ),
-                            "x-ms-lease-duration": "fixed",
+                            **({"x-ms-lease-duration": "fixed"} if state_name == "leased" else {}),
                         },
                     )
                 raise AssertionError(f"unexpected lease request: {method} {url}")

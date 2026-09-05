@@ -1112,13 +1112,13 @@ class _TerminalEvidenceFixture:
             "releaseStatus": 200,
             "identity": {"kind": "authorized-local-azure-account", "objectId": ACCOUNT_OBJECT},
             "fastLane": {"acquiredAt": stamp(NOW + dt.timedelta(minutes=2)), "renewedAt": [stamp(NOW + dt.timedelta(minutes=2, seconds=20))], "releasedAt": stamp(NOW + dt.timedelta(minutes=2, seconds=40)), "finalLeaseState": "available"},
-            "expiryFallback": {"leaseId": self.plan["temporaryAccess"]["controllerExpiryLeaseId"], "acquiredAt": stamp(NOW + dt.timedelta(minutes=3)), "releaseIntentionallyOmitted": True, "expiredAt": stamp(NOW + dt.timedelta(minutes=4, seconds=1)), "pollAttempts": 3, "finalLeaseState": "expired", "finalLeaseStatus": "unlocked", "finalLeaseDuration": "fixed"},
+            "expiryFallback": {"leaseId": self.plan["temporaryAccess"]["controllerExpiryLeaseId"], "acquiredAt": stamp(NOW + dt.timedelta(minutes=3)), "releaseIntentionallyOmitted": True, "expiredAt": stamp(NOW + dt.timedelta(minutes=4, seconds=1)), "pollAttempts": 3, "finalLeaseState": "expired", "finalLeaseStatus": "unlocked", "finalLeaseDuration": None},
             "selfCleaned": True,
         }
         self.envelope(
             "exerciseControllerLeaseCanary",
             lease_body,
-            headers={"leaseState": "Expired", "leaseStatus": "Unlocked", "leaseDuration": "Fixed"},
+            headers={"leaseState": "Expired", "leaseStatus": "Unlocked"},
         )
         controller_container_url = (
             "https://mdspdbak2608089c4e.blob.core.windows.net/"

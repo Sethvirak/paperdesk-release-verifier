@@ -2325,7 +2325,7 @@ def _validate_lease_canaries(
         or fallback_transitions["pollAttempts"] < 1
         or fallback_transitions["finalLeaseState"] != "expired"
         or fallback_transitions["finalLeaseStatus"] != "unlocked"
-        or fallback_transitions["finalLeaseDuration"] != "fixed"
+        or fallback_transitions["finalLeaseDuration"] not in (None, "fixed")
     ):
         fail("cleanup expiry-fallback canary is invalid")
     _hash(
