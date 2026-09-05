@@ -48,13 +48,8 @@ class CanaryTimingTests(unittest.TestCase):
         def advance():
             if expire_during_precondition:
                 self.current = b.parse_time(self.auth["validity"]["expiresAt"], "expiry")
-        pre_settings_etag = next(
-            item["context"]["preAppSettingsEtag"]
-            for item in f.projection["operationAdmissions"]
-            if item["operationId"] == CONFIGURE
-        )
         session = Session([
-            b._RestResponse(200, b.canonical_json_bytes({"properties": {}}), {"ETag": pre_settings_etag}),
+            b._RestResponse(200, b.canonical_json_bytes({"properties": {}}), {}),
             put_error or b._RestResponse(200, b.canonical_json_bytes({"id": f.resources["bridgeSite"]["resourceId"]}), {}),
         ], after_request=advance)
         transport = b.AzureCliBootstrapTransport(authorization=self.auth, plan=f.plan, package=f.package,
@@ -74,16 +69,18 @@ class CanaryTimingTests(unittest.TestCase):
 
     def test_real_settings_put_issues_after_readiness_and_binds_exact_bytes(self):
         transport, session, journal, state = self.transport()
-        after_precondition = self.current + dt.timedelta(seconds=11)
+        issued_at = self.current
+        after_precondition = issued_at + dt.timedelta(seconds=11)
         session.after_request = lambda: setattr(self, "current", after_precondition)
         result = transport._mutate(self.fixture.mutations[CONFIGURE], state)
         self.assertEqual([request[0] for request in session.requests], ["POST", "PUT"])
-        self.assertEqual(result["bootstrapSelfTestIssuedAt"], stamp(self.current))
+        self.assertEqual(result["bootstrapSelfTestIssuedAt"], stamp(issued_at))
         self.assertEqual(
             result["bootstrapSelfTestExpiresAt"],
-            stamp(self.current + dt.timedelta(seconds=900)),
+            stamp(issued_at + dt.timedelta(seconds=900)),
         )
         self.assertEqual(result["settingsRequestBodySha256"], b.sha256_bytes(session.requests[-1][2]))
+        self.assertNotIn("If-Match", session.requests[-1][3] or {})
         self.assertEqual(len(journal.records), 2)
         for item in journal.records:
             self.assertEqual(item["requestBodySha256"], result["settingsRequestBodySha256"])

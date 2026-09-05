@@ -231,6 +231,17 @@ lease ID and incremented state version. A different release, plan, descriptor,
 or stale receipt fails. Rollback restores only the exact old map and never
 clobbers an unknown third state.
 
+The one-shot bootstrap runs before that production activation fence exists. Its
+authorization binds the complete empty bridge-settings prestate and canonical
+digest. The executor constructs the exact desired request, performs one final
+full-map read/digest check, journals the durable intent, issues the configuration
+PUT at most once, and requires an exact desired-map readback for definite
+success. In-process rollback writes at most once and only from the exact
+executor-owned desired map; definite success requires the exact old-map
+readback. Old needs no write and every observed third state stops for manual recovery.
+The confirmation phrase explicitly accepts that neither read/PUT window can
+atomically exclude an out-of-band subscription or resource-group Owner.
+
 Health proof binds the runtime marker, served index SHA-256, live, ready,
 app-health and security responses, plus the historical full OneDeploy collection
 invariant: historical deployment ID, canonical full-collection semantic digest,

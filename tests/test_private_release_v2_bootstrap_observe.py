@@ -333,7 +333,7 @@ class FakeReadOnlySession:
             + "/config/appsettings/list?api-version=2025-03-01"
         ):
             status = 200
-            headers = {"ETag": '"bridge-settings-pre"'}
+            headers = {}
             body = {
                 "id": (
                     self.resources["bridgeSite"]["resourceId"]
@@ -803,7 +803,7 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(
                 template["requiredResidualRiskAcceptance"],
                 {
-                    "id": "temporary-storage-ip-rules-and-recovery-residuals",
+                    "id": "temporary-storage-lock-and-bridge-config-residuals",
                     "exactConfirmationText": (
                         bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
                         + " " + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
@@ -811,6 +811,23 @@ class ObserveTests(unittest.TestCase):
                         + bootstrap.BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE
                     ),
                 },
+            )
+            self.assertIn(
+                "App Service App Settings exposes no supported conditional ETag",
+                template["requiredResidualRiskAcceptance"]["exactConfirmationText"],
+            )
+            self.assertEqual(
+                template["ceremonyRequirements"],
+                [
+                    "independently-review-canonical-preflight",
+                    "obtain-fresh-explicit-user-authorization",
+                    "promote-proposedValidity-to-validity-within-freshness-window",
+                    "add-exact-confirmation-phrase-sha256",
+                    "include-exact-storage-acl-concurrency-residual-acceptance-in-confirmation",
+                    "include-exact-bridge-app-settings-concurrency-residual-acceptance-in-confirmation",
+                    "include-exact-bridge-config-hard-death-residual-acceptance-in-confirmation",
+                    "emit-separate-canonical-executable-authorization",
+                ],
             )
 
             projection = preflight["projection"]
@@ -1061,7 +1078,7 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(validated_preflight, preflight)
             self.assertEqual(validated_digest, digest)
 
-    def test_authorization_phrase_hash_requires_bridge_hard_death_acceptance(self):
+    def test_previous_bridge_phrase_cannot_authorize_no_cas_settings_put(self):
         with tempfile.TemporaryDirectory() as folder:
             _session, _preflight, template = self.build(folder)
             authorization = self.promote_template(template)
@@ -1074,6 +1091,13 @@ class ObserveTests(unittest.TestCase):
                 + bootstrap.STORAGE_ACL_AND_RECOVERY_RESIDUAL_ACCEPTANCE
                 + " "
                 + bootstrap.DELETION_LOCK_RESIDUAL_ACCEPTANCE
+                + " I accept that process death after the bridge configuration or "
+                "site-start request can leave a consumed use ledger and durable "
+                "unresolved mutation intent while the bridge site remains changed or "
+                "running. Recovery may require an exact site stop and conditional "
+                "restoration of the source-bound prestate under a separate explicit "
+                "authorization; every fresh apply must stop until that durable intent "
+                "and live state are fully resolved."
             )
             authorization["confirmation"]["phraseSha256"] = (
                 bootstrap.sha256_bytes(old_phrase.encode("utf-8"))
@@ -1083,7 +1107,7 @@ class ObserveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 bootstrap.BootstrapError,
-                "bridge configuration hard-death recovery residuals",
+                "bridge App Settings concurrency and hard-death recovery residuals",
             ):
                 bootstrap.validate_authorization(
                     authorization_path,
@@ -2196,6 +2220,68 @@ class ObserveTests(unittest.TestCase):
                 observe.ObserveError, "prestate must be empty"
             ):
                 self.build(folder, ExistingBridgeSettingsSession(self.plan))
+
+    def test_empty_bridge_settings_accept_absent_or_irrelevant_etag_metadata(self):
+        class AppSettingsEtagVariantSession(FakeReadOnlySession):
+            def __init__(self, plan, *, headers, body_etag=None):
+                super().__init__(plan)
+                self.settings_headers = headers
+                self.body_etag = body_etag
+
+            def read(self, request):
+                response = super().read(request)
+                bridge = self.resources["bridgeSite"]
+                if request.url != (
+                    "https://management.azure.com"
+                    + bridge["resourceId"]
+                    + "/config/appsettings/list?api-version=2025-03-01"
+                ):
+                    return response
+                body = copy.deepcopy(response.body)
+                if self.body_etag is not None:
+                    body["etag"] = self.body_etag
+                headers = dict(self.settings_headers)
+                self.envelopes[(request.method, request.url)] = {
+                    "method": request.method,
+                    "url": request.url,
+                    "status": response.status,
+                    "headers": {key.lower(): value for key, value in headers.items()},
+                    "body": copy.deepcopy(body),
+                }
+                return observe.ReadResponse(
+                    method=response.method,
+                    url=response.url,
+                    status=response.status,
+                    headers=headers,
+                    body=body,
+                )
+
+        variants = (
+            ("absent", {}, None),
+            ("weak-header", {"ETag": 'W/"unsupported-token"'}, None),
+            ("body-only", {}, '"unsupported-body-token"'),
+        )
+        for label, headers, body_etag in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                _session, preflight, _template = self.build(
+                    folder,
+                    AppSettingsEtagVariantSession(
+                        self.plan, headers=headers, body_etag=body_etag
+                    ),
+                )
+            admission = next(
+                item
+                for item in preflight["projection"]["operationAdmissions"]
+                if item["operationId"]
+                == "configureBridgeExactVersionedPackageAndCriticalSettings"
+            )
+            self.assertEqual(admission["status"], "exact")
+            self.assertEqual(admission["context"]["preAppSettings"], {})
+            self.assertEqual(
+                admission["context"]["preAppSettingsSha256"],
+                bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({})),
+            )
+            self.assertNotIn("preAppSettingsEtag", admission["context"])
 
     def test_retained_uploader_acl_blocks_any_fresh_release_observation(self):
         class RetainedUploaderAclSession(FakeReadOnlySession):
