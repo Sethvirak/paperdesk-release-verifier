@@ -6024,6 +6024,9 @@ def _validate_operation_source_projection(
         auth_start = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
         auth_end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
         ordered = [acquired_at, *renewed_at, released_at, fallback_acquired, fallback_expired]
+        observed_duration = headers.get("leaseDuration")
+        if isinstance(observed_duration, str):
+            observed_duration = observed_duration.lower()
         if (
             body["url"] != expected_url
             or body["leaseId"] != temporary["controllerLeaseId"]
@@ -6043,10 +6046,10 @@ def _validate_operation_source_projection(
             or fallback["pollAttempts"] < 1
             or fallback["finalLeaseState"] != "expired"
             or fallback["finalLeaseStatus"] != "unlocked"
-            or fallback["finalLeaseDuration"] != "fixed"
+            or fallback["finalLeaseDuration"] not in (None, "fixed")
             or headers.get("leaseState", "").lower() != "expired"
             or headers.get("leaseStatus", "").lower() != "unlocked"
-            or headers.get("leaseDuration", "").lower() != "fixed"
+            or observed_duration != fallback["finalLeaseDuration"]
             or ordered != sorted(ordered)
             or not auth_start <= ordered[0] <= ordered[-1] <= auth_end
         ):
@@ -12902,6 +12905,9 @@ class AzureCliBootstrapTransport:
             elif operation_id == "exerciseControllerLeaseCanary":
                 fast_lane = runtime_facts.get("fastLane") if runtime_facts else None
                 expiry_fallback = runtime_facts.get("expiryFallback") if runtime_facts else None
+                observed_duration = self._header(response, "x-ms-lease-duration")
+                if isinstance(observed_duration, str):
+                    observed_duration = observed_duration.lower()
                 if (
                     runtime_facts is None
                     or runtime_facts.get("releaseStatus") != 200
@@ -12917,13 +12923,13 @@ class AzureCliBootstrapTransport:
                     or expiry_fallback.get("releaseIntentionallyOmitted") is not True
                     or expiry_fallback.get("finalLeaseState") != "expired"
                     or expiry_fallback.get("finalLeaseStatus") != "unlocked"
-                    or expiry_fallback.get("finalLeaseDuration") != "fixed"
+                    or "finalLeaseDuration" not in expiry_fallback
+                    or expiry_fallback["finalLeaseDuration"] not in (None, "fixed")
                     or str(self._header(response, "x-ms-lease-state") or "").lower()
                     != "expired"
                     or str(self._header(response, "x-ms-lease-status") or "").lower()
                     != "unlocked"
-                    or str(self._header(response, "x-ms-lease-duration") or "").lower()
-                    != "fixed"
+                    or observed_duration != expiry_fallback["finalLeaseDuration"]
                 ):
                     fail("controller lock lease canary did not prove natural finite expiry")
             elif operation_id == "startBridgeForBoundedCanary":
@@ -15506,11 +15512,16 @@ class AzureCliBootstrapTransport:
                     status_name = str(
                         self._header(response, "x-ms-lease-status") or ""
                     ).lower()
-                    duration_name = str(
-                        self._header(response, "x-ms-lease-duration") or ""
-                    ).lower()
+                    duration_header = self._header(response, "x-ms-lease-duration")
+                    duration_name = (
+                        str(duration_header).lower()
+                        if duration_header is not None else None
+                    )
                     if state_name == "expired":
-                        if status_name != "unlocked" or duration_name != "fixed":
+                        # Get Blob documents the duration header for leased blobs.
+                        # Its absence after expiry is valid; the finite duration
+                        # is bound by our finite acquire request and full wait.
+                        if status_name != "unlocked" or duration_name not in (None, "fixed"):
                             fail(
                                 "controller lease expiry terminal headers are not exact"
                             )
@@ -15565,7 +15576,7 @@ class AzureCliBootstrapTransport:
                     "pollAttempts": attempts,
                     "finalLeaseState": "expired",
                     "finalLeaseStatus": "unlocked",
-                    "finalLeaseDuration": "fixed",
+                    "finalLeaseDuration": duration_name,
                 },
                 "selfCleaned": True,
             }
