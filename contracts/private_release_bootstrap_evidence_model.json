@@ -53,7 +53,6 @@
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
         "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
-        "temporaryControllerRoleDefinitionId": "controller-canary-role-definition",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
       }
     },
@@ -103,7 +102,7 @@
     "The terminal receipt binds the canonical authorization, reviewed head, merged main, common tree, executor, plan, deterministic package, Azure account object, full mutation universe, component digests and S2 evidence-file digests.",
     "The terminal receipt is successful only when failures and pendingHousekeeping are both empty and no production release mutation occurred.",
     "Permanent mutation IDs occur exactly once and equal the non-temporary provider mutation universe in the reviewed plan.",
-    "Temporary package IPv4 and each authorization-specific custom package, key-read, activation-fence and controller-canary role definition and assignment are executor-owned, removed, freshly reread and absent before bridge start.",
+    "Temporary package IPv4, custom package/key-read/activation-fence definitions and assignments, and the authorization-specific controller-canary assignment are removed and freshly proven absent before bridge start. The controller uses the source-pinned built-in Storage Blob Data Contributor definition, which is never owned or mutated and is freshly proven preserved with its full authorization-bound projection.",
     "A pre-existing exact-private controller-lock container is never adopted from ARM metadata alone: it remains adopt-pending-execution-empty-proof until a bounded Azure AD list read, performed after only the uploader IPv4 and controller role are added, proves one unpaginated zero-blob inventory and retains the canonical URL, response digest, timestamp and private ARM posture.",
     "Activation-fence evidence distinguishes a current-authorization If-None-Match:* HTTP 201 create from exact immutable adoption with no current write; either path leaves the canonical idle fence Available and Unlocked.",
     "Package evidence distinguishes a current-authorization If-None-Match:* HTTP 201 upload from exact immutable version adoption with no current write, and binds deterministic versioned Azure AD readback; SAS, account keys and package bytes are never retained.",

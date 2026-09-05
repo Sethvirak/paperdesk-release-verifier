@@ -230,9 +230,38 @@ TEMPORARY_ROLE_ID_FIELDS = (
     "temporaryKeyReadRoleAssignmentId",
     "temporaryFenceRoleDefinitionId",
     "temporaryFenceRoleAssignmentId",
-    "temporaryControllerRoleDefinitionId",
     "temporaryControllerRoleAssignmentId",
 )
+CONTROLLER_BUILTIN_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+CONTROLLER_ROLE_OPERATIONS = frozenset({
+    "addOwnedOperatorControllerCanaryRole",
+    "removeOwnedOperatorControllerCanaryRole",
+})
+CONTROLLER_BUILTIN_ROLE_POLICY = {
+    "definitionId": CONTROLLER_BUILTIN_ROLE_ID,
+    "definitionKind": "BuiltInRole",
+    "definitionLifecycle": "read-only-preserved",
+    "assignmentLifecycle": "authorization-specific-create-and-delete",
+    "scope": "controllerLockContainer",
+    "projection": "fresh-full-canonical-preflight-projection",
+}
+CONTROLLER_BUILTIN_PERMISSIONS = [{
+    "actions": [
+        "Microsoft.Storage/storageAccounts/blobServices/containers/delete",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/write",
+        "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action",
+    ],
+    "notActions": [],
+    "dataActions": [
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/move/action",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+    ],
+    "notDataActions": [],
+}]
 TEMPORARY_ROLE_ID_DERIVATION = {
     "algorithm": "uuid5",
     "namespace": "15a228ac-3249-535f-940d-d915c5ce4b70",
@@ -244,7 +273,6 @@ TEMPORARY_ROLE_ID_DERIVATION = {
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
         "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
-        "temporaryControllerRoleDefinitionId": "controller-canary-role-definition",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment",
     },
 }
@@ -329,7 +357,7 @@ def _validate_temporary_role_id_derivation(plan: Mapping[str, Any]) -> Mapping[s
 def derive_temporary_role_ids(
     plan: Mapping[str, Any], authorization_id: str
 ) -> dict[str, str]:
-    """Derive one disjoint temporary-role ID set for one authorization."""
+    """Derive owned IDs and bind the provider-owned controller definition."""
 
     _guid(authorization_id, "temporary role authorization ID")
     derivation = _validate_temporary_role_id_derivation(plan)
@@ -351,9 +379,11 @@ def derive_temporary_role_ids(
         any(GUID.fullmatch(value) is None for value in values)
         or len(set(values)) != len(values)
         or authorization_id in values
+        or CONTROLLER_BUILTIN_ROLE_ID in values
         or not set(values).isdisjoint(RETIRED_TEMPORARY_ROLE_IDS)
     ):
         fail("derived temporary role IDs are invalid, duplicated, or retired")
+    derived["temporaryControllerRoleDefinitionId"] = CONTROLLER_BUILTIN_ROLE_ID
     return derived
 
 
@@ -373,8 +403,29 @@ def bind_temporary_role_ids(
         or any(temporary[field] != derived[field] for field in present)
     ):
         fail("in-memory temporary role IDs do not match the authorization")
+    if temporary.get("temporaryControllerRoleDefinitionId", CONTROLLER_BUILTIN_ROLE_ID) != CONTROLLER_BUILTIN_ROLE_ID:
+        fail("in-memory controller built-in role identity drifted")
     temporary.update(derived)
     return bound
+
+
+def _validate_controller_builtin_definition(value: Any) -> dict[str, Any]:
+    """Require the reviewed full built-in projection; never infer its permissions."""
+    if not isinstance(value, Mapping) or _project_role_definition(value) != value:
+        fail("controller built-in role projection is incomplete")
+    properties = value["properties"]
+    if (
+        value.get("id") != f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/{CONTROLLER_BUILTIN_ROLE_ID}"
+        or value.get("name") != CONTROLLER_BUILTIN_ROLE_ID
+        or value.get("type") != "Microsoft.Authorization/roleDefinitions"
+        or properties.get("type") != "BuiltInRole"
+        or properties.get("roleName") != "Storage Blob Data Contributor"
+        or not isinstance(properties.get("description"), str)
+        or properties.get("assignableScopes") != ["/"]
+        or properties.get("permissions") != CONTROLLER_BUILTIN_PERMISSIONS
+    ):
+        fail("controller built-in role identity or full permissions drifted")
+    return copy.deepcopy(dict(value))
 
 
 def _temporary_role_marker(authorization_id: str, cleanup_key: str) -> str:
@@ -436,6 +487,15 @@ def _reject_residual_temporary_role_assignments(
         )
         if isinstance(temporary, Mapping) and isinstance(temporary.get(field), str)
     }
+    # The provider-owned Contributor definition also serves permanent roles.
+    # Detect our controller assignment by its marker or authorization-owned ID.
+    current_definition_ids.discard(CONTROLLER_BUILTIN_ROLE_ID)
+    current_assignment_ids = {
+        str(temporary[field]).lower()
+        for field in TEMPORARY_ROLE_ID_FIELDS
+        if field.endswith("AssignmentId")
+        and isinstance(temporary, Mapping) and isinstance(temporary.get(field), str)
+    }
     forbidden_definition_ids = current_definition_ids | {
         str(spec["definitionId"]).lower()
         for spec in RETIRED_TEMPORARY_ROLE_SPECS
@@ -452,7 +512,7 @@ def _reject_residual_temporary_role_assignments(
         if (
             isinstance(description, str)
             and description.startswith(TEMPORARY_ROLE_MARKER_PREFIX)
-        ) or definition_guid in forbidden_definition_ids:
+        ) or definition_guid in forbidden_definition_ids or str(item.get("id", "")).rstrip("/").rsplit("/", 1)[-1].lower() in current_assignment_ids:
             fail("a residual PaperDesk temporary role assignment is present")
 
 
@@ -1368,6 +1428,9 @@ def _mutation_target_allowed(
         definition_id, assignment_id = temp_role_ids[operation_id]
         definition_path = f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/{definition_id}"
         is_add = operation_id.startswith("addOwned")
+        if operation_id in CONTROLLER_ROLE_OPERATIONS:
+            assignment_path = resources["controllerLockContainer"]["resourceId"] + "/providers/Microsoft.Authorization/roleAssignments/" + assignment_id
+            return method == ("PUT" if is_add else "DELETE") and arm(assignment_path)
         return (
             (method == ("PUT" if is_add else "DELETE"))
             and host == "management.azure.com"
@@ -1775,6 +1838,8 @@ def _expected_terminal_mutation_targets(
                 ): 1,
             }
         )
+        if operation_id in CONTROLLER_ROLE_OPERATIONS:
+            del required[_normalized_mutation_target(method, arm(definition_resource, "2022-04-01"))]
         lock_proof = _expected_deletion_lock_proof(operation_id)
         if lock_proof is not None:
             for lock_method in ("DELETE", "PUT"):
@@ -2486,6 +2551,11 @@ def load_plan() -> tuple[dict[str, Any], str]:
     _validate_temporary_role_id_derivation(plan)
     if set(temporary).intersection(TEMPORARY_ROLE_ID_FIELDS):
         fail("reviewed plan must not embed reusable temporary role IDs")
+    if (
+        "temporaryControllerRoleDefinitionId" in temporary
+        or temporary.get("temporaryControllerRole") != CONTROLLER_BUILTIN_ROLE_POLICY
+    ):
+        fail("reviewed controller built-in role policy drifted")
     if (
         temporary.get("leaseDurationSeconds")
         != CONTROLLER_CANARY_LEASE_DURATION_SECONDS
@@ -5663,6 +5733,9 @@ def _validate_operation_source_projection(
                 "assignableScopes": [f"/subscriptions/{SUBSCRIPTION}"],
             },
         }
+        builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
+        if builtin:
+            expected_definition = _validate_controller_builtin_definition(context.get("builtInRoleDefinitionProjection"))
         principal_type = (
             "ServicePrincipal"
             if authorization["azure"]["accountType"] == "servicePrincipal"
@@ -5686,7 +5759,7 @@ def _validate_operation_source_projection(
         if (
             body["definitionResourceId"] != definition_resource
             or body["assignmentResourceId"] != assignment_resource
-            or body["definitionCreated"] is not True
+            or body["definitionCreated"] is not (not builtin)
             or body["assignmentCreated"] is not True
             or body["cleanupKey"] != cleanup_key
             or body["definition"] != expected_definition
@@ -5694,6 +5767,8 @@ def _validate_operation_source_projection(
         ):
             fail("temporary role definition or assignment terminal projection drifted")
     elif family == "temporary-role-cleanup-absence":
+        builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
+        definition_proof_key = "definitionPreservationProjection" if builtin else "definitionAbsenceProjection"
         body = _exact_keys(
             body,
             {
@@ -5703,7 +5778,7 @@ def _validate_operation_source_projection(
                 "assignmentRemoved",
                 "definitionRemoved",
                 "assignmentAbsenceProjection",
-                "definitionAbsenceProjection",
+                definition_proof_key,
                 "deletionLock",
             },
             "temporary role cleanup projection",
@@ -5746,6 +5821,13 @@ def _validate_operation_source_projection(
             f"{resources[scope_key]['resourceId']}/providers/"
             f"Microsoft.Authorization/roleAssignments/{assignment_id}"
         )
+        definition_proof = {"resourceId": definition_resource, "absent": True}
+        if builtin:
+            definition_proof = {
+                "resourceId": definition_resource,
+                "present": True,
+                "projection": _validate_controller_builtin_definition(context.get("builtInRoleDefinitionProjection")),
+            }
         if (
             body["cleanupKey"] != cleanup_key
             or body["definitionResourceId"] != definition_resource
@@ -5754,11 +5836,11 @@ def _validate_operation_source_projection(
             or type(body["definitionRemoved"]) is not bool
             or body["assignmentAbsenceProjection"]
             != {"resourceId": assignment_resource, "absent": True}
-            or body["definitionAbsenceProjection"]
-            != {"resourceId": definition_resource, "absent": True}
+            or body[definition_proof_key] != definition_proof
+            or (builtin and body["definitionRemoved"] is not False)
             or body["deletionLock"] != _expected_deletion_lock_proof(operation_id)
         ):
-            fail("temporary role cleanup did not prove both exact absences")
+            fail("temporary role cleanup definition/assignment readback is not exact")
     elif family == "versioned-blob-readback":
         if operation_id == "uploadVersionedBridgePackage":
             required_blob_fields = {
@@ -8643,8 +8725,10 @@ def _terminal_temporary_role_component(
                     if item.get("operationId") == remove_mutation_id
                     and "/providers/microsoft.authorization/locks/" not in str(item.get("targetUrl", "")).lower()]
     remove_count = _terminal_successful_mutation_count(role_removals, remove_mutation_id)
-    if add_count != 2 or remove_count != 2:
-        fail("terminal temporary role ownership lacks both exact subcalls")
+    builtin = definition_id == CONTROLLER_BUILTIN_ROLE_ID
+    expected_count = 1 if builtin else 2
+    if add_count != expected_count or remove_count != expected_count:
+        fail("terminal temporary role ownership lacks its exact subcalls")
     body = {
         "roleDefinitionId": definition_id,
         "roleAssignmentId": assignment_id,
@@ -8652,14 +8736,14 @@ def _terminal_temporary_role_component(
         "principalObjectId": principal_id,
         "addMutationId": add_mutation_id,
         "removeMutationId": remove_mutation_id,
-        "createdByAuthorization": add_count == 2,
-        "removed": remove_count == 2,
+        "createdByAuthorization": add_count == expected_count,
+        "removed": remove_count == expected_count,
         "presentAfterCleanup": False,
         "freshReadbackSha256": sha256_bytes(canonical_json_bytes(cleanup_source)),
         "observedAt": cleanup_source["observedAt"],
-        "roleDefinitionCreatedByAuthorization": add_count == 2,
-        "roleDefinitionRemoved": remove_count == 2,
-        "roleDefinitionPresentAfterCleanup": False,
+        "roleDefinitionCreatedByAuthorization": not builtin,
+        "roleDefinitionRemoved": not builtin,
+        "roleDefinitionPresentAfterCleanup": builtin,
     }
     return body
 
@@ -9137,6 +9221,8 @@ def _operation_context_policy(
         observed_fields |= {"uploaderIpv4", "preNetworkAcls"}
     elif operation_id == "removeOwnedUploaderIpv4Rule":
         observed_fields |= {"uploaderIpv4", "restoreNetworkAcls"}
+    elif operation_id in CONTROLLER_ROLE_OPERATIONS:
+        observed_fields.add("builtInRoleDefinitionProjection")
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
         observed_fields |= {
             "preAppSettings",
@@ -9380,6 +9466,9 @@ def _validate_operation_context(
 
     required: set[str] = {"executionDecision", *policy["observedApplyFields"]}
     context = _exact_keys(value, required, f"{operation_id} context")
+
+    if operation_id in CONTROLLER_ROLE_OPERATIONS:
+        _validate_controller_builtin_definition(context["builtInRoleDefinitionProjection"])
 
     if "etag" in required:
         if (
@@ -9726,7 +9815,7 @@ def validate_preflight_evidence(
             ]
             if (
                 len(definition_probes) != 1
-                or definition_probes[0]["status"] != 404
+                or definition_probes[0]["status"] != (200 if operation_id in CONTROLLER_ROLE_OPERATIONS else 404)
             ):
                 fail(
                     "temporary role definition absence is not bound to the fresh preflight"
@@ -9755,6 +9844,10 @@ def validate_preflight_evidence(
     if admission_ids != azure_mutation_ids:
         fail("operation admissions are not in exact mutation order")
     admission_map = {item["operationId"]: item for item in admissions}
+    controller_definitions = [admission_map[operation_id]["context"]["builtInRoleDefinitionProjection"] for operation_id in CONTROLLER_ROLE_OPERATIONS]
+    recorded_builtin = admission_map["createCustomRoleDefinitions"]["context"]["builtInRoleDefinitionProjections"][CONTROLLER_BUILTIN_ROLE_ID]
+    if any(value != recorded_builtin for value in controller_definitions):
+        fail("controller built-in role preflight projections disagree")
     bridge_adopted = admission_map["createStoppedPrivateBridge"]["context"].get(
         "adopted"
     )
@@ -11942,7 +12035,7 @@ class AzureCliBootstrapTransport:
                     "assignmentRemoved",
                     "definitionRemoved",
                     "assignmentAbsenceProjection",
-                    "definitionAbsenceProjection",
+                    "definitionPreservationProjection" if operation_id in CONTROLLER_ROLE_OPERATIONS else "definitionAbsenceProjection",
                 )
             }
             family = "temporary-role-cleanup-absence"
@@ -15991,6 +16084,13 @@ class AzureCliBootstrapTransport:
                 "assignableScopes": [f"/subscriptions/{SUBSCRIPTION}"],
             }
         }
+        builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
+        builtin_definition = None
+        if builtin:
+            builtin_definition = _validate_controller_builtin_definition(
+                self.admissions[operation_id]["context"].get("builtInRoleDefinitionProjection")
+            )
+            definition_body = {"properties": builtin_definition["properties"]}
         principal_type = (
             "ServicePrincipal"
             if self.authorization["azure"]["accountType"] == "servicePrincipal"
@@ -16041,6 +16141,8 @@ class AzureCliBootstrapTransport:
             if not isinstance(properties, Mapping):
                 fail(f"{label} lacks exact properties")
             if "permissions" in expected:
+                if builtin and _project_role_definition(document) != builtin_definition:
+                    fail(f"{label} differs from the authorization-bound built-in definition")
                 projection = {
                     "roleName": properties.get("roleName"),
                     "description": properties.get("description"),
@@ -16089,21 +16191,25 @@ class AzureCliBootstrapTransport:
             }
             pending_create: str | None = None
             try:
-                if read_exact(definition_resource, definition_body, "temporary role definition precondition") != "absent":
-                    fail("temporary role definition already exists; recovery authorization is required")
-                details["definitionAttempted"] = True
-                pending_create = "definition"
-                definition_response = self._mutation_request(
-                    "PUT",
-                    self._arm_url(definition_resource, "2022-04-01"),
-                    body=canonical_json_bytes(definition_body),
-                    headers={"Content-Type": "application/json", "If-None-Match": "*"},
-                    expected={201},
-                    ambiguous_server_error=True,
-                )
-                details["definitionCreated"] = True
-                pending_create = None
-                details["definitionEtag"] = self._header(definition_response, "ETag")
+                if builtin:
+                    if read_exact(definition_resource, definition_body, "controller built-in definition precondition") != "exact":
+                        fail("controller built-in definition is missing")
+                else:
+                    if read_exact(definition_resource, definition_body, "temporary role definition precondition") != "absent":
+                        fail("temporary role definition already exists; recovery authorization is required")
+                    details["definitionAttempted"] = True
+                    pending_create = "definition"
+                    definition_response = self._mutation_request(
+                        "PUT",
+                        self._arm_url(definition_resource, "2022-04-01"),
+                        body=canonical_json_bytes(definition_body),
+                        headers={"Content-Type": "application/json", "If-None-Match": "*"},
+                        expected={201},
+                        ambiguous_server_error=True,
+                    )
+                    details["definitionCreated"] = True
+                    pending_create = None
+                    details["definitionEtag"] = self._header(definition_response, "ETag")
                 if read_exact(definition_resource, definition_body, "temporary role definition readback") != "exact":
                     fail("temporary role definition readback is not exact")
                 details["definitionReadbackExact"] = True
@@ -16125,6 +16231,8 @@ class AzureCliBootstrapTransport:
                 if read_exact(assignment_resource, assignment_body, "temporary role assignment readback") != "exact":
                     fail("temporary role assignment readback is not exact")
                 details["assignmentReadbackExact"] = True
+                if builtin and read_exact(definition_resource, definition_body, "controller built-in definition after grant") != "exact":
+                    fail("controller built-in definition disappeared after grant")
                 details["definitionProjection"] = exact_readbacks[
                     definition_resource.lower()
                 ]
@@ -16263,6 +16371,8 @@ class AzureCliBootstrapTransport:
         assignment_ambiguous = add_details.get("assignmentAmbiguous") is True
         definition_created = add_details.get("definitionCreated") is True
         definition_ambiguous = add_details.get("definitionAmbiguous") is True
+        if builtin and (definition_created or definition_ambiguous or add_details.get("definitionAttempted")):
+            fail("controller built-in definition cannot be executor-owned")
         assignment_visibility_pending = assignment_ambiguous or (
             assignment_created
             and add_details.get("assignmentReadbackExact") is not True
@@ -16328,6 +16438,27 @@ class AzureCliBootstrapTransport:
             )
             deletion_lock = expected_lock
             assignment_state = "absent"
+
+        if builtin:
+            if read_exact(definition_resource, definition_body, "controller built-in definition preservation") != "exact":
+                fail("controller built-in definition preservation is not proven")
+            if read_exact(assignment_resource, assignment_body, "controller temporary assignment final absence") != "absent":
+                fail("controller temporary assignment reappeared during cleanup")
+            if any_visibility_pending:
+                self._prove_temporary_role_marker_inventories_absent("controller pending assignment final boundary")
+            return {
+                "cleanupKey": cleanup_key,
+                "assignmentResourceId": assignment_resource,
+                "definitionResourceId": definition_resource,
+                "assignmentRemoved": assignment_state == "exact",
+                "definitionRemoved": False,
+                "assignmentAbsenceProjection": {"resourceId": assignment_resource, "absent": True},
+                "definitionPreservationProjection": {
+                    "resourceId": definition_resource, "present": True,
+                    "projection": exact_readbacks[definition_resource.lower()],
+                },
+                "deletionLock": deletion_lock,
+            }
 
         if settled_definition_state is not None:
             definition_state = settled_definition_state

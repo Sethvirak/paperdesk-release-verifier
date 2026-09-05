@@ -91,6 +91,27 @@ in either file. The executor validates all local source, signature, exact-head
 review, package, plan, authorization, freshness and account boundaries before
 constructing its Azure CLI transport.
 
+The temporary operator controller-canary assignment uses the built-in Storage
+Blob Data Contributor definition `ba92f5b4-2d11-453d-a403-e96b0029c9fe`, scoped
+only to `paperdesk-release-controller-lock`. Observation retains its full
+provider projection in both controller admissions. Apply checks that projection
+again before granting access, creates only the authorization-specific assignment,
+and uses the existing guarded assignment deletion and lock restoration for
+cleanup. It then proves the assignment absent and the built-in definition
+unchanged. The built-in definition is never created, deleted, or treated as
+executor-owned, including after an ambiguous assignment response.
+
+This replaces only the temporary controller role. It includes container
+management and blob add/move permissions beyond the former custom controller
+definition; that complete permission set is source-pinned and must pass review.
+Package upload remains custom create-and-read only, the activation fence remains
+custom read/write without delete, and key read remains separately scoped. The
+seven owned role-resource IDs remain authorization-specific; the provider-owned
+controller definition ID is intentionally shared. An isolated same-account
+canary passed upload, exact readback, finite leases and conditional deletion
+with this built-in role. That diagnostic result does not establish the behavior
+of the other roles or authorize a bootstrap, activation, or production deployment.
+
 The executor retains one canonical, secret-free local-finalization snapshot
 only after Azure execution, cleanup, postconditions and the complete terminal
 bundle have validated. It create-only writes the five S2 bodies first and the

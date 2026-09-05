@@ -983,6 +983,21 @@ def _operation_admission(
             )
         fail(f"{operation_id} preflight returned unsupported status {status}")
 
+    if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+        if status != 404:
+            fail(f"temporary access is already present before bootstrap: {operation_id}")
+        if not isinstance(built_in_role_definitions, Mapping):
+            fail("controller built-in role was not observed")
+        definition = bootstrap._validate_controller_builtin_definition(
+            built_in_role_definitions.get(bootstrap.CONTROLLER_BUILTIN_ROLE_ID)
+        )
+        return ("absent" if operation_id.startswith("add") else "owned-present"), _policy_checked_context(
+            operation_id, policy, {
+                "executionDecision": "apply-exact",
+                "builtInRoleDefinitionProjection": definition,
+            },
+        )
+
     if status == 200 and operation_id in {
         "createStoppedPrivateBridge",
         "attachFiveUamisOnlyToBridge",
@@ -1586,11 +1601,16 @@ def build_read_only_observation(
                     definition_request, session.read(definition_request)
                 )
             definition_envelope = cache[definition_key]
-            if definition_envelope["status"] != 404:
+            controller_builtin = operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS
+            if definition_envelope["status"] != (200 if controller_builtin else 404):
                 fail(
-                    "temporary role definition is already present before bootstrap: "
+                    ("controller built-in definition is not readable: " if controller_builtin else "temporary role definition is already present before bootstrap: ")
                     + operation["id"]
                 )
+            if controller_builtin:
+                definition_body = _body_mapping(definition_envelope, "controller built-in definition")
+                built_in_role_definitions = {bootstrap.CONTROLLER_BUILTIN_ROLE_ID:
+                    bootstrap._validate_controller_builtin_definition(bootstrap._project_role_definition(definition_body))}
             extra_preflight_probes.append(
                 _preflight_probe(
                     f"preflight-{index:02d}-temporary-definition",
