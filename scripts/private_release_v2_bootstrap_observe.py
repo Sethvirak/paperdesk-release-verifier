@@ -245,17 +245,24 @@ class AzureCliReadOnlySession:
                 response = self._session.request(
                     request.method, request.url, **request_kwargs
                 )
-                break
             except bootstrap.BootstrapError as exc:
+                retryable = (
+                    isinstance(exc, bootstrap._RestTotalTimeout)
+                    or str(exc) == "Azure REST transport failed closed"
+                )
                 if (
-                    str(exc) != "Azure REST transport failed closed"
+                    not retryable
                     or attempt == 2
                 ):
                     raise
-                # This class exposes only bounded read operations.  Retrying a
-                # transient transport failure here cannot duplicate a mutation;
-                # the mutation-capable executor deliberately has no such retry.
-                self.sleep(0.5 * (2**attempt))
+            else:
+                if response.status != 504 or attempt == 2:
+                    break
+            # This class exposes only bounded read operations.  Retrying a
+            # transport timeout or an Azure gateway timeout response here
+            # cannot duplicate a mutation; the mutation-capable executor
+            # deliberately has no such retry.
+            self.sleep(0.5 * (2**attempt))
         if response is None:
             fail("read-only Azure retry boundary produced no response")
         response_sha256 = bootstrap._preflight_response_sha256(
