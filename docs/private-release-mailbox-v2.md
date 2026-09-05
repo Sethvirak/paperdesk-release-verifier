@@ -91,6 +91,17 @@ in either file. The executor validates all local source, signature, exact-head
 review, package, plan, authorization, freshness and account boundaries before
 constructing its Azure CLI transport.
 
+The one-shot authorization has a maximum lifetime of 3,900 seconds (65 minutes):
+15 minutes for observation, confirmation and pre-controller setup, followed by
+the unchanged 3,000-second controller admission, readiness and cleanup reserve.
+The preflight must still be at most five minutes old when apply validates it.
+The executor rejects an already-exhausted setup window before adding the
+temporary uploader firewall rule, and checks it again before controller-role
+creation. A slower firewall mutation can still cross that boundary and require
+cleanup. These limits do not extend a consumed authorization; each new attempt
+requires a fresh source-bound authorization. FIC repin keeps its separate
+1,800-second limit.
+
 The temporary operator controller-canary assignment uses the built-in Storage
 Blob Data Contributor definition `ba92f5b4-2d11-453d-a403-e96b0029c9fe`, scoped
 only to `paperdesk-release-controller-lock`. Observation retains its full

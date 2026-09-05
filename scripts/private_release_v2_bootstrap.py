@@ -111,12 +111,13 @@ CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
     + CONTROLLER_CANARY_LEASE_DURATION_SECONDS
     + 30
 )
-# Account validation, fresh preflight, the durable claim, and all reviewed work
-# before the controller phase have one hard ten-minute budget. Controller role
-# admission then performs four exact reads, two create-only writes, and one
-# source readback before the data-plane propagation wait begins. FIC repin owns
-# a separate, unchanged 1,800-second contract.
-CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS = 600
+# Observation, confirmation, account validation, fresh preflight, the durable
+# claim, and all work before the controller phase share a fifteen-minute budget.
+# The five-minute preflight freshness limit and every cleanup reserve remain
+# unchanged. Controller role admission then performs four exact reads, two
+# create-only writes, and one source readback before the data-plane propagation
+# wait begins. FIC repin owns a separate, unchanged 1,800-second contract.
+CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS = 900
 CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS = (
     7 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
 )
@@ -14819,6 +14820,12 @@ class AzureCliBootstrapTransport:
             }
 
         if operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
+            if (
+                operation_id == "addOwnedUploaderIpv4Rule"
+                and self.clock()
+                >= self._controller_canary_role_admission_start_deadline()
+            ):
+                fail("insufficient authorization window before uploader rule admission")
             ip_value = context.get("uploaderIpv4")
             try:
                 network = ipaddress.ip_network(str(ip_value), strict=True)
