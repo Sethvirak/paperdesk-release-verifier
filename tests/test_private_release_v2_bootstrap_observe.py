@@ -2391,6 +2391,94 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(transport.calls, 3)
         self.assertEqual(sleeps, [0.5, 1.0])
 
+        class TotalTimeoutReadSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, method, request_url):
+                self.calls += 1
+                if self.calls < 3:
+                    raise bootstrap._RestTotalTimeout(
+                        "Azure REST total response deadline expired"
+                    )
+                return bootstrap._RestResponse(
+                    status=200,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+
+        sleeps = []
+        transport = TotalTimeoutReadSession()
+        session = observe.AzureCliReadOnlySession(sleeper=sleeps.append)
+        session._session = transport
+        response = session.read(observe.ReadRequest("GET", url))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(transport.calls, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+        class ExhaustedTotalTimeoutReadSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, _method, _request_url):
+                self.calls += 1
+                raise bootstrap._RestTotalTimeout(
+                    "Azure REST total response deadline expired"
+                )
+
+        sleeps = []
+        transport = ExhaustedTotalTimeoutReadSession()
+        session = observe.AzureCliReadOnlySession(sleeper=sleeps.append)
+        session._session = transport
+        with self.assertRaisesRegex(
+            bootstrap._RestTotalTimeout, "total response deadline expired"
+        ):
+            session.read(observe.ReadRequest("GET", url))
+        self.assertEqual(transport.calls, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+        app_settings_url = (
+            "https://management.azure.com/subscriptions/"
+            f"{bootstrap.SUBSCRIPTION}/resourceGroups/"
+            "rg-paperdesk-rollback-sea-20260808/providers/Microsoft.Web/sites/"
+            "paperdesk-private-release-bridge/config/appsettings/list"
+            "?api-version=2025-03-01"
+        )
+
+        class GatewayTimeoutReadSession:
+            def __init__(self, final_status=200):
+                self.calls = 0
+                self.final_status = final_status
+
+            def request(self, method, request_url):
+                self.calls += 1
+                status = 504 if self.calls < 3 else self.final_status
+                return bootstrap._RestResponse(
+                    status=status,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+
+        for method, request_url in (("GET", url), ("POST", app_settings_url)):
+            with self.subTest(transient_gateway_method=method):
+                sleeps = []
+                transport = GatewayTimeoutReadSession()
+                session = observe.AzureCliReadOnlySession(sleeper=sleeps.append)
+                session._session = transport
+                response = session.read(observe.ReadRequest(method, request_url))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(transport.calls, 3)
+                self.assertEqual(sleeps, [0.5, 1.0])
+
+        sleeps = []
+        transport = GatewayTimeoutReadSession(final_status=504)
+        session = observe.AzureCliReadOnlySession(sleeper=sleeps.append)
+        session._session = transport
+        response = session.read(observe.ReadRequest("GET", url))
+        self.assertEqual(response.status, 504)
+        self.assertEqual(transport.calls, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
         class PermanentFailureSession:
             def __init__(self):
                 self.calls = 0
