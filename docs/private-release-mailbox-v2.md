@@ -296,6 +296,13 @@ run-from-package and the exact versioned package are the activation mechanism.
 
 ## Key and authorization proof
 
+Bootstrap public-key readiness reads the exact version URI from the validated
+`createSigningKeyVersion` projection while the dedicated temporary key-read role
+is active. The separate version-list readback remains an inventory check; its
+URL is not the target for `Get Key`. A missing proof, different version, key,
+vault, or role fails before HTTP. Readiness deadlines and cleanup reserves are
+unchanged.
+
 Before any mailbox, Storage, production, or signing action, the bridge performs
 an exact versioned Key Vault `Get Key` with a dedicated read-only identity. The
 projection digest, `kid`, RSA modulus/exponent, key operations, enabled and

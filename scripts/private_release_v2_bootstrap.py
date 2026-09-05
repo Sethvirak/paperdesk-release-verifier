@@ -13291,13 +13291,20 @@ class AzureCliBootstrapTransport:
         )
 
     def _read_signing_public_jwk_when_ready(self, url: str) -> _RestResponse:
-        expected_url = _operation_readback_url(
-            "readBackExactSigningPublicJwk", self.plan, self.authorization
-        )
+        # The operation readback lists versions; readiness reads the exact JWK
+        # already admitted by the signing-key control-plane proof.
+        source = self._validated_source_projections.get("createSigningKeyVersion")
+        projection = source.get("projection") if isinstance(source, Mapping) else None
+        key_uri = projection.get("keyUriWithVersion") if isinstance(projection, Mapping) else None
         if (
             getattr(self, "_active_protected_role_add", None)
             != "addOwnedOperatorKeyReadRole"
-            or url != expected_url
+            or not isinstance(key_uri, str)
+            or re.fullmatch(
+                r"https://kv-mds-sea-9c4e0d0d\.vault\.azure\.net/keys/paperdesk-release-result-signing/[0-9a-f]{32}",
+                key_uri,
+            ) is None
+            or url != key_uri + "?api-version=7.4"
         ):
             fail("signing-key readiness is not bound to its exact role and target")
         started = self.clock()
