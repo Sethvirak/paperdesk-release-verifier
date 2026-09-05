@@ -1290,6 +1290,39 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 "addOwnedOperatorControllerCanaryRole"
             )
 
+    def test_setup_past_ten_minutes_preserves_full_post_admission_reserve(self):
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 3900)
+        self.assertEqual(bootstrap.CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS, 3000)
+        for seconds in (660, 899):
+            with self.subTest(elapsed=seconds):
+                transport, session, journal = self.transport(
+                    [], "addOwnedOperatorControllerCanaryRole",
+                    clock=lambda: NOW + dt.timedelta(seconds=seconds),
+                )
+                transport._begin_protected_role_lifecycle(
+                    "addOwnedOperatorControllerCanaryRole"
+                )
+                self.assertEqual(
+                    transport._controller_canary_role_admission_start_deadline(),
+                    NOW + dt.timedelta(minutes=15),
+                )
+                self.assertEqual(session.requests, [])
+                self.assertEqual(journal.records, [])
+
+    def test_expired_setup_window_never_adds_uploader_rule(self):
+        for seconds in (900, 901):
+            with self.subTest(elapsed=seconds):
+                transport, session, journal = self.transport(
+                    [], "addOwnedUploaderIpv4Rule",
+                    clock=lambda: NOW + dt.timedelta(seconds=seconds),
+                )
+                with self.assertRaisesRegex(bootstrap.BootstrapError, "before uploader rule admission"):
+                    transport._mutate(
+                        self.fixture.mutations["addOwnedUploaderIpv4Rule"], {}
+                    )
+                self.assertEqual(session.requests, [])
+                self.assertEqual(journal.records, [])
+
     def test_short_authorization_fails_before_claim_or_cloud_mutation(self):
         with tempfile.TemporaryDirectory() as folder:
             validated, preflight, receipt = self.validated_inputs(

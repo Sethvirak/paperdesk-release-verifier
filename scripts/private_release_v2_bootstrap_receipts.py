@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = ROOT / "contracts" / "private_release_bootstrap_evidence_model.json"
 PLAN_PATH = ROOT / "contracts" / "private_release_bootstrap_plan.json"
-BOOTSTRAP_MAX_AUTHORIZATION_SECONDS = 3600
+BOOTSTRAP_MAX_AUTHORIZATION_SECONDS = 3900
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
