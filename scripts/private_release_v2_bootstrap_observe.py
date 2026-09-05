@@ -17,6 +17,7 @@ and add an exact confirmation binding after reviewing the canonical preflight.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import dataclasses
 import datetime as dt
@@ -26,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.parse
@@ -199,6 +201,21 @@ class ReadOnlySession(Protocol):
     def read(self, request: ReadRequest) -> ReadResponse: ...
 
 
+class _SerializedCredentialSession(bootstrap.AzureCliRestSession):
+    """Keep worker credential-cache access serial; HTTP exchanges stay isolated."""
+
+    def __init__(
+        self, authorization: Mapping[str, Any], *,
+        clock: Callable[[], dt.datetime], credential_lock: Any,
+    ) -> None:
+        super().__init__(authorization, clock=clock)
+        self._credential_lock = credential_lock
+
+    def _run_az_json(self, arguments: Sequence[str], label: str) -> Mapping[str, Any]:
+        with self._credential_lock:
+            return super()._run_az_json(arguments, label)
+
+
 class AzureCliReadOnlySession:
     """Concrete Azure CLI credential boundary exposing only reviewed reads."""
 
@@ -212,6 +229,64 @@ class AzureCliReadOnlySession:
         self.sleep = sleeper or time.sleep
         self._account: dict[str, Any] | None = None
         self._session: bootstrap.AzureCliRestSession | None = None
+        self._batch_lock = threading.Lock()
+        self._credential_lock = threading.Lock()
+        self._batch_sessions: list[AzureCliReadOnlySession] = []
+
+    def read_many(self, requests: Sequence[ReadRequest]) -> list[ReadResponse]:
+        """Read at most four requests concurrently, returning original order.
+
+        Workers have separate token caches and Storage request-ID sets. Azure
+        CLI credential calls share a lock; neither this pool nor its sessions
+        is used by the mutation executor. No batch changes the snapshot clock.
+        """
+        requests = tuple(requests)
+        if len(requests) > 128:
+            fail("read-only observation batch exceeds its fixed bound")
+        for request in requests:
+            if not isinstance(request, ReadRequest) or request.body:
+                fail("read-only observation batch contains an invalid request")
+            _safe_url(request.method, request.url)
+        if not requests:
+            return []
+        with self._batch_lock:
+            if not self._batch_sessions:
+                account = self.account()
+                for _ in range(4):
+                    child = AzureCliReadOnlySession(clock=self.clock, sleeper=self.sleep)
+                    child._account = dict(account)
+                    child._session = _SerializedCredentialSession(
+                        {"azure": dict(account)}, clock=self.clock,
+                        credential_lock=self._credential_lock,
+                    )
+                    self._batch_sessions.append(child)
+            stopped = threading.Event()
+
+            def read_partition(worker_index: int) -> list[tuple[int, ReadResponse]]:
+                responses = []
+                try:
+                    for index in range(worker_index, len(requests), 4):
+                        if stopped.is_set():
+                            break
+                        response = self._batch_sessions[worker_index].read(requests[index])
+                        responses.append((index, response))
+                except BaseException:
+                    stopped.set()
+                    raise
+                return responses
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(read_partition, index) for index in range(4)]
+                try:
+                    responses = [item for future in futures for item in future.result()]
+                except BaseException:
+                    stopped.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
+            if len(responses) != len(requests):
+                fail("read-only observation batch is incomplete")
+            return [response for _, response in sorted(responses)]
 
     def account(self) -> Mapping[str, Any]:
         if self._account is None:
@@ -319,6 +394,25 @@ class _StaticAccountSession:
 
     def account(self) -> Mapping[str, Any]:
         return dict(self._account)
+
+
+def _read_many(
+    session: ReadOnlySession, requests: Sequence[ReadRequest],
+) -> list[ReadResponse]:
+    """Allow serial injected sessions, with the same exact response bindings."""
+    batch = getattr(session, "read_many", None)
+    responses = (
+        list(batch(requests)) if callable(batch)
+        else [session.read(item) for item in requests]
+    )
+    if len(responses) != len(requests):
+        fail("read-only observation batch returned an incomplete response set")
+    for request, response in zip(requests, responses):
+        if not isinstance(response, ReadResponse) or (
+            response.method, response.url
+        ) != (request.method, request.url):
+            fail("read-only observation batch response drifted from the exact request")
+    return responses
 
 
 def _duplicate_safe_pairs(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -1552,6 +1646,45 @@ def build_read_only_observation(
         for item in plan["mutations"]
         if item["kind"] != "local-create-only-canonical-evidence"
     ]
+    # Every URL here comes from the fixed source contract, independently of
+    # admission outcomes. Validate contracts first, fetch unique reads once,
+    # then keep all dependency/adoption validation in its original order.
+    operation_requests: dict[tuple[str, str], ReadRequest] = {}
+    for operation in azure_operations:
+        contract = bootstrap._validator_contract(
+            f"operation:{operation['id']}", plan, policy_authorization
+        )
+        if contract.get("preflightContextPolicy") != bootstrap._operation_context_policy(
+            operation["id"], plan, policy_authorization
+        ):
+            fail("validator contract is not bound to the shared source context policy")
+        request = ReadRequest(
+            method=contract["expectedMethod"], url=contract["expectedUrl"]
+        )
+        operation_requests[(request.method, request.url)] = request
+        definition_url = bootstrap._temporary_role_definition_readback_url(
+            operation["id"], plan
+        )
+        if definition_url is not None:
+            operation_requests[("GET", definition_url)] = ReadRequest(
+                method="GET", url=definition_url
+            )
+    if any(item["id"] == "createCustomRoleDefinitions" for item in azure_operations):
+        definition_ids = sorted({
+            str(role["definitionId"]) for role in plan["roleMatrix"]
+            if role.get("definitionKind") == "BuiltInRole"
+        })
+        for definition_id in definition_ids:
+            url = ("https://management.azure.com/subscriptions/"
+                   f"{bootstrap.SUBSCRIPTION}/providers/Microsoft.Authorization/"
+                   f"roleDefinitions/{definition_id}?api-version=2022-04-01")
+            operation_requests[("GET", url)] = ReadRequest(method="GET", url=url)
+    if any(item["id"] == "grantPublisherGraphApplicationReadAll" for item in azure_operations):
+        url = bootstrap._microsoft_graph_service_principal_inventory_url()
+        operation_requests[("GET", url)] = ReadRequest(method="GET", url=url)
+    requests = list(operation_requests.values())
+    for request, response in zip(requests, _read_many(session, requests)):
+        cache[(request.method, request.url)] = _normalize_response(request, response)
     for index, operation in enumerate(azure_operations):
         validator_id = f"operation:{operation['id']}"
         contract = bootstrap._validator_contract(
@@ -1730,9 +1863,12 @@ def build_read_only_observation(
             dependency_facts[operation["id"]] = dict(adopted)
 
     marker_inventory_projections: list[dict[str, Any]] = []
-    for request_spec in bootstrap._temporary_role_marker_inventory_requests(plan):
-        request = ReadRequest(method="GET", url=request_spec["url"])
-        envelope = _normalize_response(request, session.read(request))
+    marker_specs = bootstrap._temporary_role_marker_inventory_requests(plan)
+    marker_requests = [ReadRequest(method="GET", url=item["url"]) for item in marker_specs]
+    for request_spec, request, response in zip(
+        marker_specs, marker_requests, _read_many(session, marker_requests)
+    ):
+        envelope = _normalize_response(request, response)
         if envelope["status"] != 200:
             fail("read-only temporary role marker inventory is not readable")
         document = _body_mapping(
@@ -1759,9 +1895,12 @@ def build_read_only_observation(
 
     retired_role_absence: list[dict[str, Any]] = []
     retired_observed_at = _stamp(observed_at)
-    for request_spec in bootstrap._retired_temporary_role_absence_requests(plan):
-        request = ReadRequest(method="GET", url=request_spec["url"])
-        envelope = _normalize_response(request, session.read(request))
+    retired_specs = bootstrap._retired_temporary_role_absence_requests(plan)
+    retired_requests = [ReadRequest(method="GET", url=item["url"]) for item in retired_specs]
+    for request_spec, request, response in zip(
+        retired_specs, retired_requests, _read_many(session, retired_requests)
+    ):
+        envelope = _normalize_response(request, response)
         if envelope["status"] != 404:
             fail(
                 "read-only observation found a retired temporary role "
@@ -1787,11 +1926,14 @@ def build_read_only_observation(
 
     production_documents: dict[str, Any] = {}
     production_probe_ids: list[str] = []
-    for request_spec in bootstrap._production_boundary_requests(plan):
-        request = ReadRequest(
-            method=request_spec["method"], url=request_spec["url"]
-        )
-        response = session.read(request)
+    production_specs = bootstrap._production_boundary_requests(plan)
+    production_requests = [
+        ReadRequest(method=item["method"], url=item["url"])
+        for item in production_specs
+    ]
+    for request_spec, request, response in zip(
+        production_specs, production_requests, _read_many(session, production_requests)
+    ):
         envelope = _normalize_production_boundary_response(request, response)
         production_documents[request_spec["id"]] = envelope["body"]
         probe_id = request_spec["id"]
