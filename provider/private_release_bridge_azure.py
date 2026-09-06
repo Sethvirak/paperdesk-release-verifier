@@ -446,7 +446,8 @@ class KeyVaultKeyReader:
                 or not isinstance(key.get("n"),str) or not isinstance(key.get("e"),str)
                 or attributes.get("enabled") is not True or attributes.get("exportable") is not False):core.fail("kv-read-shape")
         projected_attributes={name:attributes.get(name) for name in ("enabled","nbf","exp","created","updated","recoveryLevel","recoverableDays","exportable")}
-        if (any(type(projected_attributes[name]) is not int for name in ("nbf","exp","created","updated","recoverableDays"))
+        if (any(type(projected_attributes[name]) is not int for name in ("exp","created","updated","recoverableDays"))
+                or (projected_attributes["nbf"] is not None and (type(projected_attributes["nbf"]) is not int or projected_attributes["nbf"]>projected_attributes["created"]))
                 or not isinstance(projected_attributes["recoveryLevel"],str) or not projected_attributes["recoveryLevel"]):core.fail("kv-read-attributes")
         return {"kid":key["kid"],"kty":key["kty"],"key_ops":key["key_ops"],"n":key["n"],"e":key["e"],"attributes":projected_attributes}
 
