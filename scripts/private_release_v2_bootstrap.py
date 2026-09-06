@@ -5932,13 +5932,18 @@ def _validate_operation_source_projection(
             or attributes["exportable"] is not False
             or any(
                 type(attributes[name]) is not int
-                for name in ("nbf", "exp", "created", "updated", "recoverableDays")
+                for name in ("exp", "created", "updated", "recoverableDays")
             )
             or not isinstance(attributes["recoveryLevel"], str)
             or not attributes["recoveryLevel"]
             or attributes["recoverableDays"] != 90
             or attributes["exp"] != signing_key.get("expiresAt")
-            or attributes["nbf"] > attributes["created"]
+            # Azure may omit the optional not-before attribute. Retain null in
+            # the source-bound projection instead of inventing a timestamp.
+            or (attributes["nbf"] is not None and (
+                type(attributes["nbf"]) is not int
+                or attributes["nbf"] > attributes["created"]
+            ))
             or attributes["created"] > attributes["updated"]
         ):
             fail("public JWK terminal projection is not exact")
@@ -13013,6 +13018,7 @@ class AzureCliBootstrapTransport:
             started = self.clock()
             attempts = 0
             last_error: BootstrapError | None = None
+            stop_error: BootstrapError | None = None
             expires = parse_time(
                 self.authorization["validity"]["expiresAt"],
                 "authorization expiresAt",
@@ -13040,18 +13046,25 @@ class AzureCliBootstrapTransport:
             while attempts < 64:
                 before_request = self.clock()
                 if before_request < not_before or before_request >= deadline:
-                    last_error = BootstrapError("authorization or convergence window expired before readback")
+                    stop_error = BootstrapError("authorization or convergence window expired before readback")
                     break
                 attempts += 1
-                response = self._read_request_with_transport_retry(
-                    expected["method"],
-                    expected["url"],
-                    body=b"" if expected["method"] == "POST" else None,
-                    deadline=deadline,
-                )
+                try:
+                    response = self._read_request_with_transport_retry(
+                        expected["method"],
+                        expected["url"],
+                        body=b"" if expected["method"] == "POST" else None,
+                        deadline=deadline,
+                    )
+                except BootstrapError as exc:
+                    # Preserve the preceding validation failure when a later
+                    # read cannot fit its full envelope or exhausts transport
+                    # retries. Do not issue another request or extend a limit.
+                    stop_error = exc
+                    break
                 after_response = self.clock()
                 if after_response >= deadline:
-                    last_error = BootstrapError("authorization or convergence window expired during readback")
+                    stop_error = BootstrapError("authorization or convergence window expired during readback")
                     break
                 try:
                     observed = self._validate_readback_response(
@@ -13079,7 +13092,9 @@ class AzureCliBootstrapTransport:
             else:  # pragma: no cover - loop exits through success/break
                 last_error = BootstrapError("readback did not converge")
             if len(proofs) == 0 or proofs[-1]["id"] != probe_id:
-                detail = str(last_error) if last_error is not None else "unknown drift"
+                detail = str(last_error or stop_error or "unknown drift")
+                if last_error is not None and stop_error is not None:
+                    detail += f"; readback stopped: {stop_error}"
                 fail(f"{label} readback did not converge: {probe_id}: {detail}")
         return proofs
 

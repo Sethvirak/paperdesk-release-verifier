@@ -319,6 +319,20 @@ non-exportable attributes, exact version, and minimum remaining lifetime must
 match S2 evidence and the sealed JWK. The signer identity remains separate and
 has only `Microsoft.KeyVault/vaults/keys/sign/action` on that key version.
 
+Azure's [`nbf` key attribute](https://learn.microsoft.com/en-us/azure/key-vault/keys/about-keys-details#key-attributes)
+is optional. An omitted or null value is retained as explicit `nbf: null` in the
+canonical public-key projection; no timestamp is invented. A supplied value must
+be an integer no later than the key's creation time. Bootstrap, activation
+evidence, and the bridge reader enforce the same rule. Exact key/version,
+projection digests, enabled/non-exportable status, required expiry and recovery
+attributes, and the separate version-inventory comparison still apply.
+
+If a later readback cannot fit its request envelope or exhausts its existing
+transport retries, the failure includes the probe and preceding validation error
+when available. This diagnostic handling does not extend the convergence window,
+authorization, cleanup reserve, or request/retry limits, and retains no raw
+response body.
+
 Authorization evidence is produced by exhaustive, paginated subscription-scope
 role-assignment inventories for each automation principal. Direct
 `principalId eq` and effective `assignedTo(...)` projections must both equal the

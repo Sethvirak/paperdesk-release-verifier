@@ -546,7 +546,8 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
             or key_data.get("n")!=activation["signingPublicJwk"]["n"] or key_data.get("e")!=activation["signingPublicJwk"]["e"]
             or not isinstance(key_data_attributes,dict) or set(key_data_attributes)!=key_data_attribute_fields
             or key_data_attributes.get("enabled") is not True or key_data_attributes.get("exportable") is not False
-            or any(type(key_data_attributes.get(name)) is not int for name in ("nbf","exp","created","updated","recoverableDays"))
+            or any(type(key_data_attributes.get(name)) is not int for name in ("exp","created","updated","recoverableDays"))
+            or (key_data_attributes["nbf"] is not None and (type(key_data_attributes["nbf"]) is not int or key_data_attributes["nbf"]>key_data_attributes["created"]))
             or not isinstance(key_data_attributes.get("recoveryLevel"),str) or not key_data_attributes["recoveryLevel"]
             or key_data_attributes["exp"]!=key_attributes["expiresOn"]
             or key_boundary.get("keyDataPlaneProjectionSha256")!=digest(canonical(key_data))
