@@ -208,9 +208,19 @@ class PackageReadinessTests(unittest.TestCase):
 
     def test_authorization_expiry_and_package_cap_bound_only_gets(self):
         self.assertEqual(bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS, 600)
-        self.assertEqual(bootstrap.MAX_PACKAGE_READINESS_SECONDS, 1890)
-        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 3900)
-        for expiry_seconds in (3, 1800, 3900):
+        self.assertEqual(bootstrap.MAX_PACKAGE_READINESS_SECONDS, 1891)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4171)
+        modeled_cleanup_without_local_margin = (
+            9 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            + bootstrap.cleanup_locks.LOCK_CONVERGENCE_SECONDS
+            + bootstrap.cleanup_locks.LOCK_FINAL_OBSERVATION_SECONDS
+            + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+        )
+        self.assertEqual(
+            bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS,
+            modeled_cleanup_without_local_margin + 30,
+        )
+        for expiry_seconds in (3, 1800, 4171):
             with self.subTest(expiry_seconds=expiry_seconds):
                 self.current = NOW
                 self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=expiry_seconds))
@@ -219,7 +229,7 @@ class PackageReadinessTests(unittest.TestCase):
                     self.upload(transport)
                 self.assertLessEqual(len(session.requests), 64)
                 self.assertTrue(all(item[0] == "GET" for item in session.requests))
-                self.assertLessEqual((self.current - NOW).total_seconds(), min(expiry_seconds, 1890))
+                self.assertLessEqual((self.current - NOW).total_seconds(), min(expiry_seconds, 1891))
                 self.assertEqual(journal.records, [])
 
     def test_put_error_and_transport_ambiguity_are_never_replayed(self):
@@ -327,18 +337,30 @@ class PackageReadinessTests(unittest.TestCase):
                         self.assertEqual(self.sleeps, [])
                         continue
                     expected_elapsed = (
-                        deadline - follow_on_reserve
+                        deadline
+                        - follow_on_reserve
+                        - bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
                     )
                     self.assert_package_diagnostic(error.exception, attempts=len(session.requests),
                         status=403, code=code, elapsed=expected_elapsed, reason="deadline")
                     self.assertEqual((self.current - NOW).total_seconds(), expected_elapsed)
                     self.assertLessEqual(len(session.requests), 64)
                     self.assertEqual(self.sleeps[:5], [1, 2, 4, 8, 16])
-                    self.assertTrue(all(0 < seconds <= 32 for seconds in self.sleeps))
+                    self.assertTrue(
+                        all(
+                            0 < seconds
+                            <= bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                            for seconds in self.sleeps
+                        )
+                    )
                     self.assertEqual(
                         error.exception.diagnostic["attemptRecords"][-1]["startedAt"],
                         (NOW + dt.timedelta(
-                            seconds=deadline - follow_on_reserve
+                            seconds=(
+                                deadline
+                                - follow_on_reserve
+                                - bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                            )
                         )).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     )
                     self.assertTrue(all(method == "GET" and url == self.url and body is None
@@ -346,9 +368,10 @@ class PackageReadinessTests(unittest.TestCase):
                     self.assertEqual(journal.records, [])
 
     def test_deadline_adjacent_final_get_can_observe_exact_absence(self):
-        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=3900))
+        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=4171))
         final_at = NOW + dt.timedelta(
             seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
+            - bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
             - bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
         response = lambda: (
@@ -364,6 +387,53 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertTrue(all(value == NOW + dt.timedelta(
             seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
         ) for value in session.deadlines))
+        self.assertEqual(journal.records, [])
+
+    def test_real_scheduler_overshoot_still_runs_one_boundary_get(self):
+        self.authorization["validity"]["expiresAt"] = stamp(
+            NOW + dt.timedelta(seconds=4171)
+        )
+        boundary = NOW + dt.timedelta(seconds=1800)
+        request_times = []
+
+        def response():
+            request_times.append(self.current)
+            return (
+                storage_error(404, "BlobNotFound")
+                if self.current >= boundary
+                else self.private_error()
+            )
+
+        transport, session, journal = self.transport([response], repeat=True)
+
+        def real_clock_sleep(seconds):
+            self.sleeps.append(seconds)
+            target = self.current + dt.timedelta(seconds=seconds)
+            self.current = target + (
+                dt.timedelta(milliseconds=500)
+                if target == boundary
+                else dt.timedelta(0)
+            )
+
+        transport.sleep = real_clock_sleep
+        transport._prove_package_upload_ready(self.url)
+        self.assertEqual(request_times[-1], boundary + dt.timedelta(milliseconds=500))
+        self.assertLessEqual(
+            request_times[-1],
+            boundary
+            + dt.timedelta(
+                seconds=bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            ),
+        )
+        self.assertTrue(
+            all(
+                item
+                == NOW + dt.timedelta(
+                    seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
+                )
+                for item in session.deadlines
+            )
+        )
         self.assertEqual(journal.records, [])
 
     def test_full_final_get_envelope_preserves_role_cleanup_reserve(self):
@@ -518,7 +588,10 @@ class PackageReadinessTests(unittest.TestCase):
         expected_deadline = min(
             self.current
             + dt.timedelta(seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
-            transport._protected_work_deadline,
+            transport._protected_work_deadline
+            - dt.timedelta(
+                seconds=2 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            ),
         )
         transport._prove_fence_blob_create_ready(fence_url)
         self.assertEqual([item[0] for item in session.requests], ["GET", "GET"])
@@ -633,7 +706,9 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(result["versionId"], "version-1")
 
     def test_package_propagation_after_ten_minutes_admits_one_put(self):
-        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=3900))
+        self.authorization["validity"]["expiresAt"] = stamp(
+            NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
+        )
         ready_at = NOW + dt.timedelta(minutes=20)
         def response():
             if session.requests[-1][0] == "PUT":
@@ -737,14 +812,24 @@ class PackageReadinessTests(unittest.TestCase):
 
     def test_package_role_diagnostics_hash_only_validated_observed_projections(self):
         transport, session, journal = self.transport([self.private_error(code="AuthenticationFailed")])
-        definition, assignment = {"permissions": ["read"]}, {"scope": "exact"}
+        definitions = {
+            "packageAdd": {"permissions": ["add"]},
+            "packageRead": {"permissions": ["read"]},
+        }
+        assignments = {
+            "packageAdd": {"scope": "exact-add"},
+            "packageRead": {"scope": "exact-read"},
+        }
         transport._validated_source_projections["addOwnedUploaderPackageRole"] = {
             "family": "temporary-role-projection",
-            "projection": {"definition": definition, "assignment": assignment},
+            "projection": {
+                "definitions": definitions,
+                "assignments": assignments,
+            },
         }
         expected = {
-            "definitionSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(definition)),
-            "assignmentSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(assignment)),
+            "definitionSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(definitions)),
+            "assignmentSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(assignments)),
         }
         with self.assertRaises(bootstrap.PackageReadinessError) as error:
             transport._prove_package_upload_ready(self.url)

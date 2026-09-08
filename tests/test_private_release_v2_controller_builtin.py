@@ -92,7 +92,11 @@ class ControllerBuiltinTests(unittest.TestCase):
         def guarded_delete(operation_id, resource_id, expected_projection):
             self.assertEqual(operation_id, REMOVE)
             self.assertEqual(resource_id, assignment["id"])
-            self.assertEqual(expected_projection, bootstrap._project_role_assignment(assignment))
+            projected_assignment = bootstrap._project_role_assignment(assignment)
+            projected_assignment["properties"]["description"] = assignment[
+                "properties"
+            ]["description"]
+            self.assertEqual(expected_projection, projected_assignment)
             transport._arm_delete(resource_id, "2022-04-01")
             transport._last_guarded_assignment_was_present = True
             return bootstrap._expected_deletion_lock_proof(REMOVE)

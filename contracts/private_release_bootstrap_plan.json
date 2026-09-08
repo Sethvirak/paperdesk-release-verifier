@@ -346,8 +346,8 @@
       "namespace": "15a228ac-3249-535f-940d-d915c5ce4b70",
       "nameTemplate": "{authorizationId}:{label}",
       "labels": {
-        "roleDefinitionId": "package-role-definition",
-        "roleAssignmentId": "package-role-assignment",
+        "temporaryPackageAddRoleAssignmentId": "package-add-role-assignment",
+        "temporaryPackageReadRoleAssignmentId": "package-read-role-assignment",
         "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
         "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
@@ -355,7 +355,31 @@
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
       }
     },
-    "roleDefinitionProjection": "authorization-specific-custom-except-read-only-controller-builtin",
+    "roleDefinitionProjection": "stable-package-and-controller-definitions-read-only-preserved-other-temporary-definitions-authorization-specific",
+    "temporaryPackageRoles": {
+      "definitionLifecycle": "role-matrix-stable-read-only-preserved",
+      "assignmentLifecycle": "authorization-specific-create-and-delete",
+      "cleanupLifecycle": "one-reviewed-lock-suspension-for-both-assignment-deletes",
+      "scope": "packageContainer",
+      "roles": [
+        {
+          "name": "packageAdd",
+          "roleMatrixName": "writerPackageAdd",
+          "definitionId": "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d",
+          "roleMatrixAssignmentId": "3bb19352-f72e-5a39-b6b1-6c1be4029c43",
+          "assignmentIdField": "temporaryPackageAddRoleAssignmentId",
+          "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]
+        },
+        {
+          "name": "packageRead",
+          "roleMatrixName": "readerPackageRead",
+          "definitionId": "e005b62b-037b-4989-b492-932669ec0842",
+          "roleMatrixAssignmentId": "e76ee175-25d6-52c1-9cd8-9cd28c01e114",
+          "assignmentIdField": "temporaryPackageReadRoleAssignmentId",
+          "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
+        }
+      ]
+    },
     "temporaryControllerRole": {
       "definitionId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
       "definitionKind": "BuiltInRole",
@@ -364,7 +388,6 @@
       "scope": "controllerLockContainer",
       "projection": "fresh-full-canonical-preflight-projection"
     },
-    "temporaryPackageDataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"],
     "scope": "packageContainer",
     "principal": "${authorization.azure.accountObjectId}",
     "uploadAuth": "azure-ad",
@@ -382,7 +405,7 @@
     "activationFenceLeaseId": "c28f7730-431d-5c52-b885-8e43154d1ddb",
     "leaseDurationSeconds": 60,
     "leaseRenewals": 1,
-    "cleanup": "remove-only-owned-ip-rule-custom-role-definitions-and-assignments-controller-canary-blob-and-controller-assignment-preserve-controller-builtin-definition"
+    "cleanup": "remove-only-owned-ip-rule-package-assignments-other-temporary-definitions-and-assignments-and-controller-canary-blob-and-assignment-preserve-both-stable-package-definitions-and-controller-builtin-definition"
   },
   "deletionProtection": {
     "locks": {
@@ -447,10 +470,10 @@
     {"id": "bridgePrivateStoppedAfterCanary", "predicate": "V2 bridge is private and Stopped after bounded canary with only the five planned UAMIs"},
     {"id": "legacyBridgeRetired", "predicate": "legacy bridge remains Stopped private with no UAMI transient settings or publisher mutator"},
     {"id": "storageFinalNetworkExact", "predicate": "public network enabled for service endpoint only, blob public access false, default Deny, bypass None, no ipRules, no resourceAccessRules, exactly the pinned subnet Allow Succeeded"},
-    {"id": "temporaryUploaderAccessAbsent", "predicate": "the exact uploader IPv4 rule and exact temporary role assignment are absent after fresh readback"},
+    {"id": "temporaryUploaderAccessAbsent", "predicate": "the exact uploader IPv4 rule and both exact temporary package role assignments are absent after fresh readback, and both stable package role definitions are present and exact"},
     {"id": "temporaryOperatorKeyReadAbsent", "predicate": "the exact temporary key-read assignment and role definition are absent after fresh readback"},
     {"id": "temporaryOperatorFenceAccessAbsent", "predicate": "the exact temporary fence bootstrap assignment and role definition are absent after fresh readback"},
-    {"id": "temporaryControllerCanaryAccessAbsent", "predicate": "the exact temporary controller canary blob assignment and role definition are absent after fresh readback"},
+    {"id": "temporaryControllerCanaryAccessAbsent", "predicate": "the exact temporary controller canary blob and role assignment are absent after fresh readback, and the built-in role definition is present and exact"},
     {"id": "wormPoliciesLockedAtLeast91Days", "predicate": "accepted packages and results are private Locked for at least 91 days with append flags false"},
     {"id": "vaultNotDowngraded", "predicate": "vault RBAC purge protection and 90-day soft delete remain and network posture is equal or stricter than preflight"},
     {"id": "signingKeyExact", "predicate": "one enabled nonexportable RSA 3072 sign verify key version with no release policy and at least 30 days remaining is sealed"},

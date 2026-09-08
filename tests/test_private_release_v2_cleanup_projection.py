@@ -34,8 +34,29 @@ class CleanupProjectionTests(unittest.TestCase):
                 projection = proof["sourceProjection"]
                 self.assertEqual(projection["family"], "temporary-role-cleanup-absence")
                 body = projection["projection"]
-                self.assertEqual(body["assignmentAbsenceProjection"],
-                                 {"resourceId": facts["assignmentResourceId"], "absent": True})
+                if operation_id == "removeOwnedUploaderPackageRole":
+                    self.assertEqual(
+                        body["assignmentAbsenceProjections"],
+                        facts["assignmentAbsenceProjections"],
+                    )
+                    self.assertEqual(
+                        body["definitionPreservationProjections"],
+                        facts["definitionPreservationProjections"],
+                    )
+                    self.assertEqual(
+                        set(body["assignmentAbsenceProjections"]),
+                        {"packageAdd", "packageRead"},
+                    )
+                    self.assertFalse(
+                        any(
+                            method == "DELETE"
+                            and url in session.definition_urls.values()
+                            for method, url in session.mutations()
+                        )
+                    )
+                else:
+                    self.assertEqual(body["assignmentAbsenceProjection"],
+                                     {"resourceId": facts["assignmentResourceId"], "absent": True})
                 if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
                     self.assertEqual(body["definitionPreservationProjection"], {
                         "resourceId": facts["definitionResourceId"], "present": True,
@@ -43,7 +64,7 @@ class CleanupProjectionTests(unittest.TestCase):
                     })
                     self.assertFalse(body["definitionRemoved"])
                     self.assertNotIn("definitionAbsenceProjection", body)
-                else:
+                elif operation_id != "removeOwnedUploaderPackageRole":
                     self.assertEqual(body["definitionAbsenceProjection"],
                                      {"resourceId": facts["definitionResourceId"], "absent": True})
                 self.assertEqual(body["deletionLock"], bootstrap._expected_deletion_lock_proof(operation_id))
@@ -72,28 +93,61 @@ class CleanupProjectionTests(unittest.TestCase):
             facts = transport._mutate(operation, state)
             readback = session.request("GET", probe["url"])
             variants = [("all missing", None)]
-            builtin = operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS
-            definition_proof = "definitionPreservationProjection" if builtin else "definitionAbsenceProjection"
-            for field in ("cleanupKey", "assignmentResourceId", "definitionResourceId",
-                          "assignmentRemoved", "definitionRemoved", "assignmentAbsenceProjection",
-                          definition_proof, "deletionLock"):
-                missing = copy.deepcopy(facts)
-                missing.pop(field)
-                variants.append(("missing " + field, missing))
-                malformed = copy.deepcopy(facts)
-                malformed[field] = "unrelated"
-                variants.append(("malformed " + field, malformed))
-            for field in ("assignmentAbsenceProjection", definition_proof):
-                changed = copy.deepcopy(facts)
-                changed[field]["present" if builtin and field == definition_proof else "absent"] = False
-                variants.append(("wrong presence " + field, changed))
-            if builtin:
-                changed = copy.deepcopy(facts)
-                changed[definition_proof]["projection"]["properties"]["permissions"][0]["dataActions"].append("unreviewed/action")
-                variants.append(("built-in definition drift", changed))
-                changed = copy.deepcopy(facts)
-                changed["definitionRemoved"] = True
-                variants.append(("built-in definition claimed deleted", changed))
+            if operation_id == "removeOwnedUploaderPackageRole":
+                for field in (
+                    "cleanupKey",
+                    "definitionLifecycle",
+                    "definitionResourceIds",
+                    "assignmentResourceIds",
+                    "assignmentRemoved",
+                    "assignmentAbsenceProjections",
+                    "definitionPreservationProjections",
+                    "deletionLock",
+                ):
+                    missing = copy.deepcopy(facts)
+                    missing.pop(field)
+                    variants.append(("missing " + field, missing))
+                    malformed = copy.deepcopy(facts)
+                    malformed[field] = "unrelated"
+                    variants.append(("malformed " + field, malformed))
+                for member in ("packageAdd", "packageRead"):
+                    changed = copy.deepcopy(facts)
+                    changed["assignmentRemoved"][member] = False
+                    variants.append(("assignment not removed " + member, changed))
+                    changed = copy.deepcopy(facts)
+                    changed["assignmentAbsenceProjections"][member]["absent"] = False
+                    variants.append(("wrong assignment absence " + member, changed))
+                    changed = copy.deepcopy(facts)
+                    changed["definitionPreservationProjections"][member]["present"] = False
+                    variants.append(("wrong definition preservation " + member, changed))
+                    changed = copy.deepcopy(facts)
+                    changed["definitionPreservationProjections"][member]["projection"][
+                        "properties"
+                    ]["permissions"][0]["dataActions"].append("unreviewed/action")
+                    variants.append(("stable definition drift " + member, changed))
+            else:
+                builtin = operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS
+                definition_proof = "definitionPreservationProjection" if builtin else "definitionAbsenceProjection"
+                for field in ("cleanupKey", "assignmentResourceId", "definitionResourceId",
+                              "assignmentRemoved", "definitionRemoved", "assignmentAbsenceProjection",
+                              definition_proof, "deletionLock"):
+                    missing = copy.deepcopy(facts)
+                    missing.pop(field)
+                    variants.append(("missing " + field, missing))
+                    malformed = copy.deepcopy(facts)
+                    malformed[field] = "unrelated"
+                    variants.append(("malformed " + field, malformed))
+                for field in ("assignmentAbsenceProjection", definition_proof):
+                    changed = copy.deepcopy(facts)
+                    changed[field]["present" if builtin and field == definition_proof else "absent"] = False
+                    variants.append(("wrong presence " + field, changed))
+                if builtin:
+                    changed = copy.deepcopy(facts)
+                    changed[definition_proof]["projection"]["properties"]["permissions"][0]["dataActions"].append("unreviewed/action")
+                    variants.append(("built-in definition drift", changed))
+                    changed = copy.deepcopy(facts)
+                    changed["definitionRemoved"] = True
+                    variants.append(("built-in definition claimed deleted", changed))
             changed = copy.deepcopy(facts)
             changed["deletionLock"]["restored"] = False
             variants.append(("lock not restored", changed))

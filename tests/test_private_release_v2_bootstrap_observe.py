@@ -426,7 +426,6 @@ class FakeReadOnlySession:
             temporary_definition_ids = {
                 str(self.plan["temporaryAccess"][key]).lower()
                 for key in (
-                    "roleDefinitionId",
                     "temporaryKeyReadRoleDefinitionId",
                     "temporaryFenceRoleDefinitionId",
                 )
@@ -435,9 +434,19 @@ class FakeReadOnlySession:
                 str(spec["definitionId"]).lower()
                 for spec in bootstrap.RETIRED_TEMPORARY_ROLE_SPECS
             )
+            stable_package_definitions = {
+                spec["definitionId"].lower(): copy.deepcopy(
+                    spec["definitionProjection"]
+                )
+                for spec in bootstrap._stable_package_role_specs(self.plan)
+            }
             if definition_id in temporary_definition_ids:
                 status = 404
                 body = {}
+                matching = []
+            elif definition_id in stable_package_definitions:
+                status = 200
+                body = stable_package_definitions[definition_id]
                 matching = []
             else:
                 matching = [
@@ -446,7 +455,11 @@ class FakeReadOnlySession:
                     if role.get("definitionKind") == "BuiltInRole"
                     and role["definitionId"].lower() == definition_id
                 ]
-            if definition_id not in temporary_definition_ids and not matching:
+            if (
+                definition_id not in temporary_definition_ids
+                and definition_id not in stable_package_definitions
+                and not matching
+            ):
                 raise AssertionError("unexpected built-in role-definition read")
             if matching:
                 status = 200
@@ -2301,26 +2314,82 @@ class ObserveTests(unittest.TestCase):
             ):
                 self.build(folder, RetainedUploaderAclSession(self.plan))
 
-    def test_retained_temporary_role_definition_blocks_fresh_observation(self):
+    def test_stable_package_definitions_and_both_temporary_assignments_are_bound(self):
         bound_plan = bootstrap.bind_temporary_role_ids(
             self.plan, AUTHORIZATION_ID
         )
-        definition_url = bootstrap._temporary_role_definition_readback_url(
+        definition_urls = bootstrap._temporary_role_definition_readback_urls(
             "addOwnedUploaderPackageRole", bound_plan
         )
-        self.assertIsNotNone(definition_url)
+        assignment_urls = [
+            "https://management.azure.com"
+            + resource_id
+            + "?api-version=2022-04-01"
+            for resource_id in bootstrap._temporary_package_assignment_resources(
+                bound_plan
+            ).values()
+        ]
+        self.assertEqual(len(definition_urls), 2)
+        self.assertEqual(len(assignment_urls), 2)
 
-        class RetainedTemporaryRoleDefinitionSession(FakeReadOnlySession):
+        with tempfile.TemporaryDirectory() as folder:
+            session, preflight, _template = self.build(folder)
+        admission = next(
+            item
+            for item in preflight["projection"]["operationAdmissions"]
+            if item["operationId"] == "addOwnedUploaderPackageRole"
+        )
+        probes = {
+            item["id"]: item for item in preflight["projection"]["probes"]
+        }
+        bound_probes = [probes[item] for item in admission["probeIds"]]
+        for definition_url in definition_urls:
+            matches = [item for item in bound_probes if item["url"] == definition_url]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["status"], 200)
+        for assignment_url in assignment_urls:
+            matches = [item for item in bound_probes if item["url"] == assignment_url]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["status"], 404)
+        self.assertEqual(
+            admission["context"]["stablePackageRoleDefinitionProjections"],
+            bootstrap._validate_stable_package_role_definitions(
+                {
+                    spec["name"]: spec["definitionProjection"]
+                    for spec in bootstrap._stable_package_role_specs(bound_plan)
+                },
+                bound_plan,
+            ),
+        )
+        self.assertTrue(
+            set((*definition_urls, *assignment_urls)).issubset(
+                {request.url for request in session.requests}
+            )
+        )
+
+    def test_existing_temporary_package_assignment_blocks_fresh_observation(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        assignment_url = (
+            "https://management.azure.com"
+            + list(
+                bootstrap._temporary_package_assignment_resources(bound_plan).values()
+            )[1]
+            + "?api-version=2022-04-01"
+        )
+
+        class RetainedTemporaryPackageAssignmentSession(FakeReadOnlySession):
             def read(self, request):
                 response = super().read(request)
-                if request.url == definition_url:
+                if request.url == assignment_url:
                     return observe.ReadResponse(
                         method=response.method,
                         url=response.url,
                         status=200,
                         headers={},
                         body={
-                            "id": definition_url.split("?", 1)[0].removeprefix(
+                            "id": assignment_url.split("?", 1)[0].removeprefix(
                                 "https://management.azure.com"
                             )
                         },
@@ -2330,11 +2399,47 @@ class ObserveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaisesRegex(
                 observe.ObserveError,
-                "temporary role definition is already present before bootstrap",
+                "temporary package assignment is already present before bootstrap",
             ):
                 self.build(
                     folder,
-                    RetainedTemporaryRoleDefinitionSession(self.plan),
+                    RetainedTemporaryPackageAssignmentSession(self.plan),
+                )
+
+    def test_drifted_stable_package_definition_blocks_fresh_observation(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        definition_url = bootstrap._temporary_role_definition_readback_urls(
+            "addOwnedUploaderPackageRole", bound_plan
+        )[0]
+
+        class DriftedStablePackageDefinitionSession(FakeReadOnlySession):
+            def read(self, request):
+                response = super().read(request)
+                if request.url == definition_url:
+                    body = copy.deepcopy(response.body)
+                    body["properties"]["permissions"][0]["dataActions"].append(
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "blobs/delete"
+                    )
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=response.status,
+                        headers=response.headers,
+                        body=body,
+                    )
+                return response
+
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "stable package role definition is incomplete or drifted",
+            ):
+                self.build(
+                    folder,
+                    DriftedStablePackageDefinitionSession(self.plan),
                 )
 
     def test_existing_registry_role_authority_drift_fails_closed(self):

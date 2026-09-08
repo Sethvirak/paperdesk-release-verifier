@@ -165,7 +165,7 @@ class BatchTests(unittest.TestCase):
         self.assertNotIn("confirmation", template)
         self.assertEqual(bootstrap.parse_time(template["proposedValidity"]["notBefore"], "start"), fixtures.NOW)
         self.assertEqual(bootstrap.parse_time(template["proposedValidity"]["expiresAt"], "end"),
-                         fixtures.NOW + dt.timedelta(seconds=3900))
+                         fixtures.NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS))
 
 
 if __name__ == "__main__":
