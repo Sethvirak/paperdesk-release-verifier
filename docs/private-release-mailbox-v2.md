@@ -365,6 +365,14 @@ canonical body hash, metadata, ETag, and version ID. Missing receipt evidence
 keeps the normal conditional-create path; partial or changed evidence, or any
 live blob drift, fails closed without replacing the blob.
 
+The versioned package has the same restart rule when a later failed bootstrap
+definitely created the exact source-keyed ZIP. Pinned canonical intent, result,
+and terminal receipts may select `adopt-exact` only for the same merged source
+and package digest. After the temporary package roles become active, execution
+must still read and match every package byte, its size, ETag, and version ID.
+Missing receipts keep conditional create; changed receipts or live bytes fail
+closed without replacing the package.
+
 Health proof binds the runtime marker, served index SHA-256, live, ready,
 app-health and security responses, plus the historical full OneDeploy collection
 invariant: historical deployment ID, canonical full-collection semantic digest,

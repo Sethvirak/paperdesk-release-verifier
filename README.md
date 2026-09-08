@@ -279,6 +279,13 @@ idle body, metadata, ETag, and version after the temporary fence role becomes
 active. Receipt absence uses the ordinary create path, while receipt or live
 state drift stops without overwriting the fence.
 
+The exact versioned bridge package created by a later failed bootstrap can be
+adopted under the same receipt-bound rule. The observer accepts only the pinned
+intent, successful result, and consumed terminal receipts for the same merged
+source and package digest. Execution then performs the ordinary live byte,
+size, ETag, and version readback after temporary package access becomes active;
+receipt absence uses conditional create and any drift stops without overwrite.
+
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
 conditional create phase; recognized authorization-propagation 403s may wait for
