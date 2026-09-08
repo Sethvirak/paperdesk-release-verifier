@@ -198,7 +198,7 @@ class Tests(unittest.TestCase):
 
     def test_entry_constructs_only_bridge_identity_and_fence_clients(self):
         control = self.control()
-        raw = core.canonical(control).decode()
+        raw = core.canonical(control)[:-1].decode()
         token_instances = []
         fence_instances = []
 
@@ -287,6 +287,21 @@ class Tests(unittest.TestCase):
             entry.azure, "ManagedIdentityTokens", side_effect=AssertionError("constructed")
         ):
             with self.assertRaisesRegex(core.MailboxError, "entry-bootstrap-self-test"):
+                entry.run_bootstrap_self_test(core.canonical(control)[:-1].decode())
+
+    def test_entry_rejects_file_format_terminal_lf_before_client_construction(self):
+        control = self.control()
+        with mock.patch.dict(
+            entry.os.environ,
+            {
+                "WEBSITE_SITE_NAME": core.FIXED_COORDS["bridgeApp"],
+                "PAPERDESK_BRIDGE_PACKAGE_SHA256": control["packageSha256"],
+            },
+            clear=True,
+        ), mock.patch.object(
+            entry.azure, "ManagedIdentityTokens", side_effect=AssertionError("constructed")
+        ):
+            with self.assertRaisesRegex(core.MailboxError, "entry-bootstrap-self-test"):
                 entry.run_bootstrap_self_test(core.canonical(control).decode())
 
     def test_entry_rejects_unbound_authorization_before_client_construction(self):
@@ -312,7 +327,7 @@ class Tests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         core.MailboxError, "entry-bootstrap-self-test"
                     ):
-                        entry.run_bootstrap_self_test(core.canonical(control).decode())
+                        entry.run_bootstrap_self_test(core.canonical(control)[:-1].decode())
 
 
 if __name__ == "__main__":

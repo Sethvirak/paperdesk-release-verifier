@@ -97,7 +97,7 @@ class CanaryTimingTests(unittest.TestCase):
         prior = f.operations
         projection = prior[CONFIGURE]["projection"]
         control = b._bootstrap_self_test_control_from_projections(self.auth, prior)
-        self.assertEqual(b.sha256_bytes(b.canonical_json_bytes(control)), projection["bootstrapSelfTestControlSha256"])
+        self.assertEqual(b.sha256_bytes(b.canonical_app_setting_json(control).encode("utf-8")), projection["bootstrapSelfTestControlSha256"])
         tampered = dict(projection, bootstrapSelfTestExpiresAt=stamp(NOW + dt.timedelta(seconds=901)))
         with self.assertRaises(b.BootstrapError):
             b._bootstrap_self_test_control_from_projections(self.auth, prior, tampered)

@@ -149,9 +149,9 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                 "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.fixture.package["sha256"],
                 "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": (
-                    bootstrap.canonical_json_bytes(
+                    bootstrap.canonical_app_setting_json(
                         details["bootstrapSelfTestControl"]
-                    ).decode("utf-8")
+                    )
                 ),
             }
         )

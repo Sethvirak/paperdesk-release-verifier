@@ -335,6 +335,27 @@ readback. Old needs no write and every observed third state stops for manual rec
 The confirmation phrase explicitly accepts that neither read/PUT window can
 atomically exclude an out-of-band subscription or resource-group Owner.
 
+Canonical repository JSON files end in one LF. A JSON document embedded in an
+App Setting omits exactly that file delimiter because App Service normalizes a
+terminal LF away. Bootstrap configuration, compensation, source projections,
+and the bridge package all hash and compare the exact no-LF App Setting string.
+The incident-specific recovery executor accepts only the proven PR55 normalized
+five-setting digest and can restore only the source-bound empty map after a
+separate exact authorization and final live read. It binds that authorization
+to one ProgramData ledger path derived from the authorization ID, validates the
+exact incident operator account, and rejects all Azure requests outside the
+reviewed reads and the sole empty-map PUT. The confirmation phrase commits the
+exact observation time, expiry, review digest, ledger path, and a separate
+ProgramData confirmation-artifact path that `observe` proves absent and never
+creates. Its emitted text request is structurally non-executable; `apply`
+accepts only the later canonical user-confirmation JSON artifact at that bound
+path. The ledger parent and each create-only ledger entry are durably flushed
+before the mutation. Immediately before intent, the executor reads the stopped
+site and then the exact incident settings map. The reviewed phrase explicitly
+accepts the remaining cross-resource race in which an unrelated administrator
+starts the site after that read; the executor never starts it, and final success
+requires another stopped-site proof.
+
 Health proof binds the runtime marker, served index SHA-256, live, ready,
 app-health and security responses, plus the historical full OneDeploy collection
 invariant: historical deployment ID, canonical full-collection semantic digest,

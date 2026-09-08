@@ -498,6 +498,42 @@ an exact prestate needs no settings write, and any observed third state must rem
 untouched for investigation. A fresh bootstrap observation may start only after
 the durable intent and both live states have been reconciled.
 
+App Setting JSON uses the same sorted, compact JSON payload as repository
+artifacts, but omits the artifact format's one terminal LF. Azure App Service
+normalizes that terminal LF away. The bootstrap and bridge self-test therefore
+hash and compare the exact no-LF App Setting string while canonical JSON files
+continue to end in LF.
+
+The PR55 LF-normalization incident has one dedicated recovery executor. Its
+default `describe` mode is credential-free. `observe` accepts only the fixed
+incident state, stopped bridge, restored locks, restored Storage firewall, and
+absent authorization-specific temporary RBAC. It emits a non-executable
+template. `apply` requires the exact user phrase, repeats every read, creates a
+one-use journal at the authorization-derived ProgramData path, and can issue
+only one no-retry full-map PUT from the exact normalized five-setting digest
+to `{}`. The reviewed phrase binds the observation time, expiry, immutable
+review commitment, sole ledger path, and separate confirmation-artifact path.
+The text request emitted by `observe` is not accepted as confirmation. After
+the user returns the exact phrase, the operator must create the canonical
+`USER_CONFIRMED_EXACT_PHRASE` JSON artifact at the bound ProgramData path. The
+caller cannot choose a second receipt or confirmation path:
+
+```bash
+python -B scripts/private_release_v2_bridge_settings_recovery.py describe
+python -B scripts/private_release_v2_bridge_settings_recovery.py observe \
+  --output-directory /external/recovery-observation
+python -B scripts/private_release_v2_bridge_settings_recovery.py apply \
+  --observation-directory /external/recovery-observation
+```
+
+The recovery executor cannot start the bridge or mutate RBAC, locks, Storage,
+production, packages, fences, retention, identities, or legacy resources. Its
+last boundary reads the stopped site and then App Settings immediately before
+the intent and PUT. Because Azure has no cross-resource atomic guard, the exact
+confirmation also accepts that another administrator could start the site after
+that stopped-state read; final success repeats and requires the stopped-site
+proof.
+
 If Azure execution and full terminal validation completed but the process died
 while creating the five S2 files, local finalization may resume without a token,
 transport, or credential construction and performs zero Azure requests or mutations. It requires the

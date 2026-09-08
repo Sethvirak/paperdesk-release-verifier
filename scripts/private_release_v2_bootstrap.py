@@ -1186,6 +1186,22 @@ def canonical_json_bytes(value: Any) -> bytes:
         raise BootstrapError("document is not canonical-JSON representable") from exc
 
 
+def canonical_app_setting_json(value: Any) -> str:
+    """Return canonical JSON without the file-format terminal LF.
+
+    Azure App Service trims a terminal line feed from App Setting values.  The
+    repository's canonical JSON files deliberately include one terminal LF,
+    so embedding ``canonical_json_bytes`` directly creates a value whose PUT
+    bytes and readback bytes can never be equal.  Remove exactly that owned
+    file delimiter at this boundary and keep the JSON payload unchanged.
+    """
+
+    raw = canonical_json_bytes(value)
+    if not raw.endswith(b"\n") or raw.endswith(b"\r\n"):
+        fail("canonical JSON terminal delimiter is not exact")
+    return raw[:-1].decode("utf-8")
+
+
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -6799,13 +6815,15 @@ def _validate_operation_source_projection(
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": authorization["plan"][
                     "bridgePackageSha256"
                 ],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": canonical_json_bytes(
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": canonical_app_setting_json(
                     control
-                ).decode("utf-8"),
+                ),
             }
         )
         expected_settings_sha = sha256_bytes(canonical_json_bytes(desired))
-        expected_control_sha = sha256_bytes(canonical_json_bytes(control))
+        expected_control_sha = sha256_bytes(
+            canonical_app_setting_json(control).encode("utf-8")
+        )
         if (
             body["preAppSettingsSha256"] != context.get("preAppSettingsSha256")
             or body["preAppSettingsSha256"]
@@ -15396,7 +15414,8 @@ class AzureCliBootstrapTransport:
         control = details.get("bootstrapSelfTestControl")
         if not isinstance(control, Mapping):
             fail("bridge settings compensation lacks its exact canary control")
-        control_bytes = canonical_json_bytes(control)
+        control_text = canonical_app_setting_json(control)
+        control_bytes = control_text.encode("utf-8")
         upload = self._proof_detail(state, "uploadVersionedBridgePackage")
         expected_package_url = (
             f"{upload.get('url')}?versionid="
@@ -15411,9 +15430,7 @@ class AzureCliBootstrapTransport:
                 ]["resourceId"],
                 "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": control_bytes.decode(
-                    "utf-8"
-                ),
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": control_text,
             }
         )
         desired_sha = sha256_bytes(canonical_json_bytes(desired))
@@ -16507,13 +16524,14 @@ class AzureCliBootstrapTransport:
             self_test_control = _bootstrap_self_test_control(
                 self.authorization, state, issued_at=self._timestamp(self.clock())
             )
-            self_test_control_bytes = canonical_json_bytes(self_test_control)
+            self_test_control_text = canonical_app_setting_json(self_test_control)
+            self_test_control_bytes = self_test_control_text.encode("utf-8")
             desired.update({
                 "WEBSITE_RUN_FROM_PACKAGE": expected_url,
                 "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": reader_id,
                 "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": self_test_control_bytes.decode("utf-8"),
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": self_test_control_text,
             })
             details = {
                 "resourceId": site["resourceId"] + "/config/appsettings",

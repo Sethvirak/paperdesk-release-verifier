@@ -1286,12 +1286,12 @@ class _TerminalEvidenceFixture:
                 "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": self.resources["registryReaderIdentity"]["resourceId"],
                 "WEBSITE_SKIP_RUNNING_KUDUAGENT": "false",
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.package["sha256"],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": bootstrap.canonical_json_bytes(control).decode("utf-8"),
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": bootstrap.canonical_app_setting_json(control),
             }
         )
         self.envelope(
             "configureBridgeExactVersionedPackageAndCriticalSettings",
-            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(control)), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
+            {"preAppSettingsSha256": configure_context["preAppSettingsSha256"], "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(desired_settings)), "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(bootstrap.canonical_app_setting_json(control).encode("utf-8")), "packageUrl": package_url, "packageVersionId": upload["versionId"], "bootstrapSelfTestIssuedAt": control["issuedAt"], "bootstrapSelfTestExpiresAt": control["expiresAt"], "settingsRequestBodySha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"properties": desired_settings}))},
         )
 
         def worm(operation_id):
