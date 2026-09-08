@@ -152,6 +152,19 @@ canary passed upload, exact readback, finite leases and conditional deletion
 with this built-in role. That diagnostic result does not establish the behavior
 of the other roles or authorize a bootstrap, activation, or production deployment.
 
+The package, activation-fence, and controller-canary blobs are all created with
+`If-None-Match: *`. Their preceding GET or container LIST proves read access and
+absence but cannot prove that the exact create action has propagated. Each create
+may therefore retry only after a durably journaled HTTP 403 whose strictly parsed
+Storage code is `AuthorizationFailure` or `AuthorizationPermissionMismatch`.
+Every attempt retains the exact target, body, metadata, API version, and
+conditional header while using a fresh client request ID. A concurrent create
+returns 409/412 and stops. Transport ambiguity, a late response, result-journal
+failure, 5xx, malformed or mismatched XML, and every other denial also stop; no
+GET or LIST is inserted between create attempts. Terminal evidence preserves
+each serial intent/result denial pair as a no-effect prefix and still requires
+exactly one final HTTP 201 with the ETag and version ID proven by readback.
+
 The executor retains one canonical, secret-free local-finalization snapshot
 only after Azure execution, cleanup, postconditions and the complete terminal
 bundle have validated. It create-only writes the five S2 bodies first and the

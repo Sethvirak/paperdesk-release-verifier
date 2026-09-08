@@ -13,6 +13,7 @@ from scripts import private_release_v2_bootstrap as bootstrap
 NOW = dt.datetime(2026, 9, 2, tzinfo=dt.timezone.utc)
 SOURCE = "2" * 40
 OPERATION = "uploadVersionedBridgePackage"
+FENCE_OPERATION = "createInitialIdleActivationFence"
 SECRET = "Bearer package-private-token 203.0.113.41 package-raw-secret"
 
 
@@ -110,6 +111,11 @@ class PackageReadinessTests(unittest.TestCase):
             sleep=sleep,
         )
         transport._active_operation_id = OPERATION
+        transport._active_protected_role_add = "addOwnedUploaderPackageRole"
+        transport._protected_work_deadline = bootstrap.parse_time(
+            self.authorization["validity"]["expiresAt"],
+            "test authorization expiry",
+        )
         journal = MemoryJournal()
         transport.bind_journal(journal)
         return transport, session, journal
@@ -120,6 +126,18 @@ class PackageReadinessTests(unittest.TestCase):
 
         with mock.patch.object(bootstrap.package_builder, "build", side_effect=build):
             return transport._mutate(self.operation, {})
+
+    def create_fence(self, transport):
+        operation = next(
+            item for item in self.plan["mutations"]
+            if item["id"] == FENCE_OPERATION
+        )
+        transport.admissions[FENCE_OPERATION] = {
+            "context": {"executionDecision": "apply-exact"}
+        }
+        transport._active_operation_id = FENCE_OPERATION
+        transport._active_protected_role_add = "addOwnedOperatorFenceBootstrapRole"
+        return transport._mutate(operation, {})
 
     @staticmethod
     def created():
@@ -232,41 +250,90 @@ class PackageReadinessTests(unittest.TestCase):
                 self.assertLessEqual((self.current - NOW).total_seconds(), min(expiry_seconds, 1891))
                 self.assertEqual(journal.records, [])
 
-    def test_put_error_and_transport_ambiguity_are_never_replayed(self):
-        for response in (
-            storage_error(403, "AuthorizationPermissionMismatch"),
-            bootstrap.BootstrapError("Azure REST transport failed closed"),
-        ):
-            with self.subTest(response=response):
-                transport, session, journal = self.transport([storage_error(404, "BlobNotFound"), response])
-                with self.assertRaises(bootstrap.BootstrapError):
-                    self.upload(transport)
-                self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
-                self.assertEqual(journal.records[0]["phase"], "intent")
-                self.assertEqual(len(journal.records), 1 if isinstance(response, BaseException) else 2)
-
-    def test_result_journal_failure_preserves_storage_client_request_id_on_intent(self):
+    def test_exact_put_rbac_denials_retry_the_same_conditional_package_create(self):
         transport, session, journal = self.transport([
-            storage_error(404, "BlobNotFound"), self.created(),
+            storage_error(404, "BlobNotFound"),
+            storage_error(403, "AuthorizationFailure"),
+            storage_error(403, "AuthorizationPermissionMismatch"),
+            self.created(),
         ])
-        journal.fail_result = True
+
+        result = self.upload(transport)
+
+        self.assertEqual(
+            [item[0] for item in session.requests],
+            ["GET", "PUT", "PUT", "PUT"],
+        )
+        put_requests = session.requests[1:]
+        self.assertTrue(all(item[1] == self.url for item in put_requests))
+        self.assertTrue(all(item[2] == self.body for item in put_requests))
+        for _, _, _, headers in put_requests:
+            self.assertEqual(headers["If-None-Match"], "*")
+            self.assertEqual(headers["x-ms-blob-type"], "BlockBlob")
+            self.assertEqual(headers["x-ms-version"], "2023-11-03")
+            self.assertEqual(headers["x-ms-meta-sha256"], self.package["sha256"])
+        client_ids = [item[3]["x-ms-client-request-id"] for item in put_requests]
+        self.assertEqual(len(client_ids), len(set(client_ids)))
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in client_ids))
+        self.assertEqual(
+            [item["phase"] for item in journal.records],
+            ["intent", "result"] * 3,
+        )
+        self.assertEqual(
+            [item["status"] for item in journal.records[1::2]],
+            [403, 403, 201],
+        )
+        self.assertEqual(
+            [item["storageErrorCode"] for item in journal.records[1::2]],
+            ["AuthorizationFailure", "AuthorizationPermissionMismatch", "unknown"],
+        )
+        self.assertEqual(
+            [item["clientRequestId"] for item in journal.records[::2]],
+            client_ids,
+        )
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(result["versionId"], "version-1")
+
+    def test_put_transport_ambiguity_is_never_replayed(self):
+        transport, session, journal = self.transport([
+            storage_error(404, "BlobNotFound"),
+            bootstrap.BootstrapError("Azure REST transport failed closed"),
+        ])
         with self.assertRaises(bootstrap.StorageOperationError) as error:
             self.upload(transport)
-        self.assertEqual(
-            error.exception.diagnostic["stopReason"], "result-journal-error"
-        )
-        self.assertEqual(error.exception.diagnostic["status"], 201)
-
+        self.assertEqual(error.exception.diagnostic["stopReason"], "transport-error")
         self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
-        self.assertEqual(len(journal.records), 1)
-        intent = journal.records[0]
-        self.assertEqual(intent["phase"], "intent")
-        self.assertEqual(intent["operationId"], OPERATION)
-        self.assertTrue(bootstrap.GUID.fullmatch(intent["clientRequestId"]))
-        self.assertEqual(
-            intent["clientRequestId"],
-            session.requests[-1][3]["x-ms-client-request-id"],
-        )
+        self.assertEqual([item["phase"] for item in journal.records], ["intent"])
+        self.assertEqual(self.sleeps, [])
+
+    def test_result_journal_failure_never_retries_and_preserves_client_request_id(self):
+        for response in (
+            storage_error(403, "AuthorizationPermissionMismatch"),
+            self.created(),
+        ):
+            with self.subTest(status=response.status):
+                transport, session, journal = self.transport([
+                    storage_error(404, "BlobNotFound"), response,
+                ])
+                journal.fail_result = True
+                with self.assertRaises(bootstrap.StorageOperationError) as error:
+                    self.upload(transport)
+                self.assertEqual(
+                    error.exception.diagnostic["stopReason"], "result-journal-error"
+                )
+                self.assertEqual(error.exception.diagnostic["status"], response.status)
+
+                self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
+                self.assertEqual(len(journal.records), 1)
+                intent = journal.records[0]
+                self.assertEqual(intent["phase"], "intent")
+                self.assertEqual(intent["operationId"], OPERATION)
+                self.assertTrue(bootstrap.GUID.fullmatch(intent["clientRequestId"]))
+                self.assertEqual(
+                    intent["clientRequestId"],
+                    session.requests[-1][3]["x-ms-client-request-id"],
+                )
+                self.assertEqual(self.sleeps, [])
 
     def test_ambiguous_read_fails_without_mutation(self):
         transport, session, journal = self.transport([bootstrap.BootstrapError("Azure REST transport failed closed")])
@@ -480,6 +547,8 @@ class PackageReadinessTests(unittest.TestCase):
             seconds=bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
         )
         transport, session, journal = self.transport([])
+        transport._active_protected_role_add = None
+        transport._protected_work_deadline = None
         with self.assertRaisesRegex(
             bootstrap.BootstrapError,
             "insufficient authorization window before protected role creation",
@@ -598,6 +667,52 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [1])
         self.assertTrue(all(item == expected_deadline for item in session.deadlines))
         self.assertEqual(journal.records, [])
+
+    def test_exact_put_rbac_denials_retry_the_same_conditional_fence_create(self):
+        fence_url = bootstrap._operation_readback_url(
+            FENCE_OPERATION, self.plan, self.authorization
+        )
+        transport, session, journal = self.transport([
+            storage_error(404, "BlobNotFound"),
+            storage_error(403, "AuthorizationFailure"),
+            storage_error(403, "AuthorizationPermissionMismatch"),
+            self.created(),
+        ])
+
+        result = self.create_fence(transport)
+
+        self.assertEqual(
+            [item[0] for item in session.requests],
+            ["GET", "PUT", "PUT", "PUT"],
+        )
+        put_requests = session.requests[1:]
+        self.assertTrue(all(item[1] == fence_url for item in put_requests))
+        self.assertTrue(all(item[2] == put_requests[0][2] for item in put_requests))
+        self.assertNotEqual(put_requests[0][2], b"")
+        expected_sha = bootstrap.sha256_bytes(put_requests[0][2])
+        for _, _, _, headers in put_requests:
+            self.assertEqual(headers["If-None-Match"], "*")
+            self.assertEqual(headers["x-ms-blob-type"], "BlockBlob")
+            self.assertEqual(headers["x-ms-version"], "2023-11-03")
+            self.assertEqual(headers["x-ms-meta-sha256"], expected_sha)
+        client_ids = [item[3]["x-ms-client-request-id"] for item in put_requests]
+        self.assertEqual(len(client_ids), len(set(client_ids)))
+        self.assertTrue(all(bootstrap.GUID.fullmatch(value) for value in client_ids))
+        self.assertEqual(
+            [item["phase"] for item in journal.records],
+            ["intent", "result"] * 3,
+        )
+        self.assertEqual(
+            [item["status"] for item in journal.records[1::2]],
+            [403, 403, 201],
+        )
+        self.assertEqual(
+            [item["clientRequestId"] for item in journal.records[::2]],
+            client_ids,
+        )
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(result["versionId"], "version-1")
+        self.assertEqual(result["sha256"], expected_sha)
 
     def test_frozen_clock_stops_at_64_gets_with_safe_final_diagnostic(self):
         transport, session, journal = self.transport([self.private_error()], repeat=True)
@@ -728,26 +843,118 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertGreater((bootstrap.parse_time(self.authorization["validity"]["expiresAt"], "expiry") - self.current).total_seconds(),
                            bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS)
 
-    def test_failed_put_is_not_reclassified_as_retryable_readiness(self):
-        for failure in (self.private_error(), bootstrap.BootstrapError("PUT transport failed closed")):
-            with self.subTest(failure=type(failure).__name__):
-                transport, session, journal = self.transport([storage_error(404, "BlobNotFound"), failure])
-                with self.assertRaises(bootstrap.BootstrapError) as error:
+    def test_only_exact_put_rbac_denials_are_retryable(self):
+        cases = [
+            (
+                storage_error(403, "AuthenticationFailed"),
+                "unsupported-response",
+                2,
+            ),
+            (
+                bootstrap._RestResponse(
+                    403,
+                    b"<Error><Code>AuthorizationFailure</Code>",
+                    {"Content-Type": "application/xml"},
+                ),
+                "unsupported-response",
+                2,
+            ),
+            (
+                bootstrap._RestResponse(
+                    403,
+                    b"<Error><Code>AuthorizationFailure</Code></Error>",
+                    {
+                        "Content-Type": "application/xml",
+                        "x-ms-error-code": "AuthorizationPermissionMismatch",
+                    },
+                ),
+                "unsupported-response",
+                2,
+            ),
+            (storage_error(409, "BlobAlreadyExists"), "unexpected-status", 2),
+            (storage_error(412, "ConditionNotMet"), "unexpected-status", 2),
+            (storage_error(500, "InternalError"), "unexpected-status", 2),
+            (
+                bootstrap.BootstrapError("PUT transport failed closed"),
+                "transport-error",
+                1,
+            ),
+        ]
+        for failure, expected_reason, expected_journal_records in cases:
+            with self.subTest(
+                status=getattr(failure, "status", None),
+                reason=expected_reason,
+            ):
+                transport, session, journal = self.transport([
+                    storage_error(404, "BlobNotFound"), failure,
+                ])
+                with self.assertRaises(bootstrap.StorageOperationError) as error:
                     self.upload(transport)
-                self.assertIsInstance(error.exception, bootstrap.StorageOperationError)
                 diagnostic = error.exception.diagnostic
                 self.assertEqual(diagnostic["operationId"], OPERATION)
                 self.assertEqual(diagnostic["method"], "PUT")
-                self.assertEqual(diagnostic["stopReason"], (
-                    "transport-error" if isinstance(failure, BaseException)
-                    else "unexpected-status"
-                ))
+                self.assertEqual(diagnostic["stopReason"], expected_reason)
                 self.assertEqual(len(diagnostic["attemptRecords"]), 1)
                 self.assertTrue(bootstrap.GUID.fullmatch(
                     diagnostic["attemptRecords"][0]["clientRequestId"]
                 ))
                 self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
-                self.assertEqual(len(journal.records), 1 if isinstance(failure, BaseException) else 2)
+                self.assertEqual(len(journal.records), expected_journal_records)
+                self.assertEqual(self.sleeps, [])
+
+    def test_definitive_put_denial_at_retry_deadline_is_not_replayed(self):
+        def reach_retry_deadline():
+            if session.requests[-1][0] == "PUT":
+                self.current = NOW + dt.timedelta(minutes=27)
+
+        transport, session, journal = self.transport(
+            [
+                storage_error(404, "BlobNotFound"),
+                storage_error(403, "AuthorizationPermissionMismatch"),
+            ],
+            after_request=reach_retry_deadline,
+        )
+        with self.assertRaises(bootstrap.StorageOperationError) as error:
+            self.upload(transport)
+        self.assertEqual(
+            error.exception.diagnostic["stopReason"], "readiness-timeout"
+        )
+        self.assertEqual([item[0] for item in session.requests], ["GET", "PUT"])
+        self.assertEqual(
+            [item["phase"] for item in journal.records], ["intent", "result"]
+        )
+        self.assertEqual(journal.records[-1]["status"], 403)
+        self.assertEqual(self.sleeps, [])
+
+    def test_first_put_cannot_start_after_the_readiness_response_deadline(self):
+        transport, session, journal = self.transport(
+            [storage_error(404, "BlobNotFound")]
+        )
+        prove_ready = transport._prove_package_upload_ready
+
+        def pause_after_ready(url):
+            window = prove_ready(url)
+            self.current = (
+                window.first_attempt_start_deadline
+                + dt.timedelta(milliseconds=1)
+            )
+            return window
+
+        with mock.patch.object(
+            transport,
+            "_prove_package_upload_ready",
+            side_effect=pause_after_ready,
+        ):
+            with self.assertRaisesRegex(
+                bootstrap.StorageOperationError, "did not converge"
+            ) as raised:
+                self.upload(transport)
+
+        self.assertEqual(
+            raised.exception.diagnostic["stopReason"], "readiness-timeout"
+        )
+        self.assertEqual([item[0] for item in session.requests], ["GET"])
+        self.assertEqual(journal.records, [])
 
     def test_valid_request_headers_persist_from_last_response_through_transport_failure(self):
         request_id = "ABCDEF12-3456-0789-ABCD-123456789ABC"

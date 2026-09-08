@@ -255,24 +255,29 @@ to one protected role plus the exact temporary IPv4 rule.
 
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
-single create-only PUT; recognized authorization-propagation 403s may wait for
-up to ten minutes within the authorization window. Existing blobs, malformed
+conditional create phase; recognized authorization-propagation 403s may wait for
+up to thirty minutes within the authorization window. Existing blobs, malformed
 errors, authentication failures, and expiry fail closed. GET readiness proves
-read/network access, not write permission: a failed or ambiguous PUT is never
-replayed. The last GET is scheduled no later than 90 seconds before its work
-deadline, reserving the 45-second CLI credential limit and the 45-second REST
-response limit. A separate 780-second window remains before authorization expiry
-for the single active protected assignment's guarded deletion. The deadline is
-rechecked after credential acquisition and also limits the HTTP wait. A terminal
-denial fails immediately after the last allowed GET so compensation enters that
-cleanup window; it cannot start another readiness request.
+read/network access, not write permission. The create therefore retries only a
+durably journaled `403` whose exact Storage code is `AuthorizationFailure` or
+`AuthorizationPermissionMismatch`. Every attempt uses the same source-derived
+URL and body with `If-None-Match: *` and a fresh client request ID. Transport or
+journal ambiguity, a late response, 409/412, 5xx, malformed XML, a mismatched
+error header, or any other status/code stops immediately. The final retry starts
+no later than the earlier of the thirty-minute propagation boundary and two full
+request envelopes before the protected work deadline. The PUT deadline preserves
+one final 90-second envelope for exact versioned readback. A separate 1,051-second
+window remains before authorization expiry for guarded role deletion and lock
+restoration.
 
 The sequential Key Vault and activation-fence roles have their own bounded
 readiness checks. The key path retries only exact `Forbidden` / `ForbiddenByRbac`
 responses for the exact versioned public-key GET. The fence path retries only the
 two recognized Storage authorization-propagation 403s and requires exact
-`404 / BlobNotFound` before its single create-only PUT. Transport ambiguity,
-unexpected absence, malformed responses, and all write ambiguity fail closed.
+`404 / BlobNotFound` before its conditional create phase. Its PUT uses the same
+strict, durably journaled no-effect-403 retry rule as package and controller
+creation. Transport ambiguity, unexpected absence, malformed responses, and all
+write ambiguity fail closed.
 Every Storage XML response is first decoded as strict UTF-8 with either no BOM
 or exactly one leading UTF-8 BOM, matching Azure Blob's live error responses.
 Double/embedded UTF-8 BOMs, UTF-16/UTF-32 BOMs, and NUL bytes are rejected. DTD
@@ -292,18 +297,20 @@ start/completion timestamps, bounded duration, client and provider correlation
 IDs, status, allowlisted error code, and response-versus-transport outcome. Raw
 response bodies/messages, URLs, IP addresses, credentials and transport
 exception text are never retained. These facts diagnose a failed attempt; they
-do not turn a denied or ambiguous request into permission to upload or retry.
+admit a retry only for the exact no-effect conditional-create denial above.
 
 The controller-container empty proof has the same ten-minute global readiness
-cap and 64-GET limit. The bootstrap authorization is capped at exactly 3,600
-seconds (60 minutes): account validation, fresh preflight, the durable claim,
-and reviewed pre-controller operations have a hard 600-second budget; 630
+cap and 64-GET limit. The bootstrap authorization is capped at exactly 4,171
+seconds (69 minutes 31 seconds): account validation, fresh preflight, the durable
+claim, and reviewed pre-controller operations have a hard 900-second budget; 630
 seconds then admit the exact controller role through seven bounded ARM calls;
 600 seconds remain available for data-plane propagation; and one 90-second
-envelope remains for the create-only canary PUT. Another exact 900 seconds
-stage the nominal finite-lease canary and every owned cleanup request, including
-one safe conditional-DELETE replay and a 30-second local margin. The final 780
-seconds protect role cleanup, including a full 120-second lock propagation
+envelope remains for the conditional canary create. Exact, durably journaled
+authorization-propagation 403s may retry within that same readiness boundary.
+Another exact 900 seconds stage the nominal finite-lease canary and every owned
+cleanup request, including one safe conditional-DELETE replay and a 30-second
+local margin. The final 1,051 seconds protect role cleanup, including a full
+120-second lock propagation
 boundary followed by one 90-second observation envelope. Natural finite expiry is accepted only as the
 exact Storage state `Expired` with `Unlocked` status and `Fixed` duration; it is
 not misreported as `Available`. Backoff is capped at 15 seconds. Only the two
@@ -311,7 +318,7 @@ recognized authorization-propagation 403s
 may wait; malformed errors, authentication failures, transport ambiguity, a
 different target, or a nonempty/paginated inventory stop immediately. Success
 still requires the exact source-bound empty-container and private-posture proof.
-The 60-minute limit is the hard controller-safety window, not a promise that
+The 4,171-second limit is the hard controller-safety window, not a promise that
 every later Azure propagation wait will also finish in the same attempt. The
 executor rechecks live authorization before each later mutation. Expiry stops
 before the next write and compensates every executor-owned temporary resource;
@@ -339,7 +346,7 @@ readiness limit from expiry of the outer authorization. Both Storage readiness
 paths retain only shape-validated provider request IDs and canonical server
 dates; response messages, raw bodies, IP addresses and tokens are never copied.
 
-Both paths can additionally retain metadata from the credential used for the
+These paths can additionally retain metadata from the credential used for the
 last observed response: process-cache reuse versus an Azure CLI request,
 bounded token issuance/expiry/observation Unix timestamps, and a successful
 account-binding flag. A CLI request does not imply newly issued credentials;
@@ -351,7 +358,7 @@ and assignment already validated through ARM, not a planned-role declaration
 or proof that the data plane has propagated that role. Missing observed
 evidence stays null. This instrumentation makes no extra credential or Azure
 requests, does not force token refresh, and never broadens permissions,
-changes the ten-minute/64-attempt limits or 60-minute authorization lifetime,
+changes the ten-minute/64-attempt limits or 4,171-second authorization lifetime,
 or authorizes another execution. Historical failed
 receipts remain immutable; these facts are available only on a later freshly
 authorized attempt.
