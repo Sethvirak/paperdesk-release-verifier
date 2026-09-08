@@ -108,7 +108,7 @@ PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
     + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
     + 30
 )
-# After the create-only canary PUT, the nominal controller exercise and every
+# After the successful conditional canary create, the nominal controller exercise and every
 # owned failure path use one staged window before protected-role cleanup:
 # acquire, renew, fast release, expiry acquire, an ambiguity release or finite
 # expiry observation, identity resolution when needed, conditional DELETE, one
@@ -215,6 +215,21 @@ PROTECTED_ROLE_LIFECYCLES = {
     "addOwnedOperatorKeyReadRole": "removeOwnedOperatorKeyReadRole",
     "addOwnedOperatorFenceBootstrapRole": "removeOwnedOperatorFenceBootstrapRole",
 }
+CONDITIONAL_STORAGE_CREATE_ROLES = {
+    "uploadVersionedBridgePackage": "addOwnedUploaderPackageRole",
+    "createInitialIdleActivationFence": "addOwnedOperatorFenceBootstrapRole",
+    "createControllerLeaseCanaryBlob": "addOwnedOperatorControllerCanaryRole",
+}
+CONDITIONAL_STORAGE_CREATE_CONTENT_TYPES = {
+    "uploadVersionedBridgePackage": "application/zip",
+    "createInitialIdleActivationFence": "application/json",
+    "createControllerLeaseCanaryBlob": "application/json",
+}
+CONDITIONAL_STORAGE_CREATE_PROPAGATION_CODES = frozenset({
+    "AuthorizationFailure",
+    "AuthorizationPermissionMismatch",
+})
+MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS = 64
 PROTECTED_ROLE_CLEANUP_KEYS = frozenset({
     "operator-controller-canary-role",
     "uploader-package-role",
@@ -2093,6 +2108,112 @@ def _expected_terminal_mutation_targets(
     fail(f"terminal journal has no exact write cardinality for {operation_id}")
 
 
+def _validated_conditional_storage_create_denial_sequences(
+    journal: Sequence[Mapping[str, Any]],
+    *,
+    plan: Mapping[str, Any],
+    authorization_id: str,
+    source_sha: str,
+    operation_projections: Mapping[str, Mapping[str, Any]],
+    operation_contexts: Mapping[str, Mapping[str, Any]],
+) -> set[int]:
+    """Validate no-effect 403 attempts that precede one exact conditional create."""
+
+    ignored_result_sequences: set[int] = set()
+    authorization = {
+        "authorizationId": authorization_id,
+        "source": {"mergedMain": {"commitSha": source_sha}},
+    }
+    for operation_id in CONDITIONAL_STORAGE_CREATE_ROLES:
+        indexed = [
+            (index, item)
+            for index, item in enumerate(journal)
+            if item.get("operationId") == operation_id
+        ]
+        if not indexed:
+            continue
+        context = operation_contexts.get(operation_id, {})
+        envelope = operation_projections.get(operation_id, {})
+        projection = envelope.get("projection")
+        headers = envelope.get("headers")
+        if (
+            context.get("executionDecision") != "apply-exact"
+            or not isinstance(projection, Mapping)
+            or not isinstance(headers, Mapping)
+        ):
+            fail(
+                f"conditional Storage create lacks exact apply evidence: {operation_id}"
+            )
+        expected_body_sha256 = projection.get("bodySha256")
+        _sha256(
+            expected_body_sha256,
+            f"{operation_id} conditional create body digest",
+        )
+        expected_target = _operation_readback_url(
+            operation_id, plan, authorization
+        )
+        positions = [index for index, _item in indexed]
+        records = [item for _index, item in indexed]
+        if (
+            positions != list(range(positions[0], positions[0] + len(positions)))
+            or len(records) % 2 != 0
+            or not 2 <= len(records) <= 2 * MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS
+        ):
+            fail(
+                f"conditional Storage create attempts are not one serial section: {operation_id}"
+            )
+        saw_success = False
+        for offset in range(0, len(records), 2):
+            intent = records[offset]
+            result = records[offset + 1]
+            if (
+                intent.get("phase") != "intent"
+                or result.get("phase") != "result"
+                or result.get("intentId") != intent.get("intentId")
+                or any(
+                    item.get("method") != "PUT"
+                    or item.get("targetUrl") != expected_target
+                    or item.get("requestBodySha256") != expected_body_sha256
+                    for item in (intent, result)
+                )
+            ):
+                fail(
+                    f"conditional Storage create attempt is not exact: {operation_id}"
+                )
+            status = result.get("status")
+            final_pair = offset == len(records) - 2
+            if status == 403:
+                if (
+                    saw_success
+                    or final_pair
+                    or result.get("storageErrorCode")
+                    not in CONDITIONAL_STORAGE_CREATE_PROPAGATION_CODES
+                    or result.get("etag") is not None
+                    or result.get("versionId") is not None
+                ):
+                    fail(
+                        f"conditional Storage create denial is not a no-effect prefix: {operation_id}"
+                    )
+                ignored_result_sequences.add(int(result["sequence"]))
+                continue
+            if (
+                status != 201
+                or saw_success
+                or not final_pair
+                or result.get("storageErrorCode") != "unknown"
+                or result.get("etag") != headers.get("etag")
+                or result.get("versionId") != headers.get("versionId")
+            ):
+                fail(
+                    "conditional Storage create final success is not cross-bound "
+                    f"to exact readback: {operation_id}"
+                )
+            saw_success = True
+        if not saw_success:
+            fail(f"conditional Storage create did not finish exactly: {operation_id}")
+    return ignored_result_sequences
+
+
 def _validate_terminal_mutation_coverage(
     journal: Sequence[Mapping[str, Any]],
     *,
@@ -2105,6 +2226,16 @@ def _validate_terminal_mutation_coverage(
     """Require every completed cloud write exactly once in the public journal."""
 
     plan = bind_temporary_role_ids(plan, authorization_id)
+    ignored_denial_sequences = (
+        _validated_conditional_storage_create_denial_sequences(
+            journal,
+            plan=plan,
+            authorization_id=authorization_id,
+            source_sha=source_sha,
+            operation_projections=operation_projections,
+            operation_contexts=operation_contexts,
+        )
+    )
     results_by_operation: dict[str, Counter[str]] = {
         item["id"]: Counter()
         for item in plan["mutations"]
@@ -2112,6 +2243,8 @@ def _validate_terminal_mutation_coverage(
     }
     for item in journal:
         if item.get("phase") != "result":
+            continue
+        if item.get("sequence") in ignored_denial_sequences:
             continue
         status = item.get("status")
         exact_canary_absence = (
@@ -2209,6 +2342,7 @@ def _validate_terminal_mutation_coverage(
             for item in journal
             if item.get("phase") == "result"
             and item.get("operationId") == operation_id
+            and item.get("sequence") not in ignored_denial_sequences
         ]
         if context.get("executionDecision") == "adopt-exact":
             if results:
@@ -10617,6 +10751,12 @@ class _RestResponse:
     client_request_id: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _ConditionalStorageCreateWindow:
+    first_attempt_start_deadline: dt.datetime
+    final_retry_start: dt.datetime
+
+
 class _StrictStorageXmlError(BootstrapError):
     """A Storage XML body is either unsafe encoded input or malformed XML."""
 
@@ -11365,6 +11505,76 @@ def _package_blob_error_projection(
     return {"storageErrorCode": code}
 
 
+def _conditional_storage_create_propagation_code(
+    response: _RestResponse,
+) -> str:
+    """Return one exact no-effect authorization denial for a conditional PUT."""
+
+    content_types = [
+        value
+        for key, value in response.headers.items()
+        if key.lower() == "content-type"
+    ]
+    error_codes = [
+        value
+        for key, value in response.headers.items()
+        if key.lower() == "x-ms-error-code"
+    ]
+    identity_headers = [
+        key
+        for key in response.headers
+        if key.lower() in {"etag", "x-ms-version-id"}
+    ]
+    if (
+        response.status != 403
+        or len(content_types) != 1
+        or not isinstance(content_types[0], str)
+        or content_types[0].split(";", 1)[0].strip().lower()
+        not in {"application/xml", "text/xml"}
+        or len(error_codes) > 1
+        or any(not isinstance(value, str) for value in error_codes)
+        or identity_headers
+        or not response.body
+        or len(response.body) > 65536
+    ):
+        fail("conditional Storage create denial is not one exact XML 403")
+    try:
+        root = _strict_storage_xml_root(
+            response.body, "conditional Storage create denial"
+        )
+    except _StrictStorageXmlError as exc:
+        raise BootstrapError(
+            "conditional Storage create denial is not one exact XML 403"
+        ) from exc
+    children = list(root)
+    code_children = [child for child in children if child.tag == "Code"]
+    if (
+        root.tag != "Error"
+        or root.attrib
+        or (root.text or "").strip()
+        or len(code_children) != 1
+        or [child.tag for child in children].count("Message") > 1
+        or any(
+            child.tag not in {"Code", "Message"}
+            or child.attrib
+            or list(child)
+            or (child.tail or "").strip()
+            for child in children
+        )
+    ):
+        fail("conditional Storage create denial is not one exact XML 403")
+    code = code_children[0].text
+    if (
+        not isinstance(code, str)
+        or not code
+        or code.strip() != code
+        or code not in CONDITIONAL_STORAGE_CREATE_PROPAGATION_CODES
+        or (error_codes and error_codes[0] != code)
+    ):
+        fail("conditional Storage create denial is not recognized propagation")
+    return code
+
+
 def _key_vault_preflight_error_projection(
     method: str, url: str, response: _RestResponse
 ) -> dict[str, str] | None:
@@ -11588,6 +11798,7 @@ class AzureCliBootstrapTransport:
         self._active_operation_id: str | None = None
         self._active_protected_role_add: str | None = None
         self._protected_work_deadline: dt.datetime | None = None
+        self._controller_canary_create_window: _ConditionalStorageCreateWindow | None = None
         self._validated_source_projections: dict[str, Mapping[str, Any]] = {}
         self._package_readback_bytes: bytes | None = None
         self._retired_role_absence_preflight: list[dict[str, Any]] | None = None
@@ -11709,6 +11920,8 @@ class AzureCliBootstrapTransport:
             >= self._controller_canary_role_admission_start_deadline()
         ):
             fail("insufficient authorization window before controller role admission")
+        if operation_id == "addOwnedOperatorControllerCanaryRole":
+            self._controller_canary_create_window = None
         self._active_protected_role_add = operation_id
         self._protected_work_deadline = deadline
 
@@ -12207,6 +12420,185 @@ class AzureCliBootstrapTransport:
                 response,
             )
         return response
+
+    def _conditional_storage_create_when_ready(
+        self,
+        operation_id: str,
+        url: str,
+        *,
+        body: bytes,
+        headers: Mapping[str, str],
+        window: _ConditionalStorageCreateWindow,
+        request_deadline: dt.datetime,
+        backoff_cap_seconds: float,
+    ) -> _RestResponse:
+        """Retry only exact, durably journaled no-effect RBAC denials."""
+
+        expected_role = CONDITIONAL_STORAGE_CREATE_ROLES.get(operation_id)
+        expected_content_type = CONDITIONAL_STORAGE_CREATE_CONTENT_TYPES.get(
+            operation_id
+        )
+        expected_url = _operation_readback_url(
+            operation_id, self.plan, self.authorization
+        )
+        normalized_headers: dict[str, str] = {}
+        for key, value in headers.items():
+            lowered = key.lower()
+            if lowered in normalized_headers or not isinstance(value, str):
+                fail("conditional Storage create headers are not exact")
+            normalized_headers[lowered] = value
+        if (
+            self._active_operation_id != operation_id
+            or self._active_protected_role_add != expected_role
+            or expected_role is None
+            or url != expected_url
+            or not isinstance(body, bytes)
+            or not body
+            or set(normalized_headers)
+            != {
+                "content-type",
+                "x-ms-blob-type",
+                "x-ms-version",
+                "if-none-match",
+                "x-ms-meta-sha256",
+            }
+            or normalized_headers.get("content-type") != expected_content_type
+            or normalized_headers.get("if-none-match") != "*"
+            or normalized_headers.get("x-ms-blob-type") != "BlockBlob"
+            or normalized_headers.get("x-ms-version") != STORAGE_API_VERSION
+            or normalized_headers.get("x-ms-meta-sha256") != sha256_bytes(body)
+            or not isinstance(window, _ConditionalStorageCreateWindow)
+            or not isinstance(request_deadline, dt.datetime)
+            or window.first_attempt_start_deadline.tzinfo != dt.timezone.utc
+            or window.final_retry_start.tzinfo != dt.timezone.utc
+            or request_deadline.tzinfo != dt.timezone.utc
+            or window.final_retry_start > window.first_attempt_start_deadline
+            or window.first_attempt_start_deadline
+            + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+            > request_deadline
+            or backoff_cap_seconds not in {15.0, 32.0}
+        ):
+            fail("conditional Storage create is outside its exact source boundary")
+
+        started = self.clock()
+        attempt_records: list[dict[str, Any]] = []
+        last_status: int | None = None
+        last_code = "unknown"
+        last_request_id: str | None = None
+        last_server_date: str | None = None
+
+        def fail_create(message: str, stop_reason: str) -> None:
+            raise StorageOperationError(
+                message,
+                operation_id=operation_id,
+                method="PUT",
+                elapsed_seconds=(self.clock() - started).total_seconds(),
+                status=last_status,
+                error_code=last_code,
+                stop_reason=stop_reason,
+                request_id=last_request_id,
+                server_date=last_server_date,
+                attempt_records=attempt_records,
+            ) from None
+
+        for attempt in range(1, MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS + 1):
+            before_request = self.clock()
+            if (
+                (
+                    attempt == 1
+                    and before_request > window.first_attempt_start_deadline
+                )
+                or (attempt > 1 and before_request > window.final_retry_start)
+                or before_request
+                + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+                > request_deadline
+            ):
+                fail_create(
+                    "conditional Storage create propagation did not converge",
+                    "readiness-timeout",
+                )
+            response = self._mutation_request(
+                "PUT",
+                url,
+                body=body,
+                headers=headers,
+                expected={201, 403},
+                deadline=request_deadline,
+            )
+            if response.status == 201:
+                return response
+
+            observed = self.clock()
+            last_status = response.status
+            last_request_id = self._header(response, "x-ms-request-id")
+            last_server_date = self._header(response, "Date")
+            client_request_id = response.client_request_id
+            if (
+                not isinstance(client_request_id, str)
+                or GUID.fullmatch(client_request_id) is None
+            ):
+                last_code = "unknown"
+                fail_create(
+                    "conditional Storage create denial lacks exact correlation",
+                    "unsupported-response",
+                )
+            try:
+                code = _conditional_storage_create_propagation_code(response)
+            except BootstrapError:
+                last_code = "unknown"
+                attempt_records.append(
+                    _storage_attempt_record(
+                        attempt=attempt,
+                        started=before_request,
+                        completed=observed,
+                        client_request_id=client_request_id,
+                        status=response.status,
+                        error_code="unknown",
+                        request_id=last_request_id,
+                        server_date=last_server_date,
+                        outcome="response",
+                    )
+                )
+                fail_create(
+                    "conditional Storage create denial failed exact validation",
+                    "unsupported-response",
+                )
+            last_code = code
+            attempt_records.append(
+                _storage_attempt_record(
+                    attempt=attempt,
+                    started=before_request,
+                    completed=observed,
+                    client_request_id=client_request_id,
+                    status=response.status,
+                    error_code=code,
+                    request_id=last_request_id,
+                    server_date=last_server_date,
+                    outcome="response",
+                )
+            )
+            if (
+                attempt == MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS
+                or observed >= window.final_retry_start
+            ):
+                fail_create(
+                    "conditional Storage create propagation did not converge",
+                    "readiness-timeout",
+                )
+            delay = min(
+                float(2 ** min(attempt - 1, 5)),
+                backoff_cap_seconds,
+                (window.final_retry_start - observed).total_seconds(),
+            )
+            self._sleep_before_deadline(
+                delay,
+                "conditional Storage create propagation retry",
+                deadline=window.final_retry_start,
+            )
+        fail_create(
+            "conditional Storage create propagation exceeded bounded attempts",
+            "readiness-timeout",
+        )
 
     @staticmethod
     def _json_response(response: _RestResponse, expected: set[int], label: str) -> Mapping[str, Any]:
@@ -13758,7 +14150,9 @@ class AzureCliBootstrapTransport:
             fail(f"{label} has no request window before the cleanup reserve")
         return deadline
 
-    def _prove_fence_blob_create_ready(self, url: str) -> None:
+    def _prove_fence_blob_create_ready(
+        self, url: str
+    ) -> _ConditionalStorageCreateWindow:
         expected_url = _operation_readback_url(
             "createInitialIdleActivationFence", self.plan, self.authorization
         )
@@ -13921,7 +14315,10 @@ class AzureCliBootstrapTransport:
                         "activation-fence readiness 404 is not exact BlobNotFound",
                         "unsupported-response",
                     )
-                return
+                return _ConditionalStorageCreateWindow(
+                    first_attempt_start_deadline=deadline,
+                    final_retry_start=deadline,
+                )
             if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
                 fail_readiness(
                     "activation-fence readiness 403 is not recognized RBAC propagation",
@@ -14018,8 +14415,10 @@ class AzureCliBootstrapTransport:
             self._sleep_before_deadline(delay, "signing-key readiness retry")
         fail("signing-key readiness exceeded bounded attempts")
 
-    def _prove_package_upload_ready(self, url: str) -> None:
-        """Wait for exact-target read access and absence, never retry a write.
+    def _prove_package_upload_ready(
+        self, url: str
+    ) -> _ConditionalStorageCreateWindow:
+        """Wait for exact-target read access and absence before a conditional write.
 
         ARM role/ACL readback does not prove Storage data-plane propagation.
         Only recognized authorization denials may converge to BlobNotFound;
@@ -14066,6 +14465,11 @@ class AzureCliBootstrapTransport:
         except (BootstrapError, KeyError, TypeError):
             fail_readiness("package readiness authorization window is invalid", "invalid-authorization-window")
         work_deadline = self._request_deadline() or expires
+        retry_start_deadline = min(
+            started + dt.timedelta(seconds=1800),
+            work_deadline
+            - dt.timedelta(seconds=2 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS),
+        )
         readiness_deadline = work_deadline - dt.timedelta(
             seconds=2 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
         )
@@ -14203,7 +14607,10 @@ class AzureCliBootstrapTransport:
                     fail_readiness("package readiness 404 is not exact BlobNotFound", "unexpected-absence-code")
                 if self.clock() >= deadline:
                     fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
-                return
+                return _ConditionalStorageCreateWindow(
+                    first_attempt_start_deadline=deadline,
+                    final_retry_start=retry_start_deadline,
+                )
             if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
                 fail_readiness("package readiness 403 is not recognized authorization propagation", "unsupported-denial")
             if attempts == 64:
@@ -14444,6 +14851,16 @@ class AzureCliBootstrapTransport:
                     "startedAt": self._timestamp(started),
                     "observedAt": observed_at,
                 }
+            )
+            self._controller_canary_create_window = _ConditionalStorageCreateWindow(
+                first_attempt_start_deadline=deadline,
+                final_retry_start=min(
+                    started
+                    + dt.timedelta(
+                        seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                    ),
+                    self._controller_canary_readiness_deadline(),
+                ),
             )
             return [proof]
         fail_readiness("controller lock proof exceeded the bounded attempts", "attempt-limit")
@@ -15739,15 +16156,15 @@ class AzureCliBootstrapTransport:
                 fail("bridge package bytes drifted after authorization")
             blob = f"v2/control/{source_sha}/paperdesk-private-release-bridge.zip"
             url = f"{self.STORAGE_ROOT}/{self.resources['packageContainer']['name']}/{blob}"
-            self._prove_package_upload_ready(url)
+            package_create_window = self._prove_package_upload_ready(url)
             package_write_deadline = (
                 self._request_deadline() or self._authorization_expiry()
             )
             package_write_deadline -= dt.timedelta(
                 seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
             )
-            response = self._mutation_request(
-                "PUT",
+            response = self._conditional_storage_create_when_ready(
+                operation_id,
                 url,
                 body=body,
                 headers={
@@ -15757,8 +16174,9 @@ class AzureCliBootstrapTransport:
                     "If-None-Match": "*",
                     "x-ms-meta-sha256": self.package["sha256"],
                 },
-                expected={201},
-                deadline=package_write_deadline,
+                window=package_create_window,
+                request_deadline=package_write_deadline,
+                backoff_cap_seconds=32.0,
             )
             etag, version_id = self._require_storage_write_identity(
                 response, operation_id
@@ -15947,15 +16365,15 @@ class AzureCliBootstrapTransport:
                 }
             )
             url = self.resources["activationFenceBlob"]["resourceId"]
-            self._prove_fence_blob_create_ready(url)
+            fence_create_window = self._prove_fence_blob_create_ready(url)
             fence_write_deadline = (
                 self._request_deadline() or self._authorization_expiry()
             )
             fence_write_deadline -= dt.timedelta(
                 seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
             )
-            response = self._mutation_request(
-                "PUT",
+            response = self._conditional_storage_create_when_ready(
+                operation_id,
                 url,
                 body=body,
                 headers={
@@ -15965,8 +16383,9 @@ class AzureCliBootstrapTransport:
                     "If-None-Match": "*",
                     "x-ms-meta-sha256": sha256_bytes(body),
                 },
-                expected={201},
-                deadline=fence_write_deadline,
+                window=fence_create_window,
+                request_deadline=fence_write_deadline,
+                backoff_cap_seconds=15.0,
             )
             etag, version_id = self._require_storage_write_identity(
                 response, operation_id
@@ -16001,9 +16420,16 @@ class AzureCliBootstrapTransport:
                 "sha256": sha256_bytes(body),
                 "cleanupKey": "controller-lease-canary-blob",
             }
+            controller_create_window = self._controller_canary_create_window
+            if not isinstance(
+                controller_create_window, _ConditionalStorageCreateWindow
+            ):
+                fail(
+                    "controller canary create lacks its successful empty-proof readiness window"
+                )
             try:
-                response = self._mutation_request(
-                    "PUT",
+                response = self._conditional_storage_create_when_ready(
+                    operation_id,
                     url,
                     body=body,
                     headers={
@@ -16013,7 +16439,9 @@ class AzureCliBootstrapTransport:
                         "If-None-Match": "*",
                         "x-ms-meta-sha256": sha256_bytes(body),
                     },
-                    expected={201},
+                    window=controller_create_window,
+                    request_deadline=self._controller_canary_create_deadline(),
+                    backoff_cap_seconds=15.0,
                 )
                 etag, version_id = self._require_storage_write_identity(
                     response, operation_id

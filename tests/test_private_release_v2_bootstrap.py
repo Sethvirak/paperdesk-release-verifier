@@ -1472,6 +1472,10 @@ class _TerminalEvidenceFixture:
                     journal.append(intent)
                     if operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
                         intent["requestBodySha256"] = self.operations[operation_id]["projection"]["settingsRequestBodySha256"]
+                    if operation_id in bootstrap.CONDITIONAL_STORAGE_CREATE_ROLES:
+                        intent["requestBodySha256"] = self.operations[operation_id][
+                            "projection"
+                        ]["bodySha256"]
                     result = copy.deepcopy(intent)
                     versioned_headers = (
                         self.operations[operation_id]["headers"]
@@ -1479,6 +1483,7 @@ class _TerminalEvidenceFixture:
                         in {
                             "uploadVersionedBridgePackage",
                             "createInitialIdleActivationFence",
+                            "createControllerLeaseCanaryBlob",
                         }
                         else {}
                     )
@@ -1493,6 +1498,7 @@ class _TerminalEvidenceFixture:
                                     "claimAzureSingleUseAuthorization",
                                     "uploadVersionedBridgePackage",
                                     "createInitialIdleActivationFence",
+                                    "createControllerLeaseCanaryBlob",
                                 }
                                 else 200
                             ),
@@ -7437,6 +7443,70 @@ class BootstrapTests(unittest.TestCase):
             "operation_contexts": contexts,
         }
 
+    @staticmethod
+    def _resequence_terminal_journal(journal):
+        intent_ids = {}
+        for sequence, item in enumerate(journal, 1):
+            item["sequence"] = sequence
+            item["recordedAt"] = stamp(
+                NOW + dt.timedelta(milliseconds=sequence * 10)
+            )
+            old_intent_id = item["intentId"]
+            if item["phase"] == "intent":
+                new_intent_id = f"cloud-mutation-{sequence:04d}"
+                intent_ids[old_intent_id] = new_intent_id
+                item["intentId"] = new_intent_id
+            else:
+                item["intentId"] = intent_ids[old_intent_id]
+        return journal
+
+    def _journal_with_conditional_create_denial(
+        self,
+        journal,
+        operation_id,
+        code="AuthorizationPermissionMismatch",
+        *,
+        placement="before",
+    ):
+        altered = copy.deepcopy(journal)
+        success_intent_index = next(
+            index
+            for index, item in enumerate(altered)
+            if item["phase"] == "intent" and item["operationId"] == operation_id
+        )
+        success_intent = altered[success_intent_index]
+        success_result = altered[success_intent_index + 1]
+        marker = f"retry-denial:{operation_id}:{placement}:{code}"
+        denial_intent = copy.deepcopy(success_intent)
+        denial_intent["intentId"] = marker
+        denial_intent["clientRequestId"] = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, marker + ":client")
+        )
+        denial_result = copy.deepcopy(success_result)
+        denial_result.update(
+            {
+                "intentId": marker,
+                "clientRequestId": denial_intent["clientRequestId"],
+                "status": 403,
+                "responseBodySha256": bootstrap.sha256_bytes(
+                    marker.encode("utf-8")
+                ),
+                "etag": None,
+                "versionId": None,
+                "requestId": str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, marker + ":service")
+                ),
+                "storageErrorCode": code,
+            }
+        )
+        insert_at = (
+            success_intent_index
+            if placement == "before"
+            else success_intent_index + 2
+        )
+        altered[insert_at:insert_at] = [denial_intent, denial_result]
+        return self._resequence_terminal_journal(altered)
+
     def test_cleanup_terminal_proofs_reject_missing_or_drifted_restored_lock(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
@@ -7544,6 +7614,120 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(
             all(permanent[item]["outcome"] == "adopted-exact" for item in adopted)
         )
+
+    def test_terminal_journal_accepts_exact_no_effect_create_denial_prefixes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        journal = fixture["sourceEvidence"]["productionBoundary"][
+            "mutationJournal"
+        ]
+        for operation_id, code in (
+            ("uploadVersionedBridgePackage", "AuthorizationFailure"),
+            (
+                "createInitialIdleActivationFence",
+                "AuthorizationPermissionMismatch",
+            ),
+            (
+                "createControllerLeaseCanaryBlob",
+                "AuthorizationPermissionMismatch",
+            ),
+        ):
+            journal = self._journal_with_conditional_create_denial(
+                journal, operation_id, code
+            )
+
+        validated = bootstrap._validate_sanitized_mutation_journal(
+            journal, **self._terminal_journal_validation_inputs(fixture)
+        )
+
+        self.assertEqual(validated, journal)
+        for operation_id in bootstrap.CONDITIONAL_STORAGE_CREATE_ROLES:
+            results = [
+                item
+                for item in validated
+                if item["phase"] == "result"
+                and item["operationId"] == operation_id
+            ]
+            self.assertEqual([item["status"] for item in results], [403, 201])
+
+    def test_terminal_journal_rejects_inexact_create_retry_histories(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        original = fixture["sourceEvidence"]["productionBoundary"][
+            "mutationJournal"
+        ]
+        operation_id = "uploadVersionedBridgePackage"
+        inputs = self._terminal_journal_validation_inputs(fixture)
+
+        for mode in (
+            "wrong-body",
+            "wrong-code",
+            "wrong-status",
+            "denial-after-success",
+            "nonadjacent-pair",
+            "duplicate-success",
+            "success-error-code",
+        ):
+            with self.subTest(mode=mode):
+                journal = self._journal_with_conditional_create_denial(
+                    original,
+                    operation_id,
+                    placement="after" if mode == "denial-after-success" else "before",
+                )
+                denial_intent_index = next(
+                    index
+                    for index, item in enumerate(journal)
+                    if item["phase"] == "intent"
+                    and item["operationId"] == operation_id
+                    and journal[index + 1].get("status") == 403
+                )
+                denial_intent = journal[denial_intent_index]
+                denial_result = journal[denial_intent_index + 1]
+                if mode == "wrong-body":
+                    denial_intent["requestBodySha256"] = "f" * 64
+                    denial_result["requestBodySha256"] = "f" * 64
+                elif mode == "wrong-code":
+                    denial_result["storageErrorCode"] = "AuthenticationFailed"
+                elif mode == "wrong-status":
+                    denial_result["status"] = 409
+                    denial_result["storageErrorCode"] = "BlobAlreadyExists"
+                elif mode == "nonadjacent-pair":
+                    success_pair = journal[
+                        denial_intent_index + 2 : denial_intent_index + 4
+                    ]
+                    journal[denial_intent_index + 1 : denial_intent_index + 4] = [
+                        *success_pair,
+                        denial_result,
+                    ]
+                    self._resequence_terminal_journal(journal)
+                elif mode == "duplicate-success":
+                    success_intent = copy.deepcopy(journal[denial_intent_index + 2])
+                    success_result = copy.deepcopy(journal[denial_intent_index + 3])
+                    marker = "duplicate-package-success"
+                    success_intent["intentId"] = marker
+                    success_intent["clientRequestId"] = str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, marker + ":client")
+                    )
+                    success_result["intentId"] = marker
+                    success_result["clientRequestId"] = success_intent[
+                        "clientRequestId"
+                    ]
+                    success_result["requestId"] = str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, marker + ":service")
+                    )
+                    journal[denial_intent_index + 4 : denial_intent_index + 4] = [
+                        success_intent,
+                        success_result,
+                    ]
+                    self._resequence_terminal_journal(journal)
+                elif mode == "success-error-code":
+                    journal[denial_intent_index + 3][
+                        "storageErrorCode"
+                    ] = "AuthorizationPermissionMismatch"
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_sanitized_mutation_journal(
+                        journal, **inputs
+                    )
 
     def test_terminal_journal_rejects_attach_patch_when_preflight_adopts_exact(self):
         with tempfile.TemporaryDirectory() as folder:

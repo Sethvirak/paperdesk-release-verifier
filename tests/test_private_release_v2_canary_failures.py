@@ -190,6 +190,19 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             transport._active_protected_role_add = (
                 "addOwnedOperatorControllerCanaryRole"
             )
+            retry_start = min(
+                transport.clock()
+                + dt.timedelta(
+                    seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                ),
+                transport._controller_canary_readiness_deadline(),
+            )
+            transport._controller_canary_create_window = (
+                bootstrap._ConditionalStorageCreateWindow(
+                    first_attempt_start_deadline=retry_start,
+                    final_retry_start=retry_start,
+                )
+            )
         return transport, session, journal
 
     @staticmethod
@@ -271,6 +284,186 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             raised.exception.diagnostic["stopReason"], "unexpected-status"
         )
         self.assertEqual([request[0] for request in session.requests], ["PUT"])
+        self.assertEqual(
+            [record["phase"] for record in journal.records], ["intent", "result"]
+        )
+
+    def test_exact_403_create_denials_retry_to_one_conditional_success(self):
+        for code in (
+            "AuthorizationFailure",
+            "AuthorizationPermissionMismatch",
+        ):
+            with self.subTest(code=code):
+                created = bootstrap._RestResponse(
+                    201,
+                    b"",
+                    {"ETag": ETAG, "x-ms-version-id": VERSION_ID},
+                )
+                transport, session, journal = self.transport(
+                    [storage_error(403, code), created], CREATE
+                )
+
+                result = transport._mutate(self.fixture.mutations[CREATE], {})
+
+                self.assertEqual([request[0] for request in session.requests], ["PUT", "PUT"])
+                self.assertTrue(
+                    all(request[1] == self.create_contract["expectedUrl"] for request in session.requests)
+                )
+                self.assertTrue(
+                    all(request[2] == self.canary_body() for request in session.requests)
+                )
+                self.assertTrue(
+                    all(request[3]["If-None-Match"] == "*" for request in session.requests)
+                )
+                client_ids = [
+                    request[3]["x-ms-client-request-id"] for request in session.requests
+                ]
+                self.assertEqual(len(set(client_ids)), 2)
+                self.assertEqual(
+                    [record["phase"] for record in journal.records],
+                    ["intent", "result", "intent", "result"],
+                )
+                self.assertEqual(
+                    [record["status"] for record in journal.records if record["phase"] == "result"],
+                    [403, 201],
+                )
+                self.assertEqual(result["etag"], ETAG)
+                self.assertEqual(result["versionId"], VERSION_ID)
+
+    def test_controller_create_never_retries_an_inexact_403(self):
+        cases = [
+            storage_error(403, "AuthenticationFailed"),
+            bootstrap._RestResponse(
+                403,
+                b"<Error><Code>AuthorizationPermissionMismatch</Code></Error>",
+                {"Content-Type": "application/json"},
+            ),
+            bootstrap._RestResponse(
+                403,
+                b"<Error><Code>AuthorizationPermissionMismatch</Code></Error>",
+                {
+                    "Content-Type": "application/xml",
+                    "x-ms-error-code": "AuthorizationFailure",
+                },
+            ),
+        ]
+        for response in cases:
+            with self.subTest(headers=response.headers):
+                transport, session, journal = self.transport([response], CREATE)
+
+                with self.assertRaises(bootstrap.StorageOperationError) as raised:
+                    transport._mutate(self.fixture.mutations[CREATE], {})
+
+                self.assertEqual([request[0] for request in session.requests], ["PUT"])
+                self.assertEqual(raised.exception.diagnostic["stopReason"], "unsupported-response")
+                self.assertEqual(
+                    [record["phase"] for record in journal.records],
+                    ["intent", "result"],
+                )
+
+    def test_conditional_create_rejects_unreviewed_headers_before_intent(self):
+        body = self.canary_body()
+        valid_headers = {
+            "Content-Type": "application/json",
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": bootstrap.STORAGE_API_VERSION,
+            "If-None-Match": "*",
+            "x-ms-meta-sha256": bootstrap.sha256_bytes(body),
+        }
+        cases = []
+        missing_content_type = dict(valid_headers)
+        del missing_content_type["Content-Type"]
+        cases.append(missing_content_type)
+        cases.append({**valid_headers, "Content-Type": "application/octet-stream"})
+        cases.append({**valid_headers, "Content-Encoding": "gzip"})
+
+        for headers in cases:
+            with self.subTest(headers=headers):
+                transport, session, journal = self.transport([], CREATE)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError, "exact source boundary"
+                ):
+                    transport._conditional_storage_create_when_ready(
+                        CREATE,
+                        self.create_contract["expectedUrl"],
+                        body=body,
+                        headers=headers,
+                        window=transport._controller_canary_create_window,
+                        request_deadline=transport._controller_canary_create_deadline(),
+                        backoff_cap_seconds=15.0,
+                    )
+                self.assertEqual(session.requests, [])
+                self.assertEqual(journal.records, [])
+
+    def test_controller_403_result_journal_failure_is_never_retried(self):
+        transport, session, journal = self.transport(
+            [storage_error(403, "AuthorizationPermissionMismatch")], CREATE
+        )
+        journal.fail_result = True
+
+        with self.assertRaises(bootstrap.StorageOperationError) as raised:
+            transport._mutate(self.fixture.mutations[CREATE], {})
+
+        self.assertEqual([request[0] for request in session.requests], ["PUT"])
+        self.assertEqual([record["phase"] for record in journal.records], ["intent"])
+        self.assertEqual(raised.exception.diagnostic["stopReason"], "result-journal-error")
+
+    def test_controller_create_retry_stops_at_its_readiness_boundary(self):
+        current = [NOW]
+
+        def cross_boundary(_seconds):
+            current[0] = NOW + dt.timedelta(
+                seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS,
+                microseconds=1,
+            )
+
+        transport, session, journal = self.transport(
+            [storage_error(403, "AuthorizationPermissionMismatch")],
+            CREATE,
+            clock=lambda: current[0],
+            sleep=cross_boundary,
+        )
+
+        with self.assertRaises(bootstrap.StorageOperationError) as raised:
+            transport._mutate(self.fixture.mutations[CREATE], {})
+
+        self.assertEqual([request[0] for request in session.requests], ["PUT"])
+        self.assertEqual(raised.exception.diagnostic["stopReason"], "readiness-timeout")
+        self.assertEqual(len(journal.records), 2)
+
+    def test_controller_create_stops_after_64_exact_denials(self):
+        denials = [
+            storage_error(403, "AuthorizationPermissionMismatch")
+            for _index in range(bootstrap.MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS)
+        ]
+        transport, session, journal = self.transport(denials, CREATE)
+
+        with self.assertRaises(bootstrap.StorageOperationError) as raised:
+            transport._mutate(self.fixture.mutations[CREATE], {})
+
+        self.assertEqual(
+            len(session.requests), bootstrap.MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS
+        )
+        self.assertEqual(raised.exception.diagnostic["stopReason"], "readiness-timeout")
+        self.assertEqual(
+            len(journal.records),
+            2 * bootstrap.MAX_CONDITIONAL_STORAGE_CREATE_ATTEMPTS,
+        )
+
+    def test_controller_success_without_storage_identity_is_not_retried(self):
+        transport, session, journal = self.transport(
+            [bootstrap._RestResponse(201, b"", {})], CREATE
+        )
+
+        with self.assertRaises(bootstrap.OwnedTemporaryMutationError) as raised:
+            transport._mutate(self.fixture.mutations[CREATE], {})
+
+        self.assertEqual([request[0] for request in session.requests], ["PUT", "GET"])
+        self.assertIsInstance(raised.exception.__cause__, bootstrap.StorageOperationError)
+        self.assertEqual(
+            raised.exception.__cause__.diagnostic["stopReason"],
+            "unsupported-response",
+        )
         self.assertEqual(
             [record["phase"] for record in journal.records], ["intent", "result"]
         )
