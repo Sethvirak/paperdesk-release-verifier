@@ -74,6 +74,8 @@ MAX_PREFLIGHT_AGE_SECONDS = 300
 MAX_READBACK_CONVERGENCE_SECONDS = 120
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
+MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS = 4
+CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS = (1, 2, 4)
 AZURE_CLI_REQUEST_TIMEOUT_SECONDS = 45
 AZURE_REST_RESPONSE_TIMEOUT_SECONDS = 45
 STORAGE_API_VERSION = "2023-11-03"
@@ -116,7 +118,8 @@ PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
 # journal margin. Deadlines below bind every request to its own envelope.
 CONTROLLER_CANARY_LEASE_DURATION_SECONDS = 60
 CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
-    9 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    15 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + 2 * sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
     + CONTROLLER_CANARY_LEASE_DURATION_SECONDS
     + 30
 )
@@ -2261,6 +2264,119 @@ def _validated_conditional_storage_create_denial_sequences(
     return ignored_result_sequences
 
 
+def _validated_controller_lease_denial_sequences(
+    journal: Sequence[Mapping[str, Any]],
+    *,
+    plan: Mapping[str, Any],
+    authorization_id: str,
+    source_sha: str,
+) -> set[int]:
+    """Validate bounded 403 prefixes for only fast renew and fast release."""
+
+    operation_id = "exerciseControllerLeaseCanary"
+    indexed = [
+        (index, item)
+        for index, item in enumerate(journal)
+        if item.get("operationId") == operation_id
+    ]
+    if not indexed:
+        return set()
+    authorization = {
+        "authorizationId": authorization_id,
+        "source": {"mergedMain": {"commitSha": source_sha}},
+    }
+    target = (
+        _operation_readback_url(
+            "createControllerLeaseCanaryBlob", plan, authorization
+        )
+        + "?comp=lease"
+    )
+    positions = [index for index, _item in indexed]
+    records = [item for _index, item in indexed]
+    required_statuses = [
+        201,
+        *([200] * int(plan["temporaryAccess"]["leaseRenewals"])),
+        200,
+        201,
+    ]
+    maximum_denials = 2 * (MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1)
+    if (
+        positions != list(range(positions[0], positions[0] + len(positions)))
+        or len(records) % 2 != 0
+        or not 2 * len(required_statuses)
+        <= len(records)
+        <= 2 * (len(required_statuses) + maximum_denials)
+    ):
+        fail("controller lease attempts are not one bounded serial section")
+
+    ignored: set[int] = set()
+    success_index = 0
+    denial_count_for_action = 0
+    client_ids: set[str] = set()
+    request_ids: set[str] = set()
+    empty_body_sha256 = sha256_bytes(b"")
+    for offset in range(0, len(records), 2):
+        intent = records[offset]
+        result = records[offset + 1]
+        client_request_id = intent.get("clientRequestId")
+        request_id = result.get("requestId")
+        if (
+            intent.get("phase") != "intent"
+            or result.get("phase") != "result"
+            or result.get("intentId") != intent.get("intentId")
+            or any(
+                item.get("method") != "PUT"
+                or item.get("targetUrl") != target
+                or item.get("requestBodySha256") != empty_body_sha256
+                for item in (intent, result)
+            )
+            or not isinstance(client_request_id, str)
+            or GUID.fullmatch(client_request_id) is None
+            or client_request_id in client_ids
+            or not isinstance(request_id, str)
+            or GUID.fullmatch(request_id) is None
+            or request_id in request_ids
+        ):
+            fail("controller lease attempt is not exact and uniquely correlated")
+        client_ids.add(client_request_id)
+        request_ids.add(request_id)
+
+        status = result.get("status")
+        if status == 403:
+            # One or more denials may precede only the required renew success
+            # and the immediately following required release success.
+            if (
+                success_index
+                not in {
+                    1,
+                    1 + int(plan["temporaryAccess"]["leaseRenewals"]),
+                }
+                or denial_count_for_action
+                >= MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1
+                or result.get("storageErrorCode")
+                != "AuthorizationPermissionMismatch"
+                or result.get("etag") is not None
+                or result.get("versionId") is not None
+            ):
+                fail("controller lease denial is not a reviewed no-effect prefix")
+            denial_count_for_action += 1
+            ignored.add(int(result["sequence"]))
+            continue
+
+        if (
+            success_index >= len(required_statuses)
+            or status != required_statuses[success_index]
+            or result.get("storageErrorCode") != "unknown"
+        ):
+            fail("controller lease success sequence is not exact")
+        success_index += 1
+        denial_count_for_action = 0
+
+    if success_index != len(required_statuses):
+        fail("controller lease sequence did not finish exactly")
+    return ignored
+
+
 def _validate_terminal_mutation_coverage(
     journal: Sequence[Mapping[str, Any]],
     *,
@@ -2281,6 +2397,14 @@ def _validate_terminal_mutation_coverage(
             source_sha=source_sha,
             operation_projections=operation_projections,
             operation_contexts=operation_contexts,
+        )
+    )
+    ignored_denial_sequences.update(
+        _validated_controller_lease_denial_sequences(
+            journal,
+            plan=plan,
+            authorization_id=authorization_id,
+            source_sha=source_sha,
         )
     )
     results_by_operation: dict[str, Counter[str]] = {
@@ -11802,6 +11926,69 @@ def _conditional_storage_create_propagation_code(
     return code
 
 
+def _controller_lease_propagation_code(response: _RestResponse) -> str:
+    """Return the one exact no-effect lease denial eligible for retry."""
+
+    content_types = [
+        value
+        for key, value in response.headers.items()
+        if key.lower() == "content-type"
+    ]
+    error_codes = [
+        value
+        for key, value in response.headers.items()
+        if key.lower() == "x-ms-error-code"
+    ]
+    identity_headers = [
+        key
+        for key in response.headers
+        if key.lower() in {"etag", "x-ms-version-id"}
+    ]
+    if (
+        response.status != 403
+        or len(content_types) != 1
+        or not isinstance(content_types[0], str)
+        or content_types[0].split(";", 1)[0].strip().lower()
+        not in {"application/xml", "text/xml"}
+        or len(error_codes) > 1
+        or any(not isinstance(value, str) for value in error_codes)
+        or identity_headers
+        or not response.body
+        or len(response.body) > 65536
+    ):
+        fail("controller lease denial is not one exact XML 403")
+    try:
+        root = _strict_storage_xml_root(response.body, "controller lease denial")
+    except _StrictStorageXmlError as exc:
+        raise BootstrapError(
+            "controller lease denial is not one exact XML 403"
+        ) from exc
+    children = list(root)
+    code_children = [child for child in children if child.tag == "Code"]
+    if (
+        root.tag != "Error"
+        or root.attrib
+        or (root.text or "").strip()
+        or len(code_children) != 1
+        or [child.tag for child in children].count("Message") > 1
+        or any(
+            child.tag not in {"Code", "Message"}
+            or child.attrib
+            or list(child)
+            or (child.tail or "").strip()
+            for child in children
+        )
+    ):
+        fail("controller lease denial is not one exact XML 403")
+    code = code_children[0].text
+    if (
+        code != "AuthorizationPermissionMismatch"
+        or (error_codes and error_codes[0] != code)
+    ):
+        fail("controller lease denial is not the reviewed propagation response")
+    return code
+
+
 def _key_vault_preflight_error_projection(
     method: str, url: str, response: _RestResponse
 ) -> dict[str, str] | None:
@@ -12051,12 +12238,20 @@ class AzureCliBootstrapTransport:
 
     def _controller_canary_fast_renew_deadline(self) -> dt.datetime:
         return self._controller_canary_fast_acquire_deadline() + dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS
+                * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+            )
         )
 
     def _controller_canary_release_deadline(self) -> dt.datetime:
         return self._controller_canary_fast_renew_deadline() + dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS
+                * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+            )
         )
 
     def _controller_canary_expiry_acquire_deadline(self) -> dt.datetime:
@@ -12825,6 +13020,166 @@ class AzureCliBootstrapTransport:
         fail_create(
             "conditional Storage create propagation exceeded bounded attempts",
             "readiness-timeout",
+        )
+
+    def _controller_lease_action_when_ready(
+        self,
+        url: str,
+        *,
+        action: str,
+        lease_id: str,
+        lease_window_started: dt.datetime,
+        request_deadline: dt.datetime,
+    ) -> tuple[_RestResponse, dt.datetime, dt.datetime]:
+        """Retry one reviewed lease denial while the owned lease is current."""
+
+        expected_url = (
+            _operation_readback_url(
+                "createControllerLeaseCanaryBlob", self.plan, self.authorization
+            )
+            + "?comp=lease"
+        )
+        expected_status = {"renew": 200, "release": 200}.get(action)
+        expected_deadline = {
+            "renew": self._controller_canary_fast_renew_deadline(),
+            "release": self._controller_canary_release_deadline(),
+        }.get(action)
+        if (
+            self._active_operation_id != "exerciseControllerLeaseCanary"
+            or self._active_protected_role_add
+            != "addOwnedOperatorControllerCanaryRole"
+            or url != expected_url
+            or expected_status is None
+            or lease_id != self.plan["temporaryAccess"]["controllerLeaseId"]
+            or not isinstance(lease_window_started, dt.datetime)
+            or lease_window_started.tzinfo != dt.timezone.utc
+            or request_deadline != expected_deadline
+        ):
+            fail("controller lease retry is outside its exact source boundary")
+
+        started = self.clock()
+        lease_cutoff = lease_window_started + dt.timedelta(
+            seconds=self.plan["temporaryAccess"]["leaseDurationSeconds"]
+        )
+        attempt_records: list[dict[str, Any]] = []
+        last_response: _RestResponse | None = None
+        last_code = "unknown"
+
+        def fail_action(message: str, stop_reason: str) -> None:
+            correlation = _storage_response_correlation(
+                self._header(last_response, "x-ms-request-id")
+                if last_response is not None
+                else None,
+                self._header(last_response, "Date")
+                if last_response is not None
+                else None,
+            )
+            raise StorageOperationError(
+                message,
+                operation_id="exerciseControllerLeaseCanary",
+                method="PUT",
+                elapsed_seconds=(self.clock() - started).total_seconds(),
+                status=last_response.status if last_response is not None else None,
+                error_code=last_code,
+                stop_reason=stop_reason,
+                request_id=correlation["requestId"],
+                server_date=correlation["serverDate"],
+                attempt_records=attempt_records,
+            ) from None
+
+        for attempt in range(1, MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS + 1):
+            before_request = self.clock()
+            if before_request >= lease_cutoff:
+                fail_action(
+                    "controller lease authorization did not converge before expiry",
+                    "readiness-timeout",
+                )
+            response = self._mutation_request(
+                "PUT",
+                url,
+                body=b"",
+                headers={
+                    "x-ms-version": STORAGE_API_VERSION,
+                    "x-ms-lease-action": action,
+                    "x-ms-lease-id": lease_id,
+                },
+                expected={expected_status, 403},
+                cleanup=action == "release",
+                deadline=request_deadline,
+            )
+            observed = self.clock()
+            if response.status == expected_status:
+                return response, before_request, observed
+
+            last_response = response
+            last_code = "unknown"
+            client_request_id = response.client_request_id
+            correlation = _storage_response_correlation(
+                self._header(response, "x-ms-request-id"),
+                self._header(response, "Date"),
+            )
+            if (
+                not isinstance(client_request_id, str)
+                or GUID.fullmatch(client_request_id) is None
+                or correlation["requestId"] is None
+                or correlation["serverDate"] is None
+            ):
+                fail_action(
+                    "controller lease denial lacks exact correlation",
+                    "unsupported-response",
+                )
+            try:
+                code = _controller_lease_propagation_code(response)
+            except BootstrapError:
+                attempt_records.append(
+                    _storage_attempt_record(
+                        attempt=attempt,
+                        started=before_request,
+                        completed=observed,
+                        client_request_id=client_request_id,
+                        status=response.status,
+                        error_code="unknown",
+                        request_id=correlation["requestId"],
+                        server_date=correlation["serverDate"],
+                        outcome="response",
+                    )
+                )
+                fail_action(
+                    "controller lease denial failed exact validation",
+                    "unsupported-response",
+                )
+            last_code = code
+            attempt_records.append(
+                _storage_attempt_record(
+                    attempt=attempt,
+                    started=before_request,
+                    completed=observed,
+                    client_request_id=client_request_id,
+                    status=response.status,
+                    error_code=code,
+                    request_id=correlation["requestId"],
+                    server_date=correlation["serverDate"],
+                    outcome="response",
+                )
+            )
+            if attempt == MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS:
+                fail_action(
+                    "controller lease authorization did not converge",
+                    "readiness-timeout",
+                )
+            delay = CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS[attempt - 1]
+            if observed + dt.timedelta(seconds=delay) >= lease_cutoff:
+                fail_action(
+                    "controller lease authorization did not converge before expiry",
+                    "readiness-timeout",
+                )
+            self._sleep_before_deadline(
+                delay,
+                f"controller lease {action} authorization retry",
+                deadline=lease_cutoff,
+            )
+        fail_action(
+            "controller lease retry exceeded bounded attempts", "readiness-timeout"
         )
 
     @staticmethod
@@ -16850,14 +17205,28 @@ class AzureCliBootstrapTransport:
             }
             query_url = f"{url}?comp=lease"
 
-            def observed_stamp() -> str:
-                return self.clock().astimezone(dt.timezone.utc).isoformat(
+            def observed_stamp(value: dt.datetime | None = None) -> str:
+                return (value or self.clock()).astimezone(dt.timezone.utc).isoformat(
                     timespec="milliseconds"
                 ).replace("+00:00", "Z")
 
             def release(
-                candidate: str, *, deadline: dt.datetime
+                candidate: str,
+                *,
+                deadline: dt.datetime,
+                lease_window_started: dt.datetime | None = None,
             ) -> tuple[int, str]:
+                if lease_window_started is not None:
+                    response, _started, completed = (
+                        self._controller_lease_action_when_ready(
+                            query_url,
+                            action="release",
+                            lease_id=candidate,
+                            lease_window_started=lease_window_started,
+                            request_deadline=deadline,
+                        )
+                    )
+                    return response.status, observed_stamp(completed)
                 response = self._mutation_request(
                     "PUT",
                     query_url,
@@ -16878,9 +17247,14 @@ class AzureCliBootstrapTransport:
                 *,
                 release_deadline: dt.datetime,
                 expiry_deadline: dt.datetime,
+                lease_window_started: dt.datetime | None = None,
             ) -> tuple[int, str]:
                 try:
-                    return release(candidate, deadline=release_deadline)
+                    return release(
+                        candidate,
+                        deadline=release_deadline,
+                        lease_window_started=lease_window_started,
+                    )
                 except BaseException:
                     # A release can be ambiguous after the request reached
                     # Storage. The lease is source-fixed at 60 seconds, so
@@ -16895,12 +17269,14 @@ class AzureCliBootstrapTransport:
             fast_acquire_attempted = False
             fast_acquired = False
             fast_acquired_at = None
+            fast_lease_window_started: dt.datetime | None = None
             fast_renewed_at: list[str] = []
             fast_release_status = None
             fast_released_at = None
             fast_primary_error: BaseException | None = None
             try:
                 fast_acquire_attempted = True
+                fast_acquire_started = self.clock()
                 self._mutation_request(
                     "PUT",
                     query_url,
@@ -16915,21 +17291,27 @@ class AzureCliBootstrapTransport:
                     deadline=self._controller_canary_fast_acquire_deadline(),
                 )
                 fast_acquired = True
+                fast_lease_window_started = fast_acquire_started
                 fast_acquired_at = observed_stamp()
                 for _ in range(self.plan["temporaryAccess"]["leaseRenewals"]):
-                    self._mutation_request(
-                        "PUT",
-                        query_url,
-                        body=b"",
-                        headers={
-                            "x-ms-version": "2023-11-03",
-                            "x-ms-lease-action": "renew",
-                            "x-ms-lease-id": lease_id,
-                        },
-                        expected={200},
-                        deadline=self._controller_canary_fast_renew_deadline(),
+                    (
+                        _response,
+                        fast_lease_window_started,
+                        fast_renew_completed,
+                    ) = (
+                        self._controller_lease_action_when_ready(
+                            query_url,
+                            action="renew",
+                            lease_id=lease_id,
+                            lease_window_started=fast_lease_window_started,
+                            request_deadline=(
+                                self._controller_canary_fast_renew_deadline()
+                            ),
+                        )
                     )
-                    fast_renewed_at.append(observed_stamp())
+                    fast_renewed_at.append(
+                        observed_stamp(fast_renew_completed)
+                    )
             except BaseException as exc:
                 fast_primary_error = exc
             finally:
@@ -16942,6 +17324,11 @@ class AzureCliBootstrapTransport:
                             ),
                             expiry_deadline=(
                                 self._controller_canary_expiry_acquire_deadline()
+                            ),
+                            lease_window_started=(
+                                fast_lease_window_started
+                                if fast_acquired
+                                else None
                             ),
                         )
                     except BaseException as cleanup_error:

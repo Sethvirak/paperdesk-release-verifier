@@ -1494,6 +1494,8 @@ class _TerminalEvidenceFixture:
                         intent["requestBodySha256"] = self.operations[operation_id][
                             "projection"
                         ]["bodySha256"]
+                    if operation_id == "exerciseControllerLeaseCanary":
+                        intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
                     result = copy.deepcopy(intent)
                     versioned_headers = (
                         self.operations[operation_id]["headers"]
@@ -1518,6 +1520,18 @@ class _TerminalEvidenceFixture:
                                     "createInitialIdleActivationFence",
                                     "createControllerLeaseCanaryBlob",
                                 }
+                                or (
+                                    operation_id
+                                    == "exerciseControllerLeaseCanary"
+                                    and occurrence
+                                    in {
+                                        0,
+                                        2
+                                        + self.plan["temporaryAccess"][
+                                            "leaseRenewals"
+                                        ],
+                                    }
+                                )
                                 else 200
                             ),
                             "responseBodySha256": self.digest(
@@ -7740,6 +7754,55 @@ class BootstrapTests(unittest.TestCase):
         altered[insert_at:insert_at] = [denial_intent, denial_result]
         return self._resequence_terminal_journal(altered)
 
+    def _journal_with_controller_lease_denials(self, journal):
+        operation_id = "exerciseControllerLeaseCanary"
+        altered = copy.deepcopy(journal)
+        entries = [
+            item for item in altered if item["operationId"] == operation_id
+        ]
+        pairs = [entries[index:index + 2] for index in range(0, len(entries), 2)]
+
+        def denial(before_pair, marker):
+            intent = copy.deepcopy(before_pair[0])
+            result = copy.deepcopy(before_pair[1])
+            intent["intentId"] = marker
+            intent["clientRequestId"] = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, marker + ":client")
+            )
+            result.update(
+                {
+                    "intentId": marker,
+                    "clientRequestId": intent["clientRequestId"],
+                    "status": 403,
+                    "responseBodySha256": bootstrap.sha256_bytes(
+                        marker.encode("utf-8")
+                    ),
+                    "etag": None,
+                    "versionId": None,
+                    "requestId": str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, marker + ":service")
+                    ),
+                    "storageErrorCode": "AuthorizationPermissionMismatch",
+                }
+            )
+            return [intent, result]
+
+        replacement = [
+            *pairs[0],
+            *denial(pairs[1], "controller-renew-denial"),
+            *pairs[1],
+            *denial(pairs[2], "controller-release-denial"),
+            *pairs[2],
+            *pairs[3],
+        ]
+        first = next(
+            index
+            for index, item in enumerate(altered)
+            if item["operationId"] == operation_id
+        )
+        altered[first:first + len(entries)] = replacement
+        return self._resequence_terminal_journal(altered)
+
     def test_cleanup_terminal_proofs_reject_missing_or_drifted_restored_lock(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
@@ -7882,6 +7945,38 @@ class BootstrapTests(unittest.TestCase):
                 and item["operationId"] == operation_id
             ]
             self.assertEqual([item["status"] for item in results], [403, 201])
+
+    def test_terminal_journal_accepts_only_reviewed_lease_denial_prefixes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        journal = self._journal_with_controller_lease_denials(
+            fixture["sourceEvidence"]["productionBoundary"]["mutationJournal"]
+        )
+
+        validated = bootstrap._validate_sanitized_mutation_journal(
+            journal, **self._terminal_journal_validation_inputs(fixture)
+        )
+
+        results = [
+            item
+            for item in validated
+            if item["phase"] == "result"
+            and item["operationId"] == "exerciseControllerLeaseCanary"
+        ]
+        self.assertEqual(
+            [item["status"] for item in results],
+            [201, 403, 200, 403, 200, 201],
+        )
+
+        rejected = copy.deepcopy(journal)
+        denial = next(item for item in rejected if item.get("status") == 403)
+        denial["storageErrorCode"] = "AuthorizationFailure"
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "reviewed no-effect prefix"
+        ):
+            bootstrap._validate_sanitized_mutation_journal(
+                rejected, **self._terminal_journal_validation_inputs(fixture)
+            )
 
     def test_terminal_journal_rejects_inexact_create_retry_histories(self):
         with tempfile.TemporaryDirectory() as folder:
