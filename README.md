@@ -279,12 +279,11 @@ idle body, metadata, ETag, and version after the temporary fence role becomes
 active. Receipt absence uses the ordinary create path, while receipt or live
 state drift stops without overwriting the fence.
 
-The exact versioned bridge package created by a later failed bootstrap can be
-adopted under the same receipt-bound rule. The observer accepts only the pinned
-intent, successful result, and consumed terminal receipts for the same merged
-source and package digest. Execution then performs the ordinary live byte,
-size, ETag, and version readback after temporary package access becomes active;
-receipt absence uses conditional create and any drift stops without overwrite.
+If a failed bootstrap already created its exact source-keyed bridge package,
+leave that incident package in place for evidence and recovery. Resume release
+work from a new reviewed merge, whose different source SHA selects a distinct
+package key and the ordinary conditional-create path. Do not overwrite or reuse
+the earlier source-keyed package during the new release.
 
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the

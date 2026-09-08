@@ -107,27 +107,6 @@ INCIDENT_FENCE_PACKAGE_SHA256 = (
 )
 INCIDENT_FENCE_ETAG = '"0x8DF0D8A624E66BD"'
 INCIDENT_FENCE_VERSION_ID = "2026-09-08T09:20:11.5852989Z"
-INCIDENT_PACKAGE_RECEIPT_DIRECTORY = Path(
-    r"C:\ProgramData\PaperDeskReleaseCeremonies-20260905-a75d00e9"
-    r"\paperdesk-private-release-v2-bootstrap-827beb7d-af9d-4cde-8fa6-db292e1e9826"
-)
-INCIDENT_PACKAGE_RECEIPT_SHA256 = {
-    "cloud-mutation-0029.json": "78cf4caf4aa36768f77ff21ba2f645d9d74a37f68e3aabef4538ea5ccc950341",
-    "cloud-mutation-0030.json": "0a2cc3da6670d2ef494b37f25b0f48998d08572a2adaf3dee9c1838f6c7e6be3",
-    "execution-terminal.json": "6bb02afcad7406ce3b8e690b9bf8c5ffbab9420a5f6e38de69dd2e923fe8b49b",
-}
-INCIDENT_PACKAGE_AUTHORIZATION_SHA256 = (
-    "11081f779d8a4a9732cd22c46baeb93e03ce4ca2eaf5e20a96da667308624d18"
-)
-INCIDENT_PACKAGE_SOURCE_SHA = "8e051fb9ab943993bf894c1909d3b25e287a10a2"
-INCIDENT_PACKAGE_PLAN_SHA256 = (
-    "dfb157e70d85361e19e8e64b8d80f35c3ed97f9f0de6e0e30a5b885e4bca6fb8"
-)
-INCIDENT_PACKAGE_SHA256 = (
-    "63dc34d655001198df07938d821cbf87496740bafc0e06a7e72c1cbef2593bca"
-)
-INCIDENT_PACKAGE_ETAG = '"0x8DF0DB87714C963"'
-INCIDENT_PACKAGE_VERSION_ID = "2026-09-08T14:50:03.2894307Z"
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -1116,94 +1095,6 @@ def _incident_exact_activation_fence_adoption(
     }
 
 
-def _incident_exact_package_adoption(
-    plan: Mapping[str, Any],
-    authorization: Mapping[str, Any],
-    *,
-    receipt_directory: Path = INCIDENT_PACKAGE_RECEIPT_DIRECTORY,
-    expected_hashes: Mapping[str, str] = INCIDENT_PACKAGE_RECEIPT_SHA256,
-) -> dict[str, Any] | None:
-    """Bind the exact immutable package created by the failed bootstrap."""
-
-    if (
-        authorization.get("source", {}).get("mergedMain", {}).get("commitSha")
-        != INCIDENT_PACKAGE_SOURCE_SHA
-        or authorization.get("plan", {}).get("bridgePackageSha256")
-        != INCIDENT_PACKAGE_SHA256
-    ):
-        return None
-    if not receipt_directory.exists() and not receipt_directory.is_symlink():
-        return None
-    if not receipt_directory.is_dir() or receipt_directory.is_symlink():
-        fail("incident package receipt directory is unsafe")
-    if set(expected_hashes) != {
-        "cloud-mutation-0029.json",
-        "cloud-mutation-0030.json",
-        "execution-terminal.json",
-    }:
-        fail("incident package receipt manifest is not exact")
-    documents: dict[str, Mapping[str, Any]] = {}
-    for name, expected_sha256 in expected_hashes.items():
-        path = receipt_directory / name
-        if not path.is_file() or path.is_symlink():
-            fail("incident package receipt is absent or unsafe")
-        document, raw = bootstrap.load_json(path, require_canonical=True)
-        if bootstrap.sha256_bytes(raw) != expected_sha256:
-            fail("incident package receipt bytes drifted")
-        documents[name] = document
-
-    intent = documents["cloud-mutation-0029.json"]
-    result = documents["cloud-mutation-0030.json"]
-    terminal = documents["execution-terminal.json"]
-    contract = bootstrap._validator_contract(
-        "operation:uploadVersionedBridgePackage", plan, authorization
-    )
-    package_sha256 = authorization["plan"]["bridgePackageSha256"]
-    common = {
-        "authorizationSha256": INCIDENT_PACKAGE_AUTHORIZATION_SHA256,
-        "operationId": "uploadVersionedBridgePackage",
-        "method": "PUT",
-        "temporary": False,
-        "sourceSha": INCIDENT_PACKAGE_SOURCE_SHA,
-        "planSha256": INCIDENT_PACKAGE_PLAN_SHA256,
-        "packageSha256": INCIDENT_PACKAGE_SHA256,
-        "requestBodySha256": package_sha256,
-        "targetUrl": contract["expectedUrl"],
-    }
-    if (
-        package_sha256 != INCIDENT_PACKAGE_SHA256
-        or any(intent.get(key) != value for key, value in common.items())
-        or intent.get("phase") != "intent"
-        or intent.get("sequence") != 29
-        or any(result.get(key) != value for key, value in common.items())
-        or result.get("phase") != "result"
-        or result.get("sequence") != 30
-        or result.get("intentId") != "cloud-mutation-0029"
-        or result.get("status") != 201
-        or result.get("etag") != INCIDENT_PACKAGE_ETAG
-        or result.get("versionId") != INCIDENT_PACKAGE_VERSION_ID
-        or terminal.get("authorizationId") != "827beb7d-af9d-4cde-8fa6-db292e1e9826"
-        or terminal.get("authorizationSha256")
-        != INCIDENT_PACKAGE_AUTHORIZATION_SHA256
-        or terminal.get("sourceSha") != INCIDENT_PACKAGE_SOURCE_SHA
-        or terminal.get("planSha256") != INCIDENT_PACKAGE_PLAN_SHA256
-        or terminal.get("status") != "failed"
-        or terminal.get("consumed") is not True
-        or "uploadVersionedBridgePackage"
-        not in terminal.get("appliedMutationIds", [])
-    ):
-        fail("incident package creation evidence is not exact")
-    return {
-        "blob": (
-            f"v2/control/{INCIDENT_PACKAGE_SOURCE_SHA}/"
-            "paperdesk-private-release-bridge.zip"
-        ),
-        "etag": INCIDENT_PACKAGE_ETAG,
-        "versionId": INCIDENT_PACKAGE_VERSION_ID,
-        "url": contract["expectedUrl"],
-    }
-
-
 def _is_future_executor_owned_remove(operation: Mapping[str, Any]) -> bool:
     kind = str(operation.get("kind", ""))
     return operation.get("temporary") is True and (
@@ -1225,7 +1116,6 @@ def _operation_admission(
     stable_package_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
     stable_fence_role_definition: Mapping[str, Any] | None = None,
     incident_fence_receipt_directory: Path | None = None,
-    incident_package_receipt_directory: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
 
@@ -1250,21 +1140,6 @@ def _operation_admission(
                 not in TEMPORARY_STORAGE_RBAC_DENIAL_CODES
             ):
                 fail("package blob preflight is not blocked by temporary access")
-            adopted = (
-                None
-                if incident_package_receipt_directory is None
-                else _incident_exact_package_adoption(
-                    plan,
-                    authorization,
-                    receipt_directory=incident_package_receipt_directory,
-                )
-            )
-            if adopted is not None:
-                return "exact", _policy_checked_context(
-                    operation_id,
-                    policy,
-                    {"executionDecision": "adopt-exact", "adopted": adopted},
-                )
             return "network-inaccessible", _policy_checked_context(
                 operation_id,
                 policy,
@@ -1910,7 +1785,6 @@ def build_read_only_observation(
     observed_at: dt.datetime,
     uploader_ipv4: str,
     incident_fence_receipt_directory: Path | None = None,
-    incident_package_receipt_directory: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return canonical-ready preflight and non-executable auth template."""
 
@@ -2225,7 +2099,6 @@ def build_read_only_observation(
             stable_package_role_definitions,
             stable_fence_role_definition,
             incident_fence_receipt_directory,
-            incident_package_receipt_directory,
         )
         pre_id = f"preflight-{index:02d}"
         read_id = f"readback-{index:02d}"
@@ -2520,7 +2393,6 @@ def main(
             observed_at=observed_at,
             uploader_ipv4=args.uploader_ipv4,
             incident_fence_receipt_directory=INCIDENT_FENCE_RECEIPT_DIRECTORY,
-            incident_package_receipt_directory=INCIDENT_PACKAGE_RECEIPT_DIRECTORY,
         )
         # Preflight is written first.  If the second create-only write fails,
         # the non-executable partial output remains reviewable and is never

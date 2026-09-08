@@ -800,13 +800,7 @@ class ObserveTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan, cls.plan_sha = bootstrap.load_plan()
 
-    def build(
-        self,
-        folder,
-        session=None,
-        incident_fence_receipt_directory=None,
-        incident_package_receipt_directory=None,
-    ):
+    def build(self, folder, session=None, incident_fence_receipt_directory=None):
         receipt = (
             Path(folder)
             / f"paperdesk-private-release-v2-bootstrap-{AUTHORIZATION_ID}"
@@ -820,7 +814,6 @@ class ObserveTests(unittest.TestCase):
             observed_at=NOW,
             uploader_ipv4="203.0.113.10/32",
             incident_fence_receipt_directory=incident_fence_receipt_directory,
-            incident_package_receipt_directory=incident_package_receipt_directory,
         )
         return selected, preflight, template
 
@@ -925,148 +918,6 @@ class ObserveTests(unittest.TestCase):
                     receipt_directory=receipt,
                     expected_hashes=expected_hashes,
                 )
-
-    def test_incident_package_receipts_authorize_only_exact_later_readback(self):
-        with tempfile.TemporaryDirectory() as folder:
-            _session, _preflight, template = self.build(folder)
-            authorization = self.promote_template(template)
-            authorization["source"]["mergedMain"]["commitSha"] = (
-                observe.INCIDENT_PACKAGE_SOURCE_SHA
-            )
-            authorization["plan"]["bridgePackageSha256"] = (
-                observe.INCIDENT_PACKAGE_SHA256
-            )
-            contract = bootstrap._validator_contract(
-                "operation:uploadVersionedBridgePackage",
-                self.plan,
-                authorization,
-            )
-            common = {
-                "authorizationSha256": observe.INCIDENT_PACKAGE_AUTHORIZATION_SHA256,
-                "operationId": "uploadVersionedBridgePackage",
-                "method": "PUT",
-                "temporary": False,
-                "sourceSha": observe.INCIDENT_PACKAGE_SOURCE_SHA,
-                "planSha256": observe.INCIDENT_PACKAGE_PLAN_SHA256,
-                "packageSha256": observe.INCIDENT_PACKAGE_SHA256,
-                "requestBodySha256": observe.INCIDENT_PACKAGE_SHA256,
-                "targetUrl": contract["expectedUrl"],
-            }
-            receipt = Path(folder) / "package-incident"
-            receipt.mkdir()
-            documents = {
-                "cloud-mutation-0029.json": {
-                    **common,
-                    "phase": "intent",
-                    "sequence": 29,
-                },
-                "cloud-mutation-0030.json": {
-                    **common,
-                    "phase": "result",
-                    "sequence": 30,
-                    "intentId": "cloud-mutation-0029",
-                    "status": 201,
-                    "etag": observe.INCIDENT_PACKAGE_ETAG,
-                    "versionId": observe.INCIDENT_PACKAGE_VERSION_ID,
-                },
-                "execution-terminal.json": {
-                    "authorizationId": "827beb7d-af9d-4cde-8fa6-db292e1e9826",
-                    "authorizationSha256": observe.INCIDENT_PACKAGE_AUTHORIZATION_SHA256,
-                    "sourceSha": observe.INCIDENT_PACKAGE_SOURCE_SHA,
-                    "planSha256": observe.INCIDENT_PACKAGE_PLAN_SHA256,
-                    "status": "failed",
-                    "consumed": True,
-                    "appliedMutationIds": ["uploadVersionedBridgePackage"],
-                },
-            }
-            expected_hashes = {}
-            for name, document in documents.items():
-                raw = bootstrap.canonical_json_bytes(document)
-                (receipt / name).write_bytes(raw)
-                expected_hashes[name] = bootstrap.sha256_bytes(raw)
-            adopted = observe._incident_exact_package_adoption(
-                self.plan,
-                authorization,
-                receipt_directory=receipt,
-                expected_hashes=expected_hashes,
-            )
-            self.assertEqual(
-                adopted,
-                {
-                    "blob": (
-                        f"v2/control/{observe.INCIDENT_PACKAGE_SOURCE_SHA}/"
-                        "paperdesk-private-release-bridge.zip"
-                    ),
-                    "etag": observe.INCIDENT_PACKAGE_ETAG,
-                    "versionId": observe.INCIDENT_PACKAGE_VERSION_ID,
-                    "url": contract["expectedUrl"],
-                },
-            )
-            (receipt / "cloud-mutation-0030.json").write_bytes(
-                bootstrap.canonical_json_bytes(
-                    {**documents["cloud-mutation-0030.json"], "status": 200}
-                )
-            )
-            with self.assertRaisesRegex(
-                observe.ObserveError,
-                "receipt bytes drifted",
-            ):
-                observe._incident_exact_package_adoption(
-                    self.plan,
-                    authorization,
-                    receipt_directory=receipt,
-                    expected_hashes=expected_hashes,
-                )
-
-    def test_absent_or_unrelated_incident_package_preserves_create_path(self):
-        with tempfile.TemporaryDirectory() as folder:
-            _session, _preflight, template = self.build(folder)
-            authorization = self.promote_template(template)
-            self.assertIsNone(
-                observe._incident_exact_package_adoption(
-                    self.plan,
-                    authorization,
-                    receipt_directory=Path(folder) / "absent",
-                )
-            )
-
-    def test_incident_package_evidence_selects_existing_exact_admission(self):
-        with tempfile.TemporaryDirectory() as folder:
-            _session, _preflight, template = self.build(folder)
-            authorization = self.promote_template(template)
-            contract = bootstrap._validator_contract(
-                "operation:uploadVersionedBridgePackage",
-                self.plan,
-                authorization,
-            )
-            expected = {
-                "blob": (
-                    f"v2/control/{authorization['source']['mergedMain']['commitSha']}/"
-                    "paperdesk-private-release-bridge.zip"
-                ),
-                "etag": observe.INCIDENT_PACKAGE_ETAG,
-                "versionId": observe.INCIDENT_PACKAGE_VERSION_ID,
-                "url": contract["expectedUrl"],
-            }
-            with mock.patch.object(
-                observe,
-                "_incident_exact_package_adoption",
-                return_value=expected,
-            ):
-                _session, preflight, _template = self.build(
-                    folder,
-                    incident_package_receipt_directory=Path(folder),
-                )
-            admission = next(
-                item
-                for item in preflight["projection"]["operationAdmissions"]
-                if item["operationId"] == "uploadVersionedBridgePackage"
-            )
-            self.assertEqual(admission["status"], "exact")
-            self.assertEqual(
-                admission["context"],
-                {"executionDecision": "adopt-exact", "adopted": expected},
-            )
 
     def test_absent_incident_fence_receipts_preserve_create_path(self):
         with tempfile.TemporaryDirectory() as folder:
