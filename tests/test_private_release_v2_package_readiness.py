@@ -656,7 +656,13 @@ class PackageReadinessTests(unittest.TestCase):
         transport._protected_work_deadline = transport._protected_role_deadline()
         expected_deadline = min(
             self.current
-            + dt.timedelta(seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+            + dt.timedelta(
+                seconds=(
+                    bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                    + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                )
+            ),
             transport._protected_work_deadline
             - dt.timedelta(
                 seconds=2 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
@@ -666,6 +672,260 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual([item[0] for item in session.requests], ["GET", "GET"])
         self.assertEqual(self.sleeps, [1])
         self.assertTrue(all(item == expected_deadline for item in session.deadlines))
+        self.assertEqual(journal.records, [])
+
+    def test_fence_scheduler_overshoot_still_runs_full_600_second_boundary_get(self):
+        boundary = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        )
+        hard_deadline = boundary + dt.timedelta(
+            seconds=(
+                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        request_times = []
+
+        def result():
+            request_times.append(self.current)
+            return (
+                storage_error(404, "BlobNotFound")
+                if self.current >= boundary
+                else storage_error(403, "AuthorizationPermissionMismatch")
+            )
+
+        transport, session, journal = self.transport([result], repeat=True)
+        transport._active_protected_role_add = (
+            "addOwnedOperatorFenceBootstrapRole"
+        )
+
+        def real_clock_sleep(seconds):
+            self.sleeps.append(seconds)
+            target = self.current + dt.timedelta(seconds=seconds)
+            self.current = target + (
+                dt.timedelta(milliseconds=500)
+                if target == boundary
+                else dt.timedelta(0)
+            )
+
+        transport.sleep = real_clock_sleep
+        fence_url = bootstrap._operation_readback_url(
+            FENCE_OPERATION, self.plan, self.authorization
+        )
+        window = transport._prove_fence_blob_create_ready(fence_url)
+        self.assertEqual(
+            request_times[-1], boundary + dt.timedelta(milliseconds=500)
+        )
+        self.assertLessEqual(
+            request_times[-1],
+            boundary
+            + dt.timedelta(
+                seconds=bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            ),
+        )
+        self.assertTrue(all(item == hard_deadline for item in session.deadlines))
+        self.assertEqual(window.first_attempt_start_deadline, hard_deadline)
+        self.assertEqual(window.final_retry_start, boundary)
+        self.assertEqual(journal.records, [])
+
+    def test_fence_final_get_scheduler_slack_is_inclusive_only_through_one_second(self):
+        for overshoot, succeeds in (
+            (dt.timedelta(seconds=1), True),
+            (dt.timedelta(seconds=1, milliseconds=1), False),
+        ):
+            with self.subTest(overshoot=overshoot, succeeds=succeeds):
+                self.current = NOW
+                self.sleeps = []
+                boundary = NOW + dt.timedelta(
+                    seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                )
+                request_times = []
+
+                def advance_first_get():
+                    if not request_times:
+                        self.current = boundary - dt.timedelta(milliseconds=500)
+
+                def result():
+                    request_times.append(self.current)
+                    return (
+                        storage_error(404, "BlobNotFound")
+                        if self.current >= boundary
+                        else storage_error(
+                            403, "AuthorizationPermissionMismatch"
+                        )
+                    )
+
+                transport, session, journal = self.transport(
+                    [result], repeat=True, after_request=advance_first_get
+                )
+                transport._active_protected_role_add = (
+                    "addOwnedOperatorFenceBootstrapRole"
+                )
+
+                def overshooting_sleep(seconds):
+                    self.sleeps.append(seconds)
+                    target = self.current + dt.timedelta(seconds=seconds)
+                    self.current = (
+                        target + overshoot
+                        if target == boundary
+                        else target
+                    )
+
+                transport.sleep = overshooting_sleep
+                fence_url = bootstrap._operation_readback_url(
+                    FENCE_OPERATION, self.plan, self.authorization
+                )
+                if succeeds:
+                    window = transport._prove_fence_blob_create_ready(
+                        fence_url
+                    )
+                    self.assertEqual(request_times[-1], boundary + overshoot)
+                    self.assertEqual(window.final_retry_start, boundary)
+                else:
+                    with self.assertRaises(
+                        bootstrap.StorageOperationError
+                    ) as raised:
+                        transport._prove_fence_blob_create_ready(fence_url)
+                    self.assertEqual(
+                        raised.exception.diagnostic["stopReason"],
+                        "readiness-timeout",
+                    )
+                    self.assertEqual(request_times, [boundary - dt.timedelta(milliseconds=500)])
+                    self.assertEqual(self.current, boundary + overshoot)
+                self.assertEqual(journal.records, [])
+
+    def test_fence_full_final_get_response_envelope_is_strict(self):
+        boundary = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        )
+        hard_deadline = boundary + dt.timedelta(
+            seconds=(
+                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        for completion_delta, succeeds in (
+            (dt.timedelta(milliseconds=1), True),
+            (dt.timedelta(0), False),
+        ):
+            with self.subTest(succeeds=succeeds):
+                self.current = NOW
+                self.sleeps = []
+                request_started = [NOW]
+
+                def complete_request():
+                    request_started[0] = self.current
+                    if self.current >= boundary:
+                        self.current = hard_deadline - completion_delta
+
+                def result():
+                    return (
+                        storage_error(404, "BlobNotFound")
+                        if request_started[0] >= boundary
+                        else storage_error(
+                            403, "AuthorizationPermissionMismatch"
+                        )
+                    )
+
+                transport, session, journal = self.transport(
+                    [result], repeat=True, after_request=complete_request
+                )
+                transport._active_protected_role_add = (
+                    "addOwnedOperatorFenceBootstrapRole"
+                )
+                fence_url = bootstrap._operation_readback_url(
+                    FENCE_OPERATION, self.plan, self.authorization
+                )
+                if succeeds:
+                    window = transport._prove_fence_blob_create_ready(
+                        fence_url
+                    )
+                    self.assertEqual(
+                        window.first_attempt_start_deadline, hard_deadline
+                    )
+                else:
+                    with self.assertRaises(
+                        bootstrap.StorageOperationError
+                    ) as raised:
+                        transport._prove_fence_blob_create_ready(fence_url)
+                    self.assertEqual(
+                        raised.exception.diagnostic["stopReason"], "deadline"
+                    )
+                self.assertEqual(request_started[0], boundary)
+                self.assertTrue(
+                    all(item == hard_deadline for item in session.deadlines)
+                )
+                self.assertEqual(journal.records, [])
+
+    def test_fence_full_600_second_denial_times_out_without_put(self):
+        boundary = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        )
+        hard_deadline = boundary + dt.timedelta(
+            seconds=(
+                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        transport, session, journal = self.transport(
+            [storage_error(403, "AuthorizationPermissionMismatch")],
+            repeat=True,
+        )
+        transport._active_protected_role_add = (
+            "addOwnedOperatorFenceBootstrapRole"
+        )
+        fence_url = bootstrap._operation_readback_url(
+            FENCE_OPERATION, self.plan, self.authorization
+        )
+        with self.assertRaises(bootstrap.StorageOperationError) as raised:
+            transport._prove_fence_blob_create_ready(fence_url)
+        self.assertEqual(
+            raised.exception.diagnostic["stopReason"], "readiness-timeout"
+        )
+        self.assertEqual(self.current, boundary)
+        self.assertEqual(
+            raised.exception.diagnostic["attemptRecords"][-1]["startedAt"],
+            boundary.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        )
+        self.assertTrue(all(item[0] == "GET" for item in session.requests))
+        self.assertTrue(all(item == hard_deadline for item in session.deadlines))
+        self.assertEqual(journal.records, [])
+
+    def test_fence_readiness_preserves_outer_follow_on_reserves_when_clipped(self):
+        work_deadline = NOW + dt.timedelta(seconds=500)
+        hard_deadline = work_deadline - dt.timedelta(
+            seconds=2 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        nominal_final_get = hard_deadline - dt.timedelta(
+            seconds=(
+                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        request_times = []
+
+        def result():
+            request_times.append(self.current)
+            return (
+                storage_error(404, "BlobNotFound")
+                if self.current >= nominal_final_get
+                else storage_error(403, "AuthorizationPermissionMismatch")
+            )
+
+        transport, session, journal = self.transport([result], repeat=True)
+        transport._active_protected_role_add = (
+            "addOwnedOperatorFenceBootstrapRole"
+        )
+        transport._protected_work_deadline = work_deadline
+        fence_url = bootstrap._operation_readback_url(
+            FENCE_OPERATION, self.plan, self.authorization
+        )
+        window = transport._prove_fence_blob_create_ready(fence_url)
+        self.assertEqual(request_times[-1], nominal_final_get)
+        self.assertEqual(window.final_retry_start, nominal_final_get)
+        self.assertTrue(all(item == hard_deadline for item in session.deadlines))
         self.assertEqual(journal.records, [])
 
     def test_exact_put_rbac_denials_retry_the_same_conditional_fence_create(self):
@@ -713,6 +973,149 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [1.0, 2.0])
         self.assertEqual(result["versionId"], "version-1")
         self.assertEqual(result["sha256"], expected_sha)
+
+    def test_fence_put_denial_cannot_extend_rbac_wait_past_600_seconds(self):
+        boundary = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        )
+
+        def result():
+            method = session.requests[-1][0]
+            if method == "GET":
+                return (
+                    storage_error(404, "BlobNotFound")
+                    if self.current >= boundary
+                    else storage_error(
+                        403, "AuthorizationPermissionMismatch"
+                    )
+                )
+            return storage_error(403, "AuthorizationPermissionMismatch")
+
+        transport, session, journal = self.transport([result], repeat=True)
+        with self.assertRaises(bootstrap.StorageOperationError) as raised:
+            self.create_fence(transport)
+        self.assertEqual(
+            raised.exception.diagnostic["stopReason"], "readiness-timeout"
+        )
+        self.assertEqual(self.current, boundary)
+        self.assertEqual(
+            [item[0] for item in session.requests].count("PUT"), 1
+        )
+        self.assertEqual(session.requests[-1][0], "PUT")
+        self.assertEqual(
+            [item["phase"] for item in journal.records],
+            ["intent", "result"],
+        )
+        self.assertEqual(journal.records[-1]["status"], 403)
+
+    def test_fence_first_put_start_deadline_is_inclusive_only_through_t691(self):
+        for offset, succeeds in (
+            (dt.timedelta(0), True),
+            (dt.timedelta(milliseconds=1), False),
+        ):
+            with self.subTest(offset=offset, succeeds=succeeds):
+                self.current = NOW
+                self.sleeps = []
+                responses = [storage_error(404, "BlobNotFound")]
+                if succeeds:
+                    responses.append(self.created())
+                transport, session, journal = self.transport(responses)
+                prove_ready = transport._prove_fence_blob_create_ready
+
+                def pause_after_ready(url):
+                    window = prove_ready(url)
+                    self.current = window.first_attempt_start_deadline + offset
+                    return window
+
+                with mock.patch.object(
+                    transport,
+                    "_prove_fence_blob_create_ready",
+                    side_effect=pause_after_ready,
+                ):
+                    if succeeds:
+                        result = self.create_fence(transport)
+                        self.assertEqual(result["versionId"], "version-1")
+                    else:
+                        with self.assertRaises(
+                            bootstrap.StorageOperationError
+                        ) as raised:
+                            self.create_fence(transport)
+                        self.assertEqual(
+                            raised.exception.diagnostic["stopReason"],
+                            "readiness-timeout",
+                        )
+
+                self.assertEqual(
+                    [item[0] for item in session.requests],
+                    ["GET", "PUT"] if succeeds else ["GET"],
+                )
+                self.assertEqual(
+                    [item["phase"] for item in journal.records],
+                    ["intent", "result"] if succeeds else [],
+                )
+
+    def test_fence_put_retry_start_deadline_is_inclusive_only_through_t600(self):
+        boundary = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+        )
+        first_start = boundary - dt.timedelta(seconds=1)
+        first_deadline = boundary + dt.timedelta(
+            seconds=(
+                bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        window = bootstrap._ConditionalStorageCreateWindow(
+            first_attempt_start_deadline=first_deadline,
+            final_retry_start=boundary,
+        )
+        for overshoot, succeeds in (
+            (dt.timedelta(0), True),
+            (dt.timedelta(milliseconds=1), False),
+        ):
+            with self.subTest(overshoot=overshoot, succeeds=succeeds):
+                self.current = first_start
+                self.sleeps = []
+                transport, session, journal = self.transport([
+                    storage_error(403, "AuthorizationPermissionMismatch"),
+                    self.created(),
+                ])
+                transport._prove_fence_blob_create_ready = lambda url: window
+
+                def overshooting_sleep(seconds):
+                    self.sleeps.append(seconds)
+                    target = self.current + dt.timedelta(seconds=seconds)
+                    self.current = (
+                        target + overshoot
+                        if target == boundary
+                        else target
+                    )
+
+                transport.sleep = overshooting_sleep
+                if succeeds:
+                    result = self.create_fence(transport)
+                    self.assertEqual(result["versionId"], "version-1")
+                else:
+                    with self.assertRaises(
+                        bootstrap.StorageOperationError
+                    ) as raised:
+                        self.create_fence(transport)
+                    self.assertEqual(
+                        raised.exception.diagnostic["stopReason"],
+                        "readiness-timeout",
+                    )
+
+                self.assertEqual(
+                    [item[0] for item in session.requests],
+                    ["PUT", "PUT"] if succeeds else ["PUT"],
+                )
+                self.assertEqual(
+                    [item["phase"] for item in journal.records],
+                    ["intent", "result", "intent", "result"]
+                    if succeeds
+                    else ["intent", "result"],
+                )
+                self.assertEqual(self.sleeps, [1.0])
 
     def test_frozen_clock_stops_at_64_gets_with_safe_final_diagnostic(self):
         transport, session, journal = self.transport([self.private_error()], repeat=True)

@@ -1472,8 +1472,8 @@ def _validate_temporary_role(
         "observedAt",
     }
     keys |= {
-        "roleDefinitionCreatedByAuthorization",
-        "roleDefinitionRemoved",
+        "roleDefinitionCreatedByTemporaryLifecycle",
+        "roleDefinitionRemovedByTemporaryLifecycle",
         "roleDefinitionPresentAfterCleanup",
     }
     role = _exact_keys(value, keys, label)
@@ -1493,14 +1493,14 @@ def _validate_temporary_role(
     ):
         fail(f"{label} is not proven absent")
     if custom_definition and (
-        role["roleDefinitionCreatedByAuthorization"] is not True
-        or role["roleDefinitionRemoved"] is not True
+        role["roleDefinitionCreatedByTemporaryLifecycle"] is not True
+        or role["roleDefinitionRemovedByTemporaryLifecycle"] is not True
         or role["roleDefinitionPresentAfterCleanup"] is not False
     ):
         fail(f"{label} custom role definition is not proven absent")
     if not custom_definition and (
-        role["roleDefinitionCreatedByAuthorization"] is not False
-        or role["roleDefinitionRemoved"] is not False
+        role["roleDefinitionCreatedByTemporaryLifecycle"] is not False
+        or role["roleDefinitionRemovedByTemporaryLifecycle"] is not False
         or role["roleDefinitionPresentAfterCleanup"] is not True
     ):
         fail(f"{label} {preserved_definition_label} was not preserved")
@@ -1728,7 +1728,8 @@ def _validate_temporary_cleanup(
         principal_id=context["operatorObjectId"],
         add_mutation_id="addOwnedOperatorFenceBootstrapRole",
         remove_mutation_id="removeOwnedOperatorFenceBootstrapRole",
-        custom_definition=True,
+        custom_definition=False,
+        preserved_definition_label="stable definition",
         started_at=started_at,
         completed_at=completed_at,
         derived_absence_sha256=(

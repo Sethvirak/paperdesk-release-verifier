@@ -1009,6 +1009,7 @@ def _operation_admission(
     built_in_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
     graph_service_principal_envelope: Mapping[str, Any] | None = None,
     stable_package_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
+    stable_fence_role_definition: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
 
@@ -1095,6 +1096,33 @@ def _operation_admission(
             },
         )
 
+    if operation_id in bootstrap.FENCE_ROLE_OPERATIONS:
+        if status != 404:
+            fail(
+                "temporary fence assignment is already present before bootstrap: "
+                + operation_id
+            )
+        stable_fence = _exact_keys(
+            stable_fence_role_definition,
+            {"state", "projection"},
+            "stable fence role-definition preflight",
+        )
+        if stable_fence["state"] not in {"absent", "exact"}:
+            fail("stable fence role-definition preflight state is invalid")
+        definition = bootstrap._validate_stable_fence_role_definition(
+            stable_fence["projection"], plan
+        )
+        return (
+            "absent" if operation_id.startswith("add") else "owned-present"
+        ), _policy_checked_context(
+            operation_id,
+            policy,
+            {
+                "executionDecision": "apply-exact",
+                "stableFenceRoleDefinitionProjection": definition,
+                "stableFenceRoleDefinitionState": stable_fence["state"],
+            },
+        )
     if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
         if status != 404:
             fail(f"temporary access is already present before bootstrap: {operation_id}")
@@ -1737,6 +1765,7 @@ def build_read_only_observation(
         built_in_role_definitions: dict[str, Mapping[str, Any]] | None = None
         graph_service_principal_envelope: Mapping[str, Any] | None = None
         stable_package_role_definitions: dict[str, Mapping[str, Any]] | None = None
+        stable_fence_role_definition: dict[str, Any] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
         if operation["id"] == "claimAzureSingleUseAuthorization":
             lock_request = ReadRequest(method="GET", url=bootstrap._cleanup_lock_inventory_url())
@@ -1771,13 +1800,17 @@ def build_read_only_observation(
             definition_envelope = cache[definition_key]
             controller_builtin = operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS
             stable_package = operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS
-            if definition_envelope["status"] != (
-                200 if controller_builtin or stable_package else 404
-            ):
+            stable_fence = operation["id"] in bootstrap.FENCE_ROLE_OPERATIONS
+            expected_definition_statuses = (
+                {200, 404}
+                if stable_fence
+                else ({200} if controller_builtin or stable_package else {404})
+            )
+            if definition_envelope["status"] not in expected_definition_statuses:
                 fail(
                     (
                         "preserved role definition is not readable: "
-                        if controller_builtin or stable_package
+                        if controller_builtin or stable_package or stable_fence
                         else "temporary role definition is already present before bootstrap: "
                     )
                     + operation["id"]
@@ -1806,6 +1839,26 @@ def build_read_only_observation(
                 stable_package_role_definitions[matching[0]["name"]] = (
                     definition_projection
                 )
+            elif stable_fence:
+                fence_spec = bootstrap._stable_fence_role_spec(plan)
+                if definition_envelope["status"] == 200:
+                    definition_body = _body_mapping(
+                        definition_envelope, "stable fence role definition"
+                    )
+                    definition_projection = (
+                        bootstrap._validate_stable_fence_role_definition(
+                            bootstrap._project_role_definition(definition_body),
+                            plan,
+                        )
+                    )
+                    state = "exact"
+                else:
+                    definition_projection = fence_spec["definitionProjection"]
+                    state = "absent"
+                stable_fence_role_definition = {
+                    "state": state,
+                    "projection": definition_projection,
+                }
             extra_preflight_probes.append(
                 _preflight_probe(
                     f"preflight-{index:02d}-temporary-definition-{definition_index}",
@@ -1918,6 +1971,7 @@ def build_read_only_observation(
             built_in_role_definitions,
             graph_service_principal_envelope,
             stable_package_role_definitions,
+            stable_fence_role_definition,
         )
         pre_id = f"preflight-{index:02d}"
         read_id = f"readback-{index:02d}"
