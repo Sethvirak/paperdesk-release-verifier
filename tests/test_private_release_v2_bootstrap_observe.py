@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import urllib.parse
 import uuid
 
@@ -799,7 +800,7 @@ class ObserveTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan, cls.plan_sha = bootstrap.load_plan()
 
-    def build(self, folder, session=None):
+    def build(self, folder, session=None, incident_fence_receipt_directory=None):
         receipt = (
             Path(folder)
             / f"paperdesk-private-release-v2-bootstrap-{AUTHORIZATION_ID}"
@@ -812,6 +813,7 @@ class ObserveTests(unittest.TestCase):
             receipt_directory=receipt,
             observed_at=NOW,
             uploader_ipv4="203.0.113.10/32",
+            incident_fence_receipt_directory=incident_fence_receipt_directory,
         )
         return selected, preflight, template
 
@@ -833,6 +835,136 @@ class ObserveTests(unittest.TestCase):
             },
             "singleUse": template["singleUse"],
         }
+
+    def test_incident_fence_receipts_authorize_only_exact_later_readback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+            authorization = self.promote_template(template)
+            contract = bootstrap._validator_contract(
+                "operation:createInitialIdleActivationFence",
+                self.plan,
+                authorization,
+            )
+            common = {
+                "authorizationSha256": observe.INCIDENT_FENCE_AUTHORIZATION_SHA256,
+                "operationId": "createInitialIdleActivationFence",
+                "method": "PUT",
+                "temporary": False,
+                "sourceSha": observe.INCIDENT_FENCE_SOURCE_SHA,
+                "planSha256": observe.INCIDENT_FENCE_PLAN_SHA256,
+                "packageSha256": observe.INCIDENT_FENCE_PACKAGE_SHA256,
+                "requestBodySha256": contract["expectedBodySha256"],
+                "targetUrl": contract["expectedUrl"],
+            }
+            receipt = Path(folder) / "incident"
+            receipt.mkdir()
+            documents = {
+                "cloud-mutation-0053.json": {
+                    **common,
+                    "phase": "intent",
+                    "sequence": 53,
+                },
+                "cloud-mutation-0054.json": {
+                    **common,
+                    "phase": "result",
+                    "sequence": 54,
+                    "intentId": "cloud-mutation-0053",
+                    "status": 201,
+                    "etag": observe.INCIDENT_FENCE_ETAG,
+                    "versionId": observe.INCIDENT_FENCE_VERSION_ID,
+                },
+                "execution-terminal.json": {
+                    "authorizationId": "6af46788-e782-46fd-990b-72cfca7084d1",
+                    "authorizationSha256": observe.INCIDENT_FENCE_AUTHORIZATION_SHA256,
+                    "sourceSha": observe.INCIDENT_FENCE_SOURCE_SHA,
+                    "planSha256": observe.INCIDENT_FENCE_PLAN_SHA256,
+                    "status": "failed",
+                    "consumed": True,
+                    "appliedMutationIds": ["createInitialIdleActivationFence"],
+                },
+            }
+            expected_hashes = {}
+            for name, document in documents.items():
+                raw = bootstrap.canonical_json_bytes(document)
+                (receipt / name).write_bytes(raw)
+                expected_hashes[name] = bootstrap.sha256_bytes(raw)
+            adopted = observe._incident_exact_activation_fence_adoption(
+                self.plan,
+                authorization,
+                receipt_directory=receipt,
+                expected_hashes=expected_hashes,
+            )
+            self.assertEqual(
+                adopted,
+                {
+                    "url": contract["expectedUrl"],
+                    "etag": observe.INCIDENT_FENCE_ETAG,
+                    "versionId": observe.INCIDENT_FENCE_VERSION_ID,
+                    "sha256": contract["expectedBodySha256"],
+                },
+            )
+            (receipt / "cloud-mutation-0054.json").write_bytes(
+                bootstrap.canonical_json_bytes(
+                    {**documents["cloud-mutation-0054.json"], "status": 200}
+                )
+            )
+            with self.assertRaisesRegex(
+                observe.ObserveError,
+                "receipt bytes drifted",
+            ):
+                observe._incident_exact_activation_fence_adoption(
+                    self.plan,
+                    authorization,
+                    receipt_directory=receipt,
+                    expected_hashes=expected_hashes,
+                )
+
+    def test_absent_incident_fence_receipts_preserve_create_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, _preflight, template = self.build(folder)
+            self.assertIsNone(
+                observe._incident_exact_activation_fence_adoption(
+                    self.plan,
+                    self.promote_template(template),
+                    receipt_directory=Path(folder) / "absent",
+                )
+            )
+
+    def test_incident_fence_evidence_selects_existing_exact_admission(self):
+        with tempfile.TemporaryDirectory() as folder:
+            expected = {
+                "url": (
+                    "https://mdspdbak2608089c4e.blob.core.windows.net/"
+                    "paperdesk-release-activation-control/"
+                    "v2/production-activation-fence.json"
+                ),
+                "etag": observe.INCIDENT_FENCE_ETAG,
+                "versionId": observe.INCIDENT_FENCE_VERSION_ID,
+                "sha256": bootstrap._validator_contract(
+                    "operation:createInitialIdleActivationFence",
+                    self.plan,
+                    self.promote_template(self.build(folder)[2]),
+                )["expectedBodySha256"],
+            }
+            with mock.patch.object(
+                observe,
+                "_incident_exact_activation_fence_adoption",
+                return_value=expected,
+            ):
+                _session, preflight, _template = self.build(
+                    folder,
+                    incident_fence_receipt_directory=Path(folder),
+                )
+            admission = next(
+                item
+                for item in preflight["projection"]["operationAdmissions"]
+                if item["operationId"] == "createInitialIdleActivationFence"
+            )
+            self.assertEqual(admission["status"], "exact")
+            self.assertEqual(
+                admission["context"],
+                {"executionDecision": "adopt-exact", "adopted": expected},
+            )
 
     def assert_stable_fence_preflight(self, preflight, *, expected_state):
         admissions = {

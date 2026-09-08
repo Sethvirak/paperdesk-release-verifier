@@ -86,6 +86,27 @@ OBSERVED_HEADERS = {
 TEMPORARY_STORAGE_RBAC_DENIAL_CODES = frozenset(
     {"AuthorizationFailure", "AuthorizationPermissionMismatch"}
 )
+INCIDENT_FENCE_RECEIPT_DIRECTORY = Path(
+    r"C:\ProgramData\PaperDeskReleaseCeremonies-20260905-a75d00e9"
+    r"\paperdesk-private-release-v2-bootstrap-6af46788-e782-46fd-990b-72cfca7084d1"
+)
+INCIDENT_FENCE_RECEIPT_SHA256 = {
+    "cloud-mutation-0053.json": "8208bb6195a20831c08392b8cde9c4259e1f546cc1e090024bc41ed0de869ab6",
+    "cloud-mutation-0054.json": "5f233fbb09cbab28460d9914f28f8da041582be7e4e11eb3bd962bb8b6cf07d0",
+    "execution-terminal.json": "59e3e659131b76fa31472b2bea3b567fb57d9679051f22748bc206eb6eeb9b20",
+}
+INCIDENT_FENCE_AUTHORIZATION_SHA256 = (
+    "2b7c5559ffc01b3e0a9203167e26ce86c5be4fce989429e26843853a89f3a2fe"
+)
+INCIDENT_FENCE_SOURCE_SHA = "c7a3d37f2e630503153ff468b132e66fc38b4a32"
+INCIDENT_FENCE_PLAN_SHA256 = (
+    "dfb157e70d85361e19e8e64b8d80f35c3ed97f9f0de6e0e30a5b885e4bca6fb8"
+)
+INCIDENT_FENCE_PACKAGE_SHA256 = (
+    "5ca95116ec8267594d40806b40aca91b1cd1801109e6cd5021d8742a25a667e3"
+)
+INCIDENT_FENCE_ETAG = '"0x8DF0D8A624E66BD"'
+INCIDENT_FENCE_VERSION_ID = "2026-09-08T09:20:11.5852989Z"
 GUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -990,6 +1011,90 @@ def _policy_checked_context(
     return dict(context)
 
 
+def _incident_exact_activation_fence_adoption(
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    *,
+    receipt_directory: Path = INCIDENT_FENCE_RECEIPT_DIRECTORY,
+    expected_hashes: Mapping[str, str] = INCIDENT_FENCE_RECEIPT_SHA256,
+) -> dict[str, Any] | None:
+    """Bind the exact fence left by the reviewed failed bootstrap.
+
+    The read-only observer cannot inspect this private blob until the guarded
+    executor temporarily grants the reviewed data-plane role.  If the exact
+    immutable incident receipts are present, authorize the normal adopt path;
+    execution still performs the source-owned GET and rejects any live body,
+    metadata, ETag, or version drift before continuing.
+    """
+
+    if not receipt_directory.exists() and not receipt_directory.is_symlink():
+        return None
+    if not receipt_directory.is_dir() or receipt_directory.is_symlink():
+        fail("incident activation-fence receipt directory is unsafe")
+    if set(expected_hashes) != {
+        "cloud-mutation-0053.json",
+        "cloud-mutation-0054.json",
+        "execution-terminal.json",
+    }:
+        fail("incident activation-fence receipt manifest is not exact")
+    documents: dict[str, Mapping[str, Any]] = {}
+    for name, expected_sha256 in expected_hashes.items():
+        path = receipt_directory / name
+        if not path.is_file() or path.is_symlink():
+            fail("incident activation-fence receipt is absent or unsafe")
+        document, raw = bootstrap.load_json(path, require_canonical=True)
+        if bootstrap.sha256_bytes(raw) != expected_sha256:
+            fail("incident activation-fence receipt bytes drifted")
+        documents[name] = document
+
+    intent = documents["cloud-mutation-0053.json"]
+    result = documents["cloud-mutation-0054.json"]
+    terminal = documents["execution-terminal.json"]
+    contract = bootstrap._validator_contract(
+        "operation:createInitialIdleActivationFence", plan, authorization
+    )
+    common = {
+        "authorizationSha256": INCIDENT_FENCE_AUTHORIZATION_SHA256,
+        "operationId": "createInitialIdleActivationFence",
+        "method": "PUT",
+        "temporary": False,
+        "sourceSha": INCIDENT_FENCE_SOURCE_SHA,
+        "planSha256": INCIDENT_FENCE_PLAN_SHA256,
+        "packageSha256": INCIDENT_FENCE_PACKAGE_SHA256,
+        "requestBodySha256": contract["expectedBodySha256"],
+        "targetUrl": contract["expectedUrl"],
+    }
+    if (
+        any(intent.get(key) != value for key, value in common.items())
+        or intent.get("phase") != "intent"
+        or intent.get("sequence") != 53
+        or any(result.get(key) != value for key, value in common.items())
+        or result.get("phase") != "result"
+        or result.get("sequence") != 54
+        or result.get("intentId") != "cloud-mutation-0053"
+        or result.get("status") != 201
+        or result.get("etag") != INCIDENT_FENCE_ETAG
+        or result.get("versionId") != INCIDENT_FENCE_VERSION_ID
+        or terminal.get("authorizationId")
+        != "6af46788-e782-46fd-990b-72cfca7084d1"
+        or terminal.get("authorizationSha256")
+        != INCIDENT_FENCE_AUTHORIZATION_SHA256
+        or terminal.get("sourceSha") != INCIDENT_FENCE_SOURCE_SHA
+        or terminal.get("planSha256") != INCIDENT_FENCE_PLAN_SHA256
+        or terminal.get("status") != "failed"
+        or terminal.get("consumed") is not True
+        or "createInitialIdleActivationFence"
+        not in terminal.get("appliedMutationIds", [])
+    ):
+        fail("incident activation-fence creation evidence is not exact")
+    return {
+        "url": contract["expectedUrl"],
+        "etag": INCIDENT_FENCE_ETAG,
+        "versionId": INCIDENT_FENCE_VERSION_ID,
+        "sha256": contract["expectedBodySha256"],
+    }
+
+
 def _is_future_executor_owned_remove(operation: Mapping[str, Any]) -> bool:
     kind = str(operation.get("kind", ""))
     return operation.get("temporary") is True and (
@@ -1010,6 +1115,7 @@ def _operation_admission(
     graph_service_principal_envelope: Mapping[str, Any] | None = None,
     stable_package_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
     stable_fence_role_definition: Mapping[str, Any] | None = None,
+    incident_fence_receipt_directory: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
 
@@ -1072,6 +1178,25 @@ def _operation_admission(
                 fail(
                     f"{operation_id} preflight is not blocked by temporary RBAC"
                 )
+            if operation_id == "createInitialIdleActivationFence":
+                adopted = (
+                    None
+                    if incident_fence_receipt_directory is None
+                    else _incident_exact_activation_fence_adoption(
+                        plan,
+                        authorization,
+                        receipt_directory=incident_fence_receipt_directory,
+                    )
+                )
+                if adopted is not None:
+                    return "exact", _policy_checked_context(
+                        operation_id,
+                        policy,
+                        {
+                            "executionDecision": "adopt-exact",
+                            "adopted": adopted,
+                        },
+                    )
             return "temporary-access-inaccessible", _policy_checked_context(
                 operation_id,
                 policy,
@@ -1659,6 +1784,7 @@ def build_read_only_observation(
     receipt_directory: Path,
     observed_at: dt.datetime,
     uploader_ipv4: str,
+    incident_fence_receipt_directory: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return canonical-ready preflight and non-executable auth template."""
 
@@ -1972,6 +2098,7 @@ def build_read_only_observation(
             graph_service_principal_envelope,
             stable_package_role_definitions,
             stable_fence_role_definition,
+            incident_fence_receipt_directory,
         )
         pre_id = f"preflight-{index:02d}"
         read_id = f"readback-{index:02d}"
@@ -2265,6 +2392,7 @@ def main(
             receipt_directory=args.receipt_directory,
             observed_at=observed_at,
             uploader_ipv4=args.uploader_ipv4,
+            incident_fence_receipt_directory=INCIDENT_FENCE_RECEIPT_DIRECTORY,
         )
         # Preflight is written first.  If the second create-only write fails,
         # the non-executable partial output remains reviewable and is never
