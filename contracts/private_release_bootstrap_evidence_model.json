@@ -51,7 +51,6 @@
         "temporaryPackageReadRoleAssignmentId": "package-read-role-assignment",
         "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
-        "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
       }
@@ -102,7 +101,7 @@
     "The terminal receipt binds the canonical authorization, reviewed head, merged main, common tree, executor, plan, deterministic package, Azure account object, full mutation universe, component digests and S2 evidence-file digests.",
     "The terminal receipt is successful only when failures and pendingHousekeeping are both empty and no production release mutation occurred.",
     "Permanent mutation IDs occur exactly once and equal the non-temporary provider mutation universe in the reviewed plan.",
-    "Temporary package IPv4, both authorization-specific package assignments, custom key-read/activation-fence definitions and assignments, and the authorization-specific controller-canary assignment are removed and freshly proven absent before bridge start. Package access reuses the source-pinned writerPackageAdd and readerPackageRead custom definitions, and controller access uses the source-pinned built-in Storage Blob Data Contributor definition; all three stable definitions are never owned or mutated and are freshly proven preserved with their full authorization-bound projections.",
+    "Temporary package IPv4, both authorization-specific package assignments, the custom key-read definition and assignment, the authorization-specific activation-fence assignment, and the authorization-specific controller-canary assignment are removed and freshly proven absent before bridge start. Package access reuses the source-pinned writerPackageAdd and readerPackageRead custom definitions, fence access reuses the source-pinned bridgeActivationFence custom definition, and controller access uses the source-pinned built-in Storage Blob Data Contributor definition; all four preserved definitions are never owned by their temporary lifecycles and are freshly proven preserved with their full source-bound projections.",
     "A pre-existing exact-private controller-lock container is never adopted from ARM metadata alone: it remains adopt-pending-execution-empty-proof until a bounded Azure AD list read, performed after only the uploader IPv4 and controller role are added, proves one unpaginated zero-blob inventory and retains the canonical URL, response digest, timestamp and private ARM posture.",
     "Activation-fence evidence distinguishes a current-authorization If-None-Match:* HTTP 201 create from exact immutable adoption with no current write; either path leaves the canonical idle fence Available and Unlocked.",
     "Package evidence distinguishes a current-authorization If-None-Match:* HTTP 201 upload from exact immutable version adoption with no current write, and binds deterministic versioned Azure AD readback; SAS, account keys and package bytes are never retained.",

@@ -131,12 +131,16 @@ class FakeReadOnlySession:
         credential=False,
         opaque_secret=False,
         role_authority_drift=False,
+        stable_fence_absent=False,
+        stable_fence_drift=False,
     ):
         self.plan = bootstrap.bind_temporary_role_ids(plan, AUTHORIZATION_ID)
         self.drift = drift
         self.credential = credential
         self.opaque_secret = opaque_secret
         self.role_authority_drift = role_authority_drift
+        self.stable_fence_absent = stable_fence_absent
+        self.stable_fence_drift = stable_fence_drift
         self.requests = []
         self.envelopes = {}
         self.resources = {item["id"]: item for item in plan["resourceInventory"]}
@@ -425,10 +429,7 @@ class FakeReadOnlySession:
             definition_id = match.group(1).lower()
             temporary_definition_ids = {
                 str(self.plan["temporaryAccess"][key]).lower()
-                for key in (
-                    "temporaryKeyReadRoleDefinitionId",
-                    "temporaryFenceRoleDefinitionId",
-                )
+                for key in ("temporaryKeyReadRoleDefinitionId",)
             }
             temporary_definition_ids.update(
                 str(spec["definitionId"]).lower()
@@ -440,6 +441,12 @@ class FakeReadOnlySession:
                 )
                 for spec in bootstrap._stable_package_role_specs(self.plan)
             }
+            stable_fence_definition = bootstrap._stable_fence_role_spec(
+                self.plan
+            )
+            stable_fence_definition_id = stable_fence_definition[
+                "definitionId"
+            ].lower()
             if definition_id in temporary_definition_ids:
                 status = 404
                 body = {}
@@ -448,6 +455,20 @@ class FakeReadOnlySession:
                 status = 200
                 body = stable_package_definitions[definition_id]
                 matching = []
+            elif definition_id == stable_fence_definition_id:
+                matching = []
+                if self.stable_fence_absent:
+                    status = 404
+                    body = {}
+                else:
+                    status = 200
+                    body = copy.deepcopy(
+                        stable_fence_definition["definitionProjection"]
+                    )
+                    if self.stable_fence_drift:
+                        body["properties"]["permissions"][0][
+                            "dataActions"
+                        ].append("unreviewed/action")
             else:
                 matching = [
                     role
@@ -458,6 +479,7 @@ class FakeReadOnlySession:
             if (
                 definition_id not in temporary_definition_ids
                 and definition_id not in stable_package_definitions
+                and definition_id != stable_fence_definition_id
                 and not matching
             ):
                 raise AssertionError("unexpected built-in role-definition read")
@@ -511,6 +533,18 @@ class FakeReadOnlySession:
                     "e005b62b-037b-4989-b492-932669ec0842",
                 )
             ]
+            if not self.stable_fence_absent:
+                values.append(
+                    copy.deepcopy(
+                        definitions[
+                            bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+                        ]
+                    )
+                )
+                if self.stable_fence_drift:
+                    values[-1]["properties"]["permissions"][0][
+                        "dataActions"
+                    ].append("unreviewed/action")
             if self.role_authority_drift:
                 values[0]["properties"]["permissions"][0]["dataActions"].append(
                     "Microsoft.Storage/storageAccounts/blobServices/containers/"
@@ -800,6 +834,55 @@ class ObserveTests(unittest.TestCase):
             "singleUse": template["singleUse"],
         }
 
+    def assert_stable_fence_preflight(self, preflight, *, expected_state):
+        admissions = {
+            item["operationId"]: item
+            for item in preflight["projection"]["operationAdmissions"]
+        }
+        probes = {
+            item["id"]: item for item in preflight["projection"]["probes"]
+        }
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        fence_spec = bootstrap._stable_fence_role_spec(bound_plan)
+        definition_url = bootstrap._temporary_role_definition_readback_urls(
+            "addOwnedOperatorFenceBootstrapRole", bound_plan
+        )[0]
+        expected_probe_status = 200 if expected_state == "exact" else 404
+
+        self.assertEqual(
+            admissions["createCustomRoleDefinitions"]["context"][
+                "memberStates"
+            ][fence_spec["definitionId"]],
+            expected_state,
+        )
+        for operation_id, expected_admission_status in (
+            ("addOwnedOperatorFenceBootstrapRole", "absent"),
+            ("removeOwnedOperatorFenceBootstrapRole", "owned-present"),
+        ):
+            admission = admissions[operation_id]
+            self.assertEqual(admission["status"], expected_admission_status)
+            self.assertEqual(
+                admission["context"],
+                {
+                    "executionDecision": "apply-exact",
+                    "stableFenceRoleDefinitionProjection": fence_spec[
+                        "definitionProjection"
+                    ],
+                    "stableFenceRoleDefinitionState": expected_state,
+                },
+            )
+            definition_probes = [
+                probes[probe_id]
+                for probe_id in admission["probeIds"]
+                if probes[probe_id]["url"] == definition_url
+            ]
+            self.assertEqual(len(definition_probes), 1)
+            self.assertEqual(
+                definition_probes[0]["status"], expected_probe_status
+            )
+
     def test_end_to_end_is_read_only_exact_and_non_executable(self):
         with tempfile.TemporaryDirectory() as folder:
             session, preflight, template = self.build(folder)
@@ -953,8 +1036,14 @@ class ObserveTests(unittest.TestCase):
                 "exact",
             )
             self.assertEqual(
+                member_states[
+                    bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+                ],
+                "exact",
+            )
+            self.assertEqual(
                 sum(state == "absent" for state in member_states.values()),
-                len(member_states) - 2,
+                len(member_states) - 3,
             )
             self.assertEqual(
                 admissions_by_id["uploadVersionedBridgePackage"]["status"],
@@ -2366,6 +2455,170 @@ class ObserveTests(unittest.TestCase):
                 {request.url for request in session.requests}
             )
         )
+
+    def test_exact_stable_fence_definition_and_both_admissions_are_bound(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(folder)
+
+        self.assert_stable_fence_preflight(
+            preflight, expected_state="exact"
+        )
+        validated, _digest = bootstrap.validate_preflight_evidence(
+            preflight, self.promote_template(template), self.plan
+        )
+        self.assertEqual(validated, preflight)
+
+    def test_pristine_absent_stable_fence_binds_exact_future_projection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _session, preflight, template = self.build(
+                folder,
+                FakeReadOnlySession(self.plan, stable_fence_absent=True),
+            )
+
+        self.assert_stable_fence_preflight(
+            preflight, expected_state="absent"
+        )
+        validated, _digest = bootstrap.validate_preflight_evidence(
+            preflight, self.promote_template(template), self.plan
+        )
+        self.assertEqual(validated, preflight)
+
+    def test_drifted_direct_stable_fence_definition_blocks_observation(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        definition_url = bootstrap._temporary_role_definition_readback_urls(
+            "addOwnedOperatorFenceBootstrapRole", bound_plan
+        )[0]
+
+        class DriftedDirectStableFenceSession(FakeReadOnlySession):
+            def read(self, request):
+                response = super().read(request)
+                if request.url == definition_url:
+                    body = copy.deepcopy(response.body)
+                    body["properties"]["permissions"][0][
+                        "dataActions"
+                    ].append("unreviewed/action")
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=response.status,
+                        headers=response.headers,
+                        body=body,
+                    )
+                return response
+
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "stable fence role definition is incomplete or drifted",
+            ):
+                self.build(
+                    folder, DriftedDirectStableFenceSession(self.plan)
+                )
+
+    def test_stable_fence_inventory_and_direct_get_must_agree(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        definition_url = bootstrap._temporary_role_definition_readback_urls(
+            "addOwnedOperatorFenceBootstrapRole", bound_plan
+        )[0]
+
+        class InventoryExactDirectAbsentSession(FakeReadOnlySession):
+            def read(self, request):
+                response = super().read(request)
+                if request.url == definition_url:
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=404,
+                        headers={},
+                        body={},
+                    )
+                return response
+
+        class InventoryAbsentDirectExactSession(FakeReadOnlySession):
+            def __init__(self, plan):
+                super().__init__(plan, stable_fence_absent=True)
+
+            def read(self, request):
+                response = super().read(request)
+                if request.url == definition_url:
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=200,
+                        headers={},
+                        body=bootstrap._stable_fence_role_spec(
+                            self.plan
+                        )["definitionProjection"],
+                    )
+                return response
+
+        for label, session in (
+            (
+                "inventory-exact-direct-absent",
+                InventoryExactDirectAbsentSession(self.plan),
+            ),
+            (
+                "inventory-absent-direct-exact",
+                InventoryAbsentDirectExactSession(self.plan),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                _session, preflight, template = self.build(folder, session)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "stable fence role preflight projections or states disagree",
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, self.promote_template(template), self.plan
+                    )
+
+    def test_existing_authorization_specific_fence_assignment_blocks_observation(self):
+        bound_plan = bootstrap.bind_temporary_role_ids(
+            self.plan, AUTHORIZATION_ID
+        )
+        fence_spec = bootstrap._stable_fence_role_spec(bound_plan)
+        assignment_url = (
+            "https://management.azure.com"
+            + fence_spec["assignmentResourceId"]
+            + "?api-version=2022-04-01"
+        )
+        self.assertIn(
+            bound_plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"],
+            assignment_url,
+        )
+        self.assertNotIn(
+            bootstrap.FENCE_STABLE_ROLE_POLICY["roleMatrixAssignmentId"],
+            assignment_url,
+        )
+
+        class RetainedTemporaryFenceAssignmentSession(FakeReadOnlySession):
+            def read(self, request):
+                response = super().read(request)
+                if request.url == assignment_url:
+                    return observe.ReadResponse(
+                        method=response.method,
+                        url=response.url,
+                        status=200,
+                        headers={},
+                        body={
+                            "id": fence_spec["assignmentResourceId"],
+                        },
+                    )
+                return response
+
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(
+                observe.ObserveError,
+                "temporary fence assignment is already present before bootstrap",
+            ):
+                self.build(
+                    folder,
+                    RetainedTemporaryFenceAssignmentSession(self.plan),
+                )
 
     def test_existing_temporary_package_assignment_blocks_fresh_observation(self):
         bound_plan = bootstrap.bind_temporary_role_ids(

@@ -253,7 +253,6 @@ TEMPORARY_ROLE_ID_FIELDS = (
     "temporaryPackageReadRoleAssignmentId",
     "temporaryKeyReadRoleDefinitionId",
     "temporaryKeyReadRoleAssignmentId",
-    "temporaryFenceRoleDefinitionId",
     "temporaryFenceRoleAssignmentId",
     "temporaryControllerRoleAssignmentId",
 )
@@ -288,6 +287,24 @@ PACKAGE_STABLE_ROLE_POLICY = {
 PACKAGE_ROLE_OPERATIONS = frozenset({
     "addOwnedUploaderPackageRole",
     "removeOwnedUploaderPackageRole",
+})
+FENCE_STABLE_ROLE_POLICY = {
+    "definitionLifecycle": "role-matrix-stable-read-only-preserved",
+    "assignmentLifecycle": "authorization-specific-create-and-delete",
+    "cleanupLifecycle": "one-reviewed-lock-suspension-for-assignment-delete",
+    "scope": "activationFenceContainer",
+    "roleMatrixName": "bridgeActivationFence",
+    "definitionId": "906cb3b2-2061-5f5d-b168-515287d3165a",
+    "roleMatrixAssignmentId": "5e7ccc27-ff81-5cad-82de-3bc2e287d59f",
+    "assignmentIdField": "temporaryFenceRoleAssignmentId",
+    "dataActions": [
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    ],
+}
+FENCE_ROLE_OPERATIONS = frozenset({
+    "addOwnedOperatorFenceBootstrapRole",
+    "removeOwnedOperatorFenceBootstrapRole",
 })
 CONTROLLER_BUILTIN_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 CONTROLLER_ROLE_OPERATIONS = frozenset({
@@ -328,7 +345,6 @@ TEMPORARY_ROLE_ID_DERIVATION = {
         "temporaryPackageReadRoleAssignmentId": "package-read-role-assignment",
         "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
-        "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment",
     },
@@ -418,7 +434,7 @@ def _validate_temporary_role_id_derivation(plan: Mapping[str, Any]) -> Mapping[s
 def derive_temporary_role_ids(
     plan: Mapping[str, Any], authorization_id: str
 ) -> dict[str, str]:
-    """Derive owned IDs and bind the provider-owned controller definition."""
+    """Derive owned IDs and bind the preserved fence/controller definitions."""
 
     _guid(authorization_id, "temporary role authorization ID")
     derivation = _validate_temporary_role_id_derivation(plan)
@@ -452,6 +468,9 @@ def derive_temporary_role_ids(
         or not set(values).isdisjoint(permanent_role_ids)
     ):
         fail("derived temporary role IDs are invalid, duplicated, or retired")
+    derived["temporaryFenceRoleDefinitionId"] = FENCE_STABLE_ROLE_POLICY[
+        "definitionId"
+    ]
     derived["temporaryControllerRoleDefinitionId"] = CONTROLLER_BUILTIN_ROLE_ID
     return derived
 
@@ -508,6 +527,11 @@ def bind_temporary_role_ids(
         fail("in-memory temporary role IDs do not match the authorization")
     if temporary.get("temporaryControllerRoleDefinitionId", CONTROLLER_BUILTIN_ROLE_ID) != CONTROLLER_BUILTIN_ROLE_ID:
         fail("in-memory controller built-in role identity drifted")
+    if temporary.get(
+        "temporaryFenceRoleDefinitionId",
+        FENCE_STABLE_ROLE_POLICY["definitionId"],
+    ) != FENCE_STABLE_ROLE_POLICY["definitionId"]:
+        fail("in-memory stable fence role identity drifted")
     legacy_present = set(temporary).intersection(
         LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS
     )
@@ -579,7 +603,6 @@ def _reject_residual_temporary_role_definitions(
             for field in (
                 "legacyPackageRoleDefinitionId",
                 "temporaryKeyReadRoleDefinitionId",
-                "temporaryFenceRoleDefinitionId",
             )
             if isinstance(temporary.get(field), str)
         )
@@ -619,9 +642,10 @@ def _reject_residual_temporary_role_assignments(
         )
         if isinstance(temporary, Mapping) and isinstance(temporary.get(field), str)
     }
-    # The provider-owned Contributor definition also serves permanent roles.
-    # Detect our controller assignment by its marker or authorization-owned ID.
+    # These preserved definitions also serve permanent roles. Detect temporary
+    # assignments that reference them by marker or authorization-owned ID.
     current_definition_ids.discard(CONTROLLER_BUILTIN_ROLE_ID)
+    current_definition_ids.discard(FENCE_STABLE_ROLE_POLICY["definitionId"])
     current_assignment_ids = {
         str(temporary[field]).lower()
         for field in TEMPORARY_ROLE_ID_FIELDS
@@ -1577,11 +1601,13 @@ def _mutation_target_allowed(
             and path.lower() in assignment_paths
             and set(query) == {"api-version"}
         )
+    if operation_id in FENCE_ROLE_OPERATIONS:
+        assignment_path = _stable_fence_role_spec(plan)["assignmentResourceId"]
+        expected_method = "PUT" if operation_id.startswith("addOwned") else "DELETE"
+        return method == expected_method and arm(assignment_path)
     temp_role_ids = {
         "addOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
         "removeOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
-        "addOwnedOperatorFenceBootstrapRole": (plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"], plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]),
-        "removeOwnedOperatorFenceBootstrapRole": (plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"], plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]),
         "addOwnedOperatorControllerCanaryRole": (plan["temporaryAccess"]["temporaryControllerRoleDefinitionId"], plan["temporaryAccess"]["temporaryControllerRoleAssignmentId"]),
         "removeOwnedOperatorControllerCanaryRole": (plan["temporaryAccess"]["temporaryControllerRoleDefinitionId"], plan["temporaryAccess"]["temporaryControllerRoleAssignmentId"]),
     }
@@ -1957,6 +1983,21 @@ def _expected_terminal_mutation_targets(
                     lock_method, arm(lock_proof["resourceId"], "2016-09-01")
                 )] = 1
         return required, Counter()
+    if operation_id in FENCE_ROLE_OPERATIONS:
+        method = "PUT" if operation_id.startswith("addOwned") else "DELETE"
+        required = Counter({
+            _normalized_mutation_target(
+                method,
+                arm(_stable_fence_role_spec(plan)["assignmentResourceId"], "2022-04-01"),
+            ): 1
+        })
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is not None:
+            for lock_method in ("DELETE", "PUT"):
+                required[_normalized_mutation_target(
+                    lock_method, arm(lock_proof["resourceId"], "2016-09-01")
+                )] = 1
+        return required, Counter()
     temp_role_ids = {
         "addOwnedOperatorKeyReadRole": (
             plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"],
@@ -1967,16 +2008,6 @@ def _expected_terminal_mutation_targets(
             plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"],
             plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"],
             "signingKey",
-        ),
-        "addOwnedOperatorFenceBootstrapRole": (
-            plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"],
-            plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"],
-            "activationFenceContainer",
-        ),
-        "removeOwnedOperatorFenceBootstrapRole": (
-            plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"],
-            plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"],
-            "activationFenceContainer",
         ),
         "addOwnedOperatorControllerCanaryRole": (
             plan["temporaryAccess"]["temporaryControllerRoleDefinitionId"],
@@ -2865,6 +2896,12 @@ def load_plan() -> tuple[dict[str, Any], str]:
     if temporary.get("temporaryPackageRoles") != PACKAGE_STABLE_ROLE_POLICY:
         fail("reviewed stable package role policy drifted")
     _stable_package_role_specs(plan)
+    if (
+        "temporaryFenceRoleDefinitionId" in temporary
+        or temporary.get("temporaryFenceRole") != FENCE_STABLE_ROLE_POLICY
+    ):
+        fail("reviewed stable fence role policy drifted")
+    _stable_fence_role_definition_spec(plan)
     if (
         temporary.get("leaseDurationSeconds")
         != CONTROLLER_CANARY_LEASE_DURATION_SECONDS
@@ -4687,6 +4724,106 @@ def _temporary_package_assignment_resources(
     return resources
 
 
+def _stable_fence_role_definition_spec(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the unbound durable least-authority fence role contract."""
+
+    temporary = plan.get("temporaryAccess")
+    if (
+        not isinstance(temporary, Mapping)
+        or temporary.get("temporaryFenceRole") != FENCE_STABLE_ROLE_POLICY
+        or temporary.get("temporaryFenceScope")
+        != FENCE_STABLE_ROLE_POLICY["scope"]
+        or temporary.get("temporaryFenceDataActions")
+        != FENCE_STABLE_ROLE_POLICY["dataActions"]
+        or temporary.get(
+            "temporaryFenceRoleDefinitionId",
+            FENCE_STABLE_ROLE_POLICY["definitionId"],
+        )
+        != FENCE_STABLE_ROLE_POLICY["definitionId"]
+    ):
+        fail("stable fence role policy is not exact")
+    role = next(
+        (
+            item
+            for item in plan.get("roleMatrix", [])
+            if isinstance(item, Mapping)
+            and item.get("name") == FENCE_STABLE_ROLE_POLICY["roleMatrixName"]
+        ),
+        None,
+    )
+    expected_role = {
+        "name": FENCE_STABLE_ROLE_POLICY["roleMatrixName"],
+        "definitionId": FENCE_STABLE_ROLE_POLICY["definitionId"],
+        "assignmentId": FENCE_STABLE_ROLE_POLICY["roleMatrixAssignmentId"],
+        "principal": "bridgeIdentity",
+        "scope": FENCE_STABLE_ROLE_POLICY["scope"],
+        "actions": [],
+        "dataActions": FENCE_STABLE_ROLE_POLICY["dataActions"],
+    }
+    if not isinstance(role, Mapping) or dict(role) != expected_role:
+        fail("stable fence role-matrix authority drifted")
+    definition = _custom_role_definition_specs(plan).get(
+        FENCE_STABLE_ROLE_POLICY["definitionId"]
+    )
+    expected_permission = {
+        "actions": [],
+        "notActions": [],
+        "dataActions": FENCE_STABLE_ROLE_POLICY["dataActions"],
+        "notDataActions": [],
+    }
+    if (
+        not isinstance(definition, Mapping)
+        or definition.get("properties", {}).get("type") != "CustomRole"
+        or definition.get("properties", {}).get("permissions")
+        != [expected_permission]
+        or definition.get("properties", {}).get("assignableScopes")
+        != [f"/subscriptions/{SUBSCRIPTION}"]
+    ):
+        fail("stable fence role definition drifted")
+    return {
+        **copy.deepcopy(FENCE_STABLE_ROLE_POLICY),
+        "definitionResourceId": definition["id"],
+        "definitionProjection": copy.deepcopy(definition),
+    }
+
+
+def _stable_fence_role_spec(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind one authorization-owned assignment to the durable fence role."""
+
+    spec = _stable_fence_role_definition_spec(plan)
+    temporary = plan["temporaryAccess"]
+    assignment_id = temporary.get(
+        FENCE_STABLE_ROLE_POLICY["assignmentIdField"]
+    )
+    _guid(assignment_id, "temporary fence assignment ID")
+    scope = _resource_scope_from_plan(plan, FENCE_STABLE_ROLE_POLICY["scope"])
+    return {
+        **spec,
+        "assignmentId": assignment_id,
+        "assignmentResourceId": (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            f"{assignment_id}"
+        ),
+    }
+
+
+def _validate_stable_fence_role_definition(
+    value: Any, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Require the full source-derived stable fence definition projection."""
+
+    spec = _stable_fence_role_spec(plan)
+    if (
+        not isinstance(value, Mapping)
+        or _project_role_definition(value) != value
+        or value != spec["definitionProjection"]
+    ):
+        fail("stable fence role definition is incomplete or drifted")
+    return copy.deepcopy(dict(value))
+
+
 def _temporary_package_assignment_projections(
     plan: Mapping[str, Any], authorization: Mapping[str, Any]
 ) -> dict[str, dict[str, Any]]:
@@ -6292,8 +6429,14 @@ def _validate_operation_source_projection(
             },
         }
         builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
+        stable_fence = operation_id in FENCE_ROLE_OPERATIONS
+        preserved_definition = builtin or stable_fence
         if builtin:
             expected_definition = _validate_controller_builtin_definition(context.get("builtInRoleDefinitionProjection"))
+        elif stable_fence:
+            expected_definition = _validate_stable_fence_role_definition(
+                context.get("stableFenceRoleDefinitionProjection"), plan
+            )
         principal_type = (
             "ServicePrincipal"
             if authorization["azure"]["accountType"] == "servicePrincipal"
@@ -6317,7 +6460,7 @@ def _validate_operation_source_projection(
         if (
             body["definitionResourceId"] != definition_resource
             or body["assignmentResourceId"] != assignment_resource
-            or body["definitionCreated"] is not (not builtin)
+            or body["definitionCreated"] is not (not preserved_definition)
             or body["assignmentCreated"] is not True
             or body["cleanupKey"] != cleanup_key
             or body["definition"] != expected_definition
@@ -6326,7 +6469,13 @@ def _validate_operation_source_projection(
             fail("temporary role definition or assignment terminal projection drifted")
     elif family == "temporary-role-cleanup-absence":
         builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
-        definition_proof_key = "definitionPreservationProjection" if builtin else "definitionAbsenceProjection"
+        stable_fence = operation_id in FENCE_ROLE_OPERATIONS
+        preserved_definition = builtin or stable_fence
+        definition_proof_key = (
+            "definitionPreservationProjection"
+            if preserved_definition
+            else "definitionAbsenceProjection"
+        )
         body = _exact_keys(
             body,
             {
@@ -6380,6 +6529,14 @@ def _validate_operation_source_projection(
                 "present": True,
                 "projection": _validate_controller_builtin_definition(context.get("builtInRoleDefinitionProjection")),
             }
+        elif stable_fence:
+            definition_proof = {
+                "resourceId": definition_resource,
+                "present": True,
+                "projection": _validate_stable_fence_role_definition(
+                    context.get("stableFenceRoleDefinitionProjection"), plan
+                ),
+            }
         if (
             body["cleanupKey"] != cleanup_key
             or body["definitionResourceId"] != definition_resource
@@ -6389,7 +6546,7 @@ def _validate_operation_source_projection(
             or body["assignmentAbsenceProjection"]
             != {"resourceId": assignment_resource, "absent": True}
             or body[definition_proof_key] != definition_proof
-            or (builtin and body["definitionRemoved"] is not False)
+            or (preserved_definition and body["definitionRemoved"] is not False)
             or body["deletionLock"] != _expected_deletion_lock_proof(operation_id)
         ):
             fail("temporary role cleanup definition/assignment readback is not exact")
@@ -9292,6 +9449,7 @@ def _terminal_temporary_role_component(
     remove_mutation_id: str,
     cleanup_source: Mapping[str, Any],
     mutation_journal: Sequence[Mapping[str, Any]],
+    preserved_definition: bool = False,
 ) -> dict[str, Any]:
     add_count = _terminal_successful_mutation_count(
         mutation_journal, add_mutation_id
@@ -9301,8 +9459,10 @@ def _terminal_temporary_role_component(
                     if item.get("operationId") == remove_mutation_id
                     and "/providers/microsoft.authorization/locks/" not in str(item.get("targetUrl", "")).lower()]
     remove_count = _terminal_successful_mutation_count(role_removals, remove_mutation_id)
-    builtin = definition_id == CONTROLLER_BUILTIN_ROLE_ID
-    expected_count = 1 if builtin else 2
+    preserved_definition = (
+        preserved_definition or definition_id == CONTROLLER_BUILTIN_ROLE_ID
+    )
+    expected_count = 1 if preserved_definition else 2
     if add_count != expected_count or remove_count != expected_count:
         fail("terminal temporary role ownership lacks its exact subcalls")
     body = {
@@ -9317,9 +9477,9 @@ def _terminal_temporary_role_component(
         "presentAfterCleanup": False,
         "freshReadbackSha256": sha256_bytes(canonical_json_bytes(cleanup_source)),
         "observedAt": cleanup_source["observedAt"],
-        "roleDefinitionCreatedByAuthorization": not builtin,
-        "roleDefinitionRemoved": not builtin,
-        "roleDefinitionPresentAfterCleanup": builtin,
+        "roleDefinitionCreatedByTemporaryLifecycle": not preserved_definition,
+        "roleDefinitionRemovedByTemporaryLifecycle": not preserved_definition,
+        "roleDefinitionPresentAfterCleanup": preserved_definition,
     }
     return body
 
@@ -9391,8 +9551,8 @@ def _terminal_stable_package_role_component(
             "presentAfterCleanup": False,
             "freshReadbackSha256": sha256_bytes(canonical_json_bytes(pair)),
             "observedAt": cleanup_source["observedAt"],
-            "roleDefinitionCreatedByAuthorization": False,
-            "roleDefinitionRemoved": False,
+            "roleDefinitionCreatedByTemporaryLifecycle": False,
+            "roleDefinitionRemovedByTemporaryLifecycle": False,
             "roleDefinitionPresentAfterCleanup": True,
         }
     return {
@@ -9551,6 +9711,7 @@ def build_terminal_receipt_components(
         remove_mutation_id="removeOwnedOperatorFenceBootstrapRole",
         cleanup_source=cleanup_source["operatorFenceRole"],
         mutation_journal=mutation_journal,
+        preserved_definition=True,
     )
     temporary["operatorControllerRole"] = _terminal_temporary_role_component(
         definition_id=temporary_access["temporaryControllerRoleDefinitionId"],
@@ -9880,6 +10041,11 @@ def _operation_context_policy(
         observed_fields |= {"uploaderIpv4", "restoreNetworkAcls"}
     elif operation_id in CONTROLLER_ROLE_OPERATIONS:
         observed_fields.add("builtInRoleDefinitionProjection")
+    elif operation_id in FENCE_ROLE_OPERATIONS:
+        observed_fields |= {
+            "stableFenceRoleDefinitionProjection",
+            "stableFenceRoleDefinitionState",
+        }
     elif operation_id in PACKAGE_ROLE_OPERATIONS:
         observed_fields.add("stablePackageRoleDefinitionProjections")
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
@@ -10132,6 +10298,12 @@ def _validate_operation_context(
         _validate_stable_package_role_definitions(
             context["stablePackageRoleDefinitionProjections"], plan
         )
+    if operation_id in FENCE_ROLE_OPERATIONS:
+        _validate_stable_fence_role_definition(
+            context["stableFenceRoleDefinitionProjection"], plan
+        )
+        if context["stableFenceRoleDefinitionState"] not in {"absent", "exact"}:
+            fail("stable fence role definition preflight state is invalid")
 
     if "etag" in required:
         if (
@@ -10493,6 +10665,15 @@ def validate_preflight_evidence(
                 or operation_id in PACKAGE_ROLE_OPERATIONS
                 else 404
             )
+            if operation_id in FENCE_ROLE_OPERATIONS:
+                expected_status = (
+                    200
+                    if admission["context"].get(
+                        "stableFenceRoleDefinitionState"
+                    )
+                    == "exact"
+                    else 404
+                )
             if len(definition_probes) != 1 or definition_probes[0]["status"] != expected_status:
                 fail(
                     "temporary or stable role definition state is not bound to the fresh preflight"
@@ -10554,6 +10735,34 @@ def validate_preflight_evidence(
     recorded_builtin = admission_map["createCustomRoleDefinitions"]["context"]["builtInRoleDefinitionProjections"][CONTROLLER_BUILTIN_ROLE_ID]
     if any(value != recorded_builtin for value in controller_definitions):
         fail("controller built-in role preflight projections disagree")
+    stable_fence_definition_id = FENCE_STABLE_ROLE_POLICY["definitionId"]
+    recorded_fence_state = admission_map["createCustomRoleDefinitions"][
+        "context"
+    ]["memberStates"].get(stable_fence_definition_id)
+    fence_states = [
+        admission_map[operation_id]["context"][
+            "stableFenceRoleDefinitionState"
+        ]
+        for operation_id in FENCE_ROLE_OPERATIONS
+    ]
+    fence_projections = [
+        admission_map[operation_id]["context"][
+            "stableFenceRoleDefinitionProjection"
+        ]
+        for operation_id in FENCE_ROLE_OPERATIONS
+    ]
+    expected_fence_projection = _stable_fence_role_spec(plan)[
+        "definitionProjection"
+    ]
+    if (
+        recorded_fence_state not in {"absent", "exact"}
+        or any(state != recorded_fence_state for state in fence_states)
+        or any(
+            projection != expected_fence_projection
+            for projection in fence_projections
+        )
+    ):
+        fail("stable fence role preflight projections or states disagree")
     bridge_adopted = admission_map["createStoppedPrivateBridge"]["context"].get(
         "adopted"
     )
@@ -13029,7 +13238,12 @@ class AzureCliBootstrapTransport:
                     "assignmentRemoved",
                     "definitionRemoved",
                     "assignmentAbsenceProjection",
-                    "definitionPreservationProjection" if operation_id in CONTROLLER_ROLE_OPERATIONS else "definitionAbsenceProjection",
+                    (
+                        "definitionPreservationProjection"
+                        if operation_id
+                        in CONTROLLER_ROLE_OPERATIONS | FENCE_ROLE_OPERATIONS
+                        else "definitionAbsenceProjection"
+                    ),
                 )
             }
             family = "temporary-role-cleanup-absence"
@@ -14131,6 +14345,7 @@ class AzureCliBootstrapTransport:
         label: str,
         *,
         follow_on_request_envelopes: int = 0,
+        preserve_full_readiness_interval: bool = False,
     ) -> dt.datetime:
         work_deadline = self._request_deadline() or self._authorization_expiry()
         work_deadline -= dt.timedelta(
@@ -14142,7 +14357,18 @@ class AzureCliBootstrapTransport:
         deadline = min(
             self._authorization_expiry(),
             work_deadline,
-            started + dt.timedelta(seconds=MAX_STORAGE_DATA_PLANE_READINESS_SECONDS),
+            started
+            + dt.timedelta(
+                seconds=(
+                    MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
+                    + (
+                        STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                        + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        if preserve_full_readiness_interval
+                        else 0
+                    )
+                )
+            ),
         )
         if started > deadline - dt.timedelta(
             seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
@@ -14188,18 +14414,47 @@ class AzureCliBootstrapTransport:
             started,
             "activation-fence readiness",
             follow_on_request_envelopes=2,
+            # Preserve the full 600-second RBAC convergence interval before
+            # reserving the final Storage response envelope below.
+            preserve_full_readiness_interval=True,
         )
         final_request_at = deadline - dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            )
+        )
+        final_request_start_deadline = final_request_at + dt.timedelta(
+            seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
         )
         for attempt in range(1, 65):
             attempts = attempt
             now = self.clock()
-            if now > final_request_at:
+            if now > final_request_start_deadline:
                 fail_readiness(
                     "activation-fence readiness expired before exact absence",
                     "readiness-timeout",
                 )
+            if (
+                now < final_request_at
+                and now
+                + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+                >= final_request_at
+            ):
+                # Keep the last transport envelope for a GET begun at the full
+                # RBAC propagation boundary. A scheduler may resume up to one
+                # second late; that slack is already inside the hard deadline.
+                self.sleep((final_request_at - now).total_seconds())
+                aligned = self.clock()
+                if (
+                    aligned < final_request_at
+                    or aligned > final_request_start_deadline
+                ):
+                    fail_readiness(
+                        "activation-fence readiness scheduler missed its final observation window",
+                        "readiness-timeout",
+                    )
+                now = aligned
             client_request_id = _new_storage_client_request_id()
             try:
                 response = self.session.request(
@@ -14317,7 +14572,11 @@ class AzureCliBootstrapTransport:
                     )
                 return _ConditionalStorageCreateWindow(
                     first_attempt_start_deadline=deadline,
-                    final_retry_start=deadline,
+                    # A slow final readiness GET may use its full response
+                    # envelope before the first conditional PUT. Any exact
+                    # no-effect PUT denial must not extend RBAC propagation
+                    # retries beyond the reviewed 600-second boundary.
+                    final_retry_start=final_request_at,
                 )
             if code not in {"AuthorizationFailure", "AuthorizationPermissionMismatch"}:
                 fail_readiness(
@@ -17706,11 +17965,12 @@ class AzureCliBootstrapTransport:
             cleanup_key = "operator-key-read-role"
             data_actions = self.plan["temporaryAccess"]["temporaryKeyReadDataActions"]
         elif "OperatorFence" in operation_id:
-            assignment_id = self.plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]
-            definition_id = self.plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"]
-            scope = self._resource_scope("activationFenceContainer")
+            fence_spec = _stable_fence_role_spec(self.plan)
+            assignment_id = fence_spec["assignmentId"]
+            definition_id = fence_spec["definitionId"]
+            scope = self._resource_scope(FENCE_STABLE_ROLE_POLICY["scope"])
             cleanup_key = "operator-fence-bootstrap-role"
-            data_actions = self.plan["temporaryAccess"]["temporaryFenceDataActions"]
+            data_actions = fence_spec["dataActions"]
         elif "OperatorController" in operation_id:
             assignment_id = self.plan["temporaryAccess"]["temporaryControllerRoleAssignmentId"]
             definition_id = self.plan["temporaryAccess"]["temporaryControllerRoleDefinitionId"]
@@ -17741,12 +18001,25 @@ class AzureCliBootstrapTransport:
             }
         }
         builtin = operation_id in CONTROLLER_ROLE_OPERATIONS
+        stable_fence = operation_id in FENCE_ROLE_OPERATIONS
+        preserved_definition = builtin or stable_fence
         builtin_definition = None
+        stable_fence_definition = None
         if builtin:
             builtin_definition = _validate_controller_builtin_definition(
                 self.admissions[operation_id]["context"].get("builtInRoleDefinitionProjection")
             )
             definition_body = {"properties": builtin_definition["properties"]}
+        elif stable_fence:
+            stable_fence_definition = _validate_stable_fence_role_definition(
+                self.admissions[operation_id]["context"].get(
+                    "stableFenceRoleDefinitionProjection"
+                ),
+                self.plan,
+            )
+            definition_body = {
+                "properties": stable_fence_definition["properties"]
+            }
         principal_type = (
             "ServicePrincipal"
             if self.authorization["azure"]["accountType"] == "servicePrincipal"
@@ -17800,6 +18073,14 @@ class AzureCliBootstrapTransport:
             if "permissions" in expected:
                 if builtin and _project_role_definition(document) != builtin_definition:
                     fail(f"{label} differs from the authorization-bound built-in definition")
+                if (
+                    stable_fence
+                    and _project_role_definition(document)
+                    != stable_fence_definition
+                ):
+                    fail(
+                        f"{label} differs from the source-bound stable fence definition"
+                    )
                 projection = {
                     "roleName": properties.get("roleName"),
                     "description": properties.get("description"),
@@ -17852,9 +18133,14 @@ class AzureCliBootstrapTransport:
             }
             pending_create: str | None = None
             try:
-                if builtin:
-                    if read_exact(definition_resource, definition_body, "controller built-in definition precondition") != "exact":
-                        fail("controller built-in definition is missing")
+                if preserved_definition:
+                    definition_label = (
+                        "controller built-in definition precondition"
+                        if builtin
+                        else "stable fence definition precondition"
+                    )
+                    if read_exact(definition_resource, definition_body, definition_label) != "exact":
+                        fail("preserved role definition is missing before assignment creation")
                 else:
                     if read_exact(definition_resource, definition_body, "temporary role definition precondition") != "absent":
                         fail("temporary role definition already exists; recovery authorization is required")
@@ -17876,6 +18162,14 @@ class AzureCliBootstrapTransport:
                 details["definitionReadbackExact"] = True
                 if read_exact(assignment_resource, assignment_body, "temporary role assignment precondition") != "absent":
                     fail("temporary role assignment already exists; recovery authorization is required")
+                if stable_fence and read_exact(
+                    definition_resource,
+                    definition_body,
+                    "stable fence definition immediately before assignment creation",
+                ) != "exact":
+                    fail(
+                        "stable fence role definition changed before assignment creation"
+                    )
                 details["assignmentAttempted"] = True
                 pending_create = "assignment"
                 assignment_response = self._mutation_request(
@@ -17892,8 +18186,16 @@ class AzureCliBootstrapTransport:
                 if read_exact(assignment_resource, assignment_body, "temporary role assignment readback") != "exact":
                     fail("temporary role assignment readback is not exact")
                 details["assignmentReadbackExact"] = True
-                if builtin and read_exact(definition_resource, definition_body, "controller built-in definition after grant") != "exact":
-                    fail("controller built-in definition disappeared after grant")
+                if preserved_definition and read_exact(
+                    definition_resource,
+                    definition_body,
+                    (
+                        "controller built-in definition after grant"
+                        if builtin
+                        else "stable fence definition after grant"
+                    ),
+                ) != "exact":
+                    fail("preserved role definition disappeared after grant")
                 details["definitionProjection"] = exact_readbacks[
                     definition_resource.lower()
                 ]
@@ -18032,8 +18334,12 @@ class AzureCliBootstrapTransport:
         assignment_ambiguous = add_details.get("assignmentAmbiguous") is True
         definition_created = add_details.get("definitionCreated") is True
         definition_ambiguous = add_details.get("definitionAmbiguous") is True
-        if builtin and (definition_created or definition_ambiguous or add_details.get("definitionAttempted")):
-            fail("controller built-in definition cannot be executor-owned")
+        if preserved_definition and (
+            definition_created
+            or definition_ambiguous
+            or add_details.get("definitionAttempted")
+        ):
+            fail("preserved role definition cannot be executor-owned")
         assignment_visibility_pending = assignment_ambiguous or (
             assignment_created
             and add_details.get("assignmentReadbackExact") is not True
@@ -18100,13 +18406,27 @@ class AzureCliBootstrapTransport:
             deletion_lock = expected_lock
             assignment_state = "absent"
 
-        if builtin:
-            if read_exact(definition_resource, definition_body, "controller built-in definition preservation") != "exact":
-                fail("controller built-in definition preservation is not proven")
-            if read_exact(assignment_resource, assignment_body, "controller temporary assignment final absence") != "absent":
-                fail("controller temporary assignment reappeared during cleanup")
+        if preserved_definition:
+            if read_exact(
+                definition_resource,
+                definition_body,
+                (
+                    "controller built-in definition preservation"
+                    if builtin
+                    else "stable fence definition preservation"
+                ),
+            ) != "exact":
+                fail("preserved role definition preservation is not proven")
+            if read_exact(
+                assignment_resource,
+                assignment_body,
+                "preserved-definition temporary assignment final absence",
+            ) != "absent":
+                fail("temporary assignment reappeared during cleanup")
             if any_visibility_pending:
-                self._prove_temporary_role_marker_inventories_absent("controller pending assignment final boundary")
+                self._prove_temporary_role_marker_inventories_absent(
+                    "preserved-definition pending assignment final boundary"
+                )
             return {
                 "cleanupKey": cleanup_key,
                 "assignmentResourceId": assignment_resource,

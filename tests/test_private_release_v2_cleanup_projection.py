@@ -57,7 +57,10 @@ class CleanupProjectionTests(unittest.TestCase):
                 else:
                     self.assertEqual(body["assignmentAbsenceProjection"],
                                      {"resourceId": facts["assignmentResourceId"], "absent": True})
-                if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+                if operation_id in (
+                    bootstrap.CONTROLLER_ROLE_OPERATIONS
+                    | bootstrap.FENCE_ROLE_OPERATIONS
+                ):
                     self.assertEqual(body["definitionPreservationProjection"], {
                         "resourceId": facts["definitionResourceId"], "present": True,
                         "projection": session.definition,
@@ -82,7 +85,16 @@ class CleanupProjectionTests(unittest.TestCase):
                 self.assertTrue(result["owned"])
                 self.assertEqual(session.locks, session.original_locks)
                 self.assertEqual(sleeps, [])
-                self.assertEqual(len(session.mutations()), 3 if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS else 4)
+                self.assertEqual(
+                    len(session.mutations()),
+                    3
+                    if operation_id
+                    in (
+                        bootstrap.CONTROLLER_ROLE_OPERATIONS
+                        | bootstrap.FENCE_ROLE_OPERATIONS
+                    )
+                    else 4,
+                )
                 production_lock = next(url for url in session.original_locks
                                        if "paperdesk-protect-app-delete" in url)
                 self.assertFalse(any(url == production_lock for _, url in session.mutations()))
@@ -126,8 +138,15 @@ class CleanupProjectionTests(unittest.TestCase):
                     ]["permissions"][0]["dataActions"].append("unreviewed/action")
                     variants.append(("stable definition drift " + member, changed))
             else:
-                builtin = operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS
-                definition_proof = "definitionPreservationProjection" if builtin else "definitionAbsenceProjection"
+                preserved = operation_id in (
+                    bootstrap.CONTROLLER_ROLE_OPERATIONS
+                    | bootstrap.FENCE_ROLE_OPERATIONS
+                )
+                definition_proof = (
+                    "definitionPreservationProjection"
+                    if preserved
+                    else "definitionAbsenceProjection"
+                )
                 for field in ("cleanupKey", "assignmentResourceId", "definitionResourceId",
                               "assignmentRemoved", "definitionRemoved", "assignmentAbsenceProjection",
                               definition_proof, "deletionLock"):
@@ -139,15 +158,19 @@ class CleanupProjectionTests(unittest.TestCase):
                     variants.append(("malformed " + field, malformed))
                 for field in ("assignmentAbsenceProjection", definition_proof):
                     changed = copy.deepcopy(facts)
-                    changed[field]["present" if builtin and field == definition_proof else "absent"] = False
+                    changed[field][
+                        "present"
+                        if preserved and field == definition_proof
+                        else "absent"
+                    ] = False
                     variants.append(("wrong presence " + field, changed))
-                if builtin:
+                if preserved:
                     changed = copy.deepcopy(facts)
                     changed[definition_proof]["projection"]["properties"]["permissions"][0]["dataActions"].append("unreviewed/action")
-                    variants.append(("built-in definition drift", changed))
+                    variants.append(("preserved definition drift", changed))
                     changed = copy.deepcopy(facts)
                     changed["definitionRemoved"] = True
-                    variants.append(("built-in definition claimed deleted", changed))
+                    variants.append(("preserved definition claimed deleted", changed))
             changed = copy.deepcopy(facts)
             changed["deletionLock"]["restored"] = False
             variants.append(("lock not restored", changed))
@@ -161,6 +184,61 @@ class CleanupProjectionTests(unittest.TestCase):
                 with self.subTest(operation=operation_id, variant=label):
                     with self.assertRaises(bootstrap.BootstrapError):
                         transport._validate_readback_response(probe, readback, candidate)
+
+    def test_fence_cleanup_requires_exact_preserved_definition_and_never_deletes_it(self):
+        operation_id = "removeOwnedOperatorFenceBootstrapRole"
+        (transport, session, _, operation, state, _, _), probe = self.make(
+            operation_id
+        )
+        facts = transport._mutate(operation, state)
+        readback = session.request("GET", probe["url"])
+        expected_definition = bootstrap._stable_fence_role_spec(
+            transport.plan
+        )["definitionProjection"]
+
+        self.assertFalse(facts["definitionRemoved"])
+        self.assertEqual(
+            facts["definitionPreservationProjection"],
+            {
+                "resourceId": facts["definitionResourceId"],
+                "present": True,
+                "projection": expected_definition,
+            },
+        )
+        self.assertFalse(
+            any(
+                method == "DELETE" and url == session.definition_url
+                for method, url in session.mutations()
+            )
+        )
+
+        variants = {}
+        claimed_deleted = copy.deepcopy(facts)
+        claimed_deleted["definitionRemoved"] = True
+        variants["fabricated definition deletion"] = claimed_deleted
+        wrong_resource = copy.deepcopy(facts)
+        wrong_resource["definitionPreservationProjection"]["resourceId"] = (
+            "/subscriptions/"
+            + bootstrap.SUBSCRIPTION
+            + "/providers/Microsoft.Authorization/roleDefinitions/"
+            + "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        )
+        variants["preserved resource drift"] = wrong_resource
+        drifted_projection = copy.deepcopy(facts)
+        drifted_projection["definitionPreservationProjection"]["projection"][
+            "properties"
+        ]["permissions"][0]["dataActions"].append(
+            "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete"
+        )
+        variants["preserved authority drift"] = drifted_projection
+
+        for label, candidate in variants.items():
+            with self.subTest(label=label), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                transport._validate_readback_response(
+                    probe, readback, candidate
+                )
 
     def test_wrong_url_or_status_is_not_an_exact_absence(self):
         for operation_id in support.TEMPORARY:

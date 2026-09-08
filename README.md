@@ -224,34 +224,53 @@ accepted, HTTP 200 is a replay/update failure, and the claim is never deleted.
 The exact plan may temporarily add only:
 
 - the current host's exact public IPv4 `/32` Storage firewall rule; and
-- an authorization-specific custom role on the exact package container with
-  only create-new blob and exact readback DataActions;
-- an exact metadata-only Key Vault read role needed to capture the public JWK;
-- an exact fence-bootstrap role limited to creating/reading the canonical idle
-  activation-fence blob; and
-- an exact controller-canary role limited to reading, creating, leasing, and
-  deleting the authorization-specific canary blob in the controller container.
+- two authorization-specific assignments of the persistent package add/read
+  custom definitions on the exact package container;
+- an authorization-specific metadata-only Key Vault read definition and
+  assignment needed to capture the public JWK;
+- an authorization-specific assignment of the persistent
+  `bridgeActivationFence` custom definition, limited to reading/writing the
+  canonical idle activation-fence blob; and
+- an authorization-specific assignment of the provider-owned controller role
+  used to read, create, lease, and delete the authorization-specific canary blob.
 
-Every consumed bootstrap attempt owns eight temporary custom-role definition and
-assignment GUIDs derived deterministically from its unique authorization ID and
-the source-controlled UUID namespace and labels. The reviewed plan digest remains
-the source contract; the executor binds a separate in-memory plan, so a later
-authorization deterministically receives a disjoint ID set without changing the
-authorized resource or mutation IDs.
+Every consumed bootstrap attempt derives exactly six authorization-specific role
+IDs from its unique authorization ID and the source-controlled UUID namespace and
+labels: two package assignment IDs, the key-read definition and assignment IDs,
+the fence assignment ID, and the controller assignment ID. The bound runtime also
+carries two fixed, preserved definition bindings: the role-matrix
+`bridgeActivationFence` custom definition and the provider-owned controller
+definition. The two package definitions are separately fixed role-matrix
+resources. The reviewed plan digest remains the source contract; the executor
+binds a separate in-memory plan, so a later authorization deterministically
+receives a disjoint six-ID set without changing authorized resource or mutation
+IDs.
 
-Fresh preflight and terminal-boundary reads require all eight historical retired
-definition/assignment pairs to return `404`. New definitions and assignments also
-carry a canonical marker containing their authorization ID and cleanup key. The
+Fresh preflight and terminal-boundary reads require all six
+authorization-derived definition/assignment resources to return `404` at their
+required absence boundaries. New temporary definitions and assignments carry a
+canonical marker containing their authorization ID and cleanup key. The
 exhaustive unpaginated subscription custom-role and descendant assignment
 inventories reject every surviving marker, including one from a prior
-authorization whose deployment claim was later deleted. Any residual or
-reappearing temporary access stops before a claim or before successful completion.
+authorization whose deployment claim was later deleted. Fixed preserved
+definitions are not classified as residual temporary access: their complete
+source projections are checked instead. Any residual or reappearing temporary
+access stops before a claim or before successful completion.
+
+The activation-fence definition is permanent role-matrix authority. Fresh
+preflight accepts only absent or exact state consistent with
+`createCustomRoleDefinitions`; that permanent operation creates it when absent or
+adopts it when exact. The temporary fence lifecycle never creates, updates, or
+deletes the definition. It creates and deletes only the authorization-specific
+assignment, checks the definition immediately before and after the grant, and
+requires the stable definition to remain exact after cleanup.
 
 The executor keeps these protected role lifecycles contiguous and non-overlapping:
 controller proof/canary, package readiness/upload, signing-key public-JWK read,
-and activation-fence readiness/create. Each assignment and definition reaches
-exact absence before the next role is created. This limits failure compensation
-to one protected role plus the exact temporary IPv4 rule.
+and activation-fence readiness/create. Each temporary assignment, plus the
+temporary key-read definition, reaches exact absence before the next role is
+granted; every preserved definition remains exact. This limits failure
+compensation to one protected role phase plus the exact temporary IPv4 rule.
 
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
@@ -277,7 +296,11 @@ two recognized Storage authorization-propagation 403s and requires exact
 `404 / BlobNotFound` before its conditional create phase. Its PUT uses the same
 strict, durably journaled no-effect-403 retry rule as package and controller
 creation. Transport ambiguity, unexpected absence, malformed responses, and all
-write ambiguity fail closed.
+write ambiguity fail closed. The fence path preserves the full 600-second RBAC
+readiness interval: its final exact GET may start at the 600-second boundary and
+has one 90-second response envelope plus up to one second of scheduler-alignment
+slack. Outer work and authorization deadlines, including the two reserved
+follow-on request envelopes, may shorten that window but never extend RBAC waiting.
 Every Storage XML response is first decoded as strict UTF-8 with either no BOM
 or exactly one leading UTF-8 BOM, matching Azure Blob's live error responses.
 Double/embedded UTF-8 BOMs, UTF-16/UTF-32 BOMs, and NUL bytes are rejected. DTD
@@ -368,13 +391,17 @@ role-assignment removals they protect. A fresh complete subscription lock
 inventory must prove all three reviewed projections and reject any additional lock
 affecting a planned deletion before the Azure claim. Each protected deletion
 then rechecks that inventory and the authorized assignment, suspends only its
-reviewed lock, deletes only its exact assignment, and restores the original
-lock in `finally` before deleting a temporary role definition. The journal
-binds exact targets, lock bodies, and this order. Only readbacks may retry;
+reviewed lock, deletes only its exact assignment, and restores the original lock
+in `finally`. Only key-read cleanup subsequently deletes a temporary definition;
+the package, fence, and controller definitions are preserved. The journal binds
+exact targets, lock bodies, and this order. Only readbacks may retry; required
 assignment and definition absence have bounded convergence windows.
 Temporary-role cleanup 404s retain the specific assignment/definition absence
 proofs and exact lock-restoration evidence before generic absence handling; a
-bare 404 cannot stand in for complete cleanup evidence.
+bare 404 cannot stand in for complete cleanup evidence. Terminal receipts call
+the lifecycle booleans `roleDefinitionCreatedByTemporaryLifecycle` and
+`roleDefinitionRemovedByTemporaryLifecycle`: both are true only for the key-read
+definition and false for each preserved definition.
 
 The production App Service lock `paperdesk-protect-app-delete` is bound only
 to retirement of legacy sites-read assignment

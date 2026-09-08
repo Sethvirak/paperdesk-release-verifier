@@ -96,8 +96,12 @@ class CleanupSession:
                         return response(404)
                 return response(200, self.definition)
             if method == "DELETE":
-                if self.definition["properties"]["type"] == "BuiltInRole":
-                    raise AssertionError("Built-in role definition must never be deleted")
+                if (
+                    self.definition["properties"]["type"] == "BuiltInRole"
+                    or self.definition["name"]
+                    == bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+                ):
+                    raise AssertionError("preserved role definition must never be deleted")
                 if self.definition_failure:
                     return response(self.definition_failure)
                 self.definition_deleted = True
@@ -290,6 +294,13 @@ class CleanupTransportTests(unittest.TestCase):
             session=session, clock=lambda: current[0], sleep=sleep)
         if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
             transport.admissions[operation_id]["context"]["builtInRoleDefinitionProjection"] = copy.deepcopy(role["definition"])
+        if operation_id in bootstrap.FENCE_ROLE_OPERATIONS:
+            transport.admissions[operation_id]["context"][
+                "stableFenceRoleDefinitionProjection"
+            ] = copy.deepcopy(role["definition"])
+            transport.admissions[operation_id]["context"][
+                "stableFenceRoleDefinitionState"
+            ] = "exact"
         if operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
             transport.admissions[operation_id]["context"][
                 "stablePackageRoleDefinitionProjections"
@@ -551,7 +562,11 @@ class CleanupTransportTests(unittest.TestCase):
                     ]
                 else:
                     expected_mutations = [("DELETE", lock), ("DELETE", session.assignment_url), ("PUT", lock)]
-                if operation_id not in bootstrap.CONTROLLER_ROLE_OPERATIONS | bootstrap.PACKAGE_ROLE_OPERATIONS:
+                if operation_id not in (
+                    bootstrap.CONTROLLER_ROLE_OPERATIONS
+                    | bootstrap.PACKAGE_ROLE_OPERATIONS
+                    | bootstrap.FENCE_ROLE_OPERATIONS
+                ):
                     expected_mutations.append(("DELETE", session.definition_url))
                 self.assertEqual(session.mutations(), expected_mutations)
                 self.assertEqual(result["deletionLock"], bootstrap._expected_deletion_lock_proof(operation_id))

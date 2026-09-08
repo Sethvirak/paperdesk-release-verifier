@@ -350,12 +350,11 @@
         "temporaryPackageReadRoleAssignmentId": "package-read-role-assignment",
         "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
-        "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment"
       }
     },
-    "roleDefinitionProjection": "stable-package-and-controller-definitions-read-only-preserved-other-temporary-definitions-authorization-specific",
+    "roleDefinitionProjection": "stable-package-fence-and-controller-definitions-read-only-preserved-key-definition-authorization-specific",
     "temporaryPackageRoles": {
       "definitionLifecycle": "role-matrix-stable-read-only-preserved",
       "assignmentLifecycle": "authorization-specific-create-and-delete",
@@ -378,6 +377,20 @@
           "assignmentIdField": "temporaryPackageReadRoleAssignmentId",
           "dataActions": ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
         }
+      ]
+    },
+    "temporaryFenceRole": {
+      "definitionLifecycle": "role-matrix-stable-read-only-preserved",
+      "assignmentLifecycle": "authorization-specific-create-and-delete",
+      "cleanupLifecycle": "one-reviewed-lock-suspension-for-assignment-delete",
+      "scope": "activationFenceContainer",
+      "roleMatrixName": "bridgeActivationFence",
+      "definitionId": "906cb3b2-2061-5f5d-b168-515287d3165a",
+      "roleMatrixAssignmentId": "5e7ccc27-ff81-5cad-82de-3bc2e287d59f",
+      "assignmentIdField": "temporaryFenceRoleAssignmentId",
+      "dataActions": [
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
       ]
     },
     "temporaryControllerRole": {
@@ -405,7 +418,7 @@
     "activationFenceLeaseId": "c28f7730-431d-5c52-b885-8e43154d1ddb",
     "leaseDurationSeconds": 60,
     "leaseRenewals": 1,
-    "cleanup": "remove-only-owned-ip-rule-package-assignments-other-temporary-definitions-and-assignments-and-controller-canary-blob-and-assignment-preserve-both-stable-package-definitions-and-controller-builtin-definition"
+    "cleanup": "remove-only-owned-ip-rule-package-fence-and-controller-assignments-key-definition-and-assignment-and-controller-canary-blob-preserve-stable-package-fence-and-controller-definitions"
   },
   "deletionProtection": {
     "locks": {
@@ -472,7 +485,7 @@
     {"id": "storageFinalNetworkExact", "predicate": "public network enabled for service endpoint only, blob public access false, default Deny, bypass None, no ipRules, no resourceAccessRules, exactly the pinned subnet Allow Succeeded"},
     {"id": "temporaryUploaderAccessAbsent", "predicate": "the exact uploader IPv4 rule and both exact temporary package role assignments are absent after fresh readback, and both stable package role definitions are present and exact"},
     {"id": "temporaryOperatorKeyReadAbsent", "predicate": "the exact temporary key-read assignment and role definition are absent after fresh readback"},
-    {"id": "temporaryOperatorFenceAccessAbsent", "predicate": "the exact temporary fence bootstrap assignment and role definition are absent after fresh readback"},
+    {"id": "temporaryOperatorFenceAccessAbsent", "predicate": "the exact temporary fence bootstrap assignment is absent after fresh readback and the stable bridgeActivationFence role definition is present and exact"},
     {"id": "temporaryControllerCanaryAccessAbsent", "predicate": "the exact temporary controller canary blob and role assignment are absent after fresh readback, and the built-in role definition is present and exact"},
     {"id": "wormPoliciesLockedAtLeast91Days", "predicate": "accepted packages and results are private Locked for at least 91 days with append flags false"},
     {"id": "vaultNotDowngraded", "predicate": "vault RBAC purge protection and 90-day soft delete remain and network posture is equal or stricter than preflight"},

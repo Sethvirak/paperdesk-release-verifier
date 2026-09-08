@@ -109,8 +109,9 @@ The one-shot authorization has a maximum lifetime of 4,171 seconds (69 minutes
 31 seconds): 15 minutes for observation, confirmation and pre-controller setup,
 followed by a 3,271-second controller admission, readiness and cleanup reserve.
 The additional 271 seconds covers the second package assignment inside the one
-reviewed deletion-lock suspension and its one-second final-observation scheduler
-alignment allowance; it does not extend either data-plane readiness window.
+reviewed deletion-lock suspension and the one-second final-observation scheduler
+alignment allowance. A response envelope or alignment allowance never adds RBAC
+waiting beyond the applicable full data-plane readiness interval.
 The preflight must still be at most five minutes old when apply validates it.
 The executor rejects an already-exhausted setup window before adding the
 temporary uploader firewall rule, and checks it again before controller-role
@@ -140,14 +141,32 @@ definitions are persistent role-matrix resources and are never classified as
 temporary, deleted during package cleanup, or treated as owned by the current
 authorization.
 
+Activation-fence bootstrap uses the persistent role-matrix custom definition
+`906cb3b2-2061-5f5d-b168-515287d3165a` (`bridgeActivationFence`). Observation
+accepts that definition only as absent or exact, and its state must agree with
+the `createCustomRoleDefinitions` member state. That permanent operation creates
+the definition when absent or adopts it when exact. The temporary fence lifecycle
+creates and deletes only the authorization-specific container assignment; it
+never creates, updates, or deletes the definition. Apply checks the complete
+source projection immediately before assignment creation, after grant, and after
+cleanup, when the stable definition must be present and exact.
+
 The built-in role replaces only the temporary controller role. It includes container
 management and blob add/move permissions beyond the former custom controller
 definition; that complete permission set is source-pinned and must pass review.
 Package upload remains custom add-and-read only, the activation fence remains
 custom read/write without delete, and key read remains separately scoped. The
-seven owned assignment/other temporary-role IDs remain authorization-specific;
-the two package definition IDs and the provider-owned controller definition ID
-are intentionally shared. An isolated same-account
+temporary-access binding derives exactly six authorization-specific role IDs:
+two package assignments, the key-read definition and assignment, the fence
+assignment, and the controller assignment. It also carries two fixed preserved
+definition bindings, for the role-matrix fence definition and provider-owned
+controller definition. The two package definition IDs remain separately fixed
+role-matrix resources, so the package, fence, and controller definitions are all
+preserved while only the key-read definition belongs to the temporary lifecycle.
+Terminal receipts name the corresponding booleans
+`roleDefinitionCreatedByTemporaryLifecycle` and
+`roleDefinitionRemovedByTemporaryLifecycle`; both are true only for key read and
+false for every preserved definition. An isolated same-account
 canary passed upload, exact readback, finite leases and conditional deletion
 with this built-in role. That diagnostic result does not establish the behavior
 of the other roles or authorize a bootstrap, activation, or production deployment.
@@ -333,6 +352,15 @@ can shorten that window;
 the wait never borrows cleanup time. Only exact `BlobNotFound` admits one
 create-only PUT. Other readiness windows remain unchanged. A longer wait does
 not establish propagation as the cause of a denial or guarantee convergence.
+
+Activation-fence readiness separately preserves its complete 600-second RBAC
+interval. A final exact GET may start at the 600-second boundary, with one
+90-second response envelope and up to one second of scheduler-alignment slack.
+The outer work and authorization deadlines, including two reserved follow-on
+request envelopes for conditional creation and exact readback, may shorten this
+window; neither envelope nor slack extends the RBAC waiting interval. Only the
+two recognized Storage authorization-propagation 403 codes may retry, and only
+exact `404 / BlobNotFound` admits the conditional create phase.
 
 Bootstrap public-key readiness reads the exact version URI from the validated
 `createSigningKeyVersion` projection while the dedicated temporary key-read role

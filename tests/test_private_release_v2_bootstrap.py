@@ -291,6 +291,11 @@ def build_projection(plan, package, *, adopt_operations=()):
             value.update({"uploaderIpv4": "203.0.113.10/32", "restoreNetworkAcls": copy.deepcopy(base_acl)})
         elif operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
             value["builtInRoleDefinitionProjection"] = build_builtin_role_definition_projections(plan)[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]
+        elif operation_id in bootstrap.FENCE_ROLE_OPERATIONS:
+            value["stableFenceRoleDefinitionProjection"] = copy.deepcopy(
+                bootstrap._stable_fence_role_spec(plan)["definitionProjection"]
+            )
+            value["stableFenceRoleDefinitionState"] = "exact"
         elif operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
             value["stablePackageRoleDefinitionProjections"] = {
                 spec["name"]: copy.deepcopy(spec["definitionProjection"])
@@ -309,6 +314,9 @@ def build_projection(plan, package, *, adopt_operations=()):
                 item["definitionId"]
                 for item in bootstrap.PACKAGE_STABLE_ROLE_POLICY["roles"]
             }
+            stable_package_definition_ids.add(
+                bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+            )
             value["memberStates"] = {
                 role["definitionId"]: (
                     "exact"
@@ -412,6 +420,7 @@ def build_projection(plan, package, *, adopt_operations=()):
                         200
                         if operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS
                         or operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS
+                        or operation["id"] in bootstrap.FENCE_ROLE_OPERATIONS
                         else 404
                     ),
                     "responseSha256": bootstrap.sha256_bytes(
@@ -859,6 +868,13 @@ class _TerminalEvidenceFixture:
         if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
             result["definitionCreated"] = False
             result["definition"] = build_builtin_role_definition_projections(self.plan)[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]
+        elif operation_id in bootstrap.FENCE_ROLE_OPERATIONS:
+            result["definitionCreated"] = False
+            result["definition"] = copy.deepcopy(
+                bootstrap._stable_fence_role_spec(self.execution_plan)[
+                    "definitionProjection"
+                ]
+            )
         return result
 
     def temp_cleanup(self, operation_id):
@@ -916,7 +932,9 @@ class _TerminalEvidenceFixture:
             },
         }
 
-        if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+        if operation_id in (
+            bootstrap.CONTROLLER_ROLE_OPERATIONS | bootstrap.FENCE_ROLE_OPERATIONS
+        ):
             result["definitionRemoved"] = False
             del result["definitionAbsenceProjection"]
             result["definitionPreservationProjection"] = {
@@ -3093,7 +3111,29 @@ class BootstrapTests(unittest.TestCase):
             self.plan, other_authorization_id
         )
         self.assertEqual(first, repeated)
-        self.assertEqual(set(first), set(bootstrap.TEMPORARY_ROLE_ID_FIELDS) | {"temporaryControllerRoleDefinitionId"})
+        self.assertEqual(
+            set(first),
+            set(bootstrap.TEMPORARY_ROLE_ID_FIELDS)
+            | {
+                "temporaryFenceRoleDefinitionId",
+                "temporaryControllerRoleDefinitionId",
+            },
+        )
+        self.assertEqual(len(bootstrap.TEMPORARY_ROLE_ID_FIELDS), 6)
+        self.assertNotIn(
+            "temporaryFenceRoleDefinitionId",
+            bootstrap.TEMPORARY_ROLE_ID_FIELDS,
+        )
+        self.assertEqual(
+            {
+                first["temporaryFenceRoleDefinitionId"],
+                first["temporaryControllerRoleDefinitionId"],
+            },
+            {
+                bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"],
+                bootstrap.CONTROLLER_BUILTIN_ROLE_ID,
+            },
+        )
         self.assertEqual(len(set(first.values())), 8)
         self.assertEqual(len(set(second.values())), 8)
         self.assertEqual(
@@ -3104,7 +3144,13 @@ class BootstrapTests(unittest.TestCase):
             first["temporaryPackageReadRoleAssignmentId"],
             "83ba088a-07cb-5ecb-8dca-eb5aca46b0ab",
         )
-        self.assertEqual(set(first.values()) & set(second.values()), {bootstrap.CONTROLLER_BUILTIN_ROLE_ID})
+        self.assertEqual(
+            set(first.values()) & set(second.values()),
+            {
+                bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"],
+                bootstrap.CONTROLLER_BUILTIN_ROLE_ID,
+            },
+        )
         self.assertTrue({first[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS}.isdisjoint(second[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS))
         self.assertTrue(
             set(first.values()).isdisjoint(bootstrap.RETIRED_TEMPORARY_ROLE_IDS)
@@ -3128,6 +3174,48 @@ class BootstrapTests(unittest.TestCase):
             bootstrap.BootstrapError, "do not match the authorization"
         ):
             bootstrap.bind_temporary_role_ids(first_bound, other_authorization_id)
+
+    def test_plan_keeps_stable_fence_definition_unbound_and_rejects_policy_drift(self):
+        temporary = self.plan["temporaryAccess"]
+        self.assertNotIn("temporaryFenceRoleDefinitionId", temporary)
+        self.assertEqual(
+            temporary["temporaryFenceRole"],
+            bootstrap.FENCE_STABLE_ROLE_POLICY,
+        )
+
+        variants = {}
+        embedded = copy.deepcopy(self.plan)
+        embedded["temporaryAccess"]["temporaryFenceRoleDefinitionId"] = (
+            bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+        )
+        variants["embedded reusable definition ID"] = embedded
+
+        policy_drift = copy.deepcopy(self.plan)
+        policy_drift["temporaryAccess"]["temporaryFenceRole"][
+            "cleanupLifecycle"
+        ] = "delete-definition"
+        variants["temporary policy drift"] = policy_drift
+
+        role_matrix_drift = copy.deepcopy(self.plan)
+        fence_role = next(
+            role
+            for role in role_matrix_drift["roleMatrix"]
+            if role["name"] == "bridgeActivationFence"
+        )
+        fence_role["dataActions"].append(
+            "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete"
+        )
+        variants["permanent role-matrix drift"] = role_matrix_drift
+
+        for label, candidate in variants.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "drifted-plan.json"
+                path.write_bytes(bootstrap.canonical_json_bytes(candidate))
+                with (
+                    mock.patch.object(bootstrap, "PLAN_PATH", path),
+                    self.assertRaises(bootstrap.BootstrapError),
+                ):
+                    bootstrap.load_plan()
 
     def test_residual_temporary_role_markers_fail_closed_in_exhaustive_inventories(self):
         execution_plan = bootstrap.bind_temporary_role_ids(self.plan, AUTH_ID)
@@ -3184,6 +3272,151 @@ class BootstrapTests(unittest.TestCase):
                 plan=execution_plan,
                 label="test orphan assignment inventory",
             )
+
+        fence_role = next(
+            role
+            for role in execution_plan["roleMatrix"]
+            if role["name"] == bootstrap.FENCE_STABLE_ROLE_POLICY["roleMatrixName"]
+        )
+        fence_scope = next(
+            item["resourceId"]
+            for item in execution_plan["resourceInventory"]
+            if item["id"] == bootstrap.FENCE_STABLE_ROLE_POLICY["scope"]
+        )
+        stable_definition_resource = (
+            f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            + bootstrap.FENCE_STABLE_ROLE_POLICY["definitionId"]
+        )
+        permanent_fence_assignment = {
+            "id": (
+                f"{fence_scope}/providers/Microsoft.Authorization/roleAssignments/"
+                + fence_role["assignmentId"]
+            ),
+            "properties": {
+                "description": "PaperDesk durable bridge activation-fence role",
+                "roleDefinitionId": stable_definition_resource,
+            },
+        }
+        self.assertIsNone(
+            bootstrap._reject_residual_temporary_role_assignments(
+                [permanent_fence_assignment],
+                plan=execution_plan,
+                label="test permanent fence assignment inventory",
+            )
+        )
+
+        current_fence_assignment = copy.deepcopy(permanent_fence_assignment)
+        current_fence_assignment["id"] = (
+            f"{fence_scope}/providers/Microsoft.Authorization/roleAssignments/"
+            + execution_plan["temporaryAccess"][
+                "temporaryFenceRoleAssignmentId"
+            ]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "residual PaperDesk temporary role assignment",
+        ):
+            bootstrap._reject_residual_temporary_role_assignments(
+                [current_fence_assignment],
+                plan=execution_plan,
+                label="test current fence assignment inventory",
+            )
+
+        marked_fence_assignment = copy.deepcopy(permanent_fence_assignment)
+        marked_fence_assignment["id"] = (
+            f"{fence_scope}/providers/Microsoft.Authorization/roleAssignments/"
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        )
+        marked_fence_assignment["properties"]["description"] = (
+            bootstrap._temporary_role_metadata(
+                AUTH_ID, "operator-fence-bootstrap-role"
+            )["assignmentDescription"]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "residual PaperDesk temporary role assignment",
+        ):
+            bootstrap._reject_residual_temporary_role_assignments(
+                [marked_fence_assignment],
+                plan=execution_plan,
+                label="test marked fence assignment inventory",
+            )
+
+    def test_stable_fence_preflight_accepts_consistent_exact_or_absent_state(self):
+        base = build_projection(self.plan, self.package)
+        stable_definition_id = bootstrap.FENCE_STABLE_ROLE_POLICY[
+            "definitionId"
+        ]
+        stable_definition_path = f"/roleDefinitions/{stable_definition_id}"
+
+        def set_fence_state(candidate, state):
+            create_custom = next(
+                item
+                for item in candidate["operationAdmissions"]
+                if item["operationId"] == "createCustomRoleDefinitions"
+            )
+            create_custom["context"]["memberStates"][stable_definition_id] = state
+            expected_status = 200 if state == "exact" else 404
+            for admission in candidate["operationAdmissions"]:
+                if admission["operationId"] not in bootstrap.FENCE_ROLE_OPERATIONS:
+                    continue
+                admission["context"]["stableFenceRoleDefinitionState"] = state
+                for probe_id in admission["probeIds"]:
+                    probe = next(
+                        item
+                        for item in candidate["probes"]
+                        if item["id"] == probe_id
+                    )
+                    if stable_definition_path in probe["url"]:
+                        probe["status"] = expected_status
+
+        def validate(candidate):
+            with tempfile.TemporaryDirectory() as folder:
+                authorization = build_authorization(
+                    self.plan,
+                    self.plan_sha,
+                    self.package,
+                    candidate,
+                    Path(folder) / "receipt",
+                )
+                document = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"][
+                        "observedAt"
+                    ],
+                    "projection": candidate,
+                    "projectionSha256": authorization["observedPreflight"][
+                        "sha256"
+                    ],
+                }
+                return bootstrap.validate_preflight_evidence(
+                    document, authorization, self.plan
+                )
+
+        exact = copy.deepcopy(base)
+        set_fence_state(exact, "exact")
+        validate(exact)
+
+        absent = copy.deepcopy(base)
+        set_fence_state(absent, "absent")
+        validate(absent)
+
+        inconsistent = copy.deepcopy(base)
+        create_custom = next(
+            item
+            for item in inconsistent["operationAdmissions"]
+            if item["operationId"] == "createCustomRoleDefinitions"
+        )
+        create_custom["context"]["memberStates"][stable_definition_id] = (
+            "absent"
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "stable fence role preflight projections or states disagree",
+        ):
+            validate(inconsistent)
 
     def _temporary_role_transport_fixture(self, receipt):
         projection = build_projection(self.plan, self.package)
@@ -8100,7 +8333,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(set(package_roles["roles"]), {"packageAdd", "packageRead"})
         for role in package_roles["roles"].values():
             self.assertTrue(role["createdByAuthorization"])
-            self.assertFalse(role["roleDefinitionCreatedByAuthorization"])
+            self.assertFalse(role["roleDefinitionCreatedByTemporaryLifecycle"])
             self.assertTrue(role["roleDefinitionPresentAfterCleanup"])
         for name in (
             "operatorKeyReadRole",
@@ -8108,8 +8341,14 @@ class BootstrapTests(unittest.TestCase):
             "operatorControllerRole",
         ):
             self.assertTrue(temporary[name]["createdByAuthorization"])
-            self.assertEqual(temporary[name]["roleDefinitionCreatedByAuthorization"], name != "operatorControllerRole")
-            self.assertEqual(temporary[name]["roleDefinitionPresentAfterCleanup"], name == "operatorControllerRole")
+            self.assertEqual(
+                temporary[name]["roleDefinitionCreatedByTemporaryLifecycle"],
+                name == "operatorKeyReadRole",
+            )
+            self.assertEqual(
+                temporary[name]["roleDefinitionPresentAfterCleanup"],
+                name in {"operatorFenceRole", "operatorControllerRole"},
+            )
         self.assertEqual(
             components["activationFenceBootstrap"]["leaseState"], "Available"
         )

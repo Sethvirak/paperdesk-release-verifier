@@ -248,8 +248,8 @@ class CompleteReceiptBundleTests(unittest.TestCase):
     def test_both_stable_package_definitions_must_be_preserved(self):
         for name in ("packageAdd", "packageRead"):
             for field, value in (
-                ("roleDefinitionCreatedByAuthorization", True),
-                ("roleDefinitionRemoved", True),
+                ("roleDefinitionCreatedByTemporaryLifecycle", True),
+                ("roleDefinitionRemovedByTemporaryLifecycle", True),
                 ("roleDefinitionPresentAfterCleanup", False),
             ):
                 with self.subTest(name=name, field=field):
@@ -262,6 +262,28 @@ class CompleteReceiptBundleTests(unittest.TestCase):
                         "stable custom definition was not preserved",
                         synchronize_s2_components=("temporaryAccessCleanup",),
                     )
+
+    def test_stable_fence_definition_lifecycle_is_preserved_and_tamper_fails(self):
+        role = self.fixture["completeReceipt"]["bundle"][
+            "temporaryAccessCleanup"
+        ]["operatorFenceRole"]
+        self.assertFalse(role["roleDefinitionCreatedByTemporaryLifecycle"])
+        self.assertFalse(role["roleDefinitionRemovedByTemporaryLifecycle"])
+        self.assertTrue(role["roleDefinitionPresentAfterCleanup"])
+
+        for field, invalid_value in (
+            ("roleDefinitionCreatedByTemporaryLifecycle", True),
+            ("roleDefinitionRemovedByTemporaryLifecycle", True),
+            ("roleDefinitionPresentAfterCleanup", False),
+        ):
+            with self.subTest(field=field):
+                self.assert_invalid_bundle(
+                    lambda bundle, _fixture, field=field, invalid_value=invalid_value: bundle[
+                        "temporaryAccessCleanup"
+                    ]["operatorFenceRole"].update({field: invalid_value}),
+                    "stable definition was not preserved",
+                    synchronize_s2_components=("temporaryAccessCleanup",),
+                )
 
     def test_temporary_role_ids_are_derived_from_authorization_not_receipt(self):
         fixture = self.fresh()
