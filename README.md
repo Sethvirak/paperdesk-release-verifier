@@ -272,6 +272,13 @@ temporary key-read definition, reaches exact absence before the next role is
 granted; every preserved definition remains exact. This limits failure
 compensation to one protected role phase plus the exact temporary IPv4 rule.
 
+The PR55 incident's exact activation-fence creation receipts are source-bound
+for restart adoption. When those canonical local receipts match their pinned
+hashes, preflight may select `adopt-exact`; execution must then prove the live
+idle body, metadata, ETag, and version after the temporary fence role becomes
+active. Receipt absence uses the ordinary create path, while receipt or live
+state drift stops without overwriting the fence.
+
 Package upload first performs bounded, read-only GET readiness checks against
 the exact source-keyed blob. Only a matching `404 / BlobNotFound` admits the
 conditional create phase; recognized authorization-propagation 403s may wait for

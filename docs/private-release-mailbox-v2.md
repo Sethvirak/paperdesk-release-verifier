@@ -356,6 +356,15 @@ accepts the remaining cross-resource race in which an unrelated administrator
 starts the site after that read; the executor never starts it, and final success
 requires another stopped-site proof.
 
+If the failed PR55 bootstrap's exact durable intent/result receipts remain
+present with their source-pinned hashes, a later read-only observer may bind the
+recorded idle activation fence as an `adopt-exact` candidate even though the
+private data plane is inaccessible before the temporary fence role. Execution
+still reads the live blob after that role is granted and requires the same
+canonical body hash, metadata, ETag, and version ID. Missing receipt evidence
+keeps the normal conditional-create path; partial or changed evidence, or any
+live blob drift, fails closed without replacing the blob.
+
 Health proof binds the runtime marker, served index SHA-256, live, ready,
 app-health and security responses, plus the historical full OneDeploy collection
 invariant: historical deployment ID, canonical full-collection semantic digest,
