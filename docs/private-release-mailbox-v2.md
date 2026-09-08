@@ -365,6 +365,12 @@ canonical body hash, metadata, ETag, and version ID. Missing receipt evidence
 keeps the normal conditional-create path; partial or changed evidence, or any
 live blob drift, fails closed without replacing the blob.
 
+When a failed bootstrap has already created its exact source-keyed ZIP, retain
+that object as incident evidence and continue from a new reviewed merge. The
+new source SHA produces a distinct package key and follows the ordinary
+conditional-create plus exact readback path. The new release must neither
+overwrite nor reuse the package keyed to the earlier source.
+
 Health proof binds the runtime marker, served index SHA-256, live, ready,
 app-health and security responses, plus the historical full OneDeploy collection
 invariant: historical deployment ID, canonical full-collection semantic digest,
