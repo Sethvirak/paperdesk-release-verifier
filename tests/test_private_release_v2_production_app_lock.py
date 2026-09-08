@@ -66,7 +66,9 @@ class ProductionAppLockTests(unittest.TestCase):
         self.assertEqual(len(protection["operationLocks"]), 8)
         self.assertEqual(protection["locks"]["productionApp"], {
             "resourceId": APP_LOCK, "properties": {"level": "CanNotDelete", "notes": APP_NOTES}})
-        self.assertTrue(bootstrap._cleanup_assignment_resources(plan)[OPERATION].endswith("/" + ASSIGNMENT))
+        resources = bootstrap._cleanup_assignment_resources(plan)[OPERATION]
+        self.assertEqual(len(resources), 1)
+        self.assertTrue(resources[0].endswith("/" + ASSIGNMENT))
         self.assertTrue(plan["legacyPublisherRetirement"]["preservedUntilLaterActivationAssignmentResourceId"].endswith("/" + PRESERVED))
 
     def test_exact_production_assignment_cleanup_restores_lock_without_site_write(self):

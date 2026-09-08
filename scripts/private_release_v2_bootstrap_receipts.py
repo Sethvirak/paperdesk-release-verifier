@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = ROOT / "contracts" / "private_release_bootstrap_evidence_model.json"
 PLAN_PATH = ROOT / "contracts" / "private_release_bootstrap_plan.json"
-BOOTSTRAP_MAX_AUTHORIZATION_SECONDS = 3900
+BOOTSTRAP_MAX_AUTHORIZATION_SECONDS = 4171
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1456,6 +1456,7 @@ def _validate_temporary_role(
     started_at: dt.datetime,
     completed_at: dt.datetime,
     derived_absence_sha256: str | None = None,
+    preserved_definition_label: str = "built-in definition",
 ) -> None:
     keys = {
         "roleDefinitionId",
@@ -1502,7 +1503,7 @@ def _validate_temporary_role(
         or role["roleDefinitionRemoved"] is not False
         or role["roleDefinitionPresentAfterCleanup"] is not True
     ):
-        fail(f"{label} built-in definition was not preserved")
+        fail(f"{label} {preserved_definition_label} was not preserved")
     fresh_sha = _hash(
         role["freshReadbackSha256"], f"{label}.freshReadbackSha256"
     )
@@ -1510,6 +1511,92 @@ def _validate_temporary_role(
         fail(f"{label} absence proof is not source-derived")
     _observation_in_window(
         role["observedAt"],
+        f"{label}.observedAt",
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+
+
+def _validate_package_uploader_role_group(
+    value: Any,
+    label: str,
+    *,
+    context: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    started_at: dt.datetime,
+    completed_at: dt.datetime,
+    derived_absence_sha256: str | None = None,
+    derived_member_sha256: Mapping[str, str] | None = None,
+) -> None:
+    bootstrap_source = _load_bootstrap_source()
+    group = _exact_keys(
+        value,
+        {
+            "addMutationId",
+            "removeMutationId",
+            "definitionLifecycle",
+            "scopeResourceId",
+            "principalObjectId",
+            "roles",
+            "freshReadbackSha256",
+            "observedAt",
+        },
+        label,
+    )
+    temporary = plan.get("temporaryAccess")
+    if not isinstance(temporary, Mapping):
+        fail("plan temporaryAccess is invalid")
+    if (
+        group["addMutationId"] != "addOwnedUploaderPackageRole"
+        or group["removeMutationId"] != "removeOwnedUploaderPackageRole"
+        or group["definitionLifecycle"] != "read-only-preserved"
+        or group["scopeResourceId"]
+        != _resource(
+            plan, bootstrap_source.PACKAGE_STABLE_ROLE_POLICY["scope"]
+        )[
+            "resourceId"
+        ]
+        or group["principalObjectId"] != context["operatorObjectId"]
+    ):
+        fail(f"{label} exact group binding is invalid")
+    specs = bootstrap_source._stable_package_role_specs(plan)
+    role_names = {spec["name"] for spec in specs}
+    roles = _exact_keys(group["roles"], role_names, f"{label}.roles")
+    if derived_member_sha256 is not None:
+        derived_member_sha256 = _exact_keys(
+            derived_member_sha256,
+            role_names,
+            f"{label} source-derived member digests",
+        )
+    temporary_role_ids = context["temporaryRoleIds"]
+    for spec in specs:
+        name = spec["name"]
+        _validate_temporary_role(
+            roles[name],
+            f"{label}.roles.{name}",
+            definition_id=spec["definitionId"],
+            assignment_id=temporary_role_ids[spec["assignmentIdField"]],
+            scope_id=group["scopeResourceId"],
+            principal_id=group["principalObjectId"],
+            add_mutation_id=group["addMutationId"],
+            remove_mutation_id=group["removeMutationId"],
+            custom_definition=False,
+            started_at=started_at,
+            completed_at=completed_at,
+            derived_absence_sha256=(
+                None
+                if derived_member_sha256 is None
+                else derived_member_sha256[name]
+            ),
+            preserved_definition_label="stable custom definition",
+        )
+    fresh_sha = _hash(
+        group["freshReadbackSha256"], f"{label}.freshReadbackSha256"
+    )
+    if derived_absence_sha256 is not None and fresh_sha != derived_absence_sha256:
+        fail(f"{label} cleanup proof is not source-derived")
+    _observation_in_window(
+        group["observedAt"],
         f"{label}.observedAt",
         started_at=started_at,
         completed_at=completed_at,
@@ -1524,6 +1611,7 @@ def _validate_temporary_cleanup(
     started_at: dt.datetime,
     completed_at: dt.datetime,
     derived_absences: Mapping[str, str] | None = None,
+    derived_package_members: Mapping[str, str] | None = None,
 ) -> None:
     _exact_keys(
         document,
@@ -1599,16 +1687,11 @@ def _validate_temporary_cleanup(
         fail("plan temporaryAccess is invalid")
     if cidr_sha == sha256_hex(b""):
         fail("temporary IPv4 CIDR digest cannot bind an empty input")
-    _validate_temporary_role(
+    _validate_package_uploader_role_group(
         document["packageUploaderRole"],
         "temporaryAccessCleanup.packageUploaderRole",
-        definition_id=temporary_role_ids["roleDefinitionId"],
-        assignment_id=temporary_role_ids["roleAssignmentId"],
-        scope_id=_resource(plan, temporary["scope"])["resourceId"],
-        principal_id=context["operatorObjectId"],
-        add_mutation_id="addOwnedUploaderPackageRole",
-        remove_mutation_id="removeOwnedUploaderPackageRole",
-        custom_definition=True,
+        context=context,
+        plan=plan,
         started_at=started_at,
         completed_at=completed_at,
         derived_absence_sha256=(
@@ -1616,6 +1699,7 @@ def _validate_temporary_cleanup(
             if derived_absences is None
             else derived_absences.get("packageUploaderRole")
         ),
+        derived_member_sha256=derived_package_members,
     )
     _validate_temporary_role(
         document["operatorKeyReadRole"],
@@ -2783,6 +2867,11 @@ def _validate_non_execution_components(
             None
             if derived_evidence is None
             else derived_evidence.get("cleanupAbsenceSha256")
+        ),
+        derived_package_members=(
+            None
+            if derived_evidence is None
+            else derived_evidence.get("packageUploaderRoleMemberSha256")
         ),
     )
     _validate_activation_fence(
@@ -4030,12 +4119,26 @@ def _validate_source_evidence(
         "cleanup absence projections",
     )
     for name, projection in cleanup.items():
+        expected_keys = (
+            {"httpStatuses", "present", "sanitizedProjection", "observedAt"}
+            if name == "packageUploaderRole"
+            else {"httpStatus", "present", "sanitizedProjection", "observedAt"}
+        )
         body = _exact_keys(
             projection,
-            {"httpStatus", "present", "sanitizedProjection", "observedAt"},
+            expected_keys,
             f"cleanup absence projection {name}",
         )
-        if body["httpStatus"] not in {200, 404} or body["present"] is not False:
+        if name == "packageUploaderRole":
+            package_statuses = _exact_keys(
+                body["httpStatuses"],
+                {"packageAdd", "packageRead"},
+                "package uploader cleanup HTTP statuses",
+            )
+            valid_status = all(status == 404 for status in package_statuses.values())
+        else:
+            valid_status = body["httpStatus"] in {200, 404}
+        if not valid_status or body["present"] is not False:
             fail(f"cleanup absence projection {name} does not prove absence")
         _canonical_projection(
             body["sanitizedProjection"],
@@ -4250,6 +4353,23 @@ def _validate_source_evidence(
         "cleanupAbsenceSha256": {
             name: sha256_hex(item) for name, item in cleanup.items()
         },
+        "packageUploaderRoleMemberSha256": {
+            name: sha256_hex(
+                {
+                    "assignmentAbsenceProjection": cleanup[
+                        "packageUploaderRole"
+                    ]["sanitizedProjection"]["projection"][
+                        "assignmentAbsenceProjections"
+                    ][name],
+                    "definitionPreservationProjection": cleanup[
+                        "packageUploaderRole"
+                    ]["sanitizedProjection"]["projection"][
+                        "definitionPreservationProjections"
+                    ][name],
+                }
+            )
+            for name in ("packageAdd", "packageRead")
+        },
         "wormSourceSha256": worm_components,
         "bridgeFields": bridge_fields,
         "productionBoundarySha256": production_sha,
@@ -4401,6 +4521,18 @@ def _bind_source_derived_component_fields(
         bound["temporaryAccessCleanup"][name]["freshReadbackSha256"] = cleanup[
             name
         ]
+    package_members = _exact_keys(
+        derived.get("packageUploaderRoleMemberSha256"),
+        {"packageAdd", "packageRead"},
+        "derived package uploader role member digests",
+    )
+    package_roles = _exact_keys(
+        bound["temporaryAccessCleanup"]["packageUploaderRole"].get("roles"),
+        set(package_members),
+        "package uploader cleanup roles",
+    )
+    for name, member_sha256 in package_members.items():
+        package_roles[name]["freshReadbackSha256"] = member_sha256
 
     for component_name, derived_name in (
         ("activationFenceBootstrap", "activationFenceFields"),

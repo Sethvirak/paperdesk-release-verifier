@@ -291,6 +291,11 @@ def build_projection(plan, package, *, adopt_operations=()):
             value.update({"uploaderIpv4": "203.0.113.10/32", "restoreNetworkAcls": copy.deepcopy(base_acl)})
         elif operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
             value["builtInRoleDefinitionProjection"] = build_builtin_role_definition_projections(plan)[bootstrap.CONTROLLER_BUILTIN_ROLE_ID]
+        elif operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            value["stablePackageRoleDefinitionProjections"] = {
+                spec["name"]: copy.deepcopy(spec["definitionProjection"])
+                for spec in bootstrap._stable_package_role_specs(plan)
+            }
         elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
             value.update({
                 "preAppSettings": {},
@@ -300,8 +305,16 @@ def build_projection(plan, package, *, adopt_operations=()):
                 ),
             })
         elif operation_id == "createCustomRoleDefinitions":
+            stable_package_definition_ids = {
+                item["definitionId"]
+                for item in bootstrap.PACKAGE_STABLE_ROLE_POLICY["roles"]
+            }
             value["memberStates"] = {
-                role["definitionId"]: "absent"
+                role["definitionId"]: (
+                    "exact"
+                    if role["definitionId"] in stable_package_definition_ids
+                    else "absent"
+                )
                 for role in plan["roleMatrix"]
                 if role.get("definitionKind") != "BuiltInRole"
             }
@@ -352,7 +365,12 @@ def build_projection(plan, package, *, adopt_operations=()):
                         if operation_contract["expectedMethod"] == "POST"
                         else None
                     ),
-                    "status": 404 if index == 0 else 200,
+                    "status": (
+                        404
+                        if index == 0
+                        or operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS
+                        else 200
+                    ),
                     "responseSha256": bootstrap.sha256_bytes(f"pre-{index}".encode()),
                     "validatorId": None,
                     "validatorContract": None,
@@ -374,14 +392,14 @@ def build_projection(plan, package, *, adopt_operations=()):
                 },
             ]
         )
-        temporary_definition_url = (
-            bootstrap._temporary_role_definition_readback_url(
+        for definition_index, temporary_definition_url in enumerate(
+            bootstrap._temporary_role_definition_readback_urls(
                 operation["id"], plan
             )
-        )
-        if temporary_definition_url is not None:
+        ):
             temporary_definition_probe_id = (
-                f"pre-{index}-{operation['id']}-temporary-definition"
+                f"pre-{index}-{operation['id']}-temporary-definition-"
+                f"{definition_index}"
             )
             probes.append(
                 {
@@ -390,7 +408,12 @@ def build_projection(plan, package, *, adopt_operations=()):
                     "method": "GET",
                     "url": temporary_definition_url,
                     "requestBodySha256": None,
-                    "status": 200 if operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS else 404,
+                    "status": (
+                        200
+                        if operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS
+                        or operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS
+                        else 404
+                    ),
                     "responseSha256": bootstrap.sha256_bytes(
                         f"pre-temporary-definition-{index}".encode()
                     ),
@@ -399,6 +422,38 @@ def build_projection(plan, package, *, adopt_operations=()):
                 }
             )
             preflight_probe_ids.append(temporary_definition_probe_id)
+        if operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            primary_url = operation_contract["expectedUrl"]
+            for assignment_index, assignment_resource in enumerate(
+                bootstrap._temporary_package_assignment_resources(plan).values()
+            ):
+                assignment_url = (
+                    "https://management.azure.com"
+                    + assignment_resource
+                    + "?api-version=2022-04-01"
+                )
+                if assignment_url == primary_url:
+                    continue
+                assignment_probe_id = (
+                    f"pre-{index}-{operation['id']}-temporary-assignment-"
+                    f"{assignment_index}"
+                )
+                probes.append(
+                    {
+                        "id": assignment_probe_id,
+                        "phase": "preflight",
+                        "method": "GET",
+                        "url": assignment_url,
+                        "requestBodySha256": None,
+                        "status": 404,
+                        "responseSha256": bootstrap.sha256_bytes(
+                            f"pre-temporary-assignment-{index}-{assignment_index}".encode()
+                        ),
+                        "validatorId": None,
+                        "validatorContract": None,
+                    }
+                )
+                preflight_probe_ids.append(assignment_probe_id)
         if operation["id"] == "grantPublisherGraphApplicationReadAll":
             graph_resource_probe_id = (
                 f"pre-{index}-{operation['id']}-graph-resource-sp"
@@ -702,14 +757,28 @@ class _TerminalEvidenceFixture:
 
     def temp_role(self, operation_id):
         temporary = self.execution_plan["temporaryAccess"]
+        if operation_id == "addOwnedUploaderPackageRole":
+            specs = bootstrap._stable_package_role_specs(self.execution_plan)
+            return {
+                "cleanupKey": "uploader-package-role",
+                "definitionLifecycle": "read-only-preserved",
+                "definitionResourceIds": [
+                    spec["definitionResourceId"] for spec in specs
+                ],
+                "assignmentResourceIds": list(
+                    bootstrap._temporary_package_assignment_resources(
+                        self.execution_plan
+                    ).values()
+                ),
+                "definitions": {
+                    spec["name"]: copy.deepcopy(spec["definitionProjection"])
+                    for spec in specs
+                },
+                "assignments": bootstrap._temporary_package_assignment_projections(
+                    self.execution_plan, self.authorization
+                ),
+            }
         specs = {
-            "addOwnedUploaderPackageRole": (
-                temporary["roleDefinitionId"],
-                temporary["roleAssignmentId"],
-                "packageContainer",
-                "uploader-package-role",
-                temporary["temporaryPackageDataActions"],
-            ),
             "addOwnedOperatorKeyReadRole": (
                 temporary["temporaryKeyReadRoleDefinitionId"],
                 temporary["temporaryKeyReadRoleAssignmentId"],
@@ -800,6 +869,36 @@ class _TerminalEvidenceFixture:
             "removeOwnedOperatorControllerCanaryRole": "addOwnedOperatorControllerCanaryRole",
         }
         added = self.operations[add_by_remove[operation_id]]["projection"]
+        if operation_id == "removeOwnedUploaderPackageRole":
+            return {
+                "cleanupKey": "uploader-package-role",
+                "definitionLifecycle": "read-only-preserved",
+                "definitionResourceIds": copy.deepcopy(
+                    added["definitionResourceIds"]
+                ),
+                "assignmentResourceIds": copy.deepcopy(
+                    added["assignmentResourceIds"]
+                ),
+                "assignmentRemoved": {
+                    "packageAdd": True,
+                    "packageRead": True,
+                },
+                "assignmentAbsenceProjections": {
+                    name: {"resourceId": item["id"], "absent": True}
+                    for name, item in added["assignments"].items()
+                },
+                "definitionPreservationProjections": {
+                    name: {
+                        "resourceId": item["id"],
+                        "present": True,
+                        "projection": copy.deepcopy(item),
+                    }
+                    for name, item in added["definitions"].items()
+                },
+                "deletionLock": bootstrap._expected_deletion_lock_proof(
+                    operation_id
+                ),
+            }
         result = {
             "cleanupKey": added["cleanupKey"],
             "assignmentResourceId": added["assignmentResourceId"],
@@ -1317,8 +1416,16 @@ class _TerminalEvidenceFixture:
                         + "?api-version=2016-09-01")
                 elif (bootstrap._expected_deletion_lock_proof(operation_id) is not None
                       and "/roleassignments/" in target_url.lower()):
+                    assignment_resources = bootstrap._cleanup_assignment_resources(
+                        self.execution_plan
+                    )[operation_id]
+                    assignment_resource = next(
+                        item
+                        for item in assignment_resources
+                        if item.lower() in target_url.lower()
+                    )
                     target_url = ("https://management.azure.com"
-                        + bootstrap._cleanup_assignment_resources(self.execution_plan)[operation_id]
+                        + assignment_resource
                         + "?api-version=2022-04-01")
                 for occurrence in range(count):
                     intent_sequence = len(journal) + 1
@@ -1741,7 +1848,11 @@ class _TerminalEvidenceFixture:
         }
         cleanup = {
             name: {
-                "httpStatus": 200 if name == "packageIpv4Rule" else 404,
+                **(
+                    {"httpStatuses": {"packageAdd": 404, "packageRead": 404}}
+                    if name == "packageUploaderRole"
+                    else {"httpStatus": 200 if name == "packageIpv4Rule" else 404}
+                ),
                 "present": False,
                 "sanitizedProjection": self.operations[operation_id],
                 "observedAt": stamp(NOW + dt.timedelta(minutes=4, seconds=3)),
@@ -2956,9 +3067,6 @@ class BootstrapTests(unittest.TestCase):
         altered["temporaryAccess"].update(
             bootstrap.derive_temporary_role_ids(self.plan, AUTH_ID)
         )
-        altered["temporaryAccess"]["roleDefinitionId"] = sorted(
-            bootstrap.RETIRED_TEMPORARY_ROLE_IDS
-        )[0]
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "retired-role-plan.json"
             path.write_bytes(bootstrap.canonical_json_bytes(altered))
@@ -2982,6 +3090,14 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(set(first), set(bootstrap.TEMPORARY_ROLE_ID_FIELDS) | {"temporaryControllerRoleDefinitionId"})
         self.assertEqual(len(set(first.values())), 8)
         self.assertEqual(len(set(second.values())), 8)
+        self.assertEqual(
+            first["temporaryPackageAddRoleAssignmentId"],
+            "066f953a-408e-51a6-b8ef-1a838b0d7d8f",
+        )
+        self.assertEqual(
+            first["temporaryPackageReadRoleAssignmentId"],
+            "83ba088a-07cb-5ecb-8dca-eb5aca46b0ab",
+        )
         self.assertEqual(set(first.values()) & set(second.values()), {bootstrap.CONTROLLER_BUILTIN_ROLE_ID})
         self.assertTrue({first[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS}.isdisjoint(second[k] for k in bootstrap.TEMPORARY_ROLE_ID_FIELDS))
         self.assertTrue(
@@ -3014,13 +3130,13 @@ class BootstrapTests(unittest.TestCase):
             self.plan, prior_authorization_id
         )
         metadata = bootstrap._temporary_role_metadata(
-            prior_authorization_id, "uploader-package-role"
+            prior_authorization_id, "operator-key-read-role"
         )
         definition = {
             "id": (
                 f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
                 "Microsoft.Authorization/roleDefinitions/"
-                + prior_ids["roleDefinitionId"]
+                + prior_ids["temporaryKeyReadRoleDefinitionId"]
             ),
             "properties": {
                 "roleName": metadata["roleName"],
@@ -3052,7 +3168,7 @@ class BootstrapTests(unittest.TestCase):
         orphan_without_marker["properties"]["roleDefinitionId"] = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
             "Microsoft.Authorization/roleDefinitions/"
-            + execution_plan["temporaryAccess"]["roleDefinitionId"]
+            + execution_plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"]
         )
         with self.assertRaisesRegex(
             bootstrap.BootstrapError, "residual PaperDesk temporary role assignment"
@@ -3080,15 +3196,15 @@ class BootstrapTests(unittest.TestCase):
         operation = next(
             item
             for item in self.plan["mutations"]
-            if item["id"] == "addOwnedUploaderPackageRole"
+            if item["id"] == "addOwnedOperatorKeyReadRole"
         )
-        definition_id = transport.plan["temporaryAccess"]["roleDefinitionId"]
+        definition_id = transport.plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"]
         definition_resource = (
             f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
             f"Microsoft.Authorization/roleDefinitions/{definition_id}"
         )
         metadata = bootstrap._temporary_role_metadata(
-            AUTH_ID, "uploader-package-role"
+            AUTH_ID, "operator-key-read-role"
         )
         definition = {
             "id": definition_resource,
@@ -3103,7 +3219,7 @@ class BootstrapTests(unittest.TestCase):
                         "actions": [],
                         "notActions": [],
                         "dataActions": transport.plan["temporaryAccess"][
-                            "temporaryPackageDataActions"
+                            "temporaryKeyReadDataActions"
                         ],
                         "notDataActions": [],
                     }
@@ -3130,19 +3246,19 @@ class BootstrapTests(unittest.TestCase):
         transport.bind_journal(ledger)
         return ledger
 
-    def _temporary_package_assignment_document(self, transport, definition_resource):
-        assignment_id = transport.plan["temporaryAccess"]["roleAssignmentId"]
+    def _temporary_role_assignment_document(self, transport, definition_resource):
+        assignment_id = transport.plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]
         scope = next(
             item["resourceId"]
             for item in transport.plan["resourceInventory"]
-            if item["id"] == "packageContainer"
+            if item["id"] == transport.plan["temporaryAccess"]["temporaryKeyReadScope"]
         )
         assignment_resource = (
             f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
             f"{assignment_id}"
         )
         metadata = bootstrap._temporary_role_metadata(
-            AUTH_ID, "uploader-package-role"
+            AUTH_ID, "operator-key-read-role"
         )
         return assignment_resource, {
             "id": assignment_resource,
@@ -3205,7 +3321,7 @@ class BootstrapTests(unittest.TestCase):
             def absent_assignment(*_args, **_kwargs):
                 transport._last_guarded_assignment_was_present = False
                 return bootstrap._expected_deletion_lock_proof(
-                    "removeOwnedUploaderPackageRole"
+                    "removeOwnedOperatorKeyReadRole"
                 )
 
             with (
@@ -3291,7 +3407,7 @@ class BootstrapTests(unittest.TestCase):
                 self._temporary_role_transport_fixture(receipt)
             )
             assignment_resource, _assignment = (
-                self._temporary_package_assignment_document(
+                self._temporary_role_assignment_document(
                     transport, definition_resource
                 )
             )
@@ -3379,7 +3495,7 @@ class BootstrapTests(unittest.TestCase):
                 self._temporary_role_transport_fixture(receipt)
             )
             assignment_resource, assignment = (
-                self._temporary_package_assignment_document(
+                self._temporary_role_assignment_document(
                     transport, definition_resource
                 )
             )
@@ -3460,7 +3576,7 @@ class BootstrapTests(unittest.TestCase):
                 session.assignment_pending = False
                 transport._last_guarded_assignment_was_present = True
                 return bootstrap._expected_deletion_lock_proof(
-                    "removeOwnedUploaderPackageRole"
+                    "removeOwnedOperatorKeyReadRole"
                 )
 
             with (
@@ -3493,7 +3609,7 @@ class BootstrapTests(unittest.TestCase):
                 self._temporary_role_transport_fixture(receipt)
             )
             assignment_resource, _assignment = (
-                self._temporary_package_assignment_document(
+                self._temporary_role_assignment_document(
                     transport, definition_resource
                 )
             )
@@ -3619,7 +3735,7 @@ class BootstrapTests(unittest.TestCase):
                 self._temporary_role_transport_fixture(receipt)
             )
             assignment_resource, assignment = (
-                self._temporary_package_assignment_document(
+                self._temporary_role_assignment_document(
                     transport, definition_resource
                 )
             )
@@ -3703,7 +3819,7 @@ class BootstrapTests(unittest.TestCase):
                 session.assignment_present = False
                 transport._last_guarded_assignment_was_present = True
                 return bootstrap._expected_deletion_lock_proof(
-                    "removeOwnedUploaderPackageRole"
+                    "removeOwnedOperatorKeyReadRole"
                 )
 
             with (
@@ -3737,7 +3853,7 @@ class BootstrapTests(unittest.TestCase):
                 self._temporary_role_transport_fixture(receipt)
             )
             assignment_resource, _assignment = (
-                self._temporary_package_assignment_document(
+                self._temporary_role_assignment_document(
                     transport, definition_resource
                 )
             )
@@ -3799,9 +3915,9 @@ class BootstrapTests(unittest.TestCase):
                 "operationId": operation["id"],
                 "status": "applied-readback-pending",
                 "owned": True,
-                "cleanupKey": "uploader-package-role",
+                "cleanupKey": "operator-key-read-role",
                 "details": {
-                    "cleanupKey": "uploader-package-role",
+                    "cleanupKey": "operator-key-read-role",
                     "definitionAttempted": True,
                     "definitionCreated": False,
                     "definitionReadbackExact": False,
@@ -3879,9 +3995,9 @@ class BootstrapTests(unittest.TestCase):
                 "operationId": operation["id"],
                 "status": "applied-readback-pending",
                 "owned": True,
-                "cleanupKey": "uploader-package-role",
+                "cleanupKey": "operator-key-read-role",
                 "details": {
-                    "cleanupKey": "uploader-package-role",
+                    "cleanupKey": "operator-key-read-role",
                     "definitionAttempted": True,
                     "definitionCreated": False,
                     "definitionReadbackExact": False,
@@ -3953,7 +4069,7 @@ class BootstrapTests(unittest.TestCase):
                     self._temporary_role_transport_fixture(receipt)
                 )
                 assignment_resource, assignment = (
-                    self._temporary_package_assignment_document(
+                    self._temporary_role_assignment_document(
                         transport, definition_resource
                     )
                 )
@@ -4045,9 +4161,9 @@ class BootstrapTests(unittest.TestCase):
                 "operationId": operation["id"],
                 "status": "applied-readback-pending",
                 "owned": True,
-                "cleanupKey": "uploader-package-role",
+                "cleanupKey": "operator-key-read-role",
                 "details": {
-                    "cleanupKey": "uploader-package-role",
+                    "cleanupKey": "operator-key-read-role",
                     "definitionAttempted": True,
                     "definitionCreated": False,
                     "definitionAmbiguous": True,
@@ -4060,7 +4176,7 @@ class BootstrapTests(unittest.TestCase):
             def absent_assignment(*_args, **_kwargs):
                 transport._last_guarded_assignment_was_present = False
                 return bootstrap._expected_deletion_lock_proof(
-                    "removeOwnedUploaderPackageRole"
+                    "removeOwnedOperatorKeyReadRole"
                 )
 
             transport._active_protected_role_add = operation["id"]
@@ -4420,8 +4536,12 @@ class BootstrapTests(unittest.TestCase):
         transport, _session, _retired_urls = self._retired_role_gate_fixture()
         raw_temporary = transport.reviewed_plan["temporaryAccess"]
         bound_temporary = transport.plan["temporaryAccess"]
-        self.assertNotIn("roleDefinitionId", raw_temporary)
-        self.assertIn("roleDefinitionId", bound_temporary)
+        for field in (
+            "temporaryPackageAddRoleAssignmentId",
+            "temporaryPackageReadRoleAssignmentId",
+        ):
+            self.assertNotIn(field, raw_temporary)
+            self.assertIn(field, bound_temporary)
         self.assertEqual(transport.reviewed_plan, self.plan)
 
         transport.collect_preflight(self.plan)
@@ -5720,58 +5840,60 @@ class BootstrapTests(unittest.TestCase):
                 operation_context=valid,
             )
 
-    def test_preflight_requires_fresh_temporary_role_definition_absence(self):
-        projection = build_projection(self.plan, self.package)
+    def test_preflight_requires_each_fresh_stable_package_role_definition(self):
         operation_id = "addOwnedUploaderPackageRole"
-        definition_url = bootstrap._temporary_role_definition_readback_url(
+        definition_urls = bootstrap._temporary_role_definition_readback_urls(
             operation_id, bootstrap.bind_temporary_role_ids(self.plan, AUTH_ID)
         )
-        self.assertIsNotNone(definition_url)
-        admission = next(
-            item
-            for item in projection["operationAdmissions"]
-            if item["operationId"] == operation_id
-        )
-        definition_probe_id = next(
-            probe_id
-            for probe_id in admission["probeIds"]
-            if next(
-                probe
-                for probe in projection["probes"]
-                if probe["id"] == probe_id
-            )["url"]
-            == definition_url
-        )
-        admission["probeIds"].remove(definition_probe_id)
-        projection["probes"] = [
-            probe
-            for probe in projection["probes"]
-            if probe["id"] != definition_probe_id
-        ]
-        receipt = Path("C:/outside") / (
-            f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
-        )
-        authorization = build_authorization(
-            self.plan,
-            self.plan_sha,
-            self.package,
-            projection,
-            receipt,
-        )
-        preflight = {
-            "schemaVersion": 1,
-            "status": "observed-read-only",
-            "observedAt": authorization["observedPreflight"]["observedAt"],
-            "projection": projection,
-            "projectionSha256": authorization["observedPreflight"]["sha256"],
-        }
-        with self.assertRaisesRegex(
-            bootstrap.BootstrapError,
-            "temporary role definition absence",
-        ):
-            bootstrap.validate_preflight_evidence(
-                preflight, authorization, self.plan
-            )
+        self.assertEqual(len(definition_urls), 2)
+        for definition_url in definition_urls:
+            with self.subTest(definition_url=definition_url):
+                projection = build_projection(self.plan, self.package)
+                admission = next(
+                    item
+                    for item in projection["operationAdmissions"]
+                    if item["operationId"] == operation_id
+                )
+                definition_probe_id = next(
+                    probe_id
+                    for probe_id in admission["probeIds"]
+                    if next(
+                        probe
+                        for probe in projection["probes"]
+                        if probe["id"] == probe_id
+                    )["url"]
+                    == definition_url
+                )
+                admission["probeIds"].remove(definition_probe_id)
+                projection["probes"] = [
+                    probe
+                    for probe in projection["probes"]
+                    if probe["id"] != definition_probe_id
+                ]
+                receipt = Path("C:/outside") / (
+                    f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
+                )
+                authorization = build_authorization(
+                    self.plan,
+                    self.plan_sha,
+                    self.package,
+                    projection,
+                    receipt,
+                )
+                preflight = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"]["observedAt"],
+                    "projection": projection,
+                    "projectionSha256": authorization["observedPreflight"]["sha256"],
+                }
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "temporary or stable role definition state",
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, authorization, self.plan
+                    )
 
     def fixture(self, folder):
         projection = build_projection(self.plan, self.package)
@@ -7350,18 +7472,38 @@ class BootstrapTests(unittest.TestCase):
         operation_id = "removeOwnedUploaderPackageRole"
         entries = [item for item in original if item["operationId"] == operation_id]
         intents = [item for item in entries if item["phase"] == "intent"]
-        self.assertEqual([item["method"] for item in intents], ["DELETE", "DELETE", "PUT", "DELETE"])
+        self.assertEqual(
+            [item["method"] for item in intents],
+            ["DELETE", "DELETE", "DELETE", "PUT"],
+        )
         self.assertIn("/locks/", intents[0]["targetUrl"].lower())
-        self.assertEqual(intents[0]["targetUrl"], intents[2]["targetUrl"])
-        for mode in ("omit-restore", "restore-before-assignment", "definition-before-restore"):
+        self.assertEqual(intents[0]["targetUrl"], intents[3]["targetUrl"])
+        expected_assignments = list(
+            bootstrap._temporary_package_assignment_resources(
+                bootstrap.bind_temporary_role_ids(
+                    fixture["plan"], fixture["authorization"]["authorizationId"]
+                )
+            ).values()
+        )
+        self.assertEqual(
+            [item["targetUrl"].split("?", 1)[0].removeprefix(
+                "https://management.azure.com"
+            ) for item in intents[1:3]],
+            expected_assignments,
+        )
+        for mode in (
+            "omit-restore",
+            "restore-before-second-assignment",
+            "reverse-assignments",
+        ):
             with self.subTest(mode=mode):
                 pairs = [entries[i:i + 2] for i in range(0, len(entries), 2)]
                 if mode == "omit-restore":
-                    pairs.pop(2)
-                elif mode == "restore-before-assignment":
-                    pairs[1], pairs[2] = pairs[2], pairs[1]
-                else:
+                    pairs.pop(3)
+                elif mode == "restore-before-second-assignment":
                     pairs[2], pairs[3] = pairs[3], pairs[2]
+                else:
+                    pairs[1], pairs[2] = pairs[2], pairs[1]
                 replacement = [item for pair in pairs for item in pair]
                 altered = []
                 inserted = False
@@ -7769,8 +7911,14 @@ class BootstrapTests(unittest.TestCase):
         )
         temporary = components["temporaryAccessCleanup"]
         self.assertTrue(temporary["packageIpv4Rule"]["createdByAuthorization"])
+        package_roles = temporary["packageUploaderRole"]
+        self.assertEqual(package_roles["definitionLifecycle"], "read-only-preserved")
+        self.assertEqual(set(package_roles["roles"]), {"packageAdd", "packageRead"})
+        for role in package_roles["roles"].values():
+            self.assertTrue(role["createdByAuthorization"])
+            self.assertFalse(role["roleDefinitionCreatedByAuthorization"])
+            self.assertTrue(role["roleDefinitionPresentAfterCleanup"])
         for name in (
-            "packageUploaderRole",
             "operatorKeyReadRole",
             "operatorFenceRole",
             "operatorControllerRole",

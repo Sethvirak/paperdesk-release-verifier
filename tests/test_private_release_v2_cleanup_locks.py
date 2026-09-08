@@ -16,7 +16,7 @@ def fail(message):
 
 
 class Fixture:
-    def __init__(self, operation="removeOwnedUploaderPackageRole"):
+    def __init__(self, operation="removeOwnedOperatorFenceBootstrapRole"):
         self.operation = operation
         self.key = locks.applicable_cleanup_lock(operation)
         self.spec = copy.deepcopy(locks.REVIEWED_CLEANUP_LOCKS[self.key])
@@ -29,6 +29,18 @@ class Fixture:
         self.expected = copy.deepcopy(self.assignment)
         self.assignment_url = self.assignment["id"]
         self.assignment_url = locks.ARM_ROOT + self.assignment_url + "?api-version=2022-04-01"
+        self.assignment2 = copy.deepcopy(self.assignment)
+        self.assignment2["id"] = (
+            scope
+            + "/providers/Microsoft.Authorization/roleAssignments/"
+            + "22222222-2222-4222-8222-222222222222"
+        )
+        self.expected2 = copy.deepcopy(self.assignment2)
+        self.assignment_url2 = (
+            locks.ARM_ROOT
+            + self.assignment2["id"]
+            + "?api-version=2022-04-01"
+        )
         self.lock = self.lock_document()
         self.now = dt.datetime(2026, 9, 2, tzinfo=dt.timezone.utc)
         self.requests = []
@@ -41,6 +53,7 @@ class Fixture:
         self.expire_on_auth = None
         self.assignment_delay = 0
         self.pending_assignment_delete = False
+        self.pending_assignment2_delete = False
 
     def lock_document(self):
         return {
@@ -64,6 +77,10 @@ class Fixture:
                 return result
         if url == self.lock_url:
             return self.response(self.lock)
+        if url == self.assignment_url2:
+            if self.pending_assignment2_delete:
+                self.assignment2 = None
+            return self.response(self.assignment2)
         if url != self.assignment_url:
             raise AssertionError("unexpected URL")
         if self.pending_assignment_delete:
@@ -81,6 +98,9 @@ class Fixture:
             self.pending_assignment_delete = True
             if not self.assignment_delay:
                 self.assignment = None
+        elif method == "DELETE" and url == self.assignment_url2:
+            self.pending_assignment2_delete = True
+            self.assignment2 = None
         elif method == "PUT" and url == self.lock_url:
             self.lock = self.lock_document()
             self.lock["properties"] = json.loads(body)["properties"]
@@ -119,6 +139,23 @@ class Fixture:
         args.update(kwargs)
         return self.guard().delete_assignment(**args)
 
+    def run_group(self):
+        return self.guard().delete_assignments(
+            operation_id="removeOwnedUploaderPackageRole",
+            assignments=[
+                {
+                    "assignmentUrl": self.assignment_url,
+                    "expectedAssignmentProjection": self.expected,
+                    "projectAssignment": lambda document: copy.deepcopy(document),
+                },
+                {
+                    "assignmentUrl": self.assignment_url2,
+                    "expectedAssignmentProjection": self.expected2,
+                    "projectAssignment": lambda document: copy.deepcopy(document),
+                },
+            ],
+        )
+
 
 class CleanupLockTests(unittest.TestCase):
     def test_exact_three_locks_and_eight_operation_mapping(self):
@@ -155,20 +192,59 @@ class CleanupLockTests(unittest.TestCase):
     def test_all_eight_operations_restore_exact_lock_with_three_mutations(self):
         for operation in locks.REVIEWED_OPERATION_LOCKS:
             fixture = Fixture(operation)
-            proof = fixture.run()
+            proof = (
+                fixture.run_group()
+                if operation == "removeOwnedUploaderPackageRole"
+                else fixture.run()
+            )
             with self.subTest(operation=operation):
                 self.assertEqual(proof, {
                     "resourceId": fixture.spec["resourceId"],
                     "properties": fixture.spec["properties"],
                     "restored": True, "assignmentAbsent": True,
                 })
-                self.assertEqual([(x[0], x[1]) for x in fixture.mutations], [
-                    ("DELETE", fixture.lock_url), ("DELETE", fixture.assignment_url),
-                    ("PUT", fixture.lock_url),
-                ])
-                self.assertEqual([x[4] for x in fixture.mutations], [False, False, True])
+                expected_mutations = [
+                    ("DELETE", fixture.lock_url),
+                    ("DELETE", fixture.assignment_url),
+                ]
+                if operation == "removeOwnedUploaderPackageRole":
+                    expected_mutations.append(("DELETE", fixture.assignment_url2))
+                expected_mutations.append(("PUT", fixture.lock_url))
+                self.assertEqual(
+                    [(x[0], x[1]) for x in fixture.mutations],
+                    expected_mutations,
+                )
+                self.assertEqual(
+                    [x[4] for x in fixture.mutations],
+                    [False] * (len(expected_mutations) - 1) + [True],
+                )
                 self.assertEqual(json.loads(fixture.mutations[-1][2]), {"properties": fixture.spec["properties"]})
                 self.assertEqual(fixture.lock, fixture.lock_document())
+
+    def test_package_group_deletes_both_before_long_absence_poll(self):
+        fixture = Fixture("removeOwnedUploaderPackageRole")
+        fixture.assignment_delay = 4
+        expires = fixture.now + dt.timedelta(seconds=1)
+
+        def require_live():
+            fixture.auth_calls += 1
+            if fixture.now >= expires:
+                raise GuardFailure("authorization expired before grouped DELETE")
+
+        fixture.auth = require_live
+        proof = fixture.run_group()
+        self.assertTrue(proof["assignmentAbsent"])
+        self.assertEqual(
+            [(item[0], item[1]) for item in fixture.mutations[:3]],
+            [
+                ("DELETE", fixture.lock_url),
+                ("DELETE", fixture.assignment_url),
+                ("DELETE", fixture.assignment_url2),
+            ],
+        )
+        self.assertEqual(fixture.auth_calls, 3)
+        self.assertGreater(fixture.now, expires)
+        self.assertEqual(fixture.mutations[-1][0:2], ("PUT", fixture.lock_url))
 
     def test_production_app_cleanup_deletes_only_assignment_and_restores_lock(self):
         fixture = Fixture("retireLegacyPublisherSitesReadAssignment")

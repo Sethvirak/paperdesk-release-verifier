@@ -100,10 +100,17 @@ class CompleteReceiptBundleTests(unittest.TestCase):
     def fresh(self):
         return copy.deepcopy(self.fixture)
 
-    def assert_invalid_bundle(self, mutate, expected=None):
+    def assert_invalid_bundle(
+        self, mutate, expected=None, *, synchronize_s2_components=()
+    ):
         fixture = self.fresh()
         bundle = copy.deepcopy(fixture["completeReceipt"]["bundle"])
         mutate(bundle, fixture)
+        for component_name in synchronize_s2_components:
+            path = receipts.S2_EVIDENCE_COMPONENT_PATHS[component_name]
+            fixture["s2Documents"][path] = receipts.canonical_json_bytes(
+                bundle[component_name]
+            )
         with self.assertRaises(receipts.BootstrapReceiptError) as caught:
             validate_bundle(fixture, bundle)
         if expected is not None:
@@ -211,12 +218,50 @@ class CompleteReceiptBundleTests(unittest.TestCase):
             "terminally consumed",
         )
 
-    def test_temporary_access_still_present_fails(self):
-        self.assert_invalid_bundle(
-            lambda bundle, _fixture: bundle["temporaryAccessCleanup"][
-                "packageUploaderRole"
-            ].update({"presentAfterCleanup": True})
-        )
+    def test_both_temporary_package_assignments_must_be_absent(self):
+        for name in ("packageAdd", "packageRead"):
+            with self.subTest(name=name):
+                self.assert_invalid_bundle(
+                    lambda bundle, _fixture, name=name: bundle[
+                        "temporaryAccessCleanup"
+                    ]["packageUploaderRole"]["roles"][name].update(
+                        {"presentAfterCleanup": True}
+                    ),
+                    "is not proven absent",
+                    synchronize_s2_components=("temporaryAccessCleanup",),
+                )
+
+    def test_both_temporary_package_assignment_lifecycles_must_be_complete(self):
+        for name in ("packageAdd", "packageRead"):
+            for field in ("createdByAuthorization", "removed"):
+                with self.subTest(name=name, field=field):
+                    self.assert_invalid_bundle(
+                        lambda bundle, _fixture, name=name, field=field: bundle[
+                            "temporaryAccessCleanup"
+                        ]["packageUploaderRole"]["roles"][name].update(
+                            {field: False}
+                        ),
+                        "is not proven absent",
+                        synchronize_s2_components=("temporaryAccessCleanup",),
+                    )
+
+    def test_both_stable_package_definitions_must_be_preserved(self):
+        for name in ("packageAdd", "packageRead"):
+            for field, value in (
+                ("roleDefinitionCreatedByAuthorization", True),
+                ("roleDefinitionRemoved", True),
+                ("roleDefinitionPresentAfterCleanup", False),
+            ):
+                with self.subTest(name=name, field=field):
+                    self.assert_invalid_bundle(
+                        lambda bundle, _fixture, name=name, field=field, value=value: bundle[
+                            "temporaryAccessCleanup"
+                        ]["packageUploaderRole"]["roles"][name].update(
+                            {field: value}
+                        ),
+                        "stable custom definition was not preserved",
+                        synchronize_s2_components=("temporaryAccessCleanup",),
+                    )
 
     def test_temporary_role_ids_are_derived_from_authorization_not_receipt(self):
         fixture = self.fresh()
@@ -224,14 +269,40 @@ class CompleteReceiptBundleTests(unittest.TestCase):
         other_ids = bootstrap.derive_temporary_role_ids(
             fixture["plan"], "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         )
-        bundle["temporaryAccessCleanup"]["packageUploaderRole"].update(
+        bundle["temporaryAccessCleanup"]["packageUploaderRole"]["roles"][
+            "packageRead"
+        ].update(
             {
-                "roleDefinitionId": other_ids["roleDefinitionId"],
-                "roleAssignmentId": other_ids["roleAssignmentId"],
+                "roleAssignmentId": other_ids[
+                    "temporaryPackageReadRoleAssignmentId"
+                ],
             }
         )
-        with self.assertRaises(receipts.BootstrapReceiptError):
+        cleanup_path = receipts.S2_EVIDENCE_COMPONENT_PATHS[
+            "temporaryAccessCleanup"
+        ]
+        fixture["s2Documents"][cleanup_path] = receipts.canonical_json_bytes(
+            bundle["temporaryAccessCleanup"]
+        )
+        with self.assertRaisesRegex(
+            receipts.BootstrapReceiptError, "exact identity binding is invalid"
+        ):
             validate_bundle(fixture, bundle)
+
+    def test_stable_package_definition_identity_cannot_be_swapped(self):
+        self.assert_invalid_bundle(
+            lambda bundle, _fixture: bundle["temporaryAccessCleanup"][
+                "packageUploaderRole"
+            ]["roles"]["packageRead"].update(
+                {
+                    "roleDefinitionId": bootstrap.PACKAGE_STABLE_ROLE_POLICY[
+                        "roles"
+                    ][0]["definitionId"]
+                }
+            ),
+            "exact identity binding is invalid",
+            synchronize_s2_components=("temporaryAccessCleanup",),
+        )
 
     def test_stale_terminal_time_fails(self):
         fixture = self.fresh()

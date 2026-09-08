@@ -87,19 +87,25 @@ FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS = (
 STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS = (
     AZURE_CLI_REQUEST_TIMEOUT_SECONDS + AZURE_REST_RESPONSE_TIMEOUT_SECONDS
 )
-# Permit an exact package readiness GET at thirty minutes plus its full request
-# envelope. Authorization and protected cleanup still impose earlier deadlines.
-MAX_PACKAGE_READINESS_SECONDS = 1800 + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-# One active role cleanup uses six single-attempt Azure request envelopes
-# through assignment DELETE, one bounded lock-suspension convergence window,
-# one full final observation envelope after that boundary, and a 30-second
-# local journal margin. Exact executor-owned definition cleanup, lock
+# Keep the reviewed propagation boundary at exactly thirty minutes, then permit
+# at most one second of scheduler alignment and one full final GET envelope.
+# Authorization and protected cleanup still impose earlier hard deadlines.
+MAX_PACKAGE_READINESS_SECONDS = (
+    1800
+    + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+    + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+)
+# The grouped package-role cleanup uses nine single-attempt Azure request
+# envelopes through both assignment DELETEs, one bounded lock-suspension window,
+# one full final observation envelope after that boundary, the allowed scheduler
+# alignment slack, and a 30-second local journal margin. Exact executor-owned definition cleanup, lock
 # restoration, and deletion-absence readbacks may finish after expiry; they
 # cannot create new access.
 PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
-    6 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    9 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
     + cleanup_locks.LOCK_CONVERGENCE_SECONDS
     + cleanup_locks.LOCK_FINAL_OBSERVATION_SECONDS
+    + FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
     + 30
 )
 # After the create-only canary PUT, the nominal controller exercise and every
@@ -116,8 +122,8 @@ CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
 )
 # Observation, confirmation, account validation, fresh preflight, the durable
 # claim, and all work before the controller phase share a fifteen-minute budget.
-# The five-minute preflight freshness limit and every cleanup reserve remain
-# unchanged. Controller role admission then performs four exact reads, two
+# The five-minute preflight freshness limit and controller absolute cutoffs
+# remain unchanged. Controller role admission then performs four exact reads, two
 # create-only writes, and one source readback before the data-plane propagation
 # wait begins. FIC repin owns a separate, unchanged 1,800-second contract.
 CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS = 900
@@ -228,14 +234,46 @@ TEMPORARY_OWNER_BY_CLEANUP = {
     for owner_id, cleanup_id in TEMPORARY_CLEANUP_BY_OWNER.items()
 }
 TEMPORARY_ROLE_ID_FIELDS = (
-    "roleDefinitionId",
-    "roleAssignmentId",
+    "temporaryPackageAddRoleAssignmentId",
+    "temporaryPackageReadRoleAssignmentId",
     "temporaryKeyReadRoleDefinitionId",
     "temporaryKeyReadRoleAssignmentId",
     "temporaryFenceRoleDefinitionId",
     "temporaryFenceRoleAssignmentId",
     "temporaryControllerRoleAssignmentId",
 )
+PACKAGE_STABLE_ROLE_POLICY = {
+    "definitionLifecycle": "role-matrix-stable-read-only-preserved",
+    "assignmentLifecycle": "authorization-specific-create-and-delete",
+    "cleanupLifecycle": "one-reviewed-lock-suspension-for-both-assignment-deletes",
+    "scope": "packageContainer",
+    "roles": [
+        {
+            "name": "packageAdd",
+            "roleMatrixName": "writerPackageAdd",
+            "definitionId": "b5d9d7c7-9367-4ac0-9d41-28b71e0d517d",
+            "roleMatrixAssignmentId": "3bb19352-f72e-5a39-b6b1-6c1be4029c43",
+            "assignmentIdField": "temporaryPackageAddRoleAssignmentId",
+            "dataActions": [
+                "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+            ],
+        },
+        {
+            "name": "packageRead",
+            "roleMatrixName": "readerPackageRead",
+            "definitionId": "e005b62b-037b-4989-b492-932669ec0842",
+            "roleMatrixAssignmentId": "e76ee175-25d6-52c1-9cd8-9cd28c01e114",
+            "assignmentIdField": "temporaryPackageReadRoleAssignmentId",
+            "dataActions": [
+                "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+            ],
+        },
+    ],
+}
+PACKAGE_ROLE_OPERATIONS = frozenset({
+    "addOwnedUploaderPackageRole",
+    "removeOwnedUploaderPackageRole",
+})
 CONTROLLER_BUILTIN_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 CONTROLLER_ROLE_OPERATIONS = frozenset({
     "addOwnedOperatorControllerCanaryRole",
@@ -271,14 +309,18 @@ TEMPORARY_ROLE_ID_DERIVATION = {
     "namespace": "15a228ac-3249-535f-940d-d915c5ce4b70",
     "nameTemplate": "{authorizationId}:{label}",
     "labels": {
-        "roleDefinitionId": "package-role-definition",
-        "roleAssignmentId": "package-role-assignment",
+        "temporaryPackageAddRoleAssignmentId": "package-add-role-assignment",
+        "temporaryPackageReadRoleAssignmentId": "package-read-role-assignment",
         "temporaryKeyReadRoleDefinitionId": "signing-key-read-role-definition",
         "temporaryKeyReadRoleAssignmentId": "signing-key-read-role-assignment",
         "temporaryFenceRoleDefinitionId": "activation-fence-role-definition",
         "temporaryFenceRoleAssignmentId": "activation-fence-role-assignment",
         "temporaryControllerRoleAssignmentId": "controller-canary-role-assignment",
     },
+}
+LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS = {
+    "legacyPackageRoleDefinitionId": "package-role-definition",
+    "legacyPackageRoleAssignmentId": "package-role-assignment",
 }
 TEMPORARY_ROLE_NAME_PREFIX = "PaperDesk V2 temporary "
 TEMPORARY_ROLE_MARKER_PREFIX = "paperdesk-private-release-v2-temporary:"
@@ -379,16 +421,55 @@ def derive_temporary_role_ids(
         for field in TEMPORARY_ROLE_ID_FIELDS
     }
     values = list(derived.values())
+    permanent_role_ids = {
+        str(role[field])
+        for role in plan.get("roleMatrix", [])
+        if isinstance(role, Mapping)
+        for field in ("definitionId", "assignmentId")
+        if isinstance(role.get(field), str)
+    }
     if (
         any(GUID.fullmatch(value) is None for value in values)
         or len(set(values)) != len(values)
         or authorization_id in values
         or CONTROLLER_BUILTIN_ROLE_ID in values
         or not set(values).isdisjoint(RETIRED_TEMPORARY_ROLE_IDS)
+        or not set(values).isdisjoint(permanent_role_ids)
     ):
         fail("derived temporary role IDs are invalid, duplicated, or retired")
     derived["temporaryControllerRoleDefinitionId"] = CONTROLLER_BUILTIN_ROLE_ID
     return derived
+
+
+def _derive_legacy_authorization_package_role_ids(
+    plan: Mapping[str, Any], authorization_id: str
+) -> dict[str, str]:
+    """Retain detection identities from the superseded per-run package role."""
+
+    _guid(authorization_id, "legacy package role authorization ID")
+    derivation = _validate_temporary_role_id_derivation(plan)
+    namespace = uuid.UUID(str(derivation["namespace"]))
+    values = {
+        field: str(
+            uuid.uuid5(
+                namespace,
+                derivation["nameTemplate"].format(
+                    authorizationId=authorization_id,
+                    label=label,
+                ),
+            )
+        )
+        for field, label in LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS.items()
+    }
+    if (
+        len(set(values.values())) != len(values)
+        or not set(values.values()).isdisjoint(RETIRED_TEMPORARY_ROLE_IDS)
+        or not set(values.values()).isdisjoint(
+            derive_temporary_role_ids(plan, authorization_id).values()
+        )
+    ):
+        fail("legacy authorization-specific package role IDs are invalid")
+    return values
 
 
 def bind_temporary_role_ids(
@@ -397,6 +478,9 @@ def bind_temporary_role_ids(
     """Return an in-memory execution plan with exact authorization-owned IDs."""
 
     derived = derive_temporary_role_ids(plan, authorization_id)
+    legacy_package_ids = _derive_legacy_authorization_package_role_ids(
+        plan, authorization_id
+    )
     bound = copy.deepcopy(dict(plan))
     temporary = bound.get("temporaryAccess")
     if not isinstance(temporary, dict):
@@ -409,7 +493,19 @@ def bind_temporary_role_ids(
         fail("in-memory temporary role IDs do not match the authorization")
     if temporary.get("temporaryControllerRoleDefinitionId", CONTROLLER_BUILTIN_ROLE_ID) != CONTROLLER_BUILTIN_ROLE_ID:
         fail("in-memory controller built-in role identity drifted")
+    legacy_present = set(temporary).intersection(
+        LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS
+    )
+    if legacy_present and (
+        legacy_present != set(LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS)
+        or any(
+            temporary[field] != legacy_package_ids[field]
+            for field in legacy_present
+        )
+    ):
+        fail("in-memory legacy package role IDs do not match the authorization")
     temporary.update(derived)
+    temporary.update(legacy_package_ids)
     return bound
 
 
@@ -453,10 +549,25 @@ def _temporary_role_metadata(
 
 
 def _reject_residual_temporary_role_definitions(
-    values: Any, *, label: str
+    values: Any, *, label: str, plan: Mapping[str, Any] | None = None
 ) -> None:
     if not isinstance(values, list):
         fail(f"{label} is not an exhaustive role-definition list")
+    forbidden_definition_ids = {
+        str(spec["definitionId"]).lower()
+        for spec in RETIRED_TEMPORARY_ROLE_SPECS
+    }
+    temporary = plan.get("temporaryAccess") if isinstance(plan, Mapping) else None
+    if isinstance(temporary, Mapping):
+        forbidden_definition_ids.update(
+            str(temporary[field]).lower()
+            for field in (
+                "legacyPackageRoleDefinitionId",
+                "temporaryKeyReadRoleDefinitionId",
+                "temporaryFenceRoleDefinitionId",
+            )
+            if isinstance(temporary.get(field), str)
+        )
     for item in values:
         if not isinstance(item, Mapping):
             fail(f"{label} contains a non-object")
@@ -465,13 +576,16 @@ def _reject_residual_temporary_role_definitions(
             fail(f"{label} contains a role definition without properties")
         role_name = properties.get("roleName")
         description = properties.get("description")
+        definition_guid = (
+            str(item.get("id", "")).rstrip("/").rsplit("/", 1)[-1].lower()
+        )
         if (
             isinstance(role_name, str)
             and role_name.startswith(TEMPORARY_ROLE_NAME_PREFIX)
         ) or (
             isinstance(description, str)
             and description.startswith(TEMPORARY_ROLE_MARKER_PREFIX)
-        ):
+        ) or definition_guid in forbidden_definition_ids:
             fail("a residual PaperDesk temporary role definition is present")
 
 
@@ -484,7 +598,6 @@ def _reject_residual_temporary_role_assignments(
     current_definition_ids = {
         str(temporary[field]).lower()
         for field in (
-            "roleDefinitionId",
             "temporaryKeyReadRoleDefinitionId",
             "temporaryFenceRoleDefinitionId",
             "temporaryControllerRoleDefinitionId",
@@ -500,6 +613,13 @@ def _reject_residual_temporary_role_assignments(
         if field.endswith("AssignmentId")
         and isinstance(temporary, Mapping) and isinstance(temporary.get(field), str)
     }
+    if isinstance(temporary, Mapping):
+        legacy_definition_id = temporary.get("legacyPackageRoleDefinitionId")
+        legacy_assignment_id = temporary.get("legacyPackageRoleAssignmentId")
+        if isinstance(legacy_definition_id, str):
+            current_definition_ids.add(legacy_definition_id.lower())
+        if isinstance(legacy_assignment_id, str):
+            current_assignment_ids.add(legacy_assignment_id.lower())
     forbidden_definition_ids = current_definition_ids | {
         str(spec["definitionId"]).lower()
         for spec in RETIRED_TEMPORARY_ROLE_SPECS
@@ -590,26 +710,30 @@ def _expected_deletion_lock_proof(operation_id: str) -> dict[str, Any] | None:
             "restored": True, "assignmentAbsent": True}
 
 
-def _cleanup_assignment_resources(plan: Mapping[str, Any]) -> dict[str, str]:
+def _cleanup_assignment_resources(
+    plan: Mapping[str, Any]
+) -> dict[str, tuple[str, ...]]:
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     temporary = plan["temporaryAccess"]
-    result = {}
+    result: dict[str, tuple[str, ...]] = {}
     if all(field in temporary for field in TEMPORARY_ROLE_ID_FIELDS):
+        result["removeOwnedUploaderPackageRole"] = tuple(
+            _temporary_package_assignment_resources(plan).values()
+        )
         for operation_id, scope, field in (
-            ("removeOwnedUploaderPackageRole", "packageContainer", "roleAssignmentId"),
             ("removeOwnedOperatorKeyReadRole", "signingKey", "temporaryKeyReadRoleAssignmentId"),
             ("removeOwnedOperatorFenceBootstrapRole", "activationFenceContainer", "temporaryFenceRoleAssignmentId"),
             ("removeOwnedOperatorControllerCanaryRole", "controllerLockContainer", "temporaryControllerRoleAssignmentId"),
         ):
             result[operation_id] = (resources[scope]["resourceId"]
-                + "/providers/Microsoft.Authorization/roleAssignments/" + temporary[field])
+                + "/providers/Microsoft.Authorization/roleAssignments/" + temporary[field],)
     legacy = plan["legacyPublisherRetirement"]
     result.update({
-        "retireLegacyPublisherMutatorAssignment": legacy["roleAssignmentResourceIds"][0],
-        "retireLegacyPublisherSitesReadAssignment": legacy["roleAssignmentResourceIds"][1],
-        "retireLegacyPublisherResultReadAssignment": legacy["roleAssignmentResourceIds"][2],
-        "removeLegacyWriterResultAssignment": legacy["legacyWriterResultAssignmentResourceId"],
-        "removeLegacyReaderResultAssignment": legacy["legacyReaderResultAssignmentResourceId"],
+        "retireLegacyPublisherMutatorAssignment": (legacy["roleAssignmentResourceIds"][0],),
+        "retireLegacyPublisherSitesReadAssignment": (legacy["roleAssignmentResourceIds"][1],),
+        "retireLegacyPublisherResultReadAssignment": (legacy["roleAssignmentResourceIds"][2],),
+        "removeLegacyWriterResultAssignment": (legacy["legacyWriterResultAssignmentResourceId"],),
+        "removeLegacyReaderResultAssignment": (legacy["legacyReaderResultAssignmentResourceId"],),
     })
     return result
 
@@ -619,7 +743,11 @@ def _cleanup_lock_inventory_projection(document: Any, plan: Mapping[str, Any]) -
     if (not isinstance(document, Mapping) or set(document) - {"value", "nextLink"}
         or document.get("nextLink") not in (None, "") or not isinstance(document.get("value"), list)):
         fail("cleanup lock inventory is incomplete or paginated")
-    targets = list(_cleanup_assignment_resources(plan).values())
+    targets = [
+        target
+        for group in _cleanup_assignment_resources(plan).values()
+        for target in group
+    ]
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     temporary = plan["temporaryAccess"]
     # Lock inheritance depends on each temporary assignment's scope, not on its
@@ -1361,9 +1489,13 @@ def _mutation_target_allowed(
     if operation_id == "createSigningKeyVersion":
         return method == "PUT" and arm(resources["signingKey"]["resourceId"])
     if operation_id == "createCustomRoleDefinitions":
+        stable_package_definition_ids = {
+            item["definitionId"] for item in PACKAGE_STABLE_ROLE_POLICY["roles"]
+        }
         valid = {
             str(item["id"]).lower()
-            for item in _custom_role_definition_specs(plan).values()
+            for definition_id, item in _custom_role_definition_specs(plan).items()
+            if definition_id not in stable_package_definition_ids
         }
         resource_id = path
         return method == "PUT" and any(
@@ -1418,9 +1550,19 @@ def _mutation_target_allowed(
         return method == "PATCH" and arm(resources["legacyBridgeSite"]["resourceId"])
     if operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
         return method == "PATCH" and arm(resources["storageAccount"]["resourceId"])
+    if operation_id in PACKAGE_ROLE_OPERATIONS:
+        assignment_paths = {
+            value.lower()
+            for value in _temporary_package_assignment_resources(plan).values()
+        }
+        expected_method = "PUT" if operation_id.startswith("addOwned") else "DELETE"
+        return (
+            method == expected_method
+            and host == "management.azure.com"
+            and path.lower() in assignment_paths
+            and set(query) == {"api-version"}
+        )
     temp_role_ids = {
-        "addOwnedUploaderPackageRole": (plan["temporaryAccess"]["roleDefinitionId"], plan["temporaryAccess"]["roleAssignmentId"]),
-        "removeOwnedUploaderPackageRole": (plan["temporaryAccess"]["roleDefinitionId"], plan["temporaryAccess"]["roleAssignmentId"]),
         "addOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
         "removeOwnedOperatorKeyReadRole": (plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"], plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]),
         "addOwnedOperatorFenceBootstrapRole": (plan["temporaryAccess"]["temporaryFenceRoleDefinitionId"], plan["temporaryAccess"]["temporaryFenceRoleAssignmentId"]),
@@ -1714,8 +1856,17 @@ def _expected_terminal_mutation_targets(
         member_states = context.get("memberStates")
         if not isinstance(member_states, Mapping):
             fail("terminal custom-role journal lacks member states")
+        stable_package_definition_ids = {
+            item["definitionId"] for item in PACKAGE_STABLE_ROLE_POLICY["roles"]
+        }
         required = Counter()
         for definition_id, state_name in member_states.items():
+            if definition_id in stable_package_definition_ids:
+                if state_name != "exact":
+                    fail(
+                        "stable package role definition must pre-exist and remain exact"
+                    )
+                continue
             if state_name == "absent":
                 resource_id = (
                     f"/subscriptions/{SUBSCRIPTION}/providers/"
@@ -1778,17 +1929,20 @@ def _expected_terminal_mutation_targets(
     if operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
         return one("PATCH", arm(resources["storageAccount"]["resourceId"], "2025-06-01"))
 
+    if operation_id in PACKAGE_ROLE_OPERATIONS:
+        method = "PUT" if operation_id.startswith("addOwned") else "DELETE"
+        required = Counter(
+            _normalized_mutation_target(method, arm(resource_id, "2022-04-01"))
+            for resource_id in _temporary_package_assignment_resources(plan).values()
+        )
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is not None:
+            for lock_method in ("DELETE", "PUT"):
+                required[_normalized_mutation_target(
+                    lock_method, arm(lock_proof["resourceId"], "2016-09-01")
+                )] = 1
+        return required, Counter()
     temp_role_ids = {
-        "addOwnedUploaderPackageRole": (
-            plan["temporaryAccess"]["roleDefinitionId"],
-            plan["temporaryAccess"]["roleAssignmentId"],
-            "packageContainer",
-        ),
-        "removeOwnedUploaderPackageRole": (
-            plan["temporaryAccess"]["roleDefinitionId"],
-            plan["temporaryAccess"]["roleAssignmentId"],
-            "packageContainer",
-        ),
         "addOwnedOperatorKeyReadRole": (
             plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"],
             plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"],
@@ -1999,10 +2153,21 @@ def _validate_terminal_mutation_coverage(
             results = [item for item in journal if item.get("phase") == "result"
                        and item.get("operationId") == operation_id]
             lock_url = "https://management.azure.com" + lock_proof["resourceId"] + "?api-version=2016-09-01"
-            assignment_url = "https://management.azure.com" + _cleanup_assignment_resources(plan)[operation_id] + "?api-version=2022-04-01"
-            expected_prefix = [("DELETE", lock_url), ("DELETE", assignment_url), ("PUT", lock_url)]
-            if [(item["method"], item["targetUrl"]) for item in results[:3]] != expected_prefix:
-                fail("cleanup lock must bracket assignment deletion before definition deletion")
+            assignment_urls = [
+                "https://management.azure.com" + resource_id
+                + "?api-version=2022-04-01"
+                for resource_id in _cleanup_assignment_resources(plan)[operation_id]
+            ]
+            expected_prefix = [
+                ("DELETE", lock_url),
+                *(("DELETE", assignment_url) for assignment_url in assignment_urls),
+                ("PUT", lock_url),
+            ]
+            if [
+                (item["method"], item["targetUrl"])
+                for item in results[: len(expected_prefix)]
+            ] != expected_prefix:
+                fail("cleanup lock must bracket every exact assignment deletion")
             ordered = [(item["phase"], item["method"], item["targetUrl"]) for item in journal
                        if item.get("operationId") == operation_id]
             paired = [(phase, item["method"], item["targetUrl"]) for item in results
@@ -2553,13 +2718,19 @@ def load_plan() -> tuple[dict[str, Any], str]:
     if not isinstance(temporary, Mapping):
         fail("bootstrap temporary access is invalid")
     _validate_temporary_role_id_derivation(plan)
-    if set(temporary).intersection(TEMPORARY_ROLE_ID_FIELDS):
+    if set(temporary).intersection(
+        set(TEMPORARY_ROLE_ID_FIELDS)
+        | set(LEGACY_AUTHORIZATION_PACKAGE_ROLE_ID_LABELS)
+    ):
         fail("reviewed plan must not embed reusable temporary role IDs")
     if (
         "temporaryControllerRoleDefinitionId" in temporary
         or temporary.get("temporaryControllerRole") != CONTROLLER_BUILTIN_ROLE_POLICY
     ):
         fail("reviewed controller built-in role policy drifted")
+    if temporary.get("temporaryPackageRoles") != PACKAGE_STABLE_ROLE_POLICY:
+        fail("reviewed stable package role policy drifted")
+    _stable_package_role_specs(plan)
     if (
         temporary.get("leaseDurationSeconds")
         != CONTROLLER_CANARY_LEASE_DURATION_SECONDS
@@ -3555,7 +3726,9 @@ def _validate_temporary_role_marker_inventory_document(
         fail(f"{label} is partial, paginated, or malformed")
     values = document["value"]
     if kind == "definitionInventory":
-        _reject_residual_temporary_role_definitions(values, label=label)
+        _reject_residual_temporary_role_definitions(
+            values, label=label, plan=plan
+        )
     elif kind in {
         "assignmentInventory:packageContainer",
         "assignmentInventory:signingKey",
@@ -4273,6 +4446,149 @@ def _custom_role_definition_specs(plan: Mapping[str, Any]) -> dict[str, dict[str
     return grouped
 
 
+def _stable_package_role_specs(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Bind temporary package assignments to the two durable least-authority roles."""
+
+    temporary = plan.get("temporaryAccess")
+    if (
+        not isinstance(temporary, Mapping)
+        or temporary.get("temporaryPackageRoles") != PACKAGE_STABLE_ROLE_POLICY
+    ):
+        fail("stable package role policy is not exact")
+    roles_by_name = {
+        str(role.get("name")): role
+        for role in plan.get("roleMatrix", [])
+        if isinstance(role, Mapping)
+    }
+    definitions = _custom_role_definition_specs(plan)
+    result: list[dict[str, Any]] = []
+    for policy in PACKAGE_STABLE_ROLE_POLICY["roles"]:
+        role = roles_by_name.get(policy["roleMatrixName"])
+        expected_role = {
+            "name": policy["roleMatrixName"],
+            "definitionId": policy["definitionId"],
+            "assignmentId": policy["roleMatrixAssignmentId"],
+            "principal": (
+                "registryWriterIdentity"
+                if policy["name"] == "packageAdd"
+                else "registryReaderIdentity"
+            ),
+            "scope": "packageContainer",
+            "actions": [],
+            "dataActions": policy["dataActions"],
+        }
+        if not isinstance(role, Mapping) or dict(role) != expected_role:
+            fail(f"stable package role-matrix authority drifted: {policy['name']}")
+        definition = definitions.get(policy["definitionId"])
+        expected_permission = {
+            "actions": [],
+            "notActions": [],
+            "dataActions": policy["dataActions"],
+            "notDataActions": [],
+        }
+        if (
+            not isinstance(definition, Mapping)
+            or definition.get("properties", {}).get("type") != "CustomRole"
+            or definition.get("properties", {}).get("permissions")
+            != [expected_permission]
+            or definition.get("properties", {}).get("assignableScopes")
+            != [f"/subscriptions/{SUBSCRIPTION}"]
+        ):
+            fail(f"stable package role definition drifted: {policy['name']}")
+        result.append(
+            {
+                **copy.deepcopy(policy),
+                "definitionResourceId": definition["id"],
+                "definitionProjection": copy.deepcopy(definition),
+            }
+        )
+    if len(result) != 2 or len({item["definitionId"] for item in result}) != 2:
+        fail("stable package roles are missing or duplicated")
+    return result
+
+
+def _validate_stable_package_role_definitions(
+    value: Any, plan: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Require both full source-derived definitions; never infer live authority."""
+
+    specs = _stable_package_role_specs(plan)
+    projections = _exact_keys(
+        value,
+        {item["name"] for item in specs},
+        "stable package role-definition projections",
+    )
+    validated: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        candidate = projections[spec["name"]]
+        if (
+            not isinstance(candidate, Mapping)
+            or _project_role_definition(candidate) != candidate
+            or candidate != spec["definitionProjection"]
+        ):
+            fail(f"stable package role definition is incomplete or drifted: {spec['name']}")
+        validated[spec["name"]] = copy.deepcopy(dict(candidate))
+    return validated
+
+
+def _temporary_package_assignment_resources(
+    plan: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return both authorization-bound assignment resources in reviewed order."""
+
+    temporary = plan.get("temporaryAccess")
+    if not isinstance(temporary, Mapping):
+        fail("temporary package assignment policy is absent")
+    scope = _resource_scope_from_plan(plan, PACKAGE_STABLE_ROLE_POLICY["scope"])
+    resources: dict[str, str] = {}
+    for spec in _stable_package_role_specs(plan):
+        assignment_id = temporary.get(spec["assignmentIdField"])
+        _guid(assignment_id, f"{spec['name']} temporary assignment ID")
+        resources[spec["name"]] = (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            f"{assignment_id}"
+        )
+    if len(resources) != 2 or len(set(resources.values())) != 2:
+        fail("temporary package assignment resources are missing or duplicated")
+    return resources
+
+
+def _temporary_package_assignment_projections(
+    plan: Mapping[str, Any], authorization: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Return both exact authorization-owned assignment projections."""
+
+    resources = _temporary_package_assignment_resources(plan)
+    scope = _resource_scope_from_plan(plan, PACKAGE_STABLE_ROLE_POLICY["scope"])
+    cleanup_key = "uploader-package-role"
+    marker = _temporary_role_marker(authorization["authorizationId"], cleanup_key)
+    principal_type = (
+        "ServicePrincipal"
+        if authorization["azure"]["accountType"] == "servicePrincipal"
+        else "User"
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for spec in _stable_package_role_specs(plan):
+        name = spec["name"]
+        resource_id = resources[name]
+        result[name] = {
+            "id": resource_id,
+            "name": resource_id.rsplit("/", 1)[-1],
+            "type": "Microsoft.Authorization/roleAssignments",
+            "properties": {
+                "principalId": authorization["azure"]["accountObjectId"],
+                "principalType": principal_type,
+                "roleDefinitionId": spec["definitionResourceId"],
+                "scope": scope,
+                "condition": None,
+                "conditionVersion": None,
+                "delegatedManagedIdentityResourceId": None,
+                "description": marker,
+            },
+        }
+    return result
+
+
 def _role_assignment_spec(
     plan: Mapping[str, Any], role: Mapping[str, Any], principal_id: str
 ) -> dict[str, Any]:
@@ -4554,14 +4870,19 @@ def _bootstrap_self_test_control_from_projections(
     return control
 
 
-def _temporary_role_definition_readback_url(
+def _temporary_role_definition_readback_urls(
     operation_id: str,
     plan: Mapping[str, Any],
-) -> str | None:
+) -> tuple[str, ...]:
+    if operation_id in PACKAGE_ROLE_OPERATIONS:
+        return tuple(
+            "https://management.azure.com"
+            + spec["definitionResourceId"]
+            + "?api-version=2022-04-01"
+            for spec in _stable_package_role_specs(plan)
+        )
     temporary = plan["temporaryAccess"]
     definition_ids = {
-        "addOwnedUploaderPackageRole": temporary["roleDefinitionId"],
-        "removeOwnedUploaderPackageRole": temporary["roleDefinitionId"],
         "addOwnedOperatorKeyReadRole": temporary[
             "temporaryKeyReadRoleDefinitionId"
         ],
@@ -4583,11 +4904,13 @@ def _temporary_role_definition_readback_url(
     }
     definition_id = definition_ids.get(operation_id)
     if definition_id is None:
-        return None
+        return ()
     return (
-        "https://management.azure.com/subscriptions/"
-        f"{SUBSCRIPTION}/providers/Microsoft.Authorization/"
-        f"roleDefinitions/{definition_id}?api-version=2022-04-01"
+        (
+            "https://management.azure.com/subscriptions/"
+            f"{SUBSCRIPTION}/providers/Microsoft.Authorization/"
+            f"roleDefinitions/{definition_id}?api-version=2022-04-01"
+        ),
     )
 
 
@@ -4675,9 +4998,12 @@ def _operation_readback_url(
     }
     if operation_id in temporary_role_operation_ids:
         temporary = plan["temporaryAccess"]
+        if operation_id in PACKAGE_ROLE_OPERATIONS:
+            assignment_resource = next(
+                iter(_temporary_package_assignment_resources(plan).values())
+            )
+            return arm(assignment_resource, "2022-04-01")
         temporary_role_operations = {
-            "addOwnedUploaderPackageRole": (temporary["scope"], temporary["roleAssignmentId"]),
-            "removeOwnedUploaderPackageRole": (temporary["scope"], temporary["roleAssignmentId"]),
             "addOwnedOperatorKeyReadRole": (temporary["temporaryKeyReadScope"], temporary["temporaryKeyReadRoleAssignmentId"]),
             "removeOwnedOperatorKeyReadRole": (temporary["temporaryKeyReadScope"], temporary["temporaryKeyReadRoleAssignmentId"]),
             "addOwnedOperatorFenceBootstrapRole": (temporary["temporaryFenceScope"], temporary["temporaryFenceRoleAssignmentId"]),
@@ -5225,6 +5551,107 @@ def _validate_operation_source_projection(
     resources = {item["id"]: item for item in plan["resourceInventory"]}
     context = dict(operation_context or {})
     facts = dict(runtime_facts or {})
+    if operation_id == "addOwnedUploaderPackageRole":
+        body = _exact_keys(
+            body,
+            {
+                "cleanupKey",
+                "definitionLifecycle",
+                "definitionResourceIds",
+                "assignmentResourceIds",
+                "definitions",
+                "assignments",
+            },
+            "stable package role terminal projection",
+        )
+        specs = _stable_package_role_specs(plan)
+        definitions = _validate_stable_package_role_definitions(
+            context.get("stablePackageRoleDefinitionProjections"), plan
+        )
+        assignments = _exact_keys(
+            body["assignments"],
+            {spec["name"] for spec in specs},
+            "stable package assignment projections",
+        )
+        expected_assignments = _temporary_package_assignment_projections(
+            plan, authorization
+        )
+        if (
+            body["cleanupKey"] != "uploader-package-role"
+            or body["definitionLifecycle"] != "read-only-preserved"
+            or body["definitionResourceIds"]
+            != [spec["definitionResourceId"] for spec in specs]
+            or body["assignmentResourceIds"]
+            != list(_temporary_package_assignment_resources(plan).values())
+            or body["definitions"] != definitions
+            or dict(assignments) != expected_assignments
+        ):
+            fail("stable package role terminal projection is not exact")
+        return projection
+    if operation_id == "removeOwnedUploaderPackageRole":
+        body = _exact_keys(
+            body,
+            {
+                "cleanupKey",
+                "definitionLifecycle",
+                "definitionResourceIds",
+                "assignmentResourceIds",
+                "assignmentRemoved",
+                "assignmentAbsenceProjections",
+                "definitionPreservationProjections",
+                "deletionLock",
+            },
+            "stable package role cleanup projection",
+        )
+        specs = _stable_package_role_specs(plan)
+        definition_resources = {
+            spec["name"]: spec["definitionResourceId"] for spec in specs
+        }
+        assignment_resources = _temporary_package_assignment_resources(plan)
+        definitions = _validate_stable_package_role_definitions(
+            context.get("stablePackageRoleDefinitionProjections"), plan
+        )
+        removals = _exact_keys(
+            body["assignmentRemoved"],
+            set(assignment_resources),
+            "stable package assignment removals",
+        )
+        absences = _exact_keys(
+            body["assignmentAbsenceProjections"],
+            set(assignment_resources),
+            "stable package assignment absences",
+        )
+        preservation = _exact_keys(
+            body["definitionPreservationProjections"],
+            set(definition_resources),
+            "stable package definition preservation",
+        )
+        if (
+            body["cleanupKey"] != "uploader-package-role"
+            or body["definitionLifecycle"] != "read-only-preserved"
+            or body["definitionResourceIds"] != list(definition_resources.values())
+            or body["assignmentResourceIds"] != list(assignment_resources.values())
+            or dict(removals)
+            != {name: True for name in assignment_resources}
+            or dict(absences)
+            != {
+                name: {"resourceId": resource_id, "absent": True}
+                for name, resource_id in assignment_resources.items()
+            }
+            or dict(preservation)
+            != {
+                name: {
+                    "resourceId": definition_resources[name],
+                    "present": True,
+                    "projection": definitions[name],
+                }
+                for name in definition_resources
+            }
+            or body["deletionLock"]
+            != _expected_deletion_lock_proof(operation_id)
+        ):
+            fail("stable package role cleanup projection is not exact")
+        return projection
     if family == "exact-absence":
         expected_absence = {"absent": True}
         if _expected_deletion_lock_proof(operation_id) is not None:
@@ -5675,13 +6102,6 @@ def _validate_operation_source_projection(
             fail("temporary role terminal projection is not exact")
         temporary = plan["temporaryAccess"]
         temp_specs = {
-            "addOwnedUploaderPackageRole": (
-                temporary["roleDefinitionId"],
-                temporary["roleAssignmentId"],
-                "packageContainer",
-                "uploader-package-role",
-                temporary["temporaryPackageDataActions"],
-            ),
             "addOwnedOperatorKeyReadRole": (
                 temporary["temporaryKeyReadRoleDefinitionId"],
                 temporary["temporaryKeyReadRoleAssignmentId"],
@@ -5789,12 +6209,6 @@ def _validate_operation_source_projection(
         )
         temporary = plan["temporaryAccess"]
         cleanup_specs = {
-            "removeOwnedUploaderPackageRole": (
-                temporary["roleDefinitionId"],
-                temporary["roleAssignmentId"],
-                "packageContainer",
-                "uploader-package-role",
-            ),
             "removeOwnedOperatorKeyReadRole": (
                 temporary["temporaryKeyReadRoleDefinitionId"],
                 temporary["temporaryKeyReadRoleAssignmentId"],
@@ -6712,10 +7126,16 @@ def _validate_cleanup_absence_sources(
     }
     validated_temp: dict[str, Mapping[str, Any]] = dict(prior)
     for name, operation_id in operation_by_name.items():
+        status_field = (
+            {"httpStatuses"}
+            if name == "packageUploaderRole"
+            else {"httpStatus"}
+        )
         item = dict(
             _exact_keys(
                 sources[name],
-                {"httpStatus", "present", "sanitizedProjection", "observedAt"},
+                status_field
+                | {"present", "sanitizedProjection", "observedAt"},
                 f"cleanup absence projection {name}",
             )
         )
@@ -6727,8 +7147,13 @@ def _validate_cleanup_absence_sources(
             prior=validated_temp,
             operation_context=operation_contexts.get(operation_id),
         )
-        expected_status = 200 if name == "packageIpv4Rule" else 404
-        if item["httpStatus"] != expected_status or item["present"] is not False:
+        status_exact = (
+            item["httpStatuses"]
+            == {"packageAdd": 404, "packageRead": 404}
+            if name == "packageUploaderRole"
+            else item["httpStatus"] == (200 if name == "packageIpv4Rule" else 404)
+        )
+        if not status_exact or item["present"] is not False:
             fail(f"cleanup absence projection {name} does not prove exact absence")
         _terminal_observed_at(
             item["observedAt"], f"cleanup absence {name} observedAt", authorization
@@ -7834,6 +8259,11 @@ def build_terminal_source_evidence(
         }
         for name, operation_id in cleanup_operations.items()
     }
+    cleanup["packageUploaderRole"].pop("httpStatus")
+    cleanup["packageUploaderRole"]["httpStatuses"] = {
+        "packageAdd": 404,
+        "packageRead": 404,
+    }
 
     worm_mapping = {
         "acceptedReleases": (
@@ -8760,6 +9190,89 @@ def _terminal_temporary_role_component(
     return body
 
 
+def _terminal_stable_package_role_component(
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    add_mutation_id: str,
+    remove_mutation_id: str,
+    cleanup_source: Mapping[str, Any],
+    mutation_journal: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind two temporary assignments and two preserved CustomRole definitions."""
+
+    add_count = _terminal_successful_mutation_count(
+        mutation_journal, add_mutation_id
+    )
+    role_removals = [
+        item
+        for item in mutation_journal
+        if item.get("operationId") == remove_mutation_id
+        and "/providers/microsoft.authorization/locks/"
+        not in str(item.get("targetUrl", "")).lower()
+    ]
+    remove_count = _terminal_successful_mutation_count(
+        role_removals, remove_mutation_id
+    )
+    if add_count != 2 or remove_count != 2:
+        fail("terminal stable package roles lack their exact assignment subcalls")
+    cleanup_projection = cleanup_source.get("sanitizedProjection")
+    cleanup_body = (
+        cleanup_projection.get("projection")
+        if isinstance(cleanup_projection, Mapping)
+        else None
+    )
+    if not isinstance(cleanup_body, Mapping):
+        fail("terminal stable package role cleanup source is absent")
+    assignment_absences = _exact_keys(
+        cleanup_body.get("assignmentAbsenceProjections"),
+        {"packageAdd", "packageRead"},
+        "terminal stable package assignment absences",
+    )
+    definition_preservation = _exact_keys(
+        cleanup_body.get("definitionPreservationProjections"),
+        {"packageAdd", "packageRead"},
+        "terminal stable package definition preservation",
+    )
+    scope_resource_id = _resource_scope_from_plan(
+        plan, PACKAGE_STABLE_ROLE_POLICY["scope"]
+    )
+    roles: dict[str, Any] = {}
+    for spec in _stable_package_role_specs(plan):
+        name = spec["name"]
+        pair = {
+            "assignmentAbsenceProjection": assignment_absences[name],
+            "definitionPreservationProjection": definition_preservation[name],
+        }
+        assignment_id = plan["temporaryAccess"][spec["assignmentIdField"]]
+        roles[name] = {
+            "roleDefinitionId": spec["definitionId"],
+            "roleAssignmentId": assignment_id,
+            "scopeResourceId": scope_resource_id,
+            "principalObjectId": authorization["azure"]["accountObjectId"],
+            "addMutationId": add_mutation_id,
+            "removeMutationId": remove_mutation_id,
+            "createdByAuthorization": True,
+            "removed": True,
+            "presentAfterCleanup": False,
+            "freshReadbackSha256": sha256_bytes(canonical_json_bytes(pair)),
+            "observedAt": cleanup_source["observedAt"],
+            "roleDefinitionCreatedByAuthorization": False,
+            "roleDefinitionRemoved": False,
+            "roleDefinitionPresentAfterCleanup": True,
+        }
+    return {
+        "addMutationId": add_mutation_id,
+        "removeMutationId": remove_mutation_id,
+        "definitionLifecycle": "read-only-preserved",
+        "scopeResourceId": scope_resource_id,
+        "principalObjectId": authorization["azure"]["accountObjectId"],
+        "roles": roles,
+        "freshReadbackSha256": sha256_bytes(canonical_json_bytes(cleanup_source)),
+        "observedAt": cleanup_source["observedAt"],
+    }
+
+
 def build_terminal_receipt_components(
     *,
     plan: Mapping[str, Any],
@@ -8873,11 +9386,9 @@ def build_terminal_receipt_components(
         "observedAt": cleanup_source["packageIpv4Rule"]["observedAt"],
     }
     temporary_access = plan["temporaryAccess"]
-    temporary["packageUploaderRole"] = _terminal_temporary_role_component(
-        definition_id=temporary_access["roleDefinitionId"],
-        assignment_id=temporary_access["roleAssignmentId"],
-        scope_resource_id=resources[temporary_access["scope"]]["resourceId"],
-        principal_id=authorization["azure"]["accountObjectId"],
+    temporary["packageUploaderRole"] = _terminal_stable_package_role_component(
+        plan=plan,
+        authorization=authorization,
         add_mutation_id="addOwnedUploaderPackageRole",
         remove_mutation_id="removeOwnedUploaderPackageRole",
         cleanup_source=cleanup_source["packageUploaderRole"],
@@ -9235,6 +9746,8 @@ def _operation_context_policy(
         observed_fields |= {"uploaderIpv4", "restoreNetworkAcls"}
     elif operation_id in CONTROLLER_ROLE_OPERATIONS:
         observed_fields.add("builtInRoleDefinitionProjection")
+    elif operation_id in PACKAGE_ROLE_OPERATIONS:
+        observed_fields.add("stablePackageRoleDefinitionProjections")
     elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
         observed_fields |= {
             "preAppSettings",
@@ -9481,6 +9994,10 @@ def _validate_operation_context(
 
     if operation_id in CONTROLLER_ROLE_OPERATIONS:
         _validate_controller_builtin_definition(context["builtInRoleDefinitionProjection"])
+    if operation_id in PACKAGE_ROLE_OPERATIONS:
+        _validate_stable_package_role_definitions(
+            context["stablePackageRoleDefinitionProjections"], plan
+        )
 
     if "etag" in required:
         if (
@@ -9554,6 +10071,17 @@ def _validate_operation_context(
             _validate_builtin_role_definition_projections(
                 context["builtInRoleDefinitionProjections"], load_plan()[0]
             )
+            stable_package_definition_ids = {
+                item["definitionId"] for item in PACKAGE_STABLE_ROLE_POLICY["roles"]
+            }
+            if any(
+                member_states.get(definition_id) != "exact"
+                for definition_id in stable_package_definition_ids
+            ):
+                fail(
+                    "stable package role definitions must be present and exact "
+                    "before any bootstrap mutation"
+                )
     return dict(context)
 
 
@@ -9809,7 +10337,7 @@ def validate_preflight_evidence(
                 fail(
                     "package WORM absence is not bound to the exact deleted tombstone"
                 )
-        temporary_definition_url = _temporary_role_definition_readback_url(
+        temporary_definition_urls = _temporary_role_definition_readback_urls(
             operation_id, plan
         )
         if operation_id == "claimAzureSingleUseAuthorization":
@@ -9818,20 +10346,52 @@ def validate_preflight_evidence(
             if (len(lock_probes) != 1 or lock_probes[0]["status"] != 200
                 or lock_probes[0]["responseSha256"] != sha256_bytes(canonical_json_bytes(_expected_cleanup_lock_inventory()))):
                 fail("cleanup deletion locks are not bound to fresh exact preflight")
-        if temporary_definition_url is not None:
+        for temporary_definition_url in temporary_definition_urls:
             definition_probes = [
                 probe_map[item]
                 for item in admission["probeIds"]
                 if probe_map[item]["method"] == "GET"
                 and probe_map[item]["url"] == temporary_definition_url
             ]
-            if (
-                len(definition_probes) != 1
-                or definition_probes[0]["status"] != (200 if operation_id in CONTROLLER_ROLE_OPERATIONS else 404)
-            ):
+            expected_status = (
+                200
+                if operation_id in CONTROLLER_ROLE_OPERATIONS
+                or operation_id in PACKAGE_ROLE_OPERATIONS
+                else 404
+            )
+            if len(definition_probes) != 1 or definition_probes[0]["status"] != expected_status:
                 fail(
-                    "temporary role definition absence is not bound to the fresh preflight"
+                    "temporary or stable role definition state is not bound to the fresh preflight"
                 )
+        if operation_id in PACKAGE_ROLE_OPERATIONS:
+            _validate_stable_package_role_definitions(
+                admission["context"].get(
+                    "stablePackageRoleDefinitionProjections"
+                ),
+                plan,
+            )
+            for assignment_resource in _temporary_package_assignment_resources(
+                plan
+            ).values():
+                assignment_url = (
+                    "https://management.azure.com"
+                    + assignment_resource
+                    + "?api-version=2022-04-01"
+                )
+                assignment_probes = [
+                    probe_map[item]
+                    for item in admission["probeIds"]
+                    if probe_map[item]["method"] == "GET"
+                    and probe_map[item]["url"] == assignment_url
+                ]
+                if (
+                    len(assignment_probes) != 1
+                    or assignment_probes[0]["status"] != 404
+                ):
+                    fail(
+                        "temporary package assignment absence is not bound "
+                        "to the fresh preflight"
+                    )
         if operation_id == "grantPublisherGraphApplicationReadAll":
             graph_resource_probes = [
                 probe_map[item]
@@ -11216,8 +11776,25 @@ class AzureCliBootstrapTransport:
         if not isinstance(envelope, Mapping) or envelope.get("family") != "temporary-role-projection":
             return None
         projection = envelope.get("projection")
-        if not isinstance(projection, Mapping) or not all(
-            isinstance(projection.get(key), Mapping) for key in ("definition", "assignment")
+        if not isinstance(projection, Mapping):
+            return None
+        if operation_id == "addOwnedUploaderPackageRole":
+            if not all(
+                isinstance(projection.get(key), Mapping)
+                for key in ("definitions", "assignments")
+            ):
+                return None
+            return {
+                "definitionSha256": sha256_bytes(
+                    canonical_json_bytes(projection["definitions"])
+                ),
+                "assignmentSha256": sha256_bytes(
+                    canonical_json_bytes(projection["assignments"])
+                ),
+            }
+        if not all(
+            isinstance(projection.get(key), Mapping)
+            for key in ("definition", "assignment")
         ):
             return None
         # Only observed, already validated ARM projections; no planned-role inference.
@@ -12030,8 +12607,21 @@ class AzureCliBootstrapTransport:
                 "controllerLockInventory": inventory,
             }
             family = "controller-lock-empty-after-canary"
+        elif operation_id == "removeOwnedUploaderPackageRole":
+            retained = {
+                key: facts.get(key)
+                for key in (
+                    "cleanupKey",
+                    "definitionLifecycle",
+                    "definitionResourceIds",
+                    "assignmentResourceIds",
+                    "assignmentRemoved",
+                    "assignmentAbsenceProjections",
+                    "definitionPreservationProjections",
+                )
+            }
+            family = "temporary-role-cleanup-absence"
         elif operation_id in {
-            "removeOwnedUploaderPackageRole",
             "removeOwnedOperatorKeyReadRole",
             "removeOwnedOperatorFenceBootstrapRole",
             "removeOwnedOperatorControllerCanaryRole",
@@ -12179,8 +12769,20 @@ class AzureCliBootstrapTransport:
                 "virtualNetworkRules": network_acls.get("virtualNetworkRules"),
             }
             family = "storage-network-acl-redacted-projection"
+        elif operation_id == "addOwnedUploaderPackageRole":
+            retained = {
+                key: facts.get(key)
+                for key in (
+                    "cleanupKey",
+                    "definitionLifecycle",
+                    "definitionResourceIds",
+                    "assignmentResourceIds",
+                    "definitions",
+                    "assignments",
+                )
+            }
+            family = "temporary-role-projection"
         elif operation_id in {
-            "addOwnedUploaderPackageRole",
             "addOwnedOperatorKeyReadRole",
             "addOwnedOperatorFenceBootstrapRole",
             "addOwnedOperatorControllerCanaryRole",
@@ -12508,7 +13110,9 @@ class AzureCliBootstrapTransport:
                 ):
                     fail("custom role-definition inventory is partial")
                 _reject_residual_temporary_role_definitions(
-                    values, label="custom role-definition mutation readback inventory"
+                    values,
+                    label="custom role-definition mutation readback inventory",
+                    plan=self.plan,
                 )
                 expected_definitions = _custom_role_definition_specs(self.plan)
                 relevant: dict[str, Mapping[str, Any]] = {}
@@ -12824,8 +13428,39 @@ class AzureCliBootstrapTransport:
                     != expected_digest
                 ):
                     fail("storage network ACL readback is not exact")
+            elif operation_id == "addOwnedUploaderPackageRole":
+                expected_assignments = _temporary_package_assignment_projections(
+                    self.plan, self.authorization
+                )
+                expected_definitions = _validate_stable_package_role_definitions(
+                    self.admissions[operation_id]["context"].get(
+                        "stablePackageRoleDefinitionProjections"
+                    ),
+                    self.plan,
+                )
+                specs = _stable_package_role_specs(self.plan)
+                observed_assignment = _project_role_assignment(projection_document)
+                if isinstance(properties, Mapping):
+                    observed_assignment["properties"]["description"] = properties.get(
+                        "description"
+                    )
+                if (
+                    runtime_facts is None
+                    or runtime_facts.get("cleanupKey") != "uploader-package-role"
+                    or runtime_facts.get("definitionLifecycle")
+                    != "read-only-preserved"
+                    or runtime_facts.get("definitionResourceIds")
+                    != [spec["definitionResourceId"] for spec in specs]
+                    or runtime_facts.get("assignmentResourceIds")
+                    != list(
+                        _temporary_package_assignment_resources(self.plan).values()
+                    )
+                    or runtime_facts.get("definitions") != expected_definitions
+                    or runtime_facts.get("assignments") != expected_assignments
+                    or observed_assignment != expected_assignments["packageAdd"]
+                ):
+                    fail("stable package assignment readback is not exact")
             elif operation_id in {
-                "addOwnedUploaderPackageRole",
                 "addOwnedOperatorKeyReadRole",
                 "addOwnedOperatorFenceBootstrapRole",
                 "addOwnedOperatorControllerCanaryRole",
@@ -13440,15 +14075,42 @@ class AzureCliBootstrapTransport:
             started + dt.timedelta(seconds=MAX_PACKAGE_READINESS_SECONDS),
         )
         final_request_at = deadline - dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            )
+        )
+        final_request_start_deadline = final_request_at + dt.timedelta(
+            seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
         )
         while attempts < 64:
             now = self.clock()
-            if now < not_before or now > final_request_at:
+            if now < not_before or now > final_request_start_deadline:
                 fail_readiness(
                     "package data-plane readiness authorization or convergence window expired",
                     "expired-before-get" if attempts == 0 else "deadline",
                 )
+            if (
+                now < final_request_at
+                and now
+                + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+                >= final_request_at
+            ):
+                # Preserve the only final transport envelope for a GET that
+                # begins at the exact propagation boundary. A real scheduler
+                # may resume up to one second late, which is already budgeted
+                # before the source-bound authorization/cleanup deadline.
+                self.sleep((final_request_at - now).total_seconds())
+                aligned = self.clock()
+                if (
+                    aligned < final_request_at
+                    or aligned > final_request_start_deadline
+                ):
+                    fail_readiness(
+                        "package readiness scheduler missed its final observation window",
+                        "deadline",
+                    )
+                now = aligned
             attempts += 1
             client_request_id = _new_storage_client_request_id()
             request_started = now
@@ -13549,10 +14211,11 @@ class AzureCliBootstrapTransport:
             wait_started = self.clock()
             if wait_started >= final_request_at:
                 fail_readiness("package data-plane readiness did not converge before its deadline", "deadline")
+            remaining_to_alignment = (final_request_at - wait_started).total_seconds()
             delay = min(
                 float(2 ** min(attempts - 1, 5)),
                 32.0,
-                (final_request_at - wait_started).total_seconds(),
+                remaining_to_alignment,
             )
             self.sleep(delay)
         fail_readiness("package data-plane readiness exceeded bounded attempts", "attempt-limit")
@@ -14220,20 +14883,137 @@ class AzureCliBootstrapTransport:
             self._protected_cleanup_blocked = True
             raise
 
+    def _guarded_assignment_group_delete(
+        self,
+        operation_id: str,
+        authorized_projections: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Delete the exact two package assignments under one lock suspension."""
+
+        if getattr(self, "_protected_cleanup_blocked", False):
+            fail("protected cleanup is NO-GO; fresh authorization is required")
+        if operation_id != "removeOwnedUploaderPackageRole":
+            fail("grouped assignment deletion is outside the package lifecycle")
+        resources = _cleanup_assignment_resources(self.plan).get(operation_id)
+        if not isinstance(resources, tuple) or len(resources) != 2:
+            fail("grouped assignment deletion targets are not source-bound")
+        if (
+            not isinstance(authorized_projections, Sequence)
+            or isinstance(authorized_projections, (str, bytes, bytearray))
+            or len(authorized_projections) != len(resources)
+        ):
+            fail("grouped assignment deletion projections are incomplete")
+        lock_proof = _expected_deletion_lock_proof(operation_id)
+        if lock_proof is None:
+            fail("grouped assignment deletion has no reviewed lock")
+        lock_url = self._arm_url(lock_proof["resourceId"], "2016-09-01")
+        assignment_urls = [self._arm_url(item, "2022-04-01") for item in resources]
+        members: list[dict[str, Any]] = []
+        for resource_id, assignment_url, projection in zip(
+            resources, assignment_urls, authorized_projections
+        ):
+            if not isinstance(projection, Mapping):
+                fail("grouped assignment deletion projection is invalid")
+            expected = {**dict(projection), "id": resource_id}
+
+            def project_assignment(
+                document: Mapping[str, Any], *, expected_id: str = resource_id
+            ) -> Mapping[str, Any]:
+                if str(document.get("id", "")).lower() != expected_id.lower():
+                    fail("guarded assignment group precondition ID drifted")
+                projected = {**_project_role_assignment(document), "id": expected_id}
+                properties = document.get("properties")
+                if not isinstance(properties, Mapping):
+                    fail("guarded assignment group precondition lacks properties")
+                projected["properties"]["description"] = properties.get(
+                    "description"
+                )
+                return projected
+
+            if expected != project_assignment(projection):
+                fail("grouped assignment deletion projection is not canonical")
+            members.append(
+                {
+                    "assignmentUrl": assignment_url,
+                    "expectedAssignmentProjection": expected,
+                    "projectAssignment": project_assignment,
+                }
+            )
+
+        def mutate(method, url, *, body=None, expected, restore=False):
+            allowed = {
+                ("DELETE", lock_url),
+                ("PUT", lock_url),
+                *(("DELETE", url) for url in assignment_urls),
+            }
+            if (method, url) not in allowed:
+                fail("guarded package cleanup attempted an unrelated mutation")
+            if restore and (
+                method != "PUT"
+                or url != lock_url
+                or body
+                != canonical_json_bytes({"properties": lock_proof["properties"]})
+            ):
+                fail("guarded package restoration is not the exact original lock")
+            if not restore:
+                self._require_cleanup_delete_window(operation_id)
+            headers = {"Content-Type": "application/json"} if body is not None else None
+            return self._mutation_request(
+                method,
+                url,
+                body=body,
+                headers=headers,
+                expected=expected,
+                cleanup=restore,
+                deadline=None if restore else self._authorization_expiry(),
+            )
+
+        guard = cleanup_locks.CleanupLockGuard(
+            read_request=self._cleanup_read_request_once,
+            mutate_request=mutate,
+            verify_lock_inventory=self._verify_cleanup_lock_inventory,
+            clock=self.clock,
+            sleep=self.sleep,
+            fail=fail,
+            require_live_authorization=lambda: self._require_cleanup_delete_window(
+                operation_id
+            ),
+            post_delete_read_request=self._cleanup_read_request_after_expiry,
+        )
+        try:
+            result = guard.delete_assignments(
+                operation_id=operation_id,
+                assignments=members,
+            )
+        except BaseException:
+            self._protected_cleanup_blocked = True
+            raise
+        self._last_guarded_assignment_was_present_by_id = dict(
+            guard.assignment_was_present_by_id
+        )
+        return result
+
     def _guarded_assignment_delete_impl(
         self,
         operation_id: str,
         resource_id: str,
         authorized_projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if _cleanup_assignment_resources(self.plan).get(operation_id) != resource_id:
+        if _cleanup_assignment_resources(self.plan).get(operation_id) != (resource_id,):
             fail("guarded assignment deletion target is not source-bound")
         assignment_url = self._arm_url(resource_id, "2022-04-01")
         expected_assignment = {"id": resource_id}
         def project_assignment(document):
             if str(document.get("id", "")).lower() != resource_id.lower():
                 fail("guarded assignment precondition ID drifted")
-            return {**_project_role_assignment(document), "id": resource_id}
+            projected = {**_project_role_assignment(document), "id": resource_id}
+            properties = document.get("properties")
+            if not isinstance(properties, Mapping):
+                fail("guarded assignment precondition lacks properties")
+            projected["properties"]["description"] = properties.get(
+                "description"
+            )
+            return projected
         if operation_id.startswith("removeOwned"):
             expected_assignment = (
                 {**dict(authorized_projection), "id": resource_id}
@@ -14637,6 +15417,10 @@ class AzureCliBootstrapTransport:
 
         if operation_id == "createCustomRoleDefinitions":
             specs = _custom_role_definition_specs(self.plan)
+            stable_package_definition_ids = {
+                item["definitionId"]
+                for item in PACKAGE_STABLE_ROLE_POLICY["roles"]
+            }
             observed: list[dict[str, Any]] = []
             for definition_id in sorted(specs):
                 expected_projection = specs[definition_id]
@@ -14654,6 +15438,10 @@ class AzureCliBootstrapTransport:
                     fail(f"custom role definition precondition failed: {definition_id}")
                 if context["memberStates"][definition_id] != state_name:
                     fail(f"custom role definition drifted after authorization: {definition_id}")
+                if definition_id in stable_package_definition_ids and state_name != "exact":
+                    fail(
+                        "stable package role definition must pre-exist and remain exact"
+                    )
                 if state_name == "absent":
                     response = self._mutation_request(
                         "PUT",
@@ -16078,15 +16866,412 @@ class AzureCliBootstrapTransport:
                 self._protected_cleanup_blocked = True
             raise
 
-    def _mutate_temporary_role_impl(self, operation_id: str, state: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _mutate_stable_package_roles(
+        self, operation_id: str, state: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Create/remove only the two authorization-owned package assignments.
+
+        The writer-add and reader-read definitions are durable role-matrix
+        resources.  Their complete initial projections are authorization-bound,
+        both assignments are proven absent before the first PUT, and both
+        definitions are reread before each PUT.  Definition mutation is never
+        part of this lifecycle.
+        """
+
+        if operation_id not in PACKAGE_ROLE_OPERATIONS:
+            fail("stable package role operation is unknown")
         add = operation_id.startswith("addOwned")
-        if "UploaderPackage" in operation_id:
-            assignment_id = self.plan["temporaryAccess"]["roleAssignmentId"]
-            definition_id = self.plan["temporaryAccess"]["roleDefinitionId"]
-            scope = self._resource_scope("packageContainer")
-            cleanup_key = "uploader-package-role"
-            data_actions = self.plan["temporaryAccess"]["temporaryPackageDataActions"]
-        elif "OperatorKeyRead" in operation_id:
+        cleanup_key = "uploader-package-role"
+        specs = _stable_package_role_specs(self.plan)
+        assignment_resources = _temporary_package_assignment_resources(self.plan)
+        definition_resources = {
+            spec["name"]: spec["definitionResourceId"] for spec in specs
+        }
+        source_definitions = _validate_stable_package_role_definitions(
+            self.admissions[operation_id]["context"].get(
+                "stablePackageRoleDefinitionProjections"
+            ),
+            self.plan,
+        )
+        metadata = _temporary_role_metadata(
+            self.authorization["authorizationId"], cleanup_key
+        )
+        principal_type = (
+            "ServicePrincipal"
+            if self.authorization["azure"]["accountType"] == "servicePrincipal"
+            else "User"
+        )
+        scope = self._resource_scope(PACKAGE_STABLE_ROLE_POLICY["scope"])
+        assignment_bodies: dict[str, dict[str, Any]] = {}
+        expected_assignments: dict[str, dict[str, Any]] = {}
+        for spec in specs:
+            name = spec["name"]
+            resource_id = assignment_resources[name]
+            assignment_id = resource_id.rsplit("/", 1)[-1]
+            definition_resource_id = definition_resources[name]
+            assignment_bodies[name] = {
+                "properties": {
+                    "principalId": self.authorization["azure"]["accountObjectId"],
+                    "principalType": principal_type,
+                    "roleDefinitionId": definition_resource_id,
+                    "description": metadata["assignmentDescription"],
+                }
+            }
+            expected_assignments[name] = {
+                "id": resource_id,
+                "name": assignment_id,
+                "type": "Microsoft.Authorization/roleAssignments",
+                "properties": {
+                    "principalId": self.authorization["azure"]["accountObjectId"],
+                    "principalType": principal_type,
+                    "roleDefinitionId": definition_resource_id,
+                    "scope": scope,
+                    "condition": None,
+                    "conditionVersion": None,
+                    "delegatedManagedIdentityResourceId": None,
+                    "description": metadata["assignmentDescription"],
+                },
+            }
+
+        exact_definitions: dict[str, dict[str, Any]] = {}
+        exact_assignments: dict[str, dict[str, Any]] = {}
+
+        def read_definition(
+            name: str, label: str, *, deadline: dt.datetime | None = None
+        ) -> str:
+            resource_id = definition_resources[name]
+            response = self._read_request_with_transport_retry(
+                "GET",
+                self._arm_url(resource_id, "2022-04-01"),
+                deadline=deadline,
+            )
+            if response.status == 404:
+                return "absent"
+            document = self._json_response(response, {200}, label)
+            projection = _project_role_definition(document)
+            if projection != source_definitions[name]:
+                fail(f"{label} differs from the authorization-bound stable definition")
+            exact_definitions[name] = projection
+            return "exact"
+
+        def read_assignment(
+            name: str, label: str, *, deadline: dt.datetime | None = None
+        ) -> str:
+            resource_id = assignment_resources[name]
+            response = self._read_request_with_transport_retry(
+                "GET",
+                self._arm_url(resource_id, "2022-04-01"),
+                deadline=deadline,
+            )
+            if response.status == 404:
+                return "absent"
+            document = self._json_response(response, {200}, label)
+            properties = document.get("properties")
+            if not isinstance(properties, Mapping):
+                fail(f"{label} lacks exact properties")
+            projection = _project_role_assignment(document)
+            projection["properties"]["description"] = properties.get("description")
+            if projection != expected_assignments[name]:
+                fail(f"{label} is a third state")
+            exact_assignments[name] = projection
+            return "exact"
+
+        if add:
+            self._begin_protected_role_lifecycle(operation_id)
+            details: dict[str, Any] = {
+                "cleanupKey": cleanup_key,
+                "definitionLifecycle": "read-only-preserved",
+                "definitionResourceIds": list(definition_resources.values()),
+                "assignmentResourceIds": list(assignment_resources.values()),
+                "definitions": {},
+                "assignments": {},
+                "assignmentStates": {
+                    spec["name"]: {
+                        "attempted": False,
+                        "created": False,
+                        "readbackExact": False,
+                        "ambiguous": False,
+                    }
+                    for spec in specs
+                },
+            }
+            pending_name: str | None = None
+            try:
+                # Prove every create precondition before either assignment PUT.
+                for spec in specs:
+                    name = spec["name"]
+                    if read_assignment(
+                        name, f"{name} package assignment precondition"
+                    ) != "absent":
+                        fail(
+                            "temporary package assignment already exists; "
+                            "recovery authorization is required"
+                        )
+                for spec in specs:
+                    name = spec["name"]
+                    # Both definitions are reread immediately before each PUT.
+                    for definition_spec in specs:
+                        definition_name = definition_spec["name"]
+                        if read_definition(
+                            definition_name,
+                            f"{name} pre-create stable definition {definition_name}",
+                        ) != "exact":
+                            fail(
+                                "stable package role definition is absent before "
+                                "assignment creation"
+                            )
+                    pending_name = name
+                    details["assignmentStates"][name]["attempted"] = True
+                    response = self._mutation_request(
+                        "PUT",
+                        self._arm_url(assignment_resources[name], "2022-04-01"),
+                        body=canonical_json_bytes(assignment_bodies[name]),
+                        headers={
+                            "Content-Type": "application/json",
+                            "If-None-Match": "*",
+                        },
+                        expected={201},
+                        ambiguous_server_error=True,
+                    )
+                    details["assignmentStates"][name]["created"] = True
+                    pending_name = None
+                    if read_assignment(
+                        name, f"{name} package assignment readback"
+                    ) != "exact":
+                        fail("temporary package assignment readback is not exact")
+                    details["assignmentStates"][name]["readbackExact"] = True
+                for spec in specs:
+                    name = spec["name"]
+                    if read_definition(
+                        name, f"stable definition preservation after package grant {name}"
+                    ) != "exact":
+                        fail("stable package definition disappeared after grant")
+                details["definitions"] = {
+                    name: exact_definitions[name] for name in definition_resources
+                }
+                details["assignments"] = {
+                    name: exact_assignments[name] for name in assignment_resources
+                }
+                return details
+            except BaseException as exc:
+                if isinstance(exc, _MutationOwnershipAmbiguity) and pending_name:
+                    details["assignmentStates"][pending_name]["ambiguous"] = True
+                if any(
+                    member["created"] or member["ambiguous"]
+                    for member in details["assignmentStates"].values()
+                ):
+                    provisional = {
+                        "operationId": operation_id,
+                        "status": "applied-readback-pending",
+                        "owned": True,
+                        "cleanupKey": cleanup_key,
+                        "details": details,
+                    }
+                    raise OwnedTemporaryMutationError(
+                        "stable package assignment mutation stopped after an "
+                        f"owned subcall: {operation_id}: {exc}",
+                        provisional,
+                    ) from exc
+                raise
+
+        add_operation_id = "addOwnedUploaderPackageRole"
+        if getattr(self, "_active_protected_role_add", None) != add_operation_id:
+            fail("protected package role cleanup is not the active lifecycle")
+        add_details = self._proof_detail(state, add_operation_id)
+        if (
+            add_details.get("cleanupKey") != cleanup_key
+            or add_details.get("definitionLifecycle") != "read-only-preserved"
+            or add_details.get("definitionResourceIds")
+            != list(definition_resources.values())
+            or add_details.get("assignmentResourceIds")
+            != list(assignment_resources.values())
+        ):
+            fail("package role cleanup is not bound to its owned add proof")
+        assignment_states = _exact_keys(
+            add_details.get("assignmentStates"),
+            set(assignment_resources),
+            "package assignment ownership states",
+        )
+
+        def settle_ambiguous_assignment(name: str) -> str:
+            previous = self.clock()
+            settlement_boundary = previous + dt.timedelta(
+                seconds=TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            )
+            hard_deadline = self._protected_role_deadline()
+            if (
+                settlement_boundary
+                + dt.timedelta(
+                    seconds=(
+                        FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                    )
+                )
+                > hard_deadline
+            ):
+                fail(
+                    "pending package assignment lacks a full settlement window "
+                    "and final request envelope before cleanup"
+                )
+            for attempt in range(64):
+                before = self.clock()
+                if before < previous or before >= hard_deadline:
+                    fail("pending package assignment settlement clock is invalid")
+                if before > settlement_boundary + dt.timedelta(
+                    seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                ):
+                    fail("pending package assignment settlement clock is invalid")
+                if (
+                    before < settlement_boundary
+                    and before
+                    + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+                    >= settlement_boundary
+                ):
+                    self.sleep((settlement_boundary - before).total_seconds())
+                    aligned = self.clock()
+                    if (
+                        aligned < settlement_boundary
+                        or aligned
+                        > settlement_boundary
+                        + dt.timedelta(
+                            seconds=FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                        )
+                    ):
+                        fail("pending package assignment settlement clock is invalid")
+                    before = aligned
+                final_observation = before >= settlement_boundary
+                request_deadline = (
+                    before
+                    + dt.timedelta(seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS)
+                    if final_observation
+                    else settlement_boundary
+                )
+                if request_deadline > hard_deadline:
+                    fail(
+                        "pending package assignment lacks its final request "
+                        "envelope before cleanup"
+                    )
+                observed = read_assignment(
+                    name,
+                    f"pending {name} package assignment visibility",
+                    deadline=request_deadline,
+                )
+                after = self.clock()
+                if after < before or after >= request_deadline:
+                    fail("pending package assignment settlement crossed its window")
+                if observed == "exact":
+                    return "exact"
+                if final_observation:
+                    return "absent"
+                if after >= settlement_boundary or attempt == 63:
+                    fail("pending package assignment settlement boundary is invalid")
+                self.sleep(min(15, (settlement_boundary - after).total_seconds()))
+                previous = after
+            raise AssertionError("unreachable package assignment settlement loop")
+
+        preconditions: dict[str, str] = {}
+        any_visibility_pending = False
+        for spec in specs:
+            name = spec["name"]
+            member = _exact_keys(
+                assignment_states[name],
+                {"attempted", "created", "readbackExact", "ambiguous"},
+                f"{name} package assignment ownership state",
+            )
+            if any(
+                type(member[field]) is not bool
+                for field in ("attempted", "created", "readbackExact", "ambiguous")
+            ):
+                fail("package assignment ownership state is invalid")
+            if (
+                member["created"] and not member["attempted"]
+                or member["readbackExact"] and not member["created"]
+                or member["ambiguous"] and (
+                    not member["attempted"] or member["created"]
+                )
+            ):
+                fail("package assignment ownership state is contradictory")
+            pending = member["ambiguous"] or (
+                member["created"] and not member["readbackExact"]
+            )
+            any_visibility_pending = any_visibility_pending or pending
+            if member["created"] and not pending:
+                preconditions[name] = "exact"
+            elif pending:
+                preconditions[name] = settle_ambiguous_assignment(name)
+            else:
+                preconditions[name] = read_assignment(
+                    name, f"{name} package assignment cleanup precondition"
+                )
+            if preconditions[name] == "exact" and not (
+                member["created"] or member["ambiguous"]
+            ):
+                fail("unowned package assignment is present; manual recovery is required")
+
+        if any(value == "exact" for value in preconditions.values()):
+            deletion_lock = self._guarded_assignment_group_delete(
+                operation_id,
+                [expected_assignments[name] for name in assignment_resources],
+            )
+            removed_by_id = getattr(
+                self, "_last_guarded_assignment_was_present_by_id", {}
+            )
+        else:
+            expected_lock = _expected_deletion_lock_proof(operation_id)
+            if expected_lock is None:
+                fail("package role cleanup lacks its reviewed deletion lock")
+            self._verify_cleanup_lock_inventory(
+                operation_id,
+                cleanup_locks.applicable_cleanup_lock(operation_id),
+            )
+            deletion_lock = expected_lock
+            removed_by_id = {}
+
+        final_definitions: dict[str, dict[str, Any]] = {}
+        for spec in specs:
+            name = spec["name"]
+            if read_assignment(
+                name, f"{name} package assignment final absence"
+            ) != "absent":
+                fail("temporary package assignment reappeared during cleanup")
+            if read_definition(
+                name, f"{name} stable definition final preservation"
+            ) != "exact":
+                fail("stable package role definition is not preserved")
+            final_definitions[name] = exact_definitions[name]
+        if any_visibility_pending:
+            self._prove_temporary_role_marker_inventories_absent(
+                "pending package assignment cleanup final boundary"
+            )
+        return {
+            "cleanupKey": cleanup_key,
+            "definitionLifecycle": "read-only-preserved",
+            "definitionResourceIds": list(definition_resources.values()),
+            "assignmentResourceIds": list(assignment_resources.values()),
+            "assignmentRemoved": {
+                name: bool(removed_by_id.get(resource_id))
+                for name, resource_id in assignment_resources.items()
+            },
+            "assignmentAbsenceProjections": {
+                name: {"resourceId": resource_id, "absent": True}
+                for name, resource_id in assignment_resources.items()
+            },
+            "definitionPreservationProjections": {
+                name: {
+                    "resourceId": definition_resources[name],
+                    "present": True,
+                    "projection": final_definitions[name],
+                }
+                for name in definition_resources
+            },
+            "deletionLock": deletion_lock,
+        }
+
+    def _mutate_temporary_role_impl(self, operation_id: str, state: Mapping[str, Any]) -> Mapping[str, Any]:
+        if operation_id in PACKAGE_ROLE_OPERATIONS:
+            return self._mutate_stable_package_roles(operation_id, state)
+        add = operation_id.startswith("addOwned")
+        if "OperatorKeyRead" in operation_id:
             assignment_id = self.plan["temporaryAccess"]["temporaryKeyReadRoleAssignmentId"]
             definition_id = self.plan["temporaryAccess"]["temporaryKeyReadRoleDefinitionId"]
             scope = self._resource_scope("signingKey")
@@ -16159,6 +17344,7 @@ class AzureCliBootstrapTransport:
                 "condition": None,
                 "conditionVersion": None,
                 "delegatedManagedIdentityResourceId": None,
+                "description": assignment_body["properties"]["description"],
             },
         }
 
@@ -16200,7 +17386,11 @@ class AzureCliBootstrapTransport:
                     "properties": projection,
                 }
             else:
-                if _project_role_assignment(document) != expected_assignment_projection:
+                core_expected_assignment = copy.deepcopy(
+                    expected_assignment_projection
+                )
+                core_expected_assignment["properties"].pop("description")
+                if _project_role_assignment(document) != core_expected_assignment:
                     fail(f"{label} differs from the source-authorized assignment")
                 if properties.get("description") != expected.get("description"):
                     fail(f"{label} marker differs from the source-authorized assignment")
@@ -16612,8 +17802,6 @@ class AzureCliBootstrapTransport:
                 details["readbackProjections"] = [
                     item["sourceProjection"] for item in readbacks
                 ]
-                if operation["id"] in PROTECTED_ROLE_LIFECYCLES:
-                    self._protected_work_deadline = self._protected_role_deadline()
                 return {
                     "operationId": operation["id"],
                     "status": "verified-exact",
@@ -16662,6 +17850,12 @@ class AzureCliBootstrapTransport:
                 raise
         finally:
             self._active_operation_id = None
+        if operation["id"] in PROTECTED_ROLE_LIFECYCLES:
+            # Creation and every authorization-bound desired readback are exact.
+            # The shorter create-settlement deadline is no longer needed, so
+            # expose the reviewed work window while preserving the full cleanup
+            # reserve. Provisional or failed reads exit above and never expand it.
+            self._protected_work_deadline = self._protected_role_deadline()
         if cleanup_resolved_after_ambiguity:
             cleanup_key = details.get("cleanupKey")
             raise CleanupResolvedMutationError(

@@ -105,9 +105,12 @@ in either file. The executor validates all local source, signature, exact-head
 review, package, plan, authorization, freshness and account boundaries before
 constructing its Azure CLI transport.
 
-The one-shot authorization has a maximum lifetime of 3,900 seconds (65 minutes):
-15 minutes for observation, confirmation and pre-controller setup, followed by
-the unchanged 3,000-second controller admission, readiness and cleanup reserve.
+The one-shot authorization has a maximum lifetime of 4,171 seconds (69 minutes
+31 seconds): 15 minutes for observation, confirmation and pre-controller setup,
+followed by a 3,271-second controller admission, readiness and cleanup reserve.
+The additional 271 seconds covers the second package assignment inside the one
+reviewed deletion-lock suspension and its one-second final-observation scheduler
+alignment allowance; it does not extend either data-plane readiness window.
 The preflight must still be at most five minutes old when apply validates it.
 The executor rejects an already-exhausted setup window before adding the
 temporary uploader firewall rule, and checks it again before controller-role
@@ -126,13 +129,25 @@ cleanup. It then proves the assignment absent and the built-in definition
 unchanged. The built-in definition is never created, deleted, or treated as
 executor-owned, including after an ambiguous assignment response.
 
-This replaces only the temporary controller role. It includes container
+The package upload uses the existing role-matrix custom definitions
+`b5d9d7c7-9367-4ac0-9d41-28b71e0d517d` for blob add and
+`e005b62b-037b-4989-b492-932669ec0842` for blob read. Observation requires both
+full definitions to match the source projection and both authorization-specific
+container assignments to be absent. Apply creates only those two assignments,
+then cleanup removes both under one reviewed package-container lock suspension
+and proves both assignments absent while both definitions remain exact. The
+definitions are persistent role-matrix resources and are never classified as
+temporary, deleted during package cleanup, or treated as owned by the current
+authorization.
+
+The built-in role replaces only the temporary controller role. It includes container
 management and blob add/move permissions beyond the former custom controller
 definition; that complete permission set is source-pinned and must pass review.
-Package upload remains custom create-and-read only, the activation fence remains
+Package upload remains custom add-and-read only, the activation fence remains
 custom read/write without delete, and key read remains separately scoped. The
-seven owned role-resource IDs remain authorization-specific; the provider-owned
-controller definition ID is intentionally shared. An isolated same-account
+seven owned assignment/other temporary-role IDs remain authorization-specific;
+the two package definition IDs and the provider-owned controller definition ID
+are intentionally shared. An isolated same-account
 canary passed upload, exact readback, finite leases and conditional deletion
 with this built-in role. That diagnostic result does not establish the behavior
 of the other roles or authorize a bootstrap, activation, or production deployment.
@@ -299,8 +314,9 @@ run-from-package and the exact versioned package are the activation mechanism.
 Package-upload readiness alone permits an exact-target GET at up to 30 minutes,
 plus its 90-second request envelope, to accommodate the upper propagation
 allowance documented by [Azure Storage](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
-Its exponential backoff caps at 32 seconds and 64 GET attempts. The unchanged
-65-minute authorization and protected cleanup deadline can shorten that window;
+Its exponential backoff caps at 32 seconds and 64 GET attempts. The exact
+4,171-second (69-minute 31-second) authorization and protected cleanup deadline
+can shorten that window;
 the wait never borrows cleanup time. Only exact `BlobNotFound` admits one
 create-only PUT. Other readiness windows remain unchanged. A longer wait does
 not establish propagation as the cause of a denial or guarantee convergence.
@@ -383,9 +399,9 @@ Activation is blocked until all of the following are independently proven:
 - S1 source review, exact resource provisioning, S2 evidence review, sole FIC
   repin to S2, and exact main caller pin;
 - V2 bridge package upload by temporary bounded local authority, exact readback,
-  removal of the owned temporary `/32` firewall rule and exact custom
-  create-new/readback package-role assignment and definition, and proof all are
-  absent before bridge start;
+  removal of the owned temporary `/32` firewall rule and both exact custom-role
+  assignments, proof both assignments are absent, and proof both stable package
+  role definitions remain exact before bridge start;
 - service-endpoint topology, private containers, default-deny Storage firewall,
   exact integration subnet, bridge `allTraffic=true` plus
   `applicationTraffic=true`, and the production routing projection observed as

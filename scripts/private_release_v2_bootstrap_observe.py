@@ -1008,6 +1008,7 @@ def _operation_admission(
     dependency_facts: Mapping[str, Mapping[str, Any]],
     built_in_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
     graph_service_principal_envelope: Mapping[str, Any] | None = None,
+    stable_package_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
 
@@ -1076,6 +1077,23 @@ def _operation_admission(
                 {"executionDecision": "apply-exact"},
             )
         fail(f"{operation_id} preflight returned unsupported status {status}")
+
+    if operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
+        if status != 404:
+            fail(f"temporary package assignment is already present before bootstrap: {operation_id}")
+        definitions = bootstrap._validate_stable_package_role_definitions(
+            stable_package_role_definitions, plan
+        )
+        return (
+            "absent" if operation_id.startswith("add") else "owned-present"
+        ), _policy_checked_context(
+            operation_id,
+            policy,
+            {
+                "executionDecision": "apply-exact",
+                "stablePackageRoleDefinitionProjections": definitions,
+            },
+        )
 
     if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
         if status != 404:
@@ -1476,7 +1494,9 @@ def _operation_admission(
             fail(f"{operation_id} response is partial or paginated")
         if operation_id == "createCustomRoleDefinitions":
             bootstrap._reject_residual_temporary_role_definitions(
-                values, label="preflight custom role-definition inventory"
+                values,
+                label="preflight custom role-definition inventory",
+                plan=plan,
             )
             expected_specs = bootstrap._custom_role_definition_specs(plan)
             expected_by_resource_id = {
@@ -1662,13 +1682,25 @@ def build_read_only_observation(
             method=contract["expectedMethod"], url=contract["expectedUrl"]
         )
         operation_requests[(request.method, request.url)] = request
-        definition_url = bootstrap._temporary_role_definition_readback_url(
+        definition_urls = bootstrap._temporary_role_definition_readback_urls(
             operation["id"], plan
         )
-        if definition_url is not None:
+        for definition_url in definition_urls:
             operation_requests[("GET", definition_url)] = ReadRequest(
                 method="GET", url=definition_url
             )
+        if operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            for assignment_resource in bootstrap._temporary_package_assignment_resources(
+                plan
+            ).values():
+                assignment_url = (
+                    "https://management.azure.com"
+                    + assignment_resource
+                    + "?api-version=2022-04-01"
+                )
+                operation_requests[("GET", assignment_url)] = ReadRequest(
+                    method="GET", url=assignment_url
+                )
     if any(item["id"] == "createCustomRoleDefinitions" for item in azure_operations):
         definition_ids = sorted({
             str(role["definitionId"]) for role in plan["roleMatrix"]
@@ -1704,6 +1736,7 @@ def build_read_only_observation(
         envelope = cache[key]
         built_in_role_definitions: dict[str, Mapping[str, Any]] | None = None
         graph_service_principal_envelope: Mapping[str, Any] | None = None
+        stable_package_role_definitions: dict[str, Mapping[str, Any]] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
         if operation["id"] == "claimAzureSingleUseAuthorization":
             lock_request = ReadRequest(method="GET", url=bootstrap._cleanup_lock_inventory_url())
@@ -1716,12 +1749,14 @@ def build_read_only_observation(
             lock_probe = _preflight_probe("preflight-cleanup-lock-inventory", lock_request, lock_envelope)
             lock_probe["responseSha256"] = bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(lock_projection))
             extra_preflight_probes.append(lock_probe)
-        temporary_definition_url = (
-            bootstrap._temporary_role_definition_readback_url(
-                operation["id"], plan
-            )
+        temporary_definition_urls = bootstrap._temporary_role_definition_readback_urls(
+            operation["id"], plan
         )
-        if temporary_definition_url is not None:
+        if operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            stable_package_role_definitions = {}
+        for definition_index, temporary_definition_url in enumerate(
+            temporary_definition_urls
+        ):
             definition_request = ReadRequest(
                 method="GET", url=temporary_definition_url
             )
@@ -1735,22 +1770,87 @@ def build_read_only_observation(
                 )
             definition_envelope = cache[definition_key]
             controller_builtin = operation["id"] in bootstrap.CONTROLLER_ROLE_OPERATIONS
-            if definition_envelope["status"] != (200 if controller_builtin else 404):
+            stable_package = operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS
+            if definition_envelope["status"] != (
+                200 if controller_builtin or stable_package else 404
+            ):
                 fail(
-                    ("controller built-in definition is not readable: " if controller_builtin else "temporary role definition is already present before bootstrap: ")
+                    (
+                        "preserved role definition is not readable: "
+                        if controller_builtin or stable_package
+                        else "temporary role definition is already present before bootstrap: "
+                    )
                     + operation["id"]
                 )
             if controller_builtin:
                 definition_body = _body_mapping(definition_envelope, "controller built-in definition")
                 built_in_role_definitions = {bootstrap.CONTROLLER_BUILTIN_ROLE_ID:
                     bootstrap._validate_controller_builtin_definition(bootstrap._project_role_definition(definition_body))}
+            elif stable_package:
+                definition_body = _body_mapping(
+                    definition_envelope, "stable package role definition"
+                )
+                definition_projection = bootstrap._project_role_definition(
+                    definition_body
+                )
+                definition_resource_id = temporary_definition_url.removeprefix(
+                    "https://management.azure.com"
+                ).split("?", 1)[0]
+                matching = [
+                    spec
+                    for spec in bootstrap._stable_package_role_specs(plan)
+                    if spec["definitionResourceId"] == definition_resource_id
+                ]
+                if len(matching) != 1:
+                    fail("stable package role definition URL is not source-bound")
+                stable_package_role_definitions[matching[0]["name"]] = (
+                    definition_projection
+                )
             extra_preflight_probes.append(
                 _preflight_probe(
-                    f"preflight-{index:02d}-temporary-definition",
+                    f"preflight-{index:02d}-temporary-definition-{definition_index}",
                     definition_request,
                     definition_envelope,
                 )
             )
+        if operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            stable_package_role_definitions = (
+                bootstrap._validate_stable_package_role_definitions(
+                    stable_package_role_definitions, plan
+                )
+            )
+            primary_assignment_url = request.url
+            for assignment_index, assignment_resource in enumerate(
+                bootstrap._temporary_package_assignment_resources(plan).values()
+            ):
+                assignment_url = (
+                    "https://management.azure.com"
+                    + assignment_resource
+                    + "?api-version=2022-04-01"
+                )
+                assignment_request = ReadRequest(method="GET", url=assignment_url)
+                assignment_key = (
+                    assignment_request.method,
+                    assignment_request.url,
+                )
+                if assignment_key not in cache:
+                    cache[assignment_key] = _normalize_response(
+                        assignment_request, session.read(assignment_request)
+                    )
+                assignment_envelope = cache[assignment_key]
+                if assignment_envelope["status"] != 404:
+                    fail(
+                        "temporary package assignment is already present before bootstrap: "
+                        + operation["id"]
+                    )
+                if assignment_url != primary_assignment_url:
+                    extra_preflight_probes.append(
+                        _preflight_probe(
+                            f"preflight-{index:02d}-package-assignment-{assignment_index}",
+                            assignment_request,
+                            assignment_envelope,
+                        )
+                    )
         if operation["id"] == "createCustomRoleDefinitions":
             built_in_role_definitions = {}
             definition_ids = sorted(
@@ -1817,6 +1917,7 @@ def build_read_only_observation(
             dependency_facts,
             built_in_role_definitions,
             graph_service_principal_envelope,
+            stable_package_role_definitions,
         )
         pre_id = f"preflight-{index:02d}"
         read_id = f"readback-{index:02d}"

@@ -14,8 +14,8 @@ from tests.test_private_release_v2_package_readiness import MemoryJournal
 
 
 TEMPORARY = (
-    "removeOwnedUploaderPackageRole", "removeOwnedOperatorKeyReadRole",
-    "removeOwnedOperatorFenceBootstrapRole", "removeOwnedOperatorControllerCanaryRole",
+    "removeOwnedOperatorKeyReadRole", "removeOwnedOperatorFenceBootstrapRole",
+    "removeOwnedOperatorControllerCanaryRole", "removeOwnedUploaderPackageRole",
 )
 LEGACY = (
     "removeLegacyWriterResultAssignment", "removeLegacyReaderResultAssignment",
@@ -108,6 +108,112 @@ class CleanupSession:
         return [(method, url) for method, url, _ in self.requests if method != "GET"]
 
 
+class PackageCleanupSession(CleanupSession):
+    def __init__(self, assignments, definitions):
+        super().__init__(assignments["packageAdd"], definitions["packageAdd"])
+        self.assignments = copy.deepcopy(assignments)
+        self.definitions = copy.deepcopy(definitions)
+        self.assignment_urls = {
+            name: self.arm(item["id"], "2022-04-01")
+            for name, item in self.assignments.items()
+        }
+        self.definition_urls = {
+            name: self.arm(item["id"], "2022-04-01")
+            for name, item in self.definitions.items()
+        }
+
+    def request(self, method, url, *, body=None, headers=None, deadline=None):
+        self.requests.append((method, url, body))
+        if method == "GET" and url == bootstrap._cleanup_lock_inventory_url():
+            return response(200, {"value": list(self.locks.values())})
+        if url in self.original_locks:
+            if method == "GET":
+                return response(200, self.locks[url]) if url in self.locks else response(404)
+            if method == "DELETE":
+                self.locks.pop(url, None)
+                return response(204)
+            if method == "PUT":
+                expected = bootstrap.canonical_json_bytes(
+                    {"properties": self.original_locks[url]["properties"]}
+                )
+                if body != expected:
+                    raise AssertionError("non-exact restoration body")
+                self.locks[url] = copy.deepcopy(self.original_locks[url])
+                return response(200, self.locks[url])
+        for name, assignment_url in self.assignment_urls.items():
+            if url == assignment_url:
+                if method == "GET":
+                    item = self.assignments.get(name)
+                    return response(200, item) if item is not None else response(404)
+                if method == "DELETE":
+                    self.assignments[name] = None
+                    return response(204)
+        for name, definition_url in self.definition_urls.items():
+            if url == definition_url:
+                if method == "GET":
+                    return response(200, self.definitions[name])
+                raise AssertionError("stable package definition must never be mutated")
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+
+class PackageAddSession:
+    def __init__(self, assignments, definitions, *, ambiguous_member=None):
+        self.expected_assignments = copy.deepcopy(assignments)
+        self.assignments = {name: None for name in assignments}
+        self.definitions = copy.deepcopy(definitions)
+        self.assignment_urls = {
+            name: CleanupSession.arm(item["id"], "2022-04-01")
+            for name, item in assignments.items()
+        }
+        self.definition_urls = {
+            name: CleanupSession.arm(item["id"], "2022-04-01")
+            for name, item in definitions.items()
+        }
+        self.ambiguous_member = ambiguous_member
+        self.requests = []
+        self.put_headers = {}
+
+    def request(self, method, url, *, body=None, headers=None, deadline=None):
+        self.requests.append((method, url, body))
+        for name, definition_url in self.definition_urls.items():
+            if url == definition_url:
+                if method != "GET":
+                    raise AssertionError("stable package definition must never be mutated")
+                return response(200, self.definitions[name])
+        for name, assignment_url in self.assignment_urls.items():
+            if url != assignment_url:
+                continue
+            if method == "GET":
+                item = self.assignments[name]
+                return response(200, item) if item is not None else response(404)
+            if method == "PUT":
+                expected = self.expected_assignments[name]
+                expected_body = bootstrap.canonical_json_bytes(
+                    {
+                        "properties": {
+                            key: expected["properties"][key]
+                            for key in (
+                                "principalId",
+                                "principalType",
+                                "roleDefinitionId",
+                                "description",
+                            )
+                        }
+                    }
+                )
+                if body != expected_body:
+                    raise AssertionError("package assignment PUT body is not exact")
+                self.put_headers[name] = dict(headers or {})
+                self.assignments[name] = copy.deepcopy(expected)
+                if name == self.ambiguous_member:
+                    return response(500)
+                return response(201)
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    def mutations(self):
+        return [(method, url) for method, url, _ in self.requests if method != "GET"]
+
+
 class CleanupTransportTests(unittest.TestCase):
     def make(self, operation_id):
         plan, plan_sha = bootstrap.load_plan()
@@ -118,18 +224,37 @@ class CleanupTransportTests(unittest.TestCase):
         if operation_id in TEMPORARY:
             added = operation_id.replace("remove", "add", 1)
             role = fixture.temp_role(added)
-            session = CleanupSession(role["assignment"], role["definition"])
-            state["proofs"][added] = {
-                "details": {
-                    "cleanupKey": role["cleanupKey"],
-                    "definitionCreated": role["definitionCreated"],
-                    "definitionReadbackExact": True,
-                    "assignmentCreated": True,
-                    "assignmentReadbackExact": True,
+            if operation_id == "removeOwnedUploaderPackageRole":
+                session = PackageCleanupSession(
+                    role["assignments"], role["definitions"]
+                )
+                state["proofs"][added] = {
+                    "details": {
+                        **copy.deepcopy(role),
+                        "assignmentStates": {
+                            name: {
+                                "attempted": True,
+                                "created": True,
+                                "readbackExact": True,
+                                "ambiguous": False,
+                            }
+                            for name in role["assignments"]
+                        },
+                    }
                 }
-            }
+            else:
+                session = CleanupSession(role["assignment"], role["definition"])
+                state["proofs"][added] = {
+                    "details": {
+                        "cleanupKey": role["cleanupKey"],
+                        "definitionCreated": role["definitionCreated"],
+                        "definitionReadbackExact": True,
+                        "assignmentCreated": True,
+                        "assignmentReadbackExact": True,
+                    }
+                }
         else:
-            resource_id = bootstrap._cleanup_assignment_resources(plan)[operation_id]
+            resource_id = bootstrap._cleanup_assignment_resources(plan)[operation_id][0]
             assignment = {"id": resource_id, "name": resource_id.rsplit("/", 1)[-1],
                 "type": "Microsoft.Authorization/roleAssignments", "properties": {
                     "principalId": ACCOUNT_OBJECT, "principalType": "User",
@@ -139,9 +264,19 @@ class CleanupTransportTests(unittest.TestCase):
                     "delegatedManagedIdentityResourceId": None,
                 }}
             session = CleanupSession(assignment)
-        probe = {"id": "authorized-assignment", "method": "GET", "url": session.assignment_url,
+        probe_assignment = (
+            session.assignments["packageAdd"]
+            if isinstance(session, PackageCleanupSession)
+            else session.assignment
+        )
+        probe_url = (
+            session.assignment_urls["packageAdd"]
+            if isinstance(session, PackageCleanupSession)
+            else session.assignment_url
+        )
+        probe = {"id": "authorized-assignment", "method": "GET", "url": probe_url,
             "status": 200, "responseSha256": bootstrap._preflight_response_sha256(
-                "GET", session.assignment_url, response(200, session.assignment))}
+                "GET", probe_url, response(200, probe_assignment))}
         current = [NOW]
         sleeps = []
         def sleep(seconds):
@@ -155,6 +290,10 @@ class CleanupTransportTests(unittest.TestCase):
             session=session, clock=lambda: current[0], sleep=sleep)
         if operation_id in bootstrap.CONTROLLER_ROLE_OPERATIONS:
             transport.admissions[operation_id]["context"]["builtInRoleDefinitionProjection"] = copy.deepcopy(role["definition"])
+        if operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
+            transport.admissions[operation_id]["context"][
+                "stablePackageRoleDefinitionProjections"
+            ] = copy.deepcopy(role["definitions"])
         transport._active_operation_id = operation_id
         if operation_id in TEMPORARY:
             transport._active_protected_role_add = operation_id.replace(
@@ -166,14 +305,253 @@ class CleanupTransportTests(unittest.TestCase):
         operation = next(item for item in plan["mutations"] if item["id"] == operation_id)
         return transport, session, journal, operation, state, current, sleeps
 
+    def make_package_add(self, *, ambiguous_member=None):
+        plan, plan_sha = bootstrap.load_plan()
+        fixture = _TerminalEvidenceFixture(
+            plan,
+            plan_sha,
+            {"sha256": "a" * 64, "size": 4096},
+            Path(__file__).resolve().parents[2]
+            / ("paperdesk-private-release-v2-bootstrap-" + AUTH_ID),
+        )
+        role = fixture.temp_role("addOwnedUploaderPackageRole")
+        session = PackageAddSession(
+            role["assignments"],
+            role["definitions"],
+            ambiguous_member=ambiguous_member,
+        )
+        transport = bootstrap.AzureCliBootstrapTransport(
+            authorization=fixture.authorization,
+            plan=plan,
+            package=fixture.package,
+            preflight={"projection": fixture.projection},
+            session=session,
+            clock=lambda: NOW,
+            sleep=lambda _seconds: None,
+        )
+        journal = MemoryJournal()
+        transport.bind_journal(journal)
+        transport._active_operation_id = "addOwnedUploaderPackageRole"
+        return transport, session, journal, role
+
+    def test_package_add_creates_both_exact_assignments_and_preserves_definitions(self):
+        transport, session, journal, role = self.make_package_add()
+        result = transport._mutate_temporary_role_impl(
+            "addOwnedUploaderPackageRole", {}
+        )
+        self.assertEqual(result["definitions"], role["definitions"])
+        self.assertEqual(result["assignments"], role["assignments"])
+        self.assertEqual(
+            [url for method, url in session.mutations() if method == "PUT"],
+            [
+                session.assignment_urls["packageAdd"],
+                session.assignment_urls["packageRead"],
+            ],
+        )
+        self.assertFalse(
+            any(
+                method != "GET" and url in session.definition_urls.values()
+                for method, url, _ in session.requests
+            )
+        )
+        for name in ("packageAdd", "packageRead"):
+            self.assertEqual(
+                session.put_headers[name],
+                {"Content-Type": "application/json", "If-None-Match": "*"},
+            )
+            self.assertEqual(
+                result["assignmentStates"][name],
+                {
+                    "attempted": True,
+                    "created": True,
+                    "readbackExact": True,
+                    "ambiguous": False,
+                },
+            )
+        self.assertEqual(
+            [item["phase"] for item in journal.records],
+            ["intent", "result", "intent", "result"],
+        )
+
+    def test_package_add_partial_and_ambiguous_states_fail_closed(self):
+        for member in ("packageAdd", "packageRead"):
+            with self.subTest(member=member):
+                transport, session, _journal, _role = self.make_package_add(
+                    ambiguous_member=member
+                )
+                with self.assertRaises(
+                    bootstrap.OwnedTemporaryMutationError
+                ) as raised:
+                    transport._mutate_temporary_role_impl(
+                        "addOwnedUploaderPackageRole", {}
+                    )
+                states = raised.exception.proof["details"]["assignmentStates"]
+                self.assertTrue(states[member]["attempted"])
+                self.assertFalse(states[member]["created"])
+                self.assertTrue(states[member]["ambiguous"])
+                if member == "packageRead":
+                    self.assertTrue(states["packageAdd"]["readbackExact"])
+                else:
+                    self.assertFalse(states["packageRead"]["attempted"])
+                self.assertFalse(
+                    any(
+                        method != "GET" and url in session.definition_urls.values()
+                        for method, url, _ in session.requests
+                    )
+                )
+
+    def test_successful_package_add_expands_deadline_only_after_desired_readback(self):
+        transport, _session, _journal, _role = self.make_package_add()
+        operation = next(
+            item
+            for item in transport.plan["mutations"]
+            if item["id"] == "addOwnedUploaderPackageRole"
+        )
+        settlement_deadline = transport._protected_role_deadline(
+            bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+            + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+            + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+        )
+        full_work_deadline = transport._protected_role_deadline()
+        self.assertGreater(full_work_deadline, settlement_deadline)
+        result = transport.apply_operation(operation, {"proofs": {}})
+        self.assertEqual(result["status"], "applied-exact")
+        self.assertEqual(transport._protected_work_deadline, full_work_deadline)
+        self.assertTrue(result["details"]["readbackProjections"])
+
+    def test_failed_package_add_never_expands_create_settlement_deadline(self):
+        operation_id = "addOwnedUploaderPackageRole"
+        for failure in ("ambiguous-put", "desired-readback"):
+            with self.subTest(failure=failure):
+                transport, _session, _journal, _role = self.make_package_add(
+                    ambiguous_member=("packageRead" if failure == "ambiguous-put" else None)
+                )
+                operation = next(
+                    item
+                    for item in transport.plan["mutations"]
+                    if item["id"] == operation_id
+                )
+                settlement_deadline = transport._protected_role_deadline(
+                    bootstrap.TEMPORARY_ROLE_CREATE_SETTLEMENT_SECONDS
+                    + bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
+                    + bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+                if failure == "desired-readback":
+                    prove = mock.patch.object(
+                        transport,
+                        "_prove_probe_ids",
+                        side_effect=bootstrap.BootstrapError(
+                            "desired readback failed"
+                        ),
+                    )
+                else:
+                    prove = mock.patch.object(
+                        transport,
+                        "_prove_probe_ids",
+                        wraps=transport._prove_probe_ids,
+                    )
+                with prove:
+                    with self.assertRaises(bootstrap.OwnedTemporaryMutationError):
+                        transport.apply_operation(operation, {"proofs": {}})
+                self.assertEqual(
+                    transport._protected_work_deadline,
+                    settlement_deadline,
+                )
+                self.assertNotEqual(
+                    transport._protected_work_deadline,
+                    transport._protected_role_deadline(),
+                )
+
+    def test_stable_package_definitions_have_zero_mutation_authority(self):
+        plan, plan_sha = bootstrap.load_plan()
+        fixture = _TerminalEvidenceFixture(
+            plan,
+            plan_sha,
+            {"sha256": "a" * 64, "size": 4096},
+            Path(__file__).resolve().parents[2]
+            / ("paperdesk-private-release-v2-bootstrap-" + AUTH_ID),
+        )
+        for spec in bootstrap._stable_package_role_specs(fixture.execution_plan):
+            url = CleanupSession.arm(spec["definitionResourceId"], "2022-04-01")
+            for operation_id in (
+                "createCustomRoleDefinitions",
+                "addOwnedUploaderPackageRole",
+                "removeOwnedUploaderPackageRole",
+            ):
+                for method in ("PUT", "DELETE"):
+                    with self.subTest(
+                        definition=spec["name"],
+                        operation=operation_id,
+                        method=method,
+                    ):
+                        self.assertFalse(
+                            bootstrap._mutation_target_allowed(
+                                operation_id,
+                                method,
+                                url,
+                                plan=plan,
+                                authorization_id=AUTH_ID,
+                                source_sha=fixture.authorization["source"][
+                                    "mergedMain"
+                                ]["commitSha"],
+                                operation_projections={},
+                                operation_contexts=fixture.contexts,
+                            )
+                        )
+
+    def test_legacy_per_authorization_package_ids_remain_residuals(self):
+        plan, _ = bootstrap.load_plan()
+        execution_plan = bootstrap.bind_temporary_role_ids(plan, AUTH_ID)
+        temporary = execution_plan["temporaryAccess"]
+        scope = bootstrap._resource_scope_from_plan(plan, "packageContainer")
+        definition_id = temporary["legacyPackageRoleDefinitionId"]
+        assignment_id = temporary["legacyPackageRoleAssignmentId"]
+        definition = {
+            "id": (
+                f"/subscriptions/{bootstrap.SUBSCRIPTION}/providers/"
+                f"Microsoft.Authorization/roleDefinitions/{definition_id}"
+            ),
+            "properties": {"roleName": "marker removed", "description": None},
+        }
+        assignment = {
+            "id": (
+                f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+                f"{assignment_id}"
+            ),
+            "properties": {
+                "description": None,
+                "roleDefinitionId": definition["id"],
+            },
+        }
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "residual PaperDesk temporary role definition"
+        ):
+            bootstrap._reject_residual_temporary_role_definitions(
+                [definition], label="legacy definition", plan=execution_plan
+            )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "residual PaperDesk temporary role assignment"
+        ):
+            bootstrap._reject_residual_temporary_role_assignments(
+                [assignment], plan=execution_plan, label="legacy assignment"
+            )
+
     def test_all_four_temporary_roles_use_exact_guarded_mutation_order(self):
         for operation_id in TEMPORARY:
             with self.subTest(operation=operation_id):
                 transport, session, journal, operation, state, _, _ = self.make(operation_id)
                 result = transport._mutate(operation, state)
                 lock = session.arm(bootstrap._expected_deletion_lock_proof(operation_id)["resourceId"], "2016-09-01")
-                expected_mutations = [("DELETE", lock), ("DELETE", session.assignment_url), ("PUT", lock)]
-                if operation_id not in bootstrap.CONTROLLER_ROLE_OPERATIONS:
+                if operation_id == "removeOwnedUploaderPackageRole":
+                    expected_mutations = [
+                        ("DELETE", lock),
+                        ("DELETE", session.assignment_urls["packageAdd"]),
+                        ("DELETE", session.assignment_urls["packageRead"]),
+                        ("PUT", lock),
+                    ]
+                else:
+                    expected_mutations = [("DELETE", lock), ("DELETE", session.assignment_url), ("PUT", lock)]
+                if operation_id not in bootstrap.CONTROLLER_ROLE_OPERATIONS | bootstrap.PACKAGE_ROLE_OPERATIONS:
                     expected_mutations.append(("DELETE", session.definition_url))
                 self.assertEqual(session.mutations(), expected_mutations)
                 self.assertEqual(result["deletionLock"], bootstrap._expected_deletion_lock_proof(operation_id))
@@ -257,17 +635,33 @@ class CleanupTransportTests(unittest.TestCase):
             "condition": "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEqualsIgnoreCase temporary",
             "conditionVersion": "2.0",
             "delegatedManagedIdentityResourceId": "/subscriptions/another/managedIdentity",
+            "description": "not-the-authorization-owned-marker",
         }
         for operation_id in TEMPORARY:
             for field, changed_value in changes.items():
-                with self.subTest(operation=operation_id, field=field):
-                    transport, session, journal, operation, state, _, _ = self.make(operation_id)
-                    session.assignment["properties"][field] = changed_value
-                    with self.assertRaisesRegex(bootstrap.BootstrapError, "source-authorized assignment"):
-                        transport._mutate(operation, state)
-                    self.assertEqual(session.mutations(), [])
-                    self.assertEqual(journal.records, [])
-                    self.assertEqual(session.locks, session.original_locks)
+                member_names = (
+                    ("packageAdd", "packageRead")
+                    if operation_id == "removeOwnedUploaderPackageRole"
+                    else (None,)
+                )
+                for member_name in member_names:
+                    with self.subTest(
+                        operation=operation_id,
+                        member=member_name,
+                        field=field,
+                    ):
+                        transport, session, journal, operation, state, _, _ = self.make(operation_id)
+                        assignment = (
+                            session.assignments[member_name]
+                            if member_name is not None
+                            else session.assignment
+                        )
+                        assignment["properties"][field] = changed_value
+                        with self.assertRaisesRegex(bootstrap.BootstrapError, "source-authorized assignment"):
+                            transport._mutate(operation, state)
+                        self.assertEqual(session.mutations(), [])
+                        self.assertEqual(journal.records, [])
+                        self.assertEqual(session.locks, session.original_locks)
 
     def test_cleanup_readback_failure_latches_compensation_without_more_http(self):
         for failure in (bootstrap.BootstrapError("post-cleanup readback failure"), KeyboardInterrupt()):

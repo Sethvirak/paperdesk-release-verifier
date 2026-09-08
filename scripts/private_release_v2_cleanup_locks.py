@@ -154,6 +154,7 @@ class CleanupLockGuard:
         self.fail = fail
         self.require_live_authorization = require_live_authorization
         self.assignment_was_present: bool | None = None
+        self.assignment_was_present_by_id: dict[str, bool] = {}
 
     def _now(self) -> dt.datetime:
         value = self.clock()
@@ -321,49 +322,119 @@ class CleanupLockGuard:
         expected_assignment_projection: Mapping[str, Any],
         project_assignment: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     ) -> dict[str, Any]:
+        return self.delete_assignments(
+            operation_id=operation_id,
+            assignments=[
+                {
+                    "assignmentUrl": assignment_url,
+                    "expectedAssignmentProjection": expected_assignment_projection,
+                    "projectAssignment": project_assignment,
+                }
+            ],
+        )
+
+    def delete_assignments(
+        self,
+        *,
+        operation_id: str,
+        assignments: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Suspend one reviewed lock around one exact assignment group.
+
+        Only the package uploader cleanup is a two-assignment group. Every
+        member is read and validated before suspension, reread after suspension,
+        deleted at most once in source order, and proven absent before the one
+        exact lock restoration.
+        """
+
         lock_key = applicable_cleanup_lock(operation_id)
         if lock_key is None:
             _reject(self.fail, "assignment cleanup has no reviewed deletion-protection lock")
+        expected_count = 2 if operation_id == "removeOwnedUploaderPackageRole" else 1
+        if not isinstance(assignments, list) or len(assignments) != expected_count:
+            _reject(self.fail, "assignment cleanup group cardinality is not reviewed")
         spec = copy.deepcopy(REVIEWED_CLEANUP_LOCKS[lock_key])
         lock_url = ARM_ROOT + spec["resourceId"] + "?api-version=" + LOCK_API_VERSION
-        expected = copy.deepcopy(dict(expected_assignment_projection))
-        assignment_id = expected.get("id")
-        parsed = urllib.parse.urlsplit(assignment_url)
         scope = spec["resourceId"].rsplit("/providers/Microsoft.Authorization/locks/", 1)[0]
-        if (
-            not isinstance(assignment_id, str)
-            or not assignment_id.lower().startswith(scope.lower() + "/")
-            or "/providers/microsoft.authorization/roleassignments/" not in assignment_id.lower()
-            or parsed.scheme != "https"
-            or parsed.netloc != "management.azure.com"
-            or parsed.path != assignment_id
-            or parsed.query != "api-version=2022-04-01"
-            or parsed.fragment
-        ):
-            _reject(self.fail, "assignment cleanup URL is outside its exact reviewed lock scope")
+        normalized: list[dict[str, Any]] = []
+        for member in assignments:
+            if not isinstance(member, Mapping) or set(member) != {
+                "assignmentUrl",
+                "expectedAssignmentProjection",
+                "projectAssignment",
+            }:
+                _reject(self.fail, "assignment cleanup group member is invalid")
+            assignment_url = member["assignmentUrl"]
+            expected_raw = member["expectedAssignmentProjection"]
+            project_assignment = member["projectAssignment"]
+            if (
+                not isinstance(assignment_url, str)
+                or not isinstance(expected_raw, Mapping)
+                or not callable(project_assignment)
+            ):
+                _reject(self.fail, "assignment cleanup group member is invalid")
+            expected = copy.deepcopy(dict(expected_raw))
+            assignment_id = expected.get("id")
+            parsed = urllib.parse.urlsplit(assignment_url)
+            if (
+                not isinstance(assignment_id, str)
+                or not assignment_id.lower().startswith(scope.lower() + "/")
+                or "/providers/microsoft.authorization/roleassignments/" not in assignment_id.lower()
+                or parsed.scheme != "https"
+                or parsed.netloc != "management.azure.com"
+                or parsed.path != assignment_id
+                or parsed.query != "api-version=2022-04-01"
+                or parsed.fragment
+            ):
+                _reject(self.fail, "assignment cleanup URL is outside its exact reviewed lock scope")
 
-        def validate_assignment(document: Mapping[str, Any]) -> None:
-            if project_assignment(document) != expected:
-                _reject(
-                    self.fail,
-                    "temporary assignment drifted: changed assignment no longer matches the source-authorized assignment",
-                )
+            def validate_assignment(
+                document: Mapping[str, Any],
+                *,
+                expected_projection: Mapping[str, Any] = expected,
+                projector: Callable[[Mapping[str, Any]], Mapping[str, Any]] = project_assignment,
+            ) -> None:
+                if projector(document) != expected_projection:
+                    _reject(
+                        self.fail,
+                        "temporary assignment drifted: changed assignment no longer matches the source-authorized assignment",
+                    )
+
+            normalized.append(
+                {
+                    "assignmentUrl": assignment_url,
+                    "assignmentId": assignment_id,
+                    "validate": validate_assignment,
+                }
+            )
+        if len({item["assignmentUrl"] for item in normalized}) != len(normalized):
+            _reject(self.fail, "assignment cleanup group contains a duplicate target")
 
         self.verify_lock_inventory(operation_id, lock_key)
         validate_lock = lambda document: validate_lock_document(document, spec, self.fail)
         if self._read_state(lock_url, validate_lock, "cleanup lock precondition") != "exact":
             _reject(self.fail, "reviewed cleanup lock is absent before suspension")
-        initial = self._read_state(
-            assignment_url, validate_assignment, "assignment cleanup precondition"
+        initial: dict[str, str] = {}
+        for member in normalized:
+            initial[member["assignmentId"]] = self._read_state(
+                member["assignmentUrl"],
+                member["validate"],
+                "assignment cleanup precondition",
+            )
+        self.assignment_was_present = any(
+            state == "exact" for state in initial.values()
         )
-        self.assignment_was_present = initial == "exact"
+        self.assignment_was_present_by_id = {
+            assignment_id: state == "exact"
+            for assignment_id, state in initial.items()
+        }
         proof = {
             "resourceId": spec["resourceId"],
             "properties": copy.deepcopy(spec["properties"]),
             "restored": True,
             "assignmentAbsent": True,
         }
-        if initial == "absent":
+        if all(state == "absent" for state in initial.values()):
             return proof
 
         self.require_live_authorization()
@@ -378,20 +449,48 @@ class CleanupLockGuard:
                 LOCK_CONVERGENCE_SECONDS,
                 final_observation_seconds=LOCK_FINAL_OBSERVATION_SECONDS,
             )
-            if self._read_state(
-                assignment_url, validate_assignment, "assignment cleanup suspended precondition"
-            ) != "exact":
-                _reject(self.fail, "assignment disappeared after cleanup lock suspension")
-            self.require_live_authorization()
-            self.mutate_request(
-                "DELETE", assignment_url, body=None, expected={200, 202, 204}, restore=False
-            )
-            self._poll_state(
-                assignment_url, "absent", validate_assignment, "assignment cleanup absence",
-                ASSIGNMENT_ABSENCE_SECONDS,
-                read_request=self.post_delete_read_request,
-                final_observation_seconds=LOCK_FINAL_OBSERVATION_SECONDS,
-            )
+            for member in normalized:
+                observed = self._read_state(
+                    member["assignmentUrl"],
+                    member["validate"],
+                    "assignment cleanup suspended precondition",
+                )
+                if observed != initial[member["assignmentId"]]:
+                    _reject(
+                        self.fail,
+                        (
+                            "assignment disappeared after cleanup lock suspension"
+                            if len(normalized) == 1
+                            and initial[member["assignmentId"]] == "exact"
+                            and observed == "absent"
+                            else "assignment group changed after cleanup lock suspension"
+                        ),
+                    )
+            for member in normalized:
+                if initial[member["assignmentId"]] == "absent":
+                    continue
+                self.require_live_authorization()
+                self.mutate_request(
+                    "DELETE",
+                    member["assignmentUrl"],
+                    body=None,
+                    expected={200, 202, 204},
+                    restore=False,
+                )
+            # Both authorization-requiring DELETEs are issued before either
+            # potentially long, read-only Azure RBAC absence convergence loop.
+            for member in normalized:
+                if initial[member["assignmentId"]] == "absent":
+                    continue
+                self._poll_state(
+                    member["assignmentUrl"],
+                    "absent",
+                    member["validate"],
+                    "assignment cleanup absence",
+                    ASSIGNMENT_ABSENCE_SECONDS,
+                    read_request=self.post_delete_read_request,
+                    final_observation_seconds=LOCK_FINAL_OBSERVATION_SECONDS,
+                )
         finally:
             self._restore_lock(lock_url, spec)
         return proof
