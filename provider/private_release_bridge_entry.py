@@ -63,7 +63,8 @@ def run_bootstrap_self_test(value):
             or not isinstance(control.get("activationFenceVersionId"),str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}",control["activationFenceVersionId"]) is None
             or control.get("activationFenceBodySha256")!=idle_sha or control.get("activationFenceLeaseId")!=BOOTSTRAP_FENCE_LEASE_ID
             or control.get("leaseDurationSeconds")!=60 or control.get("leaseRenewalCount")!=1
-            or core.canonical(control).decode()!=raw):core.fail("entry-bootstrap-self-test")
+            or not core.canonical(control).endswith(b"\n")
+            or core.canonical(control)[:-1].decode()!=raw):core.fail("entry-bootstrap-self-test")
     issued=core.parse_time(control.get("issuedAt"),"entry-bootstrap-self-test-issued");expires=core.parse_time(control.get("expiresAt"),"entry-bootstrap-self-test-expires")
     now=dt.datetime.now(dt.timezone.utc)
     if expires<=issued or (expires-issued).total_seconds()>900 or now<issued-dt.timedelta(seconds=30) or now>=expires:core.fail("entry-bootstrap-self-test-time")

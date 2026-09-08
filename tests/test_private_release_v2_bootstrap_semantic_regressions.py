@@ -756,9 +756,9 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "PAPERDESK_BRIDGE_PACKAGE_SHA256": self.authorization["plan"][
                     "bridgePackageSha256"
                 ],
-                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": bootstrap.canonical_json_bytes(
+                "PAPERDESK_BRIDGE_BOOTSTRAP_SELF_TEST_JSON": bootstrap.canonical_app_setting_json(
                     control
-                ).decode("utf-8"),
+                ),
             }
         )
         body = {
@@ -770,7 +770,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 bootstrap.canonical_json_bytes(desired)
             ),
             "bootstrapSelfTestControlSha256": bootstrap.sha256_bytes(
-                bootstrap.canonical_json_bytes(control)
+                bootstrap.canonical_app_setting_json(control).encode("utf-8")
             ),
             "packageUrl": package_url,
             "packageVersionId": upload["versionId"],
