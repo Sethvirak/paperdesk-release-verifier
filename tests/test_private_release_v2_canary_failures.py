@@ -1851,8 +1851,13 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             )
 
     def test_setup_past_ten_minutes_preserves_full_post_admission_reserve(self):
-        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4725)
-        self.assertEqual(bootstrap.CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS, 3825)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4995)
+        self.assertEqual(
+            bootstrap.WORM_POLICY_ADJACENT_READ_ALLOWANCE_SECONDS, 270
+        )
+        self.assertEqual(
+            bootstrap.CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS, 4095
+        )
         for seconds in (660, 899):
             with self.subTest(elapsed=seconds):
                 transport, session, journal = self.transport(

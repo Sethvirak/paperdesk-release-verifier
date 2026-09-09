@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 from scripts import private_release_v2_bootstrap as bootstrap
 
@@ -798,6 +799,13 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
 
     def test_worm_policy_rejects_target_type_or_etag_drift(self):
         operation_id = "lockPackageRetentionAt91Days"
+        context = {
+            "executionDecision": "apply-exact",
+            "etag": '"preflight-etag"',
+            "wormMutationAction": "put-lock",
+            "prestateState": "Unlocked",
+            "prestateDays": 91,
+        }
         target_id = self.resources[self.operations[operation_id]["target"]]["resourceId"]
         body = {
             "id": target_id + "/immutabilityPolicies/default",
@@ -813,16 +821,24 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "allowProtectedAppendWrites": False,
                 "allowProtectedAppendWritesAll": False,
             },
+            "mutationAction": "put-lock",
             "stateAfterPut": "Locked",
             "lockPostIssued": False,
         }
-        valid = self.envelope(operation_id, body)
-        self.assertEqual(self.validate(operation_id, valid), valid)
+        valid = self.envelope(
+            operation_id, body, headers={"etag": '"worm-etag"'}
+        )
+        self.assertEqual(
+            self.validate(operation_id, valid, operation_context=context), valid
+        )
         stricter = copy.deepcopy(valid)
         stricter["projection"]["properties"][
             "immutabilityPeriodSinceCreationInDays"
         ] = 120
-        self.assertEqual(self.validate(operation_id, stricter), stricter)
+        self.assertEqual(
+            self.validate(operation_id, stricter, operation_context=context),
+            stricter,
+        )
         variants = []
         wrong_target = copy.deepcopy(valid)
         wrong_target["projection"]["id"] = (
@@ -836,9 +852,12 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         bad_etag = copy.deepcopy(valid)
         bad_etag["projection"]["etag"] = "unquoted"
         variants.append(bad_etag)
+        mismatched_header_etag = copy.deepcopy(valid)
+        mismatched_header_etag["headers"]["etag"] = '"different-etag"'
+        variants.append(mismatched_header_etag)
         for altered in variants:
             with self.assertRaises(bootstrap.BootstrapError):
-                self.validate(operation_id, altered)
+                self.validate(operation_id, altered, operation_context=context)
 
     def test_deleted_worm_tombstone_is_never_terminal_success(self):
         operation_id = "lockPackageRetentionAt91Days"
@@ -859,13 +878,24 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                     "allowProtectedAppendWrites": False,
                     "allowProtectedAppendWritesAll": False,
                 },
+                "mutationAction": "put-lock",
                 "stateAfterPut": "Locked",
                 "lockPostIssued": False,
             },
         )
 
         with self.assertRaises(bootstrap.BootstrapError):
-            self.validate(operation_id, tombstone)
+            self.validate(
+                operation_id,
+                tombstone,
+                operation_context={
+                    "executionDecision": "apply-exact",
+                    "etag": None,
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Absent",
+                    "prestateDays": None,
+                },
+            )
 
     def test_deleted_worm_tombstone_is_never_successful_executor_readback(self):
         operation_id = "lockPackageRetentionAt91Days"
@@ -905,6 +935,17 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         transport.plan = self.plan
         transport.authorization = self.authorization
         transport.resources = self.resources
+        transport.admissions = {
+            operation_id: {
+                "context": {
+                    "executionDecision": "apply-exact",
+                    "etag": None,
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Absent",
+                    "prestateDays": None,
+                }
+            }
+        }
 
         with self.assertRaisesRegex(
             bootstrap.BootstrapError,
@@ -914,6 +955,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 expected,
                 response,
                 {
+                    "mutationAction": "put-lock",
                     "stateAfterPut": "Locked",
                     "lockPostIssued": False,
                 },
@@ -931,6 +973,9 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "context": {
                     "executionDecision": "apply-exact",
                     "etag": None,
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Absent",
+                    "prestateDays": None,
                 }
             }
         }
@@ -956,7 +1001,39 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             }
 
         transport._arm_put = arm_put
-        result = transport._mutate(operation, {})
+        policy_id = (
+            self.resources[operation["target"]]["resourceId"]
+            + "/immutabilityPolicies/default"
+        )
+        adjacent = {
+            "id": policy_id,
+            "name": "default",
+            "type": (
+                "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                "immutabilityPolicies"
+            ),
+            "etag": '"post-put-etag"',
+            "properties": {
+                "state": "Locked",
+                "immutabilityPeriodSinceCreationInDays": 91,
+                "allowProtectedAppendWrites": False,
+                "allowProtectedAppendWritesAll": False,
+            },
+        }
+        adjacent_response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes(adjacent),
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '"post-put-etag"',
+            },
+        )
+        with mock.patch.object(
+            transport,
+            "_read_request_with_transport_retry",
+            return_value=adjacent_response,
+        ):
+            result = transport._mutate(operation, {})
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["headers"], {"If-None-Match": "*"})
@@ -972,6 +1049,570 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
         )
         self.assertEqual(result["stateAfterPut"], "Locked")
         self.assertFalse(result["lockPostIssued"])
+        self.assertEqual(result["mutationAction"], "put-lock")
+
+    def test_unlocked_package_worm_lock_uses_adjacent_read_etag(self):
+        operation_id = "lockPackageRetentionAt91Days"
+        operation = self.operations[operation_id]
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        transport.authorization = copy.deepcopy(self.authorization)
+        transport.plan = self.plan
+        transport.resources = self.resources
+        transport.admissions = {
+            operation_id: {
+                "context": {
+                    "etag": '"preflight-etag"',
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Unlocked",
+                    "prestateDays": 30,
+                }
+            }
+        }
+        put_result = {
+            "properties": {
+                "state": "Unlocked",
+                "immutabilityPeriodSinceCreationInDays": 91,
+                "allowProtectedAppendWrites": False,
+                "allowProtectedAppendWritesAll": False,
+            },
+        }
+        adjacent = {
+            "id": (
+                self.resources[operation["target"]]["resourceId"]
+                + "/immutabilityPolicies/default"
+            ),
+            "name": "default",
+            "type": (
+                "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                "immutabilityPolicies"
+            ),
+            "etag": '"post-put-read-etag"',
+            "properties": copy.deepcopy(put_result["properties"]),
+        }
+        adjacent_response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes(adjacent),
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '"post-put-read-etag"',
+            },
+        )
+        locked = copy.deepcopy(adjacent)
+        locked["etag"] = '"post-lock-etag"'
+        locked["properties"]["state"] = "Locked"
+        locked["properties"].pop("allowProtectedAppendWrites")
+        locked["properties"].pop("allowProtectedAppendWritesAll")
+        lock_response = bootstrap._RestResponse(
+            status=200,
+            body=bootstrap.canonical_json_bytes(locked),
+            headers={
+                "Content-Type": "application/json",
+                "ETag": '"post-lock-etag"',
+            },
+        )
+
+        with (
+            mock.patch.object(transport, "_arm_put", return_value=put_result),
+            mock.patch.object(
+                transport,
+                "_read_request_with_transport_retry",
+                return_value=adjacent_response,
+            ) as read,
+            mock.patch.object(
+                transport, "_mutation_request", return_value=lock_response
+            ) as request,
+        ):
+            result = transport._mutate(operation, {})
+
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(
+            read.call_args.args,
+            ("GET", transport._arm_url(adjacent["id"], "2025-06-01")),
+        )
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs["headers"],
+            {"If-Match": '"post-put-read-etag"'},
+        )
+        self.assertEqual(request.call_args.kwargs["expected"], {200})
+        self.assertEqual(result["stateAfterPut"], "Unlocked")
+        self.assertTrue(result["lockPostIssued"])
+        self.assertEqual(result["mutationAction"], "put-lock")
+
+    def test_unlocked_worm_lock_rejects_invalid_adjacent_etag_or_day_drift(self):
+        operation_id = "lockPackageRetentionAt91Days"
+        operation = self.operations[operation_id]
+        for variant, etag, days in (
+            ("missing-etag", None, 91),
+            ("malformed-etag", "unquoted", 91),
+            ("longer-retention", '"post-put-etag"', 92),
+        ):
+            with self.subTest(variant=variant):
+                transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+                transport.authorization = copy.deepcopy(self.authorization)
+                transport.plan = self.plan
+                transport.resources = self.resources
+                transport.admissions = {
+                    operation_id: {
+                        "context": {
+                            "etag": '"preflight-etag"',
+                            "wormMutationAction": "put-lock",
+                            "prestateState": "Unlocked",
+                            "prestateDays": 30,
+                        }
+                    }
+                }
+                put_result = {
+                    "properties": {
+                        "state": "Unlocked",
+                        "immutabilityPeriodSinceCreationInDays": 91,
+                        "allowProtectedAppendWrites": False,
+                        "allowProtectedAppendWritesAll": False,
+                    },
+                }
+                adjacent = {
+                    "id": (
+                        self.resources[operation["target"]]["resourceId"]
+                        + "/immutabilityPolicies/default"
+                    ),
+                    "name": "default",
+                    "type": (
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "immutabilityPolicies"
+                    ),
+                    "etag": etag,
+                    "properties": copy.deepcopy(put_result["properties"]),
+                }
+                adjacent["properties"][
+                    "immutabilityPeriodSinceCreationInDays"
+                ] = days
+                adjacent_response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(adjacent),
+                    headers={
+                        "Content-Type": "application/json",
+                        **({"ETag": etag} if etag is not None else {}),
+                    },
+                )
+                with (
+                    mock.patch.object(transport, "_arm_put", return_value=put_result),
+                    mock.patch.object(
+                        transport,
+                        "_read_request_with_transport_retry",
+                        return_value=adjacent_response,
+                    ),
+                    mock.patch.object(transport, "_mutation_request") as request,
+                    self.assertRaises(bootstrap.BootstrapError),
+                ):
+                    transport._mutate(operation, {})
+                request.assert_not_called()
+
+    def test_locked_worm_extend_uses_adjacent_exact_prestate_etag(self):
+        for operation_id in (
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        ):
+            with self.subTest(operation_id=operation_id):
+                operation = self.operations[operation_id]
+                transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+                transport.authorization = copy.deepcopy(self.authorization)
+                transport.plan = self.plan
+                transport.resources = self.resources
+                context = {"etag": '"preflight-etag"'}
+                if operation_id == "lockPackageRetentionAt91Days":
+                    context.update(
+                        {
+                            "wormMutationAction": "extend",
+                            "prestateState": "Locked",
+                            "prestateDays": 30,
+                        }
+                    )
+                transport.admissions = {operation_id: {"context": context}}
+                policy_id = (
+                    self.resources[operation["target"]]["resourceId"]
+                    + "/immutabilityPolicies/default"
+                )
+                adjacent = {
+                    "id": policy_id,
+                    "name": "default",
+                    "type": (
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "immutabilityPolicies"
+                    ),
+                    "etag": '"preflight-etag"',
+                    "properties": {
+                        "state": "Locked",
+                        "immutabilityPeriodSinceCreationInDays": 30,
+                        "allowProtectedAppendWrites": False,
+                        "allowProtectedAppendWritesAll": False,
+                    },
+                }
+                adjacent_response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(adjacent),
+                    headers={
+                        "Content-Type": "application/json",
+                        "ETag": '"preflight-etag"',
+                    },
+                )
+                extended = copy.deepcopy(adjacent)
+                extended["etag"] = '"extended-etag"'
+                extended["properties"][
+                    "immutabilityPeriodSinceCreationInDays"
+                ] = 91
+                extended["properties"].pop("allowProtectedAppendWrites")
+                extended["properties"].pop("allowProtectedAppendWritesAll")
+                extend_response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(extended),
+                    headers={
+                        "Content-Type": "application/json",
+                        "ETag": '"extended-etag"',
+                    },
+                )
+                final_extended = copy.deepcopy(extended)
+                final_extended["properties"].update(
+                    {
+                        "allowProtectedAppendWrites": False,
+                        "allowProtectedAppendWritesAll": False,
+                    }
+                )
+                final_response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(final_extended),
+                    headers={
+                        "Content-Type": "application/json",
+                        "ETag": '"extended-etag"',
+                    },
+                )
+                with (
+                    mock.patch.object(transport, "_arm_put") as arm_put,
+                    mock.patch.object(
+                        transport,
+                        "_read_request_with_transport_retry",
+                        return_value=adjacent_response,
+                    ) as read,
+                    mock.patch.object(
+                        transport,
+                        "_mutation_request",
+                        return_value=extend_response,
+                    ) as request,
+                ):
+                    result = transport._mutate(operation, {})
+
+                arm_put.assert_not_called()
+                self.assertEqual(
+                    read.call_args.args,
+                    ("GET", transport._arm_url(policy_id, "2025-06-01")),
+                )
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(request.call_args.args[:2], (
+                    "POST",
+                    transport._arm_url(policy_id, "2025-06-01", "/extend"),
+                ))
+                self.assertEqual(
+                    request.call_args.kwargs["body"],
+                    bootstrap.canonical_json_bytes(
+                        {
+                            "properties": {
+                                "immutabilityPeriodSinceCreationInDays": 91,
+                            }
+                        }
+                    ),
+                )
+                self.assertEqual(
+                    request.call_args.kwargs["headers"],
+                    {
+                        "Content-Type": "application/json",
+                        "If-Match": '"preflight-etag"',
+                    },
+                )
+                self.assertEqual(request.call_args.kwargs["expected"], {200})
+                self.assertEqual(result["mutationAction"], "extend")
+                self.assertEqual(result["stateBeforeExtend"], "Locked")
+                if operation_id == "lockPackageRetentionAt91Days":
+                    self.assertEqual(result["daysBeforeExtend"], 30)
+                self.assertEqual(
+                    result["adjacentPrestateEtag"], '"preflight-etag"'
+                )
+                self.assertFalse(
+                    bootstrap._mutation_target_allowed(
+                        operation_id,
+                        "PUT",
+                        transport._arm_url(policy_id, "2025-06-01"),
+                        plan=self.plan,
+                        authorization_id=AUTHORIZATION_ID,
+                        source_sha=SOURCE_SHA,
+                        operation_contexts={operation_id: context},
+                    )
+                )
+                self.assertTrue(
+                    bootstrap._mutation_target_allowed(
+                        operation_id,
+                        "POST",
+                        transport._arm_url(policy_id, "2025-06-01", "/extend"),
+                        plan=self.plan,
+                        authorization_id=AUTHORIZATION_ID,
+                        source_sha=SOURCE_SHA,
+                        operation_contexts={operation_id: context},
+                    )
+                )
+                contract = bootstrap._validator_contract(
+                    f"operation:{operation_id}", self.plan, self.authorization
+                )
+                expected = {
+                    "id": f"readback-{operation_id}",
+                    "validatorId": f"operation:{operation_id}",
+                    "method": contract["expectedMethod"],
+                    "url": contract["expectedUrl"],
+                    "validatorContract": contract,
+                }
+                transport._validated_source_projections = {}
+                readback = transport._validate_readback_response(
+                    expected, final_response, result
+                )
+                retained = readback["sourceProjection"]["projection"]
+                self.assertEqual(retained["mutationAction"], "extend")
+                self.assertEqual(retained["stateBeforeExtend"], "Locked")
+                if operation_id == "lockPackageRetentionAt91Days":
+                    self.assertEqual(retained["daysBeforeExtend"], 30)
+                self.assertEqual(
+                    retained["adjacentPrestateEtag"], '"preflight-etag"'
+                )
+                self.assertNotIn("stateAfterPut", retained)
+                self.assertNotIn("lockPostIssued", retained)
+
+    def test_locked_worm_extend_rejects_prestate_or_etag_drift_before_mutation(self):
+        variants = {
+            "etag": ("etag", '"drifted-etag"'),
+            "state": ("state", "Unlocked"),
+            "days-low": ("immutabilityPeriodSinceCreationInDays", 29),
+            "days-high": ("immutabilityPeriodSinceCreationInDays", 31),
+            "days-final": ("immutabilityPeriodSinceCreationInDays", 91),
+            "append-writes": ("allowProtectedAppendWrites", True),
+            "append-writes-all": ("allowProtectedAppendWritesAll", True),
+        }
+        for operation_id in (
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+        ):
+            operation = self.operations[operation_id]
+            policy_id = (
+                self.resources[operation["target"]]["resourceId"]
+                + "/immutabilityPolicies/default"
+            )
+            exact = {
+                "id": policy_id,
+                "name": "default",
+                "type": (
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                    "immutabilityPolicies"
+                ),
+                "etag": '"preflight-etag"',
+                "properties": {
+                    "state": "Locked",
+                    "immutabilityPeriodSinceCreationInDays": 30,
+                    "allowProtectedAppendWrites": False,
+                    "allowProtectedAppendWritesAll": False,
+                },
+            }
+            context = {"etag": '"preflight-etag"'}
+            if operation_id == "lockPackageRetentionAt91Days":
+                context.update(
+                    {
+                        "wormMutationAction": "extend",
+                        "prestateState": "Locked",
+                        "prestateDays": 30,
+                    }
+                )
+            for variant, (field, value) in variants.items():
+                with self.subTest(operation_id=operation_id, variant=variant):
+                    document = copy.deepcopy(exact)
+                    if field == "etag":
+                        document[field] = value
+                        response_etag = value
+                    else:
+                        document["properties"][field] = value
+                        response_etag = document["etag"]
+                    transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+                    transport.authorization = copy.deepcopy(self.authorization)
+                    transport.plan = self.plan
+                    transport.resources = self.resources
+                    transport.admissions = {operation_id: {"context": context}}
+                    adjacent_response = bootstrap._RestResponse(
+                        status=200,
+                        body=bootstrap.canonical_json_bytes(document),
+                        headers={"ETag": response_etag},
+                    )
+                    with (
+                        mock.patch.object(transport, "_arm_put") as arm_put,
+                        mock.patch.object(
+                            transport,
+                            "_read_request_with_transport_retry",
+                            return_value=adjacent_response,
+                        ),
+                        mock.patch.object(transport, "_mutation_request") as request,
+                        self.assertRaises(bootstrap.BootstrapError),
+                    ):
+                        transport._mutate(operation, {})
+                    arm_put.assert_not_called()
+                    request.assert_not_called()
+
+    def test_locked_worm_extend_definite_412_is_not_retried(self):
+        for operation_id in (
+            "lockPackageRetentionAt91Days",
+            "extendResultRetentionFrom30To91Days",
+        ):
+            with self.subTest(operation_id=operation_id):
+                operation = self.operations[operation_id]
+                policy_id = (
+                    self.resources[operation["target"]]["resourceId"]
+                    + "/immutabilityPolicies/default"
+                )
+                adjacent = {
+                    "id": policy_id,
+                    "name": "default",
+                    "type": (
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "immutabilityPolicies"
+                    ),
+                    "etag": '"preflight-etag"',
+                    "properties": {
+                        "state": "Locked",
+                        "immutabilityPeriodSinceCreationInDays": 30,
+                        "allowProtectedAppendWrites": False,
+                        "allowProtectedAppendWritesAll": False,
+                    },
+                }
+                adjacent_response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(adjacent),
+                    headers={"ETag": '"preflight-etag"'},
+                )
+                context = {"etag": '"preflight-etag"'}
+                if operation_id == "lockPackageRetentionAt91Days":
+                    context.update(
+                        {
+                            "wormMutationAction": "extend",
+                            "prestateState": "Locked",
+                            "prestateDays": 30,
+                        }
+                    )
+                transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+                transport.authorization = copy.deepcopy(self.authorization)
+                transport.plan = self.plan
+                transport.resources = self.resources
+                transport.admissions = {operation_id: {"context": context}}
+                with (
+                    mock.patch.object(transport, "_arm_put") as arm_put,
+                    mock.patch.object(
+                        transport,
+                        "_read_request_with_transport_retry",
+                        return_value=adjacent_response,
+                    ),
+                    mock.patch.object(
+                        transport,
+                        "_mutation_request",
+                        side_effect=bootstrap.BootstrapError("HTTP status 412"),
+                    ) as request,
+                    self.assertRaisesRegex(bootstrap.BootstrapError, "412"),
+                ):
+                    transport._mutate(operation, {})
+                arm_put.assert_not_called()
+                self.assertEqual(request.call_count, 1)
+
+    def test_worm_policy_response_requires_matching_etags_and_exact_state(self):
+        operation = self.operations["lockPackageRetentionAt91Days"]
+        policy_id = (
+            self.resources[operation["target"]]["resourceId"]
+            + "/immutabilityPolicies/default"
+        )
+        document = {
+            "id": policy_id,
+            "name": "default",
+            "type": (
+                "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                "immutabilityPolicies"
+            ),
+            "etag": '"body-etag"',
+            "properties": {
+                "state": "Locked",
+                "immutabilityPeriodSinceCreationInDays": 91,
+                "allowProtectedAppendWrites": False,
+                "allowProtectedAppendWritesAll": False,
+            },
+        }
+        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+        variants = (
+            {},
+            {"ETag": '"different-etag"'},
+        )
+        for headers in variants:
+            with self.subTest(headers=headers), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                transport._exact_immutability_policy_response(
+                    bootstrap._RestResponse(
+                        status=200,
+                        body=bootstrap.canonical_json_bytes(document),
+                        headers={"Content-Type": "application/json", **headers},
+                    ),
+                    policy_id=policy_id,
+                    label="test WORM policy",
+                    allowed_states={"Locked"},
+                )
+
+        unlocked = copy.deepcopy(document)
+        unlocked["properties"]["state"] = "Unlocked"
+        with self.assertRaises(bootstrap.BootstrapError):
+            transport._exact_immutability_policy_response(
+                bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(unlocked),
+                    headers={
+                        "Content-Type": "application/json",
+                        "ETag": '"body-etag"',
+                    },
+                ),
+                policy_id=policy_id,
+                label="test locked WORM policy",
+                allowed_states={"Locked"},
+            )
+
+        action_document = copy.deepcopy(document)
+        action_document["properties"].pop("allowProtectedAppendWrites")
+        action_document["properties"].pop("allowProtectedAppendWritesAll")
+
+        def action_response(value):
+            return bootstrap._RestResponse(
+                status=200,
+                body=bootstrap.canonical_json_bytes(value),
+                headers={"ETag": '"body-etag"'},
+            )
+
+        transport._exact_immutability_policy_response(
+            action_response(action_document),
+            policy_id=policy_id,
+            label="test WORM action response",
+            allowed_states={"Locked"},
+            maximum_days=91,
+            require_append_flags=False,
+        )
+        too_long = copy.deepcopy(action_document)
+        too_long["properties"]["immutabilityPeriodSinceCreationInDays"] = 92
+        unsafe_flag = copy.deepcopy(action_document)
+        unsafe_flag["properties"]["allowProtectedAppendWrites"] = True
+        for invalid in (too_long, unsafe_flag):
+            with self.assertRaises(bootstrap.BootstrapError):
+                transport._exact_immutability_policy_response(
+                    action_response(invalid),
+                    policy_id=policy_id,
+                    label="test invalid WORM action response",
+                    allowed_states={"Locked"},
+                    maximum_days=91,
+                    require_append_flags=False,
+                )
 
     def test_signing_key_posture_rejects_stale_expiry_even_if_context_matches(self):
         operation_id = "createSigningKeyVersion"

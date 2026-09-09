@@ -339,6 +339,14 @@ def build_projection(plan, package, *, adopt_operations=()):
             "extendResultRetentionFrom30To91Days",
         }:
             value["etag"] = '"retention-etag"'
+            if operation_id == "lockPackageRetentionAt91Days":
+                value.update(
+                    {
+                        "wormMutationAction": "put-lock",
+                        "prestateState": "Unlocked",
+                        "prestateDays": 91,
+                    }
+                )
         return value
 
     def operation_status(operation):
@@ -1296,9 +1304,25 @@ class _TerminalEvidenceFixture:
 
         def worm(operation_id):
             target = self.resources[self.mutations[operation_id]["target"]]["resourceId"]
-            return {"id": target + "/immutabilityPolicies/default", "name": "default", "type": "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies", "etag": f'"{operation_id}-etag"', "properties": {"state": "Locked", "immutabilityPeriodSinceCreationInDays": 91, "allowProtectedAppendWrites": False, "allowProtectedAppendWritesAll": False}, "stateAfterPut": "Locked", "lockPostIssued": False}
+            projection = {"id": target + "/immutabilityPolicies/default", "name": "default", "type": "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies", "etag": f'"{operation_id}-etag"', "properties": {"state": "Locked", "immutabilityPeriodSinceCreationInDays": 91, "allowProtectedAppendWrites": False, "allowProtectedAppendWritesAll": False}}
+            if operation_id == "lockPackageRetentionAt91Days":
+                projection.update(
+                    {
+                        "mutationAction": "put-lock",
+                        "stateAfterPut": "Locked",
+                        "lockPostIssued": False,
+                    }
+                )
+            else:
+                projection.update({"mutationAction": "extend", "stateBeforeExtend": "Locked", "adjacentPrestateEtag": self.contexts[operation_id]["etag"]})
+            return projection
 
-        self.envelope("lockPackageRetentionAt91Days", worm("lockPackageRetentionAt91Days"))
+        package_worm = worm("lockPackageRetentionAt91Days")
+        self.envelope(
+            "lockPackageRetentionAt91Days",
+            package_worm,
+            headers={"etag": package_worm["etag"]},
+        )
 
         site = self.resources["bridgeSite"]
         terminal = {
@@ -1331,13 +1355,17 @@ class _TerminalEvidenceFixture:
             "proofBoundary": "terminal Success proves execution of the exact source/package-pinned bootstrap branch; HTTP health and literal stdout marker bytes were not observed",
         }
         self.envelope("startBridgeForBoundedCanary", canary)
+        accepted_worm = worm("extendAcceptedRetentionFrom30To91Days")
         self.envelope(
             "extendAcceptedRetentionFrom30To91Days",
-            worm("extendAcceptedRetentionFrom30To91Days"),
+            accepted_worm,
+            headers={"etag": accepted_worm["etag"]},
         )
+        result_worm = worm("extendResultRetentionFrom30To91Days")
         self.envelope(
             "extendResultRetentionFrom30To91Days",
-            worm("extendResultRetentionFrom30To91Days"),
+            result_worm,
+            headers={"etag": result_worm["etag"]},
         )
         self.envelope(
             "detachWriterAndReaderFromLegacyBridge",
@@ -1496,6 +1524,13 @@ class _TerminalEvidenceFixture:
                         ]["bodySha256"]
                     if operation_id == "exerciseControllerLeaseCanary":
                         intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
+                    expected_worm_body_sha256 = (
+                        bootstrap._expected_worm_mutation_body_sha256(
+                            operation_id, method, target_url
+                        )
+                    )
+                    if expected_worm_body_sha256 is not None:
+                        intent["requestBodySha256"] = expected_worm_body_sha256
                     result = copy.deepcopy(intent)
                     versioned_headers = (
                         self.operations[operation_id]["headers"]
@@ -5028,13 +5063,71 @@ class BootstrapTests(unittest.TestCase):
                 bootstrap.BootstrapError, "strong ETag token"
             ):
                 bootstrap._if_match_etag(malformed, "malformed ETag")
-
         source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._mutate
         )
-        self.assertEqual(source.count("_if_match_etag("), 5)
+        self.assertEqual(source.count("_if_match_etag("), 7)
+        worm_response_source = inspect.getsource(
+            bootstrap.AzureCliBootstrapTransport._exact_immutability_policy_response
+        )
+        self.assertEqual(worm_response_source.count("_if_match_etag("), 2)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
+
+    def test_package_worm_context_binds_one_exact_mutation_branch(self):
+        authorization = {"authorizationId": AUTH_ID}
+        valid_contexts = (
+            {
+                "executionDecision": "apply-exact",
+                "etag": None,
+                "wormMutationAction": "put-lock",
+                "prestateState": "Absent",
+                "prestateDays": None,
+            },
+            {
+                "executionDecision": "apply-exact",
+                "etag": '"unlocked-etag"',
+                "wormMutationAction": "put-lock",
+                "prestateState": "Unlocked",
+                "prestateDays": 91,
+            },
+            {
+                "executionDecision": "apply-exact",
+                "etag": '"locked-etag"',
+                "wormMutationAction": "extend",
+                "prestateState": "Locked",
+                "prestateDays": 30,
+            },
+        )
+        for context in valid_contexts:
+            with self.subTest(context=context):
+                self.assertEqual(
+                    bootstrap._validate_operation_context(
+                        "lockPackageRetentionAt91Days", context, authorization
+                    ),
+                    context,
+                )
+
+        invalid_contexts = []
+        value = copy.deepcopy(valid_contexts[0])
+        value["wormMutationAction"] = "extend"
+        invalid_contexts.append(value)
+        value = copy.deepcopy(valid_contexts[1])
+        value["prestateState"] = "Locked"
+        invalid_contexts.append(value)
+        value = copy.deepcopy(valid_contexts[2])
+        value["prestateDays"] = 91
+        invalid_contexts.append(value)
+        value = copy.deepcopy(valid_contexts[2])
+        value["etag"] = None
+        invalid_contexts.append(value)
+        for context in invalid_contexts:
+            with self.subTest(invalid=context), self.assertRaises(
+                bootstrap.BootstrapError
+            ):
+                bootstrap._validate_operation_context(
+                    "lockPackageRetentionAt91Days", context, authorization
+                )
 
     def test_supported_bridge_resource_write_uses_etag_but_app_settings_uses_no_fake_cas(self):
         projection = build_projection(self.plan, self.package)
@@ -8631,6 +8724,129 @@ class BootstrapTests(unittest.TestCase):
                 operation_projections=operation_projections,
                 operation_contexts=operation_contexts,
             )
+
+    def test_locked_worm_extend_cardinality_is_one_extend_post(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        source = fixture["sourceEvidence"]
+        operation_projections = {
+            item["operationId"]: copy.deepcopy(item["sourceProjection"])
+            for item in source["allOperationProjections"]
+        }
+        operation_contexts = {
+            item["operationId"]: item["context"]
+            for item in fixture["preflightProjection"]["operationAdmissions"]
+        }
+        resources = {
+            item["id"]: item for item in fixture["plan"]["resourceInventory"]
+        }
+        for operation_id, target in (
+            ("lockPackageRetentionAt91Days", "packageContainer"),
+            ("extendAcceptedRetentionFrom30To91Days", "acceptedContainer"),
+            ("extendResultRetentionFrom30To91Days", "resultContainer"),
+        ):
+            with self.subTest(operation_id=operation_id):
+                if operation_id == "lockPackageRetentionAt91Days":
+                    operation_contexts[operation_id] = {
+                        "executionDecision": "apply-exact",
+                        "etag": '"retention-etag"',
+                        "wormMutationAction": "extend",
+                        "prestateState": "Locked",
+                        "prestateDays": 30,
+                    }
+                    package_projection = operation_projections[operation_id][
+                        "projection"
+                    ]
+                    package_projection.pop("stateAfterPut")
+                    package_projection.pop("lockPostIssued")
+                    package_projection.update(
+                        {
+                            "mutationAction": "extend",
+                            "stateBeforeExtend": "Locked",
+                            "daysBeforeExtend": 30,
+                            "adjacentPrestateEtag": '"retention-etag"',
+                        }
+                    )
+                required, optional = bootstrap._expected_terminal_mutation_targets(
+                    operation_id,
+                    plan=fixture["plan"],
+                    authorization_id=AUTH_ID,
+                    source_sha=MERGE,
+                    operation_projections=operation_projections,
+                    operation_contexts=operation_contexts,
+                )
+                policy_id = (
+                    resources[target]["resourceId"]
+                    + "/immutabilityPolicies/default"
+                )
+                expected = bootstrap._normalized_mutation_target(
+                    "POST",
+                    "https://management.azure.com"
+                    + policy_id
+                    + "/extend?api-version=2025-06-01",
+                )
+                self.assertEqual(required, {expected: 1})
+                self.assertFalse(optional)
+
+    def test_worm_journal_request_bodies_are_exact(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        resources = {
+            item["id"]: item for item in fixture["plan"]["resourceInventory"]
+        }
+        package_policy_url = (
+            "https://management.azure.com"
+            + resources["packageContainer"]["resourceId"]
+            + "/immutabilityPolicies/default"
+        )
+        package_lock_digest = bootstrap._expected_worm_mutation_body_sha256(
+            "lockPackageRetentionAt91Days",
+            "POST",
+            package_policy_url + "/lock?api-version=2025-06-01",
+        )
+        package_extend_digest = bootstrap._expected_worm_mutation_body_sha256(
+            "lockPackageRetentionAt91Days",
+            "POST",
+            package_policy_url + "/extend?api-version=2025-06-01",
+        )
+        self.assertEqual(package_lock_digest, bootstrap.sha256_bytes(b""))
+        self.assertEqual(
+            package_extend_digest,
+            bootstrap.sha256_bytes(
+                bootstrap.canonical_json_bytes(
+                    {
+                        "properties": {
+                            "immutabilityPeriodSinceCreationInDays": 91
+                        }
+                    }
+                )
+            ),
+        )
+        self.assertNotEqual(package_lock_digest, package_extend_digest)
+        inputs = self._terminal_journal_validation_inputs(fixture)
+        source_journal = fixture["sourceEvidence"]["productionBoundary"][
+            "mutationJournal"
+        ]
+        for operation_id in (
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        ):
+            with self.subTest(operation_id=operation_id):
+                altered = copy.deepcopy(source_journal)
+                changed = 0
+                for item in altered:
+                    if item["operationId"] == operation_id:
+                        item["requestBodySha256"] = "f" * 64
+                        changed += 1
+                self.assertEqual(changed, 2)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "WORM mutation request body differs",
+                ):
+                    bootstrap._validate_sanitized_mutation_journal(
+                        altered, **inputs
+                    )
 
     def test_full_terminal_source_evidence_rejects_operation_tamper(self):
         with tempfile.TemporaryDirectory() as folder:

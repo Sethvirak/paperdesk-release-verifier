@@ -227,7 +227,7 @@ class PackageReadinessTests(unittest.TestCase):
     def test_authorization_expiry_and_package_cap_bound_only_gets(self):
         self.assertEqual(bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS, 600)
         self.assertEqual(bootstrap.MAX_PACKAGE_READINESS_SECONDS, 1891)
-        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4725)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4995)
         modeled_cleanup_without_local_margin = (
             9 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
             + bootstrap.cleanup_locks.LOCK_CONVERGENCE_SECONDS
@@ -238,7 +238,7 @@ class PackageReadinessTests(unittest.TestCase):
             bootstrap.PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS,
             modeled_cleanup_without_local_margin + 30,
         )
-        for expiry_seconds in (3, 1800, 4725):
+        for expiry_seconds in (3, 1800, bootstrap.MAX_AUTHORIZATION_SECONDS):
             with self.subTest(expiry_seconds=expiry_seconds):
                 self.current = NOW
                 self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=expiry_seconds))
@@ -435,7 +435,9 @@ class PackageReadinessTests(unittest.TestCase):
                     self.assertEqual(journal.records, [])
 
     def test_deadline_adjacent_final_get_can_observe_exact_absence(self):
-        self.authorization["validity"]["expiresAt"] = stamp(NOW + dt.timedelta(seconds=4725))
+        self.authorization["validity"]["expiresAt"] = stamp(
+            NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
+        )
         final_at = NOW + dt.timedelta(
             seconds=bootstrap.MAX_PACKAGE_READINESS_SECONDS
             - bootstrap.FINAL_OBSERVATION_ALIGNMENT_SLACK_SECONDS
@@ -458,7 +460,7 @@ class PackageReadinessTests(unittest.TestCase):
 
     def test_real_scheduler_overshoot_still_runs_one_boundary_get(self):
         self.authorization["validity"]["expiresAt"] = stamp(
-            NOW + dt.timedelta(seconds=4725)
+            NOW + dt.timedelta(seconds=bootstrap.MAX_AUTHORIZATION_SECONDS)
         )
         boundary = NOW + dt.timedelta(seconds=1800)
         request_times = []

@@ -225,7 +225,7 @@
       "properties": {
         "notBefore": {"type": "string", "format": "date-time"},
         "expiresAt": {"type": "string", "format": "date-time"},
-        "maximumLifetimeSeconds": {"const": 4725}
+        "maximumLifetimeSeconds": {"const": 4995}
       }
     },
     "confirmation": {

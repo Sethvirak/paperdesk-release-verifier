@@ -800,7 +800,13 @@ def _worm_policy_admission(
         return "absent", _policy_checked_context(
             operation_id,
             policy,
-            {"executionDecision": "apply-exact", "etag": None},
+            {
+                "executionDecision": "apply-exact",
+                "etag": None,
+                "wormMutationAction": "put-lock",
+                "prestateState": "Absent",
+                "prestateDays": None,
+            },
         )
     if status != 200:
         fail(f"{operation_id} WORM preflight returned unsupported status")
@@ -847,7 +853,13 @@ def _worm_policy_admission(
         return "absent", _policy_checked_context(
             operation_id,
             policy,
-            {"executionDecision": "apply-exact", "etag": None},
+            {
+                "executionDecision": "apply-exact",
+                "etag": None,
+                "wormMutationAction": "put-lock",
+                "prestateState": "Absent",
+                "prestateDays": None,
+            },
         )
     if (
         str(body.get("id", "")).lower() != expected_id.lower()
@@ -878,6 +890,18 @@ def _worm_policy_admission(
     if operation_id == "lockPackageRetentionAt91Days":
         if state not in {"Locked", "Unlocked"} or not 1 <= days <= 91:
             fail("package WORM policy is outside the supported resumable prestate")
+        package_context = {
+            "executionDecision": "apply-exact",
+            "etag": _etag(envelope, operation_id),
+            "wormMutationAction": "extend" if state == "Locked" else "put-lock",
+            "prestateState": state,
+            "prestateDays": days,
+        }
+        return "exact", _policy_checked_context(
+            operation_id,
+            policy,
+            package_context,
+        )
     elif state != "Locked" or days != 30:
         fail(f"{operation_id} is not an exact locked 30-day policy")
     return "exact", _policy_checked_context(
