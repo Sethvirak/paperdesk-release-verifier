@@ -2129,6 +2129,18 @@ def _expected_terminal_mutation_targets(
                 required[_normalized_mutation_target(lock_method, arm(lock_proof["resourceId"], "2016-09-01"))] = 1
         return required, Counter()
     if operation_id == "uploadVersionedBridgePackage":
+        package_projection = operation_projections.get(operation_id, {}).get(
+            "projection", {}
+        )
+        package_outcome = (
+            package_projection.get("provisioningOutcome")
+            if isinstance(package_projection, Mapping)
+            else None
+        )
+        if package_outcome == "adopted-exact":
+            return Counter(), Counter()
+        if package_outcome != "created":
+            fail("terminal package projection lacks an exact provisioning outcome")
         blob = (
             f"https://mdspdbak2608089c4e.blob.core.windows.net/"
             f"{resources['packageContainer']['name']}/v2/control/{source_sha}/"
@@ -2592,11 +2604,28 @@ def _validate_terminal_mutation_coverage(
             and item.get("operationId") == operation_id
             and item.get("sequence") not in ignored_denial_sequences
         ]
-        if context.get("executionDecision") == "adopt-exact":
+        projection = operation_projections.get(operation_id, {})
+        body = projection.get("projection")
+        package_outcome = (
+            body.get("provisioningOutcome")
+            if operation_id == "uploadVersionedBridgePackage"
+            and isinstance(body, Mapping)
+            else None
+        )
+        adopted_without_write = (
+            package_outcome == "adopted-exact"
+            if operation_id == "uploadVersionedBridgePackage"
+            else context.get("executionDecision") == "adopt-exact"
+        )
+        if adopted_without_write:
             if results:
                 fail(f"adopted exact object has a current write: {operation_id}")
             continue
-        projection = operation_projections.get(operation_id, {})
+        if (
+            operation_id == "uploadVersionedBridgePackage"
+            and package_outcome != "created"
+        ):
+            fail("package journal lacks an exact provisioning outcome")
         headers = projection.get("headers")
         if (
             context.get("executionDecision") != "apply-exact"
@@ -2627,11 +2656,31 @@ def _validate_terminal_mutation_coverage(
 
 
 def _expected_permanent_outcome(
-    mutation: Mapping[str, Any], context: Mapping[str, Any]
+    mutation: Mapping[str, Any],
+    context: Mapping[str, Any],
+    source_projection: Mapping[str, Any] | None = None,
 ) -> str:
     """Bind terminal outcome vocabulary to the authorized execution path."""
 
     decision = context.get("executionDecision")
+    if mutation.get("id") == "uploadVersionedBridgePackage":
+        projection = (
+            source_projection.get("projection")
+            if isinstance(source_projection, Mapping)
+            else None
+        )
+        outcome = (
+            projection.get("provisioningOutcome")
+            if isinstance(projection, Mapping)
+            else None
+        )
+        if outcome not in {"created", "adopted-exact"}:
+            fail("terminal package outcome is not exact")
+        if decision == "adopt-exact" and outcome != "adopted-exact":
+            fail("preflight-adopted package cannot claim current creation")
+        if decision not in {"apply-exact", "adopt-exact"}:
+            fail("terminal package outcome lacks an exact decision")
+        return outcome
     if decision == "adopt-exact":
         return "adopted-exact"
     if (
@@ -6807,7 +6856,7 @@ def _validate_operation_source_projection(
         if operation_id == "uploadVersionedBridgePackage":
             required_blob_fields = {
                 "url", "blob", "etag", "versionId", "sha256", "size",
-                "bodySha256", "bodySize",
+                "bodySha256", "bodySize", "provisioningOutcome",
             }
         elif operation_id == "createInitialIdleActivationFence":
             required_blob_fields = {
@@ -6840,6 +6889,8 @@ def _validate_operation_source_projection(
             or body.get("url") != contract["expectedUrl"]
             or body.get("bodySha256") != authorization["plan"]["bridgePackageSha256"]
             or body.get("bodySize") != authorization["plan"]["bridgePackageSize"]
+            or body.get("provisioningOutcome")
+            not in {"created", "adopted-exact"}
         ):
             fail("package terminal projection is not authorization-bound")
         if operation_id != "uploadVersionedBridgePackage" and (
@@ -8690,6 +8741,12 @@ def build_terminal_source_evidence(
                 "observedAt": operation_observed_at[mutation["id"]],
             }
         )
+        if permanent[-1]["outcome"] != _expected_permanent_outcome(
+            mutation,
+            contexts.get(mutation["id"], {}),
+            operations[mutation["id"]],
+        ):
+            fail("terminal source builder outcome contradicts operation proof")
 
     postconditions = json.loads(
         canonical_json_bytes(list(postcondition_projections)).decode("utf-8")
@@ -9379,7 +9436,9 @@ def validate_terminal_source_evidence(
             or entry["outcome"] not in allowed_outcomes
             or entry["outcome"]
             != _expected_permanent_outcome(
-                mutation, operation_contexts.get(mutation["id"], {})
+                mutation,
+                operation_contexts.get(mutation["id"], {}),
+                validated_operations[mutation["id"]],
             )
         ):
             fail("terminal permanent mutation is not in exact plan order")
@@ -12788,13 +12847,19 @@ class AzureCliBootstrapTransport:
             attempt_records=[attempt],
         )
 
-    def _require_storage_write_identity(
-        self, response: _RestResponse, operation_id: str
+    def _require_storage_identity(
+        self, response: _RestResponse, operation_id: str, *, method: str = "PUT"
     ) -> tuple[str, str]:
         try:
             etag = self._header(response, "ETag")
             version_id = self._header(response, "x-ms-version-id")
-            _quoted_etag(etag, f"{operation_id} Storage ETag")
+            if (
+                not isinstance(etag, str)
+                or not etag.startswith('"')
+                or not etag.endswith('"')
+                or _quoted_etag(etag, f"{operation_id} Storage ETag") != etag
+            ):
+                fail(f"{operation_id} Storage ETag is not exact quoted form")
             if (
                 not isinstance(version_id, str)
                 or not 1 <= len(version_id) <= 512
@@ -12811,7 +12876,7 @@ class AzureCliBootstrapTransport:
             observed = self.clock()
             raise self._storage_operation_failure(
                 operation_id=operation_id,
-                method="PUT",
+                method=method,
                 started=observed,
                 completed=observed,
                 client_request_id=client_request_id,
@@ -13995,7 +14060,16 @@ class AzureCliBootstrapTransport:
         }:
             retained = {
                 key: facts.get(key)
-                for key in ("url", "blob", "etag", "versionId", "sha256", "size", "cleanupKey")
+                for key in (
+                    "url",
+                    "blob",
+                    "etag",
+                    "versionId",
+                    "sha256",
+                    "size",
+                    "cleanupKey",
+                    "provisioningOutcome",
+                )
                 if key in facts
             }
             retained.update(
@@ -15329,12 +15403,14 @@ class AzureCliBootstrapTransport:
 
     def _prove_package_upload_ready(
         self, url: str
-    ) -> _ConditionalStorageCreateWindow:
-        """Wait for exact-target read access and absence before a conditional write.
+    ) -> _ConditionalStorageCreateWindow | _RestResponse:
+        """Wait for exact-target read access before create or exact adoption.
 
         ARM role/ACL readback does not prove Storage data-plane propagation.
-        Only recognized authorization denials may converge to BlobNotFound;
-        an existing object or any other response is drift, not permission to PUT.
+        Recognized authorization denials may converge to BlobNotFound, which
+        admits a conditional create.  HTTP 200 returns the existing response to
+        the caller for full source/package/header validation and mutation-free
+        adoption; every other response fails closed.
         """
         started = self.clock()
         attempts = 0
@@ -15467,6 +15543,8 @@ class AzureCliBootstrapTransport:
             ))
             if observed >= deadline:
                 fail_readiness("package data-plane readiness window expired during GET", "expired-during-get")
+            if response.status == 200:
+                return response
             if response.status not in {403, 404}:
                 fail_readiness("package readiness returned unsupported HTTP status", "unsupported-status")
             content_type = self._header(response, "Content-Type")
@@ -17128,29 +17206,45 @@ class AzureCliBootstrapTransport:
             blob = f"v2/control/{source_sha}/paperdesk-private-release-bridge.zip"
             url = f"{self.STORAGE_ROOT}/{self.resources['packageContainer']['name']}/{blob}"
             package_create_window = self._prove_package_upload_ready(url)
-            package_write_deadline = (
-                self._request_deadline() or self._authorization_expiry()
-            )
-            package_write_deadline -= dt.timedelta(
-                seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-            )
-            response = self._conditional_storage_create_when_ready(
+            adopted_existing = isinstance(package_create_window, _RestResponse)
+            if adopted_existing:
+                response = package_create_window
+                if (
+                    response.status != 200
+                    or len(response.body) != self.package["size"]
+                    or sha256_bytes(response.body) != self.package["sha256"]
+                    or self._header(response, "x-ms-meta-sha256")
+                    != self.package["sha256"]
+                    or self._header(response, "Content-Type")
+                    != "application/zip"
+                ):
+                    fail("existing package is not the exact authorized package")
+            else:
+                package_write_deadline = (
+                    self._request_deadline() or self._authorization_expiry()
+                )
+                package_write_deadline -= dt.timedelta(
+                    seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                )
+                response = self._conditional_storage_create_when_ready(
+                    operation_id,
+                    url,
+                    body=body,
+                    headers={
+                        "Content-Type": "application/zip",
+                        "x-ms-blob-type": "BlockBlob",
+                        "x-ms-version": "2023-11-03",
+                        "If-None-Match": "*",
+                        "x-ms-meta-sha256": self.package["sha256"],
+                    },
+                    window=package_create_window,
+                    request_deadline=package_write_deadline,
+                    backoff_cap_seconds=32.0,
+                )
+            etag, version_id = self._require_storage_identity(
+                response,
                 operation_id,
-                url,
-                body=body,
-                headers={
-                    "Content-Type": "application/zip",
-                    "x-ms-blob-type": "BlockBlob",
-                    "x-ms-version": "2023-11-03",
-                    "If-None-Match": "*",
-                    "x-ms-meta-sha256": self.package["sha256"],
-                },
-                window=package_create_window,
-                request_deadline=package_write_deadline,
-                backoff_cap_seconds=32.0,
-            )
-            etag, version_id = self._require_storage_write_identity(
-                response, operation_id
+                method="GET" if adopted_existing else "PUT",
             )
             return {
                 "blob": blob,
@@ -17159,6 +17253,9 @@ class AzureCliBootstrapTransport:
                 "url": url,
                 "sha256": self.package["sha256"],
                 "size": self.package["size"],
+                "provisioningOutcome": (
+                    "adopted-exact" if adopted_existing else "created"
+                ),
             }
 
         if operation_id == "lockPackageRetentionAt91Days":
@@ -17496,7 +17593,7 @@ class AzureCliBootstrapTransport:
                 request_deadline=fence_write_deadline,
                 backoff_cap_seconds=15.0,
             )
-            etag, version_id = self._require_storage_write_identity(
+            etag, version_id = self._require_storage_identity(
                 response, operation_id
             )
             return {
@@ -17552,7 +17649,7 @@ class AzureCliBootstrapTransport:
                     request_deadline=self._controller_canary_create_deadline(),
                     backoff_cap_seconds=15.0,
                 )
-                etag, version_id = self._require_storage_write_identity(
+                etag, version_id = self._require_storage_identity(
                     response, operation_id
                 )
             except BaseException as primary_error:
@@ -17629,7 +17726,7 @@ class AzureCliBootstrapTransport:
                         ):
                             fail("ambiguous controller canary create readback drifted")
                         observed_etag, observed_version_id = (
-                            self._require_storage_write_identity(
+                            self._require_storage_identity(
                                 observation, operation_id
                             )
                         )
@@ -18121,7 +18218,7 @@ class AzureCliBootstrapTransport:
                             != "application/json"
                         ):
                             fail("controller canary cleanup identity readback drifted")
-                        cleanup_etag, _ = self._require_storage_write_identity(
+                        cleanup_etag, _ = self._require_storage_identity(
                             identity_response, "createControllerLeaseCanaryBlob"
                         )
                         cleanup_identity_was_known = True
@@ -19406,6 +19503,8 @@ class AzureCliBootstrapTransport:
             }
         if decision == "adopt-exact":
             details = dict(admission["context"].get("adopted", {}))
+            if operation["id"] == "uploadVersionedBridgePackage":
+                details["provisioningOutcome"] = "adopted-exact"
             if _expected_deletion_lock_proof(operation["id"]) is not None:
                 details["deletionLock"] = self._prove_adopted_assignment_lock(operation["id"])
             readbacks = self._prove_probe_ids(
@@ -19442,6 +19541,12 @@ class AzureCliBootstrapTransport:
             cleanup_resolved_after_ambiguity = bool(
                 details.pop("_cleanupResolvedAfterAmbiguity", False)
             )
+            package_outcome = details.get("provisioningOutcome")
+            if operation["id"] == "uploadVersionedBridgePackage":
+                if package_outcome not in {"created", "adopted-exact"}:
+                    fail("package mutation lacks an exact provisioning outcome")
+            elif package_outcome is not None:
+                fail("package provisioning outcome is outside the package boundary")
             try:
                 readbacks = self._prove_probe_ids(
                     admission["desiredProbeIds"],
@@ -19499,7 +19604,9 @@ class AzureCliBootstrapTransport:
                     "details": details,
                 },
             )
-        if operation["kind"].startswith(("delete-", "remove-", "temporary-remove")):
+        if package_outcome == "adopted-exact":
+            status = "adopted-exact"
+        elif operation["kind"].startswith(("delete-", "remove-", "temporary-remove")):
             status = "removed-exact"
         elif operation["kind"].startswith(("create-", "azure-global-create", "azure-ad-create")):
             status = "created"
