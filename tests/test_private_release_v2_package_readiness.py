@@ -167,6 +167,112 @@ class PackageReadinessTests(unittest.TestCase):
         self.assertEqual(len(journal.records), 2)
         self.assertEqual(self.sleeps, [])
 
+    def test_existing_exact_package_is_adopted_without_put(self):
+        existing = bootstrap._RestResponse(
+            200,
+            self.body,
+            {
+                "Content-Type": "application/zip",
+                "ETag": '"existing"',
+                "x-ms-version-id": "existing-version",
+                "x-ms-meta-sha256": self.package["sha256"],
+            },
+        )
+        transport, session, journal = self.transport([existing])
+        transport.admissions[OPERATION]["desiredProbeIds"] = ["package-readback"]
+        source_projection = {
+            "operationId": OPERATION,
+            "projection": {"provisioningOutcome": "adopted-exact"},
+        }
+        with (
+            mock.patch.object(
+                bootstrap.package_builder,
+                "build",
+                side_effect=lambda path: path.write_bytes(self.body),
+            ),
+            mock.patch.object(
+                transport,
+                "_prove_probe_ids",
+                return_value=[{"sourceProjection": source_projection}],
+            ) as prove,
+        ):
+            result = transport.apply_operation(self.operation, {})
+        self.assertEqual(result["status"], "adopted-exact")
+        self.assertFalse(result["owned"])
+        self.assertEqual(result["details"]["etag"], '"existing"')
+        self.assertEqual(result["details"]["versionId"], "existing-version")
+        self.assertEqual(
+            result["details"]["readbackProjections"], [source_projection]
+        )
+        prove.assert_called_once_with(
+            ["package-readback"],
+            f"{OPERATION} mutation",
+            runtime_facts=mock.ANY,
+        )
+        self.assertEqual(
+            prove.call_args.kwargs["runtime_facts"]["provisioningOutcome"],
+            "adopted-exact",
+        )
+        self.assertEqual([item[0] for item in session.requests], ["GET"])
+        self.assertEqual(journal.records, [])
+
+    def test_existing_package_mismatch_fails_without_put(self):
+        variants = (
+            (b"wrong", self.package["sha256"], "application/zip"),
+            (self.body, "0" * 64, "application/zip"),
+            (self.body, self.package["sha256"], "application/octet-stream"),
+        )
+        for response_body, metadata_sha, content_type in variants:
+            with self.subTest(
+                body=response_body,
+                metadata=metadata_sha,
+                content_type=content_type,
+            ):
+                transport, session, journal = self.transport([
+                    bootstrap._RestResponse(
+                        200,
+                        response_body,
+                        {
+                            "Content-Type": content_type,
+                            "ETag": '"existing"',
+                            "x-ms-version-id": "existing-version",
+                            "x-ms-meta-sha256": metadata_sha,
+                        },
+                    )
+                ])
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "existing package is not the exact authorized package",
+                ):
+                    self.upload(transport)
+                self.assertEqual([item[0] for item in session.requests], ["GET"])
+                self.assertEqual(journal.records, [])
+
+    def test_existing_exact_package_requires_quoted_etag_and_valid_version(self):
+        variants = (
+            ("DEADBEEF", "existing-version"),
+            ('"existing"', ""),
+            ('"existing"', "x" * 513),
+        )
+        for etag, version_id in variants:
+            with self.subTest(etag=etag, version_length=len(version_id)):
+                transport, session, journal = self.transport([
+                    bootstrap._RestResponse(
+                        200,
+                        self.body,
+                        {
+                            "Content-Type": "application/zip",
+                            "ETag": etag,
+                            "x-ms-version-id": version_id,
+                            "x-ms-meta-sha256": self.package["sha256"],
+                        },
+                    )
+                ])
+                with self.assertRaises(bootstrap.BootstrapError):
+                    self.upload(transport)
+                self.assertEqual([item[0] for item in session.requests], ["GET"])
+                self.assertEqual(journal.records, [])
+
     def test_invalid_error_status_or_shape_never_reaches_put(self):
         cases = [
             storage_error(403, "AuthenticationFailed"),
@@ -1164,7 +1270,6 @@ class PackageReadinessTests(unittest.TestCase):
             (bootstrap._RestResponse(403, b"<!DOCTYPE Error><Error><Code>AuthorizationFailure</Code></Error>",
                 {"Content-Type": "application/xml"}), "unknown", "unsafe-xml"),
             (bootstrap._RestResponse(403, b"x" * 65537, {"Content-Type": "application/xml"}), "unknown", "unsafe-xml"),
-            (bootstrap._RestResponse(200, SECRET.encode(), {}), "unknown", "unsupported-status"),
             (self.private_error(status=401), "unknown", "unsupported-status"),
             (self.private_error(status=429), "unknown", "unsupported-status"),
             (self.private_error(status=500), "unknown", "unsupported-status"),

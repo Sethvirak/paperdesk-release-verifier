@@ -697,11 +697,13 @@ class _TerminalEvidenceFixture:
         receipt_directory,
         *,
         adopt_operations=(),
+        dynamic_package_adoption=False,
     ):
         self.plan = plan
         self.execution_plan = bootstrap.bind_temporary_role_ids(plan, AUTH_ID)
         self.plan_sha = plan_sha
         self.package = package
+        self.dynamic_package_adoption = dynamic_package_adoption
         self.projection = build_projection(
             plan, package, adopt_operations=adopt_operations
         )
@@ -1180,7 +1182,24 @@ class _TerminalEvidenceFixture:
         package_blob = f"v2/control/{MERGE}/paperdesk-private-release-bridge.zip"
         self.envelope(
             "uploadVersionedBridgePackage",
-            {"url": package_contract["expectedUrl"], "blob": package_blob, "etag": package_etag, "versionId": package_version, "sha256": self.package["sha256"], "size": self.package["size"], "bodySha256": self.package["sha256"], "bodySize": self.package["size"]},
+            {
+                "url": package_contract["expectedUrl"],
+                "blob": package_blob,
+                "etag": package_etag,
+                "versionId": package_version,
+                "sha256": self.package["sha256"],
+                "size": self.package["size"],
+                "bodySha256": self.package["sha256"],
+                "bodySize": self.package["size"],
+                "provisioningOutcome": (
+                    "adopted-exact"
+                    if self.dynamic_package_adoption
+                    or self.contexts["uploadVersionedBridgePackage"][
+                        "executionDecision"
+                    ] == "adopt-exact"
+                    else "created"
+                ),
+            },
             headers={"etag": package_etag, "versionId": package_version},
         )
         modulus = base64.urlsafe_b64encode(b"\x80" + b"\x00" * 383).decode().rstrip("=")
@@ -2001,7 +2020,9 @@ class _TerminalEvidenceFixture:
                     "target": mutation["target"],
                     "kind": mutation["kind"],
                     "outcome": bootstrap._expected_permanent_outcome(
-                        mutation, self.contexts[mutation["id"]]
+                        mutation,
+                        self.contexts[mutation["id"]],
+                        self.operations[mutation["id"]],
                     ),
                     "sourceProjection": self.operations[mutation["id"]],
                     "observedAt": stamp(NOW + dt.timedelta(minutes=1)),
@@ -2046,6 +2067,7 @@ def build_valid_terminal_source_evidence_fixture(
     plan_sha=None,
     package=None,
     adopt_operations=(),
+    dynamic_package_adoption=False,
 ):
     plan, loaded_sha = bootstrap.load_plan() if plan is None else (plan, plan_sha)
     if plan_sha is None:
@@ -2057,6 +2079,7 @@ def build_valid_terminal_source_evidence_fixture(
         package,
         Path(receipt_directory),
         adopt_operations=adopt_operations,
+        dynamic_package_adoption=dynamic_package_adoption,
     )
     evidence = fixture.build_evidence()
     return {
@@ -8616,6 +8639,62 @@ class BootstrapTests(unittest.TestCase):
                 )
                 self.assertIsNone(components[name]["createCondition"])
                 self.assertIsNone(components[name]["createHttpStatus"])
+
+    def test_apply_exact_package_can_adopt_exact_live_blob_without_put(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = build_valid_terminal_source_evidence_fixture(
+                Path(folder)
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}",
+                plan=self.plan,
+                plan_sha=self.plan_sha,
+                package=self.package,
+                dynamic_package_adoption=True,
+            )
+        package_admission = next(
+            item
+            for item in fixture["preflightProjection"]["operationAdmissions"]
+            if item["operationId"] == "uploadVersionedBridgePackage"
+        )
+        self.assertEqual(
+            package_admission["context"]["executionDecision"], "apply-exact"
+        )
+        source = fixture["sourceEvidence"]
+        self.assertEqual(
+            bootstrap.validate_terminal_source_evidence(
+                plan=fixture["plan"],
+                authorization=fixture["authorization"],
+                preflight_projection=fixture["preflightProjection"],
+                evidence=source,
+            ),
+            source,
+        )
+        package_projection = next(
+            item["sourceProjection"]["projection"]
+            for item in source["allOperationProjections"]
+            if item["operationId"] == "uploadVersionedBridgePackage"
+        )
+        self.assertEqual(
+            package_projection["provisioningOutcome"], "adopted-exact"
+        )
+        self.assertFalse(
+            any(
+                item["operationId"] == "uploadVersionedBridgePackage"
+                for item in source["productionBoundary"]["mutationJournal"]
+            )
+        )
+        components = bootstrap.build_terminal_receipt_components(
+            plan=fixture["plan"],
+            authorization=fixture["authorization"],
+            preflight_projection=fixture["preflightProjection"],
+            source_evidence=source,
+            started_at=source["claimReceipt"]["claimedAt"],
+            completed_at=source["observedAt"],
+        )
+        self.assertEqual(
+            components["packageReadback"]["provisioningOutcome"],
+            "adopted-exact",
+        )
+        self.assertIsNone(components["packageReadback"]["createHttpStatus"])
 
     def test_terminal_operation_and_postcondition_times_are_inside_execution(self):
         with tempfile.TemporaryDirectory() as folder:
