@@ -133,12 +133,18 @@ CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS = 900
 CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS = (
     7 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
 )
+# The package WORM operation reads after its PUT before the irreversible lock,
+# and the two existing locked policies each read before their extend action.
+WORM_POLICY_ADJACENT_READ_ALLOWANCE_SECONDS = (
+    3 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+)
 CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS = (
     CONTROLLER_CANARY_ROLE_ADMISSION_ALLOWANCE_SECONDS
     + MAX_STORAGE_DATA_PLANE_READINESS_SECONDS
     + STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
     + CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS
     + PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+    + WORM_POLICY_ADJACENT_READ_ALLOWANCE_SECONDS
 )
 MAX_AUTHORIZATION_SECONDS = (
     CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS
@@ -1668,16 +1674,31 @@ def _mutation_target_allowed(
         return method == "PUT" and host == "mdspdbak2608089c4e.blob.core.windows.net" and path == canary_path and query == {"comp": ["lease"]}
     if operation_id == "removeControllerLeaseCanaryBlob":
         return method == "DELETE" and host == "mdspdbak2608089c4e.blob.core.windows.net" and path == canary_path and not query
-    worm_target = {
-        "lockPackageRetentionAt91Days": "packageContainer",
+    if operation_id == "lockPackageRetentionAt91Days":
+        policy_id = (
+            resources["packageContainer"]["resourceId"]
+            + "/immutabilityPolicies/default"
+        )
+        action = (operation_contexts or {}).get(operation_id, {}).get(
+            "wormMutationAction"
+        )
+        if action == "put-lock":
+            return (method == "PUT" and arm(policy_id)) or (
+                method == "POST" and arm(policy_id, suffix="/lock")
+            )
+        if action == "extend":
+            return method == "POST" and arm(policy_id, suffix="/extend")
+        return False
+    worm_extend_target = {
         "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
         "extendResultRetentionFrom30To91Days": "resultContainer",
     }.get(operation_id)
-    if worm_target is not None:
-        policy_id = resources[worm_target]["resourceId"] + "/immutabilityPolicies/default"
-        return (method == "PUT" and arm(policy_id)) or (
-            method == "POST" and arm(policy_id, suffix="/lock")
+    if worm_extend_target is not None:
+        policy_id = (
+            resources[worm_extend_target]["resourceId"]
+            + "/immutabilityPolicies/default"
         )
+        return method == "POST" and arm(policy_id, suffix="/extend")
     return False
 
 
@@ -1698,6 +1719,45 @@ def _normalized_mutation_target(method: str, target_url: str) -> str:
         )
     )
     return f"{method.upper()} {normalized}"
+
+
+def _expected_worm_mutation_body_sha256(
+    operation_id: str, method: str, target_url: str
+) -> str | None:
+    """Bind every WORM mutation to its one reviewed canonical request body."""
+
+    body: Mapping[str, Any] | None = None
+    target_path = urllib.parse.urlsplit(target_url).path.lower()
+    if operation_id == "lockPackageRetentionAt91Days" and method == "PUT":
+        body = {
+            "properties": {
+                "immutabilityPeriodSinceCreationInDays": 91,
+                "allowProtectedAppendWrites": False,
+                "allowProtectedAppendWritesAll": False,
+            }
+        }
+    elif (
+        operation_id == "lockPackageRetentionAt91Days"
+        and method == "POST"
+        and target_path.endswith("/immutabilitypolicies/default/lock")
+    ):
+        return sha256_bytes(b"")
+    elif (
+        operation_id
+        in {
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        }
+        and method == "POST"
+        and target_path.endswith("/immutabilitypolicies/default/extend")
+    ):
+        body = {
+            "properties": {
+                "immutabilityPeriodSinceCreationInDays": 91,
+            }
+        }
+    return sha256_bytes(canonical_json_bytes(body)) if body is not None else None
 
 
 def _forbidden_release_mutation_classes(
@@ -1773,9 +1833,9 @@ def _expected_terminal_mutation_targets(
     that selected ``apply-exact`` has a reviewed write cardinality.  Compound
     role, App Service, lease, and cleanup operations must therefore retain one
     successful result for every exact subcall and cannot hide an omitted member
-    behind another allowed URL.  A WORM policy lock POST is the sole optional
-    subcall: the provider returns either an already-Locked PUT projection or an
-    Unlocked projection that requires exactly one subsequent lock POST.
+    behind another allowed URL.  The package WORM policy has one PUT and a lock
+    POST exactly when the adjacent post-PUT state is Unlocked.  Each already
+    Locked 30-day policy has exactly one conditional extend POST.
     """
 
     plan = bind_temporary_role_ids(plan, authorization_id)
@@ -2104,20 +2164,27 @@ def _expected_terminal_mutation_targets(
                 "2025-03-01",
             ),
         )
-    worm_targets = {
-        "lockPackageRetentionAt91Days": "packageContainer",
-        "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
-        "extendResultRetentionFrom30To91Days": "resultContainer",
-    }
-    if operation_id in worm_targets:
+    if operation_id == "lockPackageRetentionAt91Days":
         policy_id = (
-            resources[worm_targets[operation_id]]["resourceId"]
+            resources["packageContainer"]["resourceId"]
             + "/immutabilityPolicies/default"
         )
-        required, _ = one("PUT", arm(policy_id, "2025-06-01"))
         source_projection = operation_projections.get(operation_id, {}).get(
             "projection", {}
         )
+        context_action = context.get("wormMutationAction")
+        projection_action = (
+            source_projection.get("mutationAction")
+            if isinstance(source_projection, Mapping)
+            else None
+        )
+        if context_action != projection_action:
+            fail(f"terminal WORM mutation action drifted for {operation_id}")
+        if context_action == "extend":
+            return one("POST", arm(policy_id, "2025-06-01", "/extend"))
+        if context_action != "put-lock":
+            fail(f"terminal WORM mutation action is invalid for {operation_id}")
+        required, _ = one("PUT", arm(policy_id, "2025-06-01"))
         state_after_put = (
             source_projection.get("stateAfterPut")
             if isinstance(source_projection, Mapping)
@@ -2138,6 +2205,16 @@ def _expected_terminal_mutation_targets(
         else:
             fail(f"terminal WORM mutation path is not exact: {operation_id}")
         return required, Counter()
+    worm_extend_targets = {
+        "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
+        "extendResultRetentionFrom30To91Days": "resultContainer",
+    }
+    if operation_id in worm_extend_targets:
+        policy_id = (
+            resources[worm_extend_targets[operation_id]]["resourceId"]
+            + "/immutabilityPolicies/default"
+        )
+        return one("POST", arm(policy_id, "2025-06-01", "/extend"))
     if operation_id == "startBridgeForBoundedCanary":
         site_id = resources["bridgeSite"]["resourceId"]
         return Counter(
@@ -2669,6 +2746,24 @@ def _sanitize_mutation_journal(
         ):
             fail("mutation journal target is outside the source-owned operation contract")
         _sha256(value.get("requestBodySha256"), "mutation request body digest")
+        expected_worm_body_sha256 = _expected_worm_mutation_body_sha256(
+            str(operation_id), str(method), target_url
+        )
+        if (
+            operation_id
+            in {
+                "lockPackageRetentionAt91Days",
+                "extendAcceptedRetentionFrom30To91Days",
+                "extendResultRetentionFrom30To91Days",
+            }
+            and expected_worm_body_sha256 is None
+        ):
+            fail("WORM mutation target has no exact reviewed body")
+        if (
+            expected_worm_body_sha256 is not None
+            and value.get("requestBodySha256") != expected_worm_body_sha256
+        ):
+            fail("WORM mutation request body differs from the exact reviewed body")
         is_storage = (
             (parsed.hostname or "").lower()
             == "mdspdbak2608089c4e.blob.core.windows.net"
@@ -2868,6 +2963,24 @@ def _validate_sanitized_mutation_journal(
         ):
             fail("sanitized mutation journal target or operation classification drifted")
         _sha256(item["requestBodySha256"], "sanitized journal request digest")
+        expected_worm_body_sha256 = _expected_worm_mutation_body_sha256(
+            operation_id, item["method"], item["targetUrl"]
+        )
+        if (
+            operation_id
+            in {
+                "lockPackageRetentionAt91Days",
+                "extendAcceptedRetentionFrom30To91Days",
+                "extendResultRetentionFrom30To91Days",
+            }
+            and expected_worm_body_sha256 is None
+        ):
+            fail("WORM mutation target has no exact reviewed body")
+        if (
+            expected_worm_body_sha256 is not None
+            and item["requestBodySha256"] != expected_worm_body_sha256
+        ):
+            fail("WORM mutation request body differs from the exact reviewed body")
         parsed_target = urllib.parse.urlsplit(item["targetUrl"])
         is_storage = (
             (parsed_target.hostname or "").lower()
@@ -7149,6 +7262,29 @@ def _validate_operation_source_projection(
         ):
             fail("bridge terminal canary did not succeed and finally stop")
     elif family == "worm-policy-projection":
+        if operation_id == "lockPackageRetentionAt91Days":
+            package_action = context.get("wormMutationAction")
+            if package_action == "put-lock":
+                path_fields = {
+                    "mutationAction",
+                    "stateAfterPut",
+                    "lockPostIssued",
+                }
+            elif package_action == "extend":
+                path_fields = {
+                    "mutationAction",
+                    "stateBeforeExtend",
+                    "daysBeforeExtend",
+                    "adjacentPrestateEtag",
+                }
+            else:
+                fail("terminal package WORM context has no exact mutation action")
+        else:
+            path_fields = {
+                "mutationAction",
+                "stateBeforeExtend",
+                "adjacentPrestateEtag",
+            }
         body = _exact_keys(
             body,
             {
@@ -7157,9 +7293,8 @@ def _validate_operation_source_projection(
                 "type",
                 "etag",
                 "properties",
-                "stateAfterPut",
-                "lockPostIssued",
-            },
+            }
+            | path_fields,
             "WORM projection",
         )
         properties = _exact_keys(
@@ -7174,21 +7309,63 @@ def _validate_operation_source_projection(
         )
         target_id = resources[operation["target"]]["resourceId"]
         expected_policy_id = target_id + "/immutabilityPolicies/default"
+        body_etag = _if_match_etag(body["etag"], "WORM terminal body ETag")
+        header_etag = _if_match_etag(
+            headers.get("etag"), "WORM terminal response ETag"
+        )
         if (
             str(body["id"]).lower() != expected_policy_id.lower()
             or body["name"] != "default"
             or body["type"]
             != "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
-            or _quoted_etag(body["etag"], "WORM terminal ETag") != body["etag"]
+            or body_etag != header_etag
             or properties["state"] != "Locked"
             or type(properties["immutabilityPeriodSinceCreationInDays"]) is not int
             or properties["immutabilityPeriodSinceCreationInDays"] < 91
             or properties["allowProtectedAppendWrites"] is not False
             or properties["allowProtectedAppendWritesAll"] is not False
-            or body["stateAfterPut"] not in {"Locked", "Unlocked"}
-            or body["lockPostIssued"] is not (body["stateAfterPut"] == "Unlocked")
         ):
             fail("terminal WORM projection is not locked at least 91 days")
+        if operation_id == "lockPackageRetentionAt91Days":
+            if body["mutationAction"] != package_action:
+                fail("terminal package WORM mutation action drifted")
+            if package_action == "put-lock":
+                if (
+                    body["stateAfterPut"] not in {"Locked", "Unlocked"}
+                    or body["lockPostIssued"]
+                    is not (body["stateAfterPut"] == "Unlocked")
+                ):
+                    fail("terminal package WORM put-lock path is not exact")
+            else:
+                adjacent_etag = _if_match_etag(
+                    body["adjacentPrestateEtag"],
+                    "terminal package WORM adjacent prestate ETag",
+                )
+                context_etag = _if_match_etag(
+                    context.get("etag"),
+                    "terminal package WORM authorization-bound ETag",
+                )
+                if (
+                    body["stateBeforeExtend"] != "Locked"
+                    or type(body["daysBeforeExtend"]) is not int
+                    or body["daysBeforeExtend"] != context.get("prestateDays")
+                    or adjacent_etag != context_etag
+                ):
+                    fail("terminal package WORM extend path is not exact")
+        else:
+            adjacent_etag = _if_match_etag(
+                body["adjacentPrestateEtag"],
+                "terminal WORM adjacent prestate ETag",
+            )
+            context_etag = _if_match_etag(
+                context.get("etag"), "terminal WORM authorization-bound ETag"
+            )
+            if (
+                body["mutationAction"] != "extend"
+                or body["stateBeforeExtend"] != "Locked"
+                or adjacent_etag != context_etag
+            ):
+                fail("terminal WORM extend path is not exact")
     elif family == "resource-group-projection":
         body = _exact_keys(body, {"id", "name", "type", "location"}, "resource group")
         if (
@@ -10206,6 +10383,12 @@ def _operation_context_policy(
         "extendResultRetentionFrom30To91Days",
     }:
         observed_fields.add("etag")
+        if operation_id == "lockPackageRetentionAt91Days":
+            observed_fields |= {
+                "wormMutationAction",
+                "prestateState",
+                "prestateDays",
+            }
     dependencies: dict[str, list[str]] = {
         "createPublisherServicePrincipal": ["createPublisherApplication.appId"],
         "grantPublisherGraphApplicationReadAll": ["createPublisherServicePrincipal.objectId"],
@@ -10455,6 +10638,31 @@ def _validate_operation_context(
             pass
         else:
             _quoted_etag(context["etag"], f"{operation_id} context ETag")
+    if operation_id == "lockPackageRetentionAt91Days":
+        action = context["wormMutationAction"]
+        prestate_state = context["prestateState"]
+        prestate_days = context["prestateDays"]
+        if action == "put-lock":
+            if prestate_state == "Absent":
+                if prestate_days is not None or context["etag"] is not None:
+                    fail("absent package WORM context is inconsistent")
+            elif (
+                prestate_state != "Unlocked"
+                or type(prestate_days) is not int
+                or not 1 <= prestate_days <= 91
+                or context["etag"] is None
+            ):
+                fail("package WORM put-lock context is inconsistent")
+        elif action == "extend":
+            if (
+                prestate_state != "Locked"
+                or type(prestate_days) is not int
+                or not 1 <= prestate_days < 91
+                or context["etag"] is None
+            ):
+                fail("package WORM extend context is inconsistent")
+        else:
+            fail("package WORM mutation action is invalid")
     if operation_id == "retireLegacyPublisherFic" and not GUID.fullmatch(
         str(context["legacyFederatedCredentialId"])
     ):
@@ -12227,6 +12435,7 @@ class AzureCliBootstrapTransport:
         return self._authorization_expiry() - dt.timedelta(
             seconds=(
                 PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS
+                + WORM_POLICY_ADJACENT_READ_ALLOWANCE_SECONDS
                 + extra_reserve_seconds
             )
         )
@@ -13845,9 +14054,36 @@ class AzureCliBootstrapTransport:
                 }
                 if isinstance(properties, Mapping)
                 else None,
-                "stateAfterPut": facts.get("stateAfterPut"),
-                "lockPostIssued": facts.get("lockPostIssued"),
             }
+            if operation_id == "lockPackageRetentionAt91Days":
+                retained["mutationAction"] = facts.get("mutationAction")
+                if facts.get("mutationAction") == "put-lock":
+                    retained.update(
+                        {
+                            "stateAfterPut": facts.get("stateAfterPut"),
+                            "lockPostIssued": facts.get("lockPostIssued"),
+                        }
+                    )
+                elif facts.get("mutationAction") == "extend":
+                    retained.update(
+                        {
+                            "stateBeforeExtend": facts.get("stateBeforeExtend"),
+                            "daysBeforeExtend": facts.get("daysBeforeExtend"),
+                            "adjacentPrestateEtag": facts.get(
+                                "adjacentPrestateEtag"
+                            ),
+                        }
+                    )
+            else:
+                retained.update(
+                    {
+                        "mutationAction": facts.get("mutationAction"),
+                        "stateBeforeExtend": facts.get("stateBeforeExtend"),
+                        "adjacentPrestateEtag": facts.get(
+                            "adjacentPrestateEtag"
+                        ),
+                    }
+                )
             family = "worm-policy-projection"
         elif operation_id == "createMailboxResourceGroup":
             retained = {
@@ -14470,17 +14706,61 @@ class AzureCliBootstrapTransport:
                 if (
                     not isinstance(properties, Mapping)
                     or runtime_facts is None
-                    or runtime_facts.get("stateAfterPut")
-                    not in {"Locked", "Unlocked"}
-                    or runtime_facts.get("lockPostIssued")
-                    is not (runtime_facts.get("stateAfterPut") == "Unlocked")
                     or properties.get("state") != "Locked"
                     or type(properties.get("immutabilityPeriodSinceCreationInDays")) is not int
                     or properties["immutabilityPeriodSinceCreationInDays"] < 91
-                    or properties.get("allowProtectedAppendWrites", False) is not False
-                    or properties.get("allowProtectedAppendWritesAll", False) is not False
+                    or properties.get("allowProtectedAppendWrites") is not False
+                    or properties.get("allowProtectedAppendWritesAll") is not False
                 ):
                     fail("WORM policy readback is not Locked for at least 91 days")
+                if operation_id == "lockPackageRetentionAt91Days":
+                    context = self.admissions[operation_id]["context"]
+                    mutation_action = runtime_facts.get("mutationAction")
+                    if mutation_action != context.get("wormMutationAction"):
+                        fail("package WORM mutation action drifted")
+                    if mutation_action == "put-lock":
+                        if (
+                            runtime_facts.get("stateAfterPut")
+                            not in {"Locked", "Unlocked"}
+                            or runtime_facts.get("lockPostIssued")
+                            is not (
+                                runtime_facts.get("stateAfterPut") == "Unlocked"
+                            )
+                        ):
+                            fail("package WORM put-lock path is not exact")
+                    elif mutation_action == "extend":
+                        adjacent_etag = _if_match_etag(
+                            runtime_facts.get("adjacentPrestateEtag"),
+                            "package WORM extend adjacent prestate ETag",
+                        )
+                        context_etag = _if_match_etag(
+                            context.get("etag"),
+                            "package WORM extend authorization-bound ETag",
+                        )
+                        if (
+                            runtime_facts.get("stateBeforeExtend") != "Locked"
+                            or runtime_facts.get("daysBeforeExtend")
+                            != context.get("prestateDays")
+                            or adjacent_etag != context_etag
+                        ):
+                            fail("package WORM extend path is not exact")
+                    else:
+                        fail("package WORM mutation action is invalid")
+                else:
+                    adjacent_etag = _if_match_etag(
+                        runtime_facts.get("adjacentPrestateEtag"),
+                        "WORM extend adjacent prestate ETag",
+                    )
+                    context_etag = _if_match_etag(
+                        self.admissions[operation_id]["context"].get("etag"),
+                        "WORM extend authorization-bound ETag",
+                    )
+                    if (
+                        runtime_facts.get("mutationAction") != "extend"
+                        or runtime_facts.get("stateBeforeExtend") != "Locked"
+                        or adjacent_etag != context_etag
+                    ):
+                        fail("WORM extend mutation path is not exact")
             elif operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
                 settings = document.get("properties")
                 if (
@@ -15663,6 +15943,66 @@ class AzureCliBootstrapTransport:
             result["_responseEtag"] = etag
         return result
 
+    def _exact_immutability_policy_response(
+        self,
+        response: _RestResponse,
+        *,
+        policy_id: str,
+        label: str,
+        allowed_states: set[str],
+        minimum_days: int = 91,
+        maximum_days: int | None = None,
+        require_append_flags: bool = True,
+    ) -> tuple[Mapping[str, Any], str, str]:
+        document = self._json_response(response, {200}, label)
+        properties = document.get("properties")
+        if not isinstance(properties, Mapping):
+            fail(f"{label} properties are absent")
+        state_name = properties.get("state")
+        body_etag = _if_match_etag(document.get("etag"), f"{label} body ETag")
+        header_etag = _if_match_etag(
+            self._header(response, "ETag"), f"{label} response ETag"
+        )
+        if body_etag != header_etag:
+            fail(f"{label} ETag sources disagree")
+        if (
+            str(document.get("id", "")).lower() != policy_id.lower()
+            or document.get("name") != "default"
+            or document.get("type")
+            != "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies"
+            or state_name not in allowed_states
+            or type(properties.get("immutabilityPeriodSinceCreationInDays"))
+            is not int
+            or properties["immutabilityPeriodSinceCreationInDays"] < minimum_days
+            or (
+                maximum_days is not None
+                and properties["immutabilityPeriodSinceCreationInDays"]
+                > maximum_days
+            )
+            or (
+                require_append_flags
+                and (
+                    properties.get("allowProtectedAppendWrites") is not False
+                    or properties.get("allowProtectedAppendWritesAll") is not False
+                )
+            )
+            or (
+                not require_append_flags
+                and (
+                    (
+                        "allowProtectedAppendWrites" in properties
+                        and properties["allowProtectedAppendWrites"] is not False
+                    )
+                    or (
+                        "allowProtectedAppendWritesAll" in properties
+                        and properties["allowProtectedAppendWritesAll"] is not False
+                    )
+                )
+            )
+        ):
+            fail(f"{label} state is not exact")
+        return document, state_name, body_etag
+
     def _arm_delete(
         self,
         resource_id: str,
@@ -16821,19 +17161,71 @@ class AzureCliBootstrapTransport:
                 "size": self.package["size"],
             }
 
-        if operation_id in {
-            "lockPackageRetentionAt91Days",
-            "extendAcceptedRetentionFrom30To91Days",
-            "extendResultRetentionFrom30To91Days",
-        }:
-            target = {
-                "lockPackageRetentionAt91Days": "packageContainer",
-                "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
-                "extendResultRetentionFrom30To91Days": "resultContainer",
-            }[operation_id]
-            container = self.resources[target]
+        if operation_id == "lockPackageRetentionAt91Days":
+            container = self.resources["packageContainer"]
             policy = container["resourceId"] + "/immutabilityPolicies/default"
+            mutation_action = context.get("wormMutationAction")
             current_etag = context.get("etag")
+            if mutation_action == "extend":
+                preflight_etag = _if_match_etag(
+                    current_etag, "package immutability policy preflight ETag"
+                )
+                prestate_days = context.get("prestateDays")
+                if type(prestate_days) is not int or not 1 <= prestate_days < 91:
+                    fail("package immutability policy extension days are invalid")
+                policy_url = self._arm_url(policy, "2025-06-01")
+                adjacent_response = self._read_request_with_transport_retry(
+                    "GET", policy_url
+                )
+                (
+                    _,
+                    state_before_extend,
+                    adjacent_etag,
+                ) = self._exact_immutability_policy_response(
+                    adjacent_response,
+                    policy_id=policy,
+                    label="package immutability policy pre-extend read",
+                    allowed_states={"Locked"},
+                    minimum_days=prestate_days,
+                    maximum_days=prestate_days,
+                )
+                if adjacent_etag != preflight_etag:
+                    fail(
+                        "package immutability policy pre-extend ETag drifted from preflight"
+                    )
+                extend_body = {
+                    "properties": {
+                        "immutabilityPeriodSinceCreationInDays": 91,
+                    }
+                }
+                response = self._mutation_request(
+                    "POST",
+                    self._arm_url(policy, "2025-06-01", "/extend"),
+                    body=canonical_json_bytes(extend_body),
+                    headers={
+                        "Content-Type": "application/json",
+                        "If-Match": adjacent_etag,
+                    },
+                    expected={200},
+                )
+                self._exact_immutability_policy_response(
+                    response,
+                    policy_id=policy,
+                    label="package immutability policy extend",
+                    allowed_states={"Locked"},
+                    maximum_days=91,
+                    require_append_flags=False,
+                )
+                return {
+                    "policyResourceId": policy,
+                    "days": 91,
+                    "mutationAction": "extend",
+                    "stateBeforeExtend": state_before_extend,
+                    "daysBeforeExtend": prestate_days,
+                    "adjacentPrestateEtag": adjacent_etag,
+                }
+            if mutation_action != "put-lock":
+                fail("package immutability policy mutation action is invalid")
             result = self._arm_put(
                 policy,
                 "2025-06-01",
@@ -16853,21 +17245,106 @@ class AzureCliBootstrapTransport:
                 else {"If-None-Match": "*"},
             )
             properties = result.get("properties")
-            state_name = properties.get("state") if isinstance(properties, dict) else None
-            if state_name not in {"Locked", "Unlocked"}:
+            put_state = properties.get("state") if isinstance(properties, dict) else None
+            if put_state not in {"Locked", "Unlocked"}:
                 fail("immutability policy PUT returned an unknown state")
+            policy_url = self._arm_url(policy, "2025-06-01")
+            adjacent_response = self._read_request_with_transport_retry(
+                "GET", policy_url
+            )
+            _, state_name, adjacent_etag = self._exact_immutability_policy_response(
+                adjacent_response,
+                policy_id=policy,
+                label="immutability policy post-PUT read",
+                allowed_states={"Locked", "Unlocked"},
+                maximum_days=91,
+            )
             lock_post_issued = state_name == "Unlocked"
             if state_name != "Locked":
                 lock_url = self._arm_url(policy, "2025-06-01", "/lock")
                 response = self._mutation_request(
-                    "POST", lock_url, body=b"", expected={200}
+                    "POST",
+                    lock_url,
+                    body=b"",
+                    headers={"If-Match": adjacent_etag},
+                    expected={200},
                 )
-                self._json_response(response, {200}, "immutability policy lock")
+                self._exact_immutability_policy_response(
+                    response,
+                    policy_id=policy,
+                    label="immutability policy lock",
+                    allowed_states={"Locked"},
+                    maximum_days=91,
+                    require_append_flags=False,
+                )
             return {
                 "policyResourceId": policy,
                 "days": 91,
+                "mutationAction": "put-lock",
                 "stateAfterPut": state_name,
                 "lockPostIssued": lock_post_issued,
+            }
+
+        if operation_id in {
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        }:
+            target = {
+                "extendAcceptedRetentionFrom30To91Days": "acceptedContainer",
+                "extendResultRetentionFrom30To91Days": "resultContainer",
+            }[operation_id]
+            container = self.resources[target]
+            policy = container["resourceId"] + "/immutabilityPolicies/default"
+            preflight_etag = _if_match_etag(
+                context.get("etag"), "immutability policy preflight ETag"
+            )
+            policy_url = self._arm_url(policy, "2025-06-01")
+            adjacent_response = self._read_request_with_transport_retry(
+                "GET", policy_url
+            )
+            (
+                _,
+                state_before_extend,
+                adjacent_etag,
+            ) = self._exact_immutability_policy_response(
+                adjacent_response,
+                policy_id=policy,
+                label="immutability policy pre-extend read",
+                allowed_states={"Locked"},
+                minimum_days=30,
+                maximum_days=30,
+            )
+            if adjacent_etag != preflight_etag:
+                fail("immutability policy pre-extend ETag drifted from preflight")
+            extend_body = {
+                "properties": {
+                    "immutabilityPeriodSinceCreationInDays": 91,
+                }
+            }
+            response = self._mutation_request(
+                "POST",
+                self._arm_url(policy, "2025-06-01", "/extend"),
+                body=canonical_json_bytes(extend_body),
+                headers={
+                    "Content-Type": "application/json",
+                    "If-Match": adjacent_etag,
+                },
+                expected={200},
+            )
+            self._exact_immutability_policy_response(
+                response,
+                policy_id=policy,
+                label="immutability policy extend",
+                allowed_states={"Locked"},
+                maximum_days=91,
+                require_append_flags=False,
+            )
+            return {
+                "policyResourceId": policy,
+                "days": 91,
+                "mutationAction": "extend",
+                "stateBeforeExtend": state_before_extend,
+                "adjacentPrestateEtag": adjacent_etag,
             }
 
         if operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":

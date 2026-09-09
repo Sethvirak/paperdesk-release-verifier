@@ -1199,7 +1199,13 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(package_worm["status"], "absent")
             self.assertEqual(
                 package_worm["context"],
-                {"executionDecision": "apply-exact", "etag": None},
+                {
+                    "executionDecision": "apply-exact",
+                    "etag": None,
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Absent",
+                    "prestateDays": None,
+                },
             )
             for operation_id in (
                 "extendAcceptedRetentionFrom30To91Days",
@@ -3358,6 +3364,42 @@ class ObserveTests(unittest.TestCase):
             context, {"executionDecision": "adopt-exact", "adopted": {}}
         )
 
+        for state, days, action in (
+            ("Unlocked", 1, "put-lock"),
+            ("Unlocked", 91, "put-lock"),
+            ("Locked", 1, "extend"),
+            ("Locked", 30, "extend"),
+            ("Locked", 90, "extend"),
+        ):
+            with self.subTest(state=state, days=days):
+                status, context = observe._worm_policy_admission(
+                    "lockPackageRetentionAt91Days",
+                    envelope("packageContainer", state=state, days=days),
+                    self.plan,
+                    package_policy,
+                )
+                self.assertEqual(status, "exact")
+                self.assertEqual(
+                    context,
+                    {
+                        "executionDecision": "apply-exact",
+                        "etag": '"worm-etag"',
+                        "wormMutationAction": action,
+                        "prestateState": state,
+                        "prestateDays": days,
+                    },
+                )
+
+        with self.assertRaisesRegex(
+            observe.ObserveError, "outside the supported resumable prestate"
+        ):
+            observe._worm_policy_admission(
+                "lockPackageRetentionAt91Days",
+                envelope("packageContainer", state="Unlocked", days=92),
+                self.plan,
+                package_policy,
+            )
+
         accepted_policy = bootstrap._operation_context_policy(
             "extendAcceptedRetentionFrom30To91Days", self.plan, authorization
         )
@@ -3422,7 +3464,13 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(status, "absent")
         self.assertEqual(
             context,
-            {"executionDecision": "apply-exact", "etag": None},
+            {
+                "executionDecision": "apply-exact",
+                "etag": None,
+                "wormMutationAction": "put-lock",
+                "prestateState": "Absent",
+                "prestateDays": None,
+            },
         )
 
     def test_package_deleted_tombstone_rejects_every_identity_etag_and_shape_drift(self):
@@ -3564,7 +3612,13 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(package["status"], "absent")
             self.assertEqual(
                 package["context"],
-                {"executionDecision": "apply-exact", "etag": None},
+                {
+                    "executionDecision": "apply-exact",
+                    "etag": None,
+                    "wormMutationAction": "put-lock",
+                    "prestateState": "Absent",
+                    "prestateDays": None,
+                },
             )
             self.assertEqual(
                 probes[package["probeIds"][0]]["status"],
