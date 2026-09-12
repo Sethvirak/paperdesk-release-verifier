@@ -7314,7 +7314,10 @@ def _validate_operation_source_projection(
         ):
             fail("bridge terminal canary did not succeed and finally stop")
     elif family == "worm-policy-projection":
-        if operation_id == "lockPackageRetentionAt91Days":
+        adopted_exact = context.get("executionDecision") == "adopt-exact"
+        if adopted_exact:
+            path_fields = set()
+        elif operation_id == "lockPackageRetentionAt91Days":
             package_action = context.get("wormMutationAction")
             if package_action == "put-lock":
                 path_fields = {
@@ -7378,7 +7381,9 @@ def _validate_operation_source_projection(
             or properties["allowProtectedAppendWritesAll"] is not False
         ):
             fail("terminal WORM projection is not locked at least 91 days")
-        if operation_id == "lockPackageRetentionAt91Days":
+        if adopted_exact:
+            pass
+        elif operation_id == "lockPackageRetentionAt91Days":
             if body["mutationAction"] != package_action:
                 fail("terminal package WORM mutation action drifted")
             if package_action == "put-lock":
@@ -14174,7 +14179,15 @@ class AzureCliBootstrapTransport:
                 if isinstance(properties, Mapping)
                 else None,
             }
-            if operation_id == "lockPackageRetentionAt91Days":
+            adopted_exact = (
+                self.admissions[operation_id]["context"].get(
+                    "executionDecision"
+                )
+                == "adopt-exact"
+            )
+            if adopted_exact:
+                pass
+            elif operation_id == "lockPackageRetentionAt91Days":
                 retained["mutationAction"] = facts.get("mutationAction")
                 if facts.get("mutationAction") == "put-lock":
                     retained.update(
@@ -14832,8 +14845,14 @@ class AzureCliBootstrapTransport:
                     or properties.get("allowProtectedAppendWritesAll") is not False
                 ):
                     fail("WORM policy readback is not Locked for at least 91 days")
-                if operation_id == "lockPackageRetentionAt91Days":
-                    context = self.admissions[operation_id]["context"]
+                context = self.admissions[operation_id]["context"]
+                adopted_exact = (
+                    context.get("executionDecision") == "adopt-exact"
+                )
+                if adopted_exact:
+                    if runtime_facts != context.get("adopted"):
+                        fail("adopted WORM runtime facts are not exact")
+                elif operation_id == "lockPackageRetentionAt91Days":
                     mutation_action = runtime_facts.get("mutationAction")
                     if mutation_action != context.get("wormMutationAction"):
                         fail("package WORM mutation action drifted")

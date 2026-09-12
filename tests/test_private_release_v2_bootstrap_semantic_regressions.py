@@ -1383,6 +1383,88 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 self.assertNotIn("stateAfterPut", retained)
                 self.assertNotIn("lockPostIssued", retained)
 
+    def test_adopted_exact_worm_readback_requires_state_without_mutation_facts(self):
+        for operation_id in (
+            "lockPackageRetentionAt91Days",
+            "extendAcceptedRetentionFrom30To91Days",
+            "extendResultRetentionFrom30To91Days",
+        ):
+            with self.subTest(operation_id=operation_id):
+                operation = self.operations[operation_id]
+                policy_id = (
+                    self.resources[operation["target"]]["resourceId"]
+                    + "/immutabilityPolicies/default"
+                )
+                document = {
+                    "id": policy_id,
+                    "name": "default",
+                    "type": (
+                        "Microsoft.Storage/storageAccounts/blobServices/containers/"
+                        "immutabilityPolicies"
+                    ),
+                    "etag": '"adopted-etag"',
+                    "properties": {
+                        "state": "Locked",
+                        "immutabilityPeriodSinceCreationInDays": 91,
+                        "allowProtectedAppendWrites": False,
+                        "allowProtectedAppendWritesAll": False,
+                    },
+                }
+                response = bootstrap._RestResponse(
+                    status=200,
+                    body=bootstrap.canonical_json_bytes(document),
+                    headers={
+                        "Content-Type": "application/json",
+                        "ETag": '"adopted-etag"',
+                    },
+                )
+                context = {
+                    "executionDecision": "adopt-exact",
+                    "adopted": {},
+                }
+                transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
+                transport.authorization = copy.deepcopy(self.authorization)
+                transport.plan = self.plan
+                transport.resources = self.resources
+                transport.admissions = {
+                    operation_id: {"context": context}
+                }
+                transport._validated_source_projections = {}
+                contract = bootstrap._validator_contract(
+                    f"operation:{operation_id}", self.plan, self.authorization
+                )
+                expected = {
+                    "id": f"readback-{operation_id}",
+                    "validatorId": f"operation:{operation_id}",
+                    "method": contract["expectedMethod"],
+                    "url": contract["expectedUrl"],
+                    "validatorContract": contract,
+                }
+
+                readback = transport._validate_readback_response(
+                    expected, response, runtime_facts={}
+                )
+                retained = readback["sourceProjection"]["projection"]
+                self.assertEqual(
+                    set(retained),
+                    {"id", "name", "type", "etag", "properties"},
+                )
+                self.assertEqual(
+                    retained["properties"][
+                        "immutabilityPeriodSinceCreationInDays"
+                    ],
+                    91,
+                )
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "adopted WORM runtime facts are not exact",
+                ):
+                    transport._validate_readback_response(
+                        expected,
+                        response,
+                        runtime_facts={"mutationAction": "extend"},
+                    )
+
     def test_locked_worm_extend_rejects_prestate_or_etag_drift_before_mutation(self):
         variants = {
             "etag": ("etag", '"drifted-etag"'),
