@@ -3542,6 +3542,266 @@ class BootstrapTests(unittest.TestCase):
         }
         return transport, operation, definition_resource, definition
 
+    def _cleanup_lock_restoration_retry_fixture(
+        self,
+        receipt,
+        restoration_events,
+        *,
+        ambiguous_put=False,
+    ):
+        transport, _operation, _definition_resource, _definition = (
+            self._temporary_role_transport_fixture(receipt)
+        )
+        operation_id = "removeOwnedOperatorFenceBootstrapRole"
+        lock_key = bootstrap.cleanup_locks.applicable_cleanup_lock(operation_id)
+        spec = copy.deepcopy(bootstrap.cleanup_locks.REVIEWED_CLEANUP_LOCKS[lock_key])
+        lock_url = (
+            bootstrap.cleanup_locks.ARM_ROOT
+            + spec["resourceId"]
+            + "?api-version=2016-09-01"
+        )
+        scope = spec["resourceId"].rsplit(
+            "/providers/Microsoft.Authorization/locks/", 1
+        )[0]
+        assignment = {
+            "id": (
+                scope
+                + "/providers/Microsoft.Authorization/roleAssignments/"
+                + "11111111-1111-4111-8111-111111111111"
+            ),
+            "properties": {
+                "principalId": "operator",
+                "roleDefinitionId": "exact-definition",
+            },
+        }
+        assignment_url = (
+            bootstrap.cleanup_locks.ARM_ROOT
+            + assignment["id"]
+            + "?api-version=2022-04-01"
+        )
+
+        def lock_document():
+            return {
+                "id": spec["resourceId"],
+                "name": spec["resourceId"].rsplit("/", 1)[-1],
+                "type": "Microsoft.Authorization/locks",
+                "properties": copy.deepcopy(spec["properties"]),
+            }
+
+        state = {
+            "lock": lock_document(),
+            "assignment": copy.deepcopy(assignment),
+        }
+        events = list(restoration_events)
+        requests = []
+        mutations = []
+
+        class Session:
+            def request(inner_self, method, url, **kwargs):
+                requests.append((method, url, kwargs))
+                if method != "GET":
+                    raise AssertionError("session received a mutation")
+                if (
+                    url == lock_url
+                    and state["assignment"] is None
+                    and events
+                ):
+                    event = events.pop(0)
+                    if event == "ambiguity":
+                        raise bootstrap._RestTransportAmbiguity(
+                            "typed restoration GET ambiguity"
+                        )
+                    if event == "third":
+                        changed = lock_document()
+                        changed["properties"]["notes"] = "administrator change"
+                        return bootstrap._RestResponse(
+                            200, bootstrap.canonical_json_bytes(changed), {}
+                        )
+                    if event != "actual":
+                        raise AssertionError("unknown restoration event")
+                value = (
+                    state["lock"] if url == lock_url
+                    else state["assignment"] if url == assignment_url
+                    else None
+                )
+                if url not in {lock_url, assignment_url}:
+                    raise AssertionError("unexpected read URL")
+                return bootstrap._RestResponse(
+                    404 if value is None else 200,
+                    b"" if value is None else bootstrap.canonical_json_bytes(value),
+                    {},
+                )
+
+        transport.session = Session()
+
+        def read_once(method, url, *, deadline=None):
+            return transport.session.request(method, url, deadline=deadline)
+
+        def mutate(method, url, *, body, expected, restore):
+            mutations.append((method, url, body, expected, restore))
+            if method == "DELETE" and url == lock_url:
+                state["lock"] = None
+            elif method == "DELETE" and url == assignment_url:
+                state["assignment"] = None
+            elif method == "PUT" and url == lock_url:
+                state["lock"] = lock_document()
+                if ambiguous_put:
+                    raise bootstrap._RestTransportAmbiguity(
+                        "typed restoration PUT ambiguity"
+                    )
+            else:
+                raise AssertionError("unexpected mutation")
+            return bootstrap._RestResponse(200, b"{}", {})
+
+        guard = bootstrap.cleanup_locks.CleanupLockGuard(
+            read_request=read_once,
+            post_delete_read_request=transport._cleanup_read_request_after_expiry,
+            mutate_request=mutate,
+            verify_lock_inventory=lambda _operation, _key: None,
+            clock=transport.clock,
+            sleep=transport.sleep,
+            fail=bootstrap.fail,
+            require_live_authorization=lambda: None,
+        )
+
+        def run():
+            return guard.delete_assignment(
+                operation_id=operation_id,
+                assignment_url=assignment_url,
+                expected_assignment_projection=assignment,
+                project_assignment=lambda document: copy.deepcopy(document),
+            )
+
+        return transport, run, requests, mutations, state
+
+    def test_cleanup_lock_restoration_retries_two_typed_get_ambiguities_then_puts_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transport, run, requests, mutations, state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt",
+                    ["ambiguity", "ambiguity", "actual", "actual"],
+                )
+            )
+            proof = run()
+        self.assertTrue(proof["restored"])
+        self.assertEqual([item[0] for item in mutations], ["DELETE", "DELETE", "PUT"])
+        self.assertEqual(state["lock"]["properties"], proof["properties"])
+        restoration_attempts = [
+            item for item in requests
+            if item[1].endswith("?api-version=2016-09-01")
+            and item[2].get("body") is None
+            and item[2].get("deadline") is not None
+        ][-4:]
+        self.assertEqual(len(restoration_attempts), 4)
+        self.assertIs(
+            restoration_attempts[0][2]["deadline"],
+            restoration_attempts[1][2]["deadline"],
+        )
+        self.assertIs(
+            restoration_attempts[1][2]["deadline"],
+            restoration_attempts[2][2]["deadline"],
+        )
+        self.assertEqual(
+            restoration_attempts[0][2]["deadline"],
+            NOW
+            + dt.timedelta(
+                seconds=bootstrap.CLEANUP_LOCK_RESTORATION_READ_WINDOW_SECONDS
+            ),
+        )
+        self.assertLess(
+            restoration_attempts[3][2]["deadline"],
+            restoration_attempts[2][2]["deadline"],
+        )
+        self.assertIsNotNone(transport._cleanup_restoration_read_deadline)
+
+    def test_cleanup_lock_restoration_exhausted_get_ambiguity_never_puts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _transport, run, _requests, mutations, state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt",
+                    ["ambiguity", "ambiguity", "ambiguity"],
+                )
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "failed after 3 transport attempts",
+            ):
+                run()
+        self.assertEqual([item[0] for item in mutations], ["DELETE", "DELETE"])
+        self.assertIsNone(state["lock"])
+
+    def test_cleanup_lock_restoration_third_state_after_retry_never_puts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _transport, run, requests, mutations, _state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt",
+                    ["ambiguity", "third"],
+                )
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "exact reviewed projection",
+            ):
+                run()
+        self.assertEqual([item[0] for item in mutations], ["DELETE", "DELETE"])
+        restoration_reads = [
+            item for item in requests
+            if item[1].endswith("?api-version=2016-09-01")
+            and item[2].get("body") is None
+            and item[2].get("deadline") is not None
+        ]
+        self.assertEqual(len(restoration_reads), 3)
+
+    def test_cleanup_lock_post_put_read_ambiguity_retries_without_replaying_put(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _transport, run, _requests, mutations, state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt",
+                    ["actual", "ambiguity", "actual"],
+                )
+            )
+            proof = run()
+        self.assertTrue(proof["restored"])
+        self.assertEqual([item[0] for item in mutations], ["DELETE", "DELETE", "PUT"])
+        self.assertIsNotNone(state["lock"])
+
+    def test_cleanup_lock_ambiguous_put_is_never_replayed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _transport, run, _requests, mutations, state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt",
+                    ["actual", "actual"],
+                    ambiguous_put=True,
+                )
+            )
+            with self.assertRaisesRegex(
+                bootstrap._RestTransportAmbiguity,
+                "typed restoration PUT ambiguity",
+            ):
+                run()
+        self.assertEqual([item[0] for item in mutations], ["DELETE", "DELETE", "PUT"])
+        self.assertIsNotNone(state["lock"])
+
+    def test_cleanup_post_delete_reader_preserves_earlier_caller_deadline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transport, _run, requests, _mutations, _state = (
+                self._cleanup_lock_restoration_retry_fixture(
+                    Path(folder) / "receipt", ["actual"]
+                )
+            )
+            spec = bootstrap.cleanup_locks.REVIEWED_CLEANUP_LOCKS["rollback"]
+            transport._cleanup_read_request_after_expiry(
+                "GET",
+                bootstrap.cleanup_locks.ARM_ROOT
+                + spec["resourceId"]
+                + "?api-version=2016-09-01",
+                deadline=NOW + dt.timedelta(seconds=120),
+            )
+        self.assertEqual(
+            requests[-1][2]["deadline"], NOW + dt.timedelta(seconds=120)
+        )
+        self.assertIsNone(transport._cleanup_restoration_read_deadline)
+
     def _bind_temporary_role_test_ledger(self, transport, receipt):
         ledger = bootstrap.UseLedger(
             directory=receipt,

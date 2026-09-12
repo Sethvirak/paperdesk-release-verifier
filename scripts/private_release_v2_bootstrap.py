@@ -79,6 +79,10 @@ MAX_ADOPT_READBACK_CONVERGENCE_SECONDS = 300
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
+# A protected cleanup can reach lock restoration after its authorization has
+# expired.  Give only the read-only restoration classification and readback
+# requests one fixed recovery window.  Mutation requests remain single-attempt.
+CLEANUP_LOCK_RESTORATION_READ_WINDOW_SECONDS = 300
 # Bridge startup and WebJob history can remain unavailable across all three
 # ordinary read attempts even after Azure accepts the site-start request. Give
 # only those canary reads one more attempt; the existing absolute canary
@@ -12496,6 +12500,7 @@ class AzureCliBootstrapTransport:
         self._active_protected_role_add: str | None = None
         self._adopt_readback_active = False
         self._protected_work_deadline: dt.datetime | None = None
+        self._cleanup_restoration_read_deadline: dt.datetime | None = None
         self._controller_canary_create_window: _ConditionalStorageCreateWindow | None = None
         self._validated_source_projections: dict[str, Mapping[str, Any]] = {}
         self._package_readback_bytes: bytes | None = None
@@ -16452,8 +16457,26 @@ class AzureCliBootstrapTransport:
     ) -> _RestResponse:
         if method != "GET" or body is not None:
             fail("protected post-delete reader received a non-GET request")
-        request_kwargs = {} if deadline is None else {"deadline": deadline}
-        return self.session.request(method, url, **request_kwargs)
+        # Calls without a deadline are the lock-restoration precondition. Start
+        # one absolute window there and reuse it for every subsequent
+        # restoration read. Earlier guard deadlines continue to win for
+        # assignment-absence and bounded convergence reads.
+        if deadline is None:
+            if self._cleanup_restoration_read_deadline is None:
+                self._cleanup_restoration_read_deadline = self.clock() + dt.timedelta(
+                    seconds=CLEANUP_LOCK_RESTORATION_READ_WINDOW_SECONDS
+                )
+            request_deadline = self._cleanup_restoration_read_deadline
+        elif self._cleanup_restoration_read_deadline is None:
+            request_deadline = deadline
+        else:
+            request_deadline = min(deadline, self._cleanup_restoration_read_deadline)
+        return self._read_request_with_transport_retry(
+            method,
+            url,
+            deadline=request_deadline,
+            failure_context="protected cleanup post-delete",
+        )
 
     def _require_cleanup_delete_window(self, operation_id: str) -> None:
         # A pre-existing protection lock is not executor-owned temporary state.
@@ -16580,14 +16603,18 @@ class AzureCliBootstrapTransport:
             ),
             post_delete_read_request=self._cleanup_read_request_after_expiry,
         )
+        self._cleanup_restoration_read_deadline = None
         try:
-            result = guard.delete_assignments(
-                operation_id=operation_id,
-                assignments=members,
-            )
-        except BaseException:
-            self._protected_cleanup_blocked = True
-            raise
+            try:
+                result = guard.delete_assignments(
+                    operation_id=operation_id,
+                    assignments=members,
+                )
+            except BaseException:
+                self._protected_cleanup_blocked = True
+                raise
+        finally:
+            self._cleanup_restoration_read_deadline = None
         self._last_guarded_assignment_was_present_by_id = dict(
             guard.assignment_was_present_by_id
         )
@@ -16674,12 +16701,16 @@ class AzureCliBootstrapTransport:
                 else self._read_request_with_transport_retry
             ),
         )
-        result = guard.delete_assignment(
-            operation_id=operation_id,
-            assignment_url=assignment_url,
-            expected_assignment_projection=expected_assignment,
-            project_assignment=project_assignment,
-        )
+        self._cleanup_restoration_read_deadline = None
+        try:
+            result = guard.delete_assignment(
+                operation_id=operation_id,
+                assignment_url=assignment_url,
+                expected_assignment_projection=expected_assignment,
+                project_assignment=project_assignment,
+            )
+        finally:
+            self._cleanup_restoration_read_deadline = None
         self._last_guarded_assignment_was_present = guard.assignment_was_present
         return result
 
