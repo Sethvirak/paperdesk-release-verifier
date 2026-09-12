@@ -7645,12 +7645,20 @@ class BootstrapTests(unittest.TestCase):
             current = [NOW + dt.timedelta(seconds=3)]
 
             class Session:
-                def __init__(self, terminal_status="Success", running_timeouts=0):
+                def __init__(
+                    self,
+                    terminal_status="Success",
+                    running_timeouts=0,
+                    boundary_timeouts=0,
+                    terminal_history_timeouts=0,
+                ):
                     self.requests = []
                     self.site_states = ["Stopped", "Running", "Stopped"]
                     self.history_reads = 0
                     self.terminal_status = terminal_status
                     self.running_timeouts = running_timeouts
+                    self.boundary_timeouts = boundary_timeouts
+                    self.terminal_history_timeouts = terminal_history_timeouts
 
                 def request(
                     self, method, url, *, body=None, headers=None, deadline=None
@@ -7658,6 +7666,23 @@ class BootstrapTests(unittest.TestCase):
                     self.requests.append((method, url, body, dict(headers or {})))
                     response_headers = {"Content-Type": "application/json"}
                     if "/triggeredwebjobs/" in url and "/history?" in url:
+                        history_timeouts = (
+                            "boundary_timeouts"
+                            if self.history_reads == 0
+                            else "terminal_history_timeouts"
+                        )
+                        if getattr(self, history_timeouts):
+                            setattr(
+                                self,
+                                history_timeouts,
+                                getattr(self, history_timeouts) - 1,
+                            )
+                            current[0] += dt.timedelta(
+                                seconds=bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS
+                            )
+                            raise bootstrap._RestTotalTimeout(
+                                "Azure REST total response deadline expired"
+                            )
                         self.history_reads += 1
                         values = []
                         if self.history_reads > 1:
@@ -7696,7 +7721,7 @@ class BootstrapTests(unittest.TestCase):
                         if self.site_states[0] == "Running" and self.running_timeouts:
                             self.running_timeouts -= 1
                             current[0] += dt.timedelta(
-                                seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                                seconds=bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS
                             )
                             raise bootstrap._RestTotalTimeout(
                                 "Azure REST total response deadline expired"
@@ -7783,7 +7808,7 @@ class BootstrapTests(unittest.TestCase):
             )
 
             current[0] = NOW + dt.timedelta(seconds=3)
-            retried_session = Session(running_timeouts=1)
+            retried_session = Session(running_timeouts=3)
             retried = build_transport(retried_session)._mutate(operation, state)
             self.assertEqual(retried["terminalHistory"]["status"], "Success")
             retried_methods_and_paths = [
@@ -7802,13 +7827,55 @@ class BootstrapTests(unittest.TestCase):
                 sum(path.endswith("/stop") for _method, path in retried_methods_and_paths),
                 1,
             )
+            self.assertEqual(
+                sum(
+                    method == "GET"
+                    and path.lower().endswith(site["resourceId"].lower())
+                    for method, path in retried_methods_and_paths
+                ),
+                6,
+            )
+
+            for timeout_stage in ("boundary_timeouts", "terminal_history_timeouts"):
+                current[0] = NOW + dt.timedelta(seconds=3)
+                history_session = Session(**{timeout_stage: 3})
+                history_proof = build_transport(history_session)._mutate(operation, state)
+                self.assertEqual(history_proof["terminalHistory"]["status"], "Success")
+                history_methods_and_paths = [
+                    (method, url.split("?", 1)[0])
+                    for method, url, _body, _headers in history_session.requests
+                ]
+                self.assertEqual(
+                    sum(
+                        path.endswith("/start")
+                        for _method, path in history_methods_and_paths
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    sum(
+                        path.endswith("/run")
+                        for _method, path in history_methods_and_paths
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    sum(
+                        path.endswith("/stop")
+                        for _method, path in history_methods_and_paths
+                    ),
+                    1,
+                )
 
             current[0] = NOW + dt.timedelta(seconds=3)
-            exhausted_session = Session(running_timeouts=3)
+            exhausted_session = Session(running_timeouts=4)
             with self.assertRaisesRegex(
-                bootstrap.BootstrapError, "before terminal Success"
-            ):
+                bootstrap.BootstrapError,
+                "during running-state before terminal Success: "
+                "running-state read failed after 4 transport attempts",
+            ) as exhausted:
                 build_transport(exhausted_session)._mutate(operation, state)
+            self.assertIsInstance(exhausted.exception.__cause__, bootstrap.BootstrapError)
             exhausted_methods_and_paths = [
                 (method, url.split("?", 1)[0])
                 for method, url, _body, _headers in exhausted_session.requests
