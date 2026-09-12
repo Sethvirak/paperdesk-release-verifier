@@ -4,6 +4,7 @@ import base64
 import copy
 import datetime as dt
 import unittest
+from unittest import mock
 
 from provider import private_release_bridge_azure as azure
 from scripts import private_release_mailbox as core
@@ -202,6 +203,65 @@ class KeyAttributeTests(unittest.TestCase):
             transport._prove_probe_ids([probe["id"]], OPERATION, runtime_facts=self.key)
         self.assertEqual(calls, ["GET"] * 3)
         self.assertEqual(self.current, NOW + dt.timedelta(seconds=1.5))
+
+    def test_adopt_readback_keeps_a_full_retry_envelope_after_one_timeout(self):
+        calls = []
+        owner = self
+
+        class Session:
+            def request(self, method, url, **kwargs):
+                calls.append((method, kwargs["deadline"]))
+                if len(calls) == 1:
+                    owner.current += dt.timedelta(
+                        seconds=bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS
+                    )
+                    raise bootstrap._RestTransportAmbiguity(
+                        "Azure REST transport failed closed"
+                    )
+                return owner.inventory(owner.key, omit_nbf=True)
+
+        transport, probe = self.transport(Session())
+        transport._active_operation_id = None
+        proof = transport._prove_adopt_probe_ids(
+            [probe["id"]],
+            "adopted signing key",
+            runtime_facts=self.key,
+        )[0]
+
+        expected_deadline = NOW + dt.timedelta(
+            seconds=bootstrap.MAX_ADOPT_READBACK_CONVERGENCE_SECONDS
+        )
+        self.assertEqual(proof["attempts"], 1)
+        self.assertEqual(calls, [("GET", expected_deadline)] * 2)
+        self.assertEqual(
+            self.current,
+            NOW
+            + dt.timedelta(
+                seconds=bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS + 0.5
+            ),
+        )
+        self.assertEqual(bootstrap.MAX_READBACK_CONVERGENCE_SECONDS, 120)
+        self.assertEqual(bootstrap.MAX_ADOPT_READBACK_CONVERGENCE_SECONDS, 300)
+
+    def test_adopt_operation_selects_the_extended_readback_window(self):
+        transport, probe = self.transport()
+        transport.admissions[OPERATION]["context"] = {
+            "executionDecision": "adopt-exact",
+            "adopted": {},
+        }
+        transport.admissions[OPERATION]["desiredProbeIds"] = [probe["id"]]
+        with mock.patch.object(
+            transport, "_prove_probe_ids", return_value=[]
+        ) as prove:
+            result = transport.apply_operation({"id": OPERATION}, {})
+
+        self.assertEqual(result["status"], "adopted-exact")
+        prove.assert_called_once()
+        self.assertEqual(
+            prove.call_args.args,
+            ([probe["id"]], f"{OPERATION} adopt"),
+        )
+        self.assertFalse(transport._adopt_readback_active)
 
     def test_valid_readback_can_still_converge_within_original_window(self):
         calls = []
