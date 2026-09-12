@@ -72,6 +72,10 @@ TRUSTED_REVIEWERS = {
 }
 MAX_PREFLIGHT_AGE_SECONDS = 300
 MAX_READBACK_CONVERGENCE_SECONDS = 120
+# Exact-adoption GETs can consume one 45-second response timeout before a
+# retry.  Keep enough room for all three read-only attempts and their full
+# credential-plus-response envelopes without extending mutation readbacks.
+MAX_ADOPT_READBACK_CONVERGENCE_SECONDS = 300
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS = 4
@@ -12484,6 +12488,7 @@ class AzureCliBootstrapTransport:
         self._ledger: UseLedger | None = None
         self._active_operation_id: str | None = None
         self._active_protected_role_add: str | None = None
+        self._adopt_readback_active = False
         self._protected_work_deadline: dt.datetime | None = None
         self._controller_canary_create_window: _ConditionalStorageCreateWindow | None = None
         self._validated_source_projections: dict[str, Mapping[str, Any]] = {}
@@ -15035,6 +15040,23 @@ class AzureCliBootstrapTransport:
             "sourceProjection": source_projection,
         }
 
+    def _prove_adopt_probe_ids(
+        self,
+        ids: Sequence[str],
+        label: str,
+        *,
+        runtime_facts: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if getattr(self, "_adopt_readback_active", False):
+            fail("adopt readback windows cannot be nested")
+        self._adopt_readback_active = True
+        try:
+            return self._prove_probe_ids(
+                ids, label, runtime_facts=runtime_facts
+            )
+        finally:
+            self._adopt_readback_active = False
+
     def _prove_probe_ids(
         self,
         ids: Sequence[str],
@@ -15042,6 +15064,11 @@ class AzureCliBootstrapTransport:
         *,
         runtime_facts: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        convergence_seconds = (
+            MAX_ADOPT_READBACK_CONVERGENCE_SECONDS
+            if getattr(self, "_adopt_readback_active", False)
+            else MAX_READBACK_CONVERGENCE_SECONDS
+        )
         proofs: list[dict[str, Any]] = []
         for probe_id in ids:
             expected = self.probes[probe_id]
@@ -15073,7 +15100,7 @@ class AzureCliBootstrapTransport:
                 deadline = min(
                     expires,
                     request_deadline or expires,
-                    started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS),
+                    started + dt.timedelta(seconds=convergence_seconds),
                 )
             while attempts < 64:
                 before_request = self.clock()
@@ -19574,7 +19601,7 @@ class AzureCliBootstrapTransport:
         if decision == "adopt-pending-execution-empty-proof":
             if operation["id"] != "createPrivateControllerLockContainer":
                 fail("pending empty proof is outside the controller container")
-            readbacks = self._prove_probe_ids(
+            readbacks = self._prove_adopt_probe_ids(
                 admission["desiredProbeIds"],
                 "createPrivateControllerLockContainer pending adoption",
             )
@@ -19594,7 +19621,7 @@ class AzureCliBootstrapTransport:
                 details["provisioningOutcome"] = "adopted-exact"
             if _expected_deletion_lock_proof(operation["id"]) is not None:
                 details["deletionLock"] = self._prove_adopted_assignment_lock(operation["id"])
-            readbacks = self._prove_probe_ids(
+            readbacks = self._prove_adopt_probe_ids(
                 admission["desiredProbeIds"],
                 f"{operation['id']} adopt",
                 runtime_facts=details,
