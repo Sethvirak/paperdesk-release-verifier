@@ -406,7 +406,7 @@ def load_activation_document(doc,*,runtime_workflow_sha,observed_bridge_package_
     critical={"WEBSITE_RUN_FROM_PACKAGE":package_url,"WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID":activation["registryReaderManagedIdentityResourceId"],"WEBSITE_SKIP_RUNNING_KUDUAGENT":"false","PAPERDESK_BRIDGE_PACKAGE_SHA256":activation["bridgePackageSha256"]}
     posture=bridge_runtime.get("sitePosture") if isinstance(bridge_runtime,dict) else None
     posture_fields={"siteResourceId","name","type","kind","serverFarmId","httpsOnly","publicNetworkAccess","virtualNetworkSubnetId","outboundVnetRouting","webConfig","ftpBasicAuthAllowed","scmBasicAuthAllowed","sourceControl"}
-    web_config={"alwaysOn":True,"linuxFxVersion":"PYTHON|3.12","ftpsState":"Disabled","minTlsVersion":"1.2","scmMinTlsVersion":"1.2","scmType":"None","http20Enabled":True,"vnetRouteAllEnabled":True}
+    web_config={"alwaysOn":True,"linuxFxVersion":"PYTHON|3.12","webJobsEnabled":True,"ftpsState":"Disabled","minTlsVersion":"1.2","scmMinTlsVersion":"1.2","scmType":"None","http20Enabled":True,"vnetRouteAllEnabled":True}
     bridge_outbound_routing={"allTraffic":True,"applicationTraffic":True}
     production_outbound_routing={"allTraffic":False,"applicationTraffic":True}
     site_inventory_query=f"https://management.azure.com/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Web/sites?api-version=2025-03-01"

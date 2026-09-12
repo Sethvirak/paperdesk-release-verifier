@@ -441,7 +441,10 @@ records no current write. Both paths verify exact SHA-256/size/ETag/version ID,
 then remove only the executor-owned `/32` rule and exact temporary assignment. Fresh
 readback must prove both are absent before the V2 site starts. It may not use a
 SAS, account key, Shared Key, broad CIDR, stale full-ACL restore, or public
-container. A fresh exact source-and-package-pinned WebJob invocation must start
+container. The stopped bridge posture requires App Service WebJobs enabled; an
+otherwise exact recovered bridge with that flag disabled is repaired by the
+existing ETag-guarded bridge attachment PATCH before startup. A fresh exact
+source-and-package-pinned WebJob invocation must start
 after the recorded pre-run history boundary and reach terminal `Success` under
 the exact canary control and settings. Its ARM invocation ID/start/end/status
 and output-URL metadata, package/version/control digests, managed-identity

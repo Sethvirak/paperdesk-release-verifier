@@ -255,6 +255,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                     "resourceId"
                 ],
                 "outboundVnetRouting": outbound,
+                "siteConfig": {"webJobsEnabled": True},
             },
         }
         response = bootstrap._RestResponse(
@@ -287,6 +288,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             response,
             {
                 "bridgeIdentityMode": "pristine-no-identity",
+                "webJobsMode": "enabled",
                 "identityResourceIds": [],
                 "identityProjectionSha256": bootstrap.sha256_bytes(
                     bootstrap.canonical_json_bytes(None)

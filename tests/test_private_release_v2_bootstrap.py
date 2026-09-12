@@ -2333,6 +2333,7 @@ def _build_mailbox_s2_documents_from_terminal_fixture(fixture, components):
         "webConfig": {
             "alwaysOn": True,
             "linuxFxVersion": "PYTHON|3.12",
+            "webJobsEnabled": True,
             "ftpsState": "Disabled",
             "minTlsVersion": "1.2",
             "scmMinTlsVersion": "1.2",
@@ -5578,6 +5579,7 @@ class BootstrapTests(unittest.TestCase):
                 "name": attached_projection["name"],
                 "etag": etag,
                 "bridgeIdentityMode": "exact-five-user-assigned",
+                "webJobsMode": "enabled",
                 "identityResourceIds": identity_ids,
                 "identityProjectionSha256": identity_digest,
             },
@@ -5638,6 +5640,7 @@ class BootstrapTests(unittest.TestCase):
                 )
             },
         }
+        body["properties"]["siteConfig"] = {"webJobsEnabled": True}
         transport.session.request.return_value = bootstrap._RestResponse(
             200, bootstrap.canonical_json_bytes(body), {"ETag": etag}
         )
@@ -5686,6 +5689,11 @@ class BootstrapTests(unittest.TestCase):
             200, bootstrap.canonical_json_bytes(body),
             {"ETag": etag[:-1] + ("1" if etag[-1] != "1" else "2")},
         )
+        disabled_webjobs = copy.deepcopy(body)
+        disabled_webjobs["properties"]["siteConfig"]["webJobsEnabled"] = False
+        invalid_responses["disabled WebJobs"] = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes(disabled_webjobs), {"ETag": etag}
+        )
         for label, response in invalid_responses.items():
             with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
                 transport._validate_readback_response(
@@ -5709,6 +5717,7 @@ class BootstrapTests(unittest.TestCase):
             "resourceId": resources["bridgeSite"]["resourceId"],
             "name": resources["bridgeSite"]["name"], "etag": '"recovery"',
             "bridgeIdentityMode": "exact-five-user-assigned",
+            "webJobsMode": "enabled",
             "identityResourceIds": identity_ids, "identityProjectionSha256": "a" * 64,
         }}
         attach["status"] = "exact"
@@ -5733,6 +5742,18 @@ class BootstrapTests(unittest.TestCase):
             return bootstrap.validate_preflight_evidence(document, authorization, self.plan)
 
         validate(copy.deepcopy(projection))
+        disabled = copy.deepcopy(projection)
+        disabled_create = next(
+            item for item in disabled["operationAdmissions"]
+            if item["operationId"] == "createStoppedPrivateBridge"
+        )
+        disabled_attach = next(
+            item for item in disabled["operationAdmissions"]
+            if item["operationId"] == "attachFiveUamisOnlyToBridge"
+        )
+        disabled_create["context"]["adopted"]["webJobsMode"] = "disabled"
+        disabled_attach["context"] = {"executionDecision": "apply-exact"}
+        validate(disabled)
         for label, mutate in {
             "mode": lambda c, a: c["context"]["adopted"].__setitem__("bridgeIdentityMode", "pristine-no-identity"),
             "decision": lambda c, a: a["context"].__setitem__("executionDecision", "apply-exact"),
@@ -5775,6 +5796,7 @@ class BootstrapTests(unittest.TestCase):
                 "virtualNetworkSubnetId", "outboundVnetRouting",
             )},
         }
+        body["properties"]["siteConfig"] = {"webJobsEnabled": True}
         response = bootstrap._RestResponse(
             200, bootstrap.canonical_json_bytes(body), {"ETag": '"after-attach"'}
         )
@@ -5795,6 +5817,8 @@ class BootstrapTests(unittest.TestCase):
         patch.assert_called_once()
         self.assertEqual(patch.call_args.args[0], "PATCH")
         self.assertEqual(patch.call_args.kwargs["headers"]["If-Match"], '"before-attach"')
+        request_body = json.loads(patch.call_args.kwargs["body"])
+        self.assertIs(request_body["properties"]["siteConfig"]["webJobsEnabled"], True)
         self.assertEqual(transport.session.request.call_count, 1)
         self.assertEqual(result["details"]["expectedEtag"], '"after-attach"')
         self.assertEqual(
