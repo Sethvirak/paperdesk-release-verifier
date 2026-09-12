@@ -13599,13 +13599,16 @@ class AzureCliBootstrapTransport:
         *,
         site_resource_id: str,
         job_name: str,
+        deadline: dt.datetime,
     ) -> Mapping[str, Any]:
         url = self._arm_url(
             site_resource_id,
             "2025-05-01",
             f"/triggeredwebjobs/{job_name}/history",
         )
-        response = self.session.request("GET", url)
+        response = self._read_request_with_transport_retry(
+            "GET", url, deadline=deadline
+        )
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
         if (
@@ -13642,6 +13645,7 @@ class AzureCliBootstrapTransport:
         job_name: str,
         boundary: Mapping[str, Any],
         trigger_requested_at: dt.datetime,
+        deadline: dt.datetime,
     ) -> Mapping[str, Any]:
         before_entries = boundary.get("entries")
         if not isinstance(before_entries, list):
@@ -13661,6 +13665,7 @@ class AzureCliBootstrapTransport:
             expires,
             trigger_requested_at
             + dt.timedelta(seconds=MAX_CANARY_CONVERGENCE_SECONDS),
+            deadline,
         )
         attempts = 0
         while attempts < 180:
@@ -13671,6 +13676,7 @@ class AzureCliBootstrapTransport:
             observed = self._read_webjob_history(
                 site_resource_id=site_resource_id,
                 job_name=job_name,
+                deadline=deadline,
             )
             after_response = self.clock()
             if after_response >= deadline:
@@ -13713,9 +13719,12 @@ class AzureCliBootstrapTransport:
         site_resource_id: str,
         expected_state: str,
         allow_expired_cleanup: bool,
+        deadline: dt.datetime | None = None,
     ) -> Mapping[str, Any]:
         started = self.clock()
-        deadline = started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS)
+        deadline = deadline or (
+            started + dt.timedelta(seconds=MAX_READBACK_CONVERGENCE_SECONDS)
+        )
         expires = parse_time(
             self.authorization["validity"]["expiresAt"],
             "authorization expiresAt",
@@ -13728,9 +13737,13 @@ class AzureCliBootstrapTransport:
             if now >= deadline:
                 fail(f"bridge did not reach {expected_state} before the readback deadline")
             attempts += 1
-            response = self.session.request(
-                "GET", self._arm_url(site_resource_id, "2025-03-01")
+            response = self._read_request_with_transport_retry(
+                "GET",
+                self._arm_url(site_resource_id, "2025-03-01"),
+                deadline=deadline,
             )
+            if self.clock() >= deadline:
+                fail(f"bridge {expected_state} response crossed the readback deadline")
             document = self._json_response(
                 response, {200}, f"bridge {expected_state} readback"
             )
@@ -13807,7 +13820,11 @@ class AzureCliBootstrapTransport:
                     fail("read-only response crossed the protected request deadline")
                 return response
             except BootstrapError as error:
-                if str(error) != "Azure REST transport failed closed" or delay is None:
+                retryable_transport = (
+                    isinstance(error, _RestTransportAmbiguity)
+                    or str(error) == "Azure REST transport failed closed"
+                )
+                if not retryable_transport or delay is None:
                     raise
                 if request_deadline is not None and (
                     self.clock() + dt.timedelta(seconds=delay) >= request_deadline
@@ -18387,6 +18404,15 @@ class AzureCliBootstrapTransport:
             site = self.resources["bridgeSite"]
             configure = self._proof_detail(state, "configureBridgeExactVersionedPackageAndCriticalSettings")
             timing = _validated_bootstrap_self_test_timing(self.authorization, configure)
+            canary_deadline = min(
+                parse_time(
+                    self.authorization["validity"]["expiresAt"],
+                    "authorization expiresAt",
+                ),
+                parse_time(timing["expiresAt"], "canary expiresAt"),
+                self.clock()
+                + dt.timedelta(seconds=MAX_CANARY_CONVERGENCE_SECONDS),
+            )
             def require_live_canary() -> None:
                 if not parse_time(timing["issuedAt"], "canary issuedAt") <= self.clock() < parse_time(timing["expiresAt"], "canary expiresAt"):
                     fail("bridge canary control is no longer live")
@@ -18396,6 +18422,7 @@ class AzureCliBootstrapTransport:
                 site_resource_id=site["resourceId"],
                 expected_state="Stopped",
                 allow_expired_cleanup=False,
+                deadline=canary_deadline,
             )
             start_url = self._arm_url(site["resourceId"], "2025-03-01", "/start")
             stop_url = self._arm_url(site["resourceId"], "2025-03-01", "/stop")
@@ -18424,10 +18451,12 @@ class AzureCliBootstrapTransport:
                     site_resource_id=site["resourceId"],
                     expected_state="Running",
                     allow_expired_cleanup=False,
+                    deadline=canary_deadline,
                 )
                 boundary = self._read_webjob_history(
                     site_resource_id=site["resourceId"],
                     job_name=job,
+                    deadline=canary_deadline,
                 )
                 trigger_requested_at = self.clock()
                 require_live_canary()
@@ -18443,6 +18472,7 @@ class AzureCliBootstrapTransport:
                     job_name=job,
                     boundary=boundary,
                     trigger_requested_at=trigger_requested_at,
+                    deadline=canary_deadline,
                 )
             except BaseException as exc:
                 primary_error = exc
@@ -18460,6 +18490,12 @@ class AzureCliBootstrapTransport:
                             site_resource_id=site["resourceId"],
                             expected_state="Stopped",
                             allow_expired_cleanup=True,
+                            deadline=(
+                                self.clock()
+                                + dt.timedelta(
+                                    seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                )
+                            ),
                         )
                     except BaseException as exc:
                         stop_error = exc
