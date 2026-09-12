@@ -13605,7 +13605,7 @@ class AzureCliBootstrapTransport:
             "2025-05-01",
             f"/triggeredwebjobs/{job_name}/history",
         )
-        response = self.session.request("GET", url)
+        response = self._read_request_with_transport_retry("GET", url)
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
         if (
@@ -13728,9 +13728,11 @@ class AzureCliBootstrapTransport:
             if now >= deadline:
                 fail(f"bridge did not reach {expected_state} before the readback deadline")
             attempts += 1
-            response = self.session.request(
+            response = self._read_request_with_transport_retry(
                 "GET", self._arm_url(site_resource_id, "2025-03-01")
             )
+            if self.clock() >= deadline:
+                fail(f"bridge {expected_state} response crossed the readback deadline")
             document = self._json_response(
                 response, {200}, f"bridge {expected_state} readback"
             )
@@ -13807,7 +13809,11 @@ class AzureCliBootstrapTransport:
                     fail("read-only response crossed the protected request deadline")
                 return response
             except BootstrapError as error:
-                if str(error) != "Azure REST transport failed closed" or delay is None:
+                retryable_transport = (
+                    isinstance(error, _RestTransportAmbiguity)
+                    or str(error) == "Azure REST transport failed closed"
+                )
+                if not retryable_transport or delay is None:
                     raise
                 if request_deadline is not None and (
                     self.clock() + dt.timedelta(seconds=delay) >= request_deadline

@@ -189,6 +189,65 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         transport._active_operation_id = CONFIGURE
         return transport, session
 
+    def test_bridge_site_state_retries_read_only_total_timeout(self):
+        site = self.fixture.resources["bridgeSite"]
+        response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes(
+                {
+                    "id": site["resourceId"],
+                    "name": site["name"],
+                    "properties": {"state": "Running"},
+                }
+            ),
+            {"Content-Type": "application/json"},
+        )
+        transport, session, _journal = self.transport(
+            [
+                bootstrap._RestTotalTimeout(
+                    "Azure REST total response deadline expired"
+                ),
+                response,
+            ],
+            CONFIGURE,
+        )
+
+        proof = transport._wait_for_site_state(
+            site_resource_id=site["resourceId"],
+            expected_state="Running",
+            allow_expired_cleanup=False,
+        )
+
+        self.assertEqual(proof["state"], "Running")
+        self.assertEqual(len(session.requests), 2)
+        self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
+    def test_webjob_history_retries_read_only_total_timeout(self):
+        site = self.fixture.resources["bridgeSite"]
+        response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({"value": []}),
+            {"Content-Type": "application/json"},
+        )
+        transport, session, _journal = self.transport(
+            [
+                bootstrap._RestTotalTimeout(
+                    "Azure REST total response deadline expired"
+                ),
+                response,
+            ],
+            CONFIGURE,
+        )
+
+        proof = transport._read_webjob_history(
+            site_resource_id=site["resourceId"],
+            job_name="paperdesk-accepted-release-registry",
+        )
+
+        self.assertEqual(proof["entries"], [])
+        self.assertEqual(len(session.requests), 2)
+        self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
     def transport(self, responses, operation_id, *, clock=None, sleep=None):
         session = Session(responses)
         transport = bootstrap.AzureCliBootstrapTransport(
