@@ -333,7 +333,7 @@ class PackageReadinessTests(unittest.TestCase):
     def test_authorization_expiry_and_package_cap_bound_only_gets(self):
         self.assertEqual(bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS, 600)
         self.assertEqual(bootstrap.MAX_PACKAGE_READINESS_SECONDS, 1891)
-        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 4995)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 5272)
         modeled_cleanup_without_local_margin = (
             9 * bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
             + bootstrap.cleanup_locks.LOCK_CONVERGENCE_SECONDS

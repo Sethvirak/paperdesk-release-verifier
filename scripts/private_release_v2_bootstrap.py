@@ -112,14 +112,14 @@ PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
 )
 # After the successful conditional canary create, the nominal controller exercise and every
 # owned failure path use one staged window before protected-role cleanup:
-# acquire, renew, fast release, expiry acquire, an ambiguity release or finite
+# fast acquire, renew, fast release, expiry acquire, an ambiguity release or finite
 # expiry observation, identity resolution when needed, conditional DELETE, one
 # safe DELETE replay, container inventory, exact blob absence, and a local
 # journal margin. Deadlines below bind every request to its own envelope.
 CONTROLLER_CANARY_LEASE_DURATION_SECONDS = 60
 CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
-    15 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-    + 2 * sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+    18 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + 3 * sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
     + CONTROLLER_CANARY_LEASE_DURATION_SECONDS
     + 30
 )
@@ -2360,7 +2360,7 @@ def _validated_controller_lease_denial_sequences(
     authorization_id: str,
     source_sha: str,
 ) -> set[int]:
-    """Validate bounded 403 prefixes for only fast renew and fast release."""
+    """Validate bounded 403 prefixes for fast acquire, renew, and release."""
 
     operation_id = "exerciseControllerLeaseCanary"
     indexed = [
@@ -2388,7 +2388,7 @@ def _validated_controller_lease_denial_sequences(
         200,
         201,
     ]
-    maximum_denials = 2 * (MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1)
+    maximum_denials = 3 * (MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1)
     if (
         positions != list(range(positions[0], positions[0] + len(positions)))
         or len(records) % 2 != 0
@@ -2432,11 +2432,12 @@ def _validated_controller_lease_denial_sequences(
 
         status = result.get("status")
         if status == 403:
-            # One or more denials may precede only the required renew success
-            # and the immediately following required release success.
+            # One or more denials may precede only the fast acquire, required
+            # renew success, and the immediately following release success.
             if (
                 success_index
                 not in {
+                    0,
                     1,
                     1 + int(plan["temporaryAccess"]["leaseRenewals"]),
                 }
@@ -12501,7 +12502,11 @@ class AzureCliBootstrapTransport:
 
     def _controller_canary_fast_acquire_deadline(self) -> dt.datetime:
         return self._controller_canary_create_deadline() + dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS
+                * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+            )
         )
 
     def _controller_canary_fast_renew_deadline(self) -> dt.datetime:
@@ -13302,10 +13307,10 @@ class AzureCliBootstrapTransport:
         *,
         action: str,
         lease_id: str,
-        lease_window_started: dt.datetime,
+        lease_window_started: dt.datetime | None,
         request_deadline: dt.datetime,
     ) -> tuple[_RestResponse, dt.datetime, dt.datetime]:
-        """Retry one reviewed lease denial while the owned lease is current."""
+        """Retry exact no-effect lease denials inside reviewed time bounds."""
 
         expected_url = (
             _operation_readback_url(
@@ -13313,11 +13318,20 @@ class AzureCliBootstrapTransport:
             )
             + "?comp=lease"
         )
-        expected_status = {"renew": 200, "release": 200}.get(action)
+        expected_status = {"acquire": 201, "renew": 200, "release": 200}.get(
+            action
+        )
         expected_deadline = {
+            "acquire": self._controller_canary_fast_acquire_deadline(),
             "renew": self._controller_canary_fast_renew_deadline(),
             "release": self._controller_canary_release_deadline(),
         }.get(action)
+        lease_window_is_exact = (
+            lease_window_started is None
+            if action == "acquire"
+            else isinstance(lease_window_started, dt.datetime)
+            and lease_window_started.tzinfo == dt.timezone.utc
+        )
         if (
             self._active_operation_id != "exerciseControllerLeaseCanary"
             or self._active_protected_role_add
@@ -13325,16 +13339,19 @@ class AzureCliBootstrapTransport:
             or url != expected_url
             or expected_status is None
             or lease_id != self.plan["temporaryAccess"]["controllerLeaseId"]
-            or not isinstance(lease_window_started, dt.datetime)
-            or lease_window_started.tzinfo != dt.timezone.utc
+            or not lease_window_is_exact
             or request_deadline != expected_deadline
         ):
             fail("controller lease retry is outside its exact source boundary")
 
         started = self.clock()
-        lease_cutoff = lease_window_started + dt.timedelta(
-            seconds=self.plan["temporaryAccess"]["leaseDurationSeconds"]
-        )
+        if action == "acquire":
+            lease_cutoff = request_deadline
+        else:
+            assert isinstance(lease_window_started, dt.datetime)
+            lease_cutoff = lease_window_started + dt.timedelta(
+                seconds=self.plan["temporaryAccess"]["leaseDurationSeconds"]
+            )
         attempt_records: list[dict[str, Any]] = []
         last_response: _RestResponse | None = None
         last_code = "unknown"
@@ -13368,15 +13385,26 @@ class AzureCliBootstrapTransport:
                     "controller lease authorization did not converge before expiry",
                     "readiness-timeout",
                 )
+            lease_headers = {
+                "x-ms-version": STORAGE_API_VERSION,
+                "x-ms-lease-action": action,
+            }
+            if action == "acquire":
+                lease_headers.update(
+                    {
+                        "x-ms-proposed-lease-id": lease_id,
+                        "x-ms-lease-duration": str(
+                            self.plan["temporaryAccess"]["leaseDurationSeconds"]
+                        ),
+                    }
+                )
+            else:
+                lease_headers["x-ms-lease-id"] = lease_id
             response = self._mutation_request(
                 "PUT",
                 url,
                 body=b"",
-                headers={
-                    "x-ms-version": STORAGE_API_VERSION,
-                    "x-ms-lease-action": action,
-                    "x-ms-lease-id": lease_id,
-                },
+                headers=lease_headers,
                 expected={expected_status, 403},
                 cleanup=action == "release",
                 deadline=request_deadline,
@@ -17840,7 +17868,7 @@ class AzureCliBootstrapTransport:
                     )
                     raise
 
-            fast_acquire_attempted = False
+            fast_acquire_may_own_lease = False
             fast_acquired = False
             fast_acquired_at = None
             fast_lease_window_started: dt.datetime | None = None
@@ -17849,24 +17877,20 @@ class AzureCliBootstrapTransport:
             fast_released_at = None
             fast_primary_error: BaseException | None = None
             try:
-                fast_acquire_attempted = True
-                fast_acquire_started = self.clock()
-                self._mutation_request(
-                    "PUT",
+                fast_acquire_may_own_lease = True
+                (
+                    _response,
+                    fast_lease_window_started,
+                    fast_acquire_completed,
+                ) = self._controller_lease_action_when_ready(
                     query_url,
-                    body=b"",
-                    headers={
-                        "x-ms-version": "2023-11-03",
-                        "x-ms-proposed-lease-id": lease_id,
-                        "x-ms-lease-duration": str(duration),
-                        "x-ms-lease-action": "acquire",
-                    },
-                    expected={201},
-                    deadline=self._controller_canary_fast_acquire_deadline(),
+                    action="acquire",
+                    lease_id=lease_id,
+                    lease_window_started=None,
+                    request_deadline=self._controller_canary_fast_acquire_deadline(),
                 )
                 fast_acquired = True
-                fast_lease_window_started = fast_acquire_started
-                fast_acquired_at = observed_stamp()
+                fast_acquired_at = observed_stamp(fast_acquire_completed)
                 for _ in range(self.plan["temporaryAccess"]["leaseRenewals"]):
                     (
                         _response,
@@ -17888,8 +17912,16 @@ class AzureCliBootstrapTransport:
                     )
             except BaseException as exc:
                 fast_primary_error = exc
+                if (
+                    not fast_acquired
+                    and isinstance(exc, StorageOperationError)
+                    and exc.diagnostic.get("status") == 403
+                ):
+                    # A concrete Storage 403 proves the acquire had no effect,
+                    # including when its local result journal could not persist.
+                    fast_acquire_may_own_lease = False
             finally:
-                if fast_acquire_attempted:
+                if fast_acquire_may_own_lease:
                     try:
                         fast_release_status, fast_released_at = release_or_expire(
                             lease_id,
