@@ -78,6 +78,12 @@ MAX_READBACK_CONVERGENCE_SECONDS = 120
 MAX_ADOPT_READBACK_CONVERGENCE_SECONDS = 300
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
+READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
+# Bridge startup and WebJob history can remain unavailable across all three
+# ordinary read attempts even after Azure accepts the site-start request. Give
+# only those canary reads one more attempt; the existing absolute canary
+# deadline and full-request reserve still bound every request.
+CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, None)
 MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS = 4
 CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS = (1, 2, 4)
 AZURE_CLI_REQUEST_TIMEOUT_SECONDS = 45
@@ -13610,6 +13616,8 @@ class AzureCliBootstrapTransport:
         site_resource_id: str,
         job_name: str,
         deadline: dt.datetime,
+        retry_delays: tuple[float | None, ...] | None = None,
+        failure_context: str | None = None,
     ) -> Mapping[str, Any]:
         url = self._arm_url(
             site_resource_id,
@@ -13617,7 +13625,11 @@ class AzureCliBootstrapTransport:
             f"/triggeredwebjobs/{job_name}/history",
         )
         response = self._read_request_with_transport_retry(
-            "GET", url, deadline=deadline
+            "GET",
+            url,
+            deadline=deadline,
+            retry_delays=retry_delays,
+            failure_context=failure_context,
         )
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
@@ -13687,6 +13699,8 @@ class AzureCliBootstrapTransport:
                 site_resource_id=site_resource_id,
                 job_name=job_name,
                 deadline=deadline,
+                retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                failure_context="terminal-history",
             )
             after_response = self.clock()
             if after_response >= deadline:
@@ -13730,6 +13744,8 @@ class AzureCliBootstrapTransport:
         expected_state: str,
         allow_expired_cleanup: bool,
         deadline: dt.datetime | None = None,
+        read_retry_delays: tuple[float | None, ...] | None = None,
+        read_failure_context: str | None = None,
     ) -> Mapping[str, Any]:
         started = self.clock()
         deadline = deadline or (
@@ -13751,6 +13767,8 @@ class AzureCliBootstrapTransport:
                 "GET",
                 self._arm_url(site_resource_id, "2025-03-01"),
                 deadline=deadline,
+                retry_delays=read_retry_delays,
+                failure_context=read_failure_context,
             )
             if self.clock() >= deadline:
                 fail(f"bridge {expected_state} response crossed the readback deadline")
@@ -13787,6 +13805,8 @@ class AzureCliBootstrapTransport:
         *,
         body: bytes | None = None,
         deadline: dt.datetime | None = None,
+        retry_delays: tuple[float | None, ...] | None = None,
+        failure_context: str | None = None,
     ) -> _RestResponse:
         """Retry only exact read-only transport failures before mutation.
 
@@ -13812,8 +13832,19 @@ class AzureCliBootstrapTransport:
             or (method == "POST" and url in allowed_posts and body == b"")
         ):
             fail("read-only retry helper received a mutation-capable request")
-        delays: tuple[float | None, ...] = (0.5, 1.0, None)
+        delays = (
+            READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS
+            if retry_delays is None
+            else retry_delays
+        )
+        if (
+            not delays
+            or delays[-1] is not None
+            or any(delay is None or delay <= 0 for delay in delays[:-1])
+        ):
+            fail("read-only retry delays are not exact")
         request_deadline = deadline or self._request_deadline()
+        request_attempts = 0
         for delay in delays:
             try:
                 self._require_full_request_envelope(
@@ -13822,6 +13853,7 @@ class AzureCliBootstrapTransport:
                 request_kwargs: dict[str, Any] = {"body": body}
                 if request_deadline is not None:
                     request_kwargs["deadline"] = request_deadline
+                request_attempts += 1
                 try:
                     response = self.session.request(method, url, **request_kwargs)
                 except _LateRestResponse as late_response:
@@ -13835,10 +13867,21 @@ class AzureCliBootstrapTransport:
                     or str(error) == "Azure REST transport failed closed"
                 )
                 if not retryable_transport or delay is None:
+                    if failure_context is not None:
+                        raise BootstrapError(
+                            f"{failure_context} read failed after "
+                            f"{request_attempts} transport attempts: {error}"
+                        ) from error
                     raise
                 if request_deadline is not None and (
                     self.clock() + dt.timedelta(seconds=delay) >= request_deadline
                 ):
+                    if failure_context is not None:
+                        raise BootstrapError(
+                            f"{failure_context} read retry stopped after "
+                            f"{request_attempts} transport attempts because the "
+                            "protected deadline would be crossed"
+                        ) from error
                     raise
                 self.sleep(delay)
         raise AssertionError("unreachable read-only retry loop")
@@ -18479,6 +18522,7 @@ class AzureCliBootstrapTransport:
             )
             start_attempted = False
             primary_error: BaseException | None = None
+            primary_stage = "start"
             stop_error: BaseException | None = None
             canary: Mapping[str, Any] | None = None
             running: Mapping[str, Any] | None = None
@@ -18493,19 +18537,26 @@ class AzureCliBootstrapTransport:
                 self._mutation_request(
                     "POST", start_url, body=b"", expected={200, 202}
                 )
+                primary_stage = "running-state"
                 running = self._wait_for_site_state(
                     site_resource_id=site["resourceId"],
                     expected_state="Running",
                     allow_expired_cleanup=False,
                     deadline=canary_deadline,
+                    read_retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                    read_failure_context="running-state",
                 )
+                primary_stage = "history-boundary"
                 boundary = self._read_webjob_history(
                     site_resource_id=site["resourceId"],
                     job_name=job,
                     deadline=canary_deadline,
+                    retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                    failure_context="history-boundary",
                 )
                 trigger_requested_at = self.clock()
                 require_live_canary()
+                primary_stage = "trigger"
                 run = self._mutation_request(
                     "POST",
                     run_url,
@@ -18513,6 +18564,7 @@ class AzureCliBootstrapTransport:
                     expected={200, 202, 204},
                 )
                 trigger_status = run.status
+                primary_stage = "terminal-history"
                 canary = self._wait_for_fresh_webjob_success(
                     site_resource_id=site["resourceId"],
                     job_name=job,
@@ -18552,7 +18604,8 @@ class AzureCliBootstrapTransport:
                         "the durable mutation journal requires operator recovery"
                     ) from primary_error
                 raise BootstrapError(
-                    f"bridge canary failed before terminal Success: {primary_error}"
+                    "bridge canary failed during "
+                    f"{primary_stage} before terminal Success: {primary_error}"
                 ) from primary_error
             if stop_error is not None:
                 raise BootstrapError(
