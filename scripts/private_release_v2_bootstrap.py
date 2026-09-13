@@ -83,6 +83,7 @@ MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 MAX_BOOTSTRAP_SELF_TEST_SECONDS = 900
 MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
+MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS = 60
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
 # A protected cleanup can reach lock restoration after its authorization has
 # expired.  Give only the read-only restoration classification and readback
@@ -13735,6 +13736,7 @@ class AzureCliBootstrapTransport:
         retry_delays: tuple[float | None, ...] | None = None,
         failure_context: str | None = None,
         allow_transient_startup_error: bool = False,
+        allow_transient_rate_limit: bool = False,
     ) -> Mapping[str, Any] | None:
         url = self._arm_url(
             site_resource_id,
@@ -13750,12 +13752,28 @@ class AzureCliBootstrapTransport:
         )
         # A newly started Linux App Service can report Running before Kudu has
         # mounted the run-from-package content and initialized its WebJob
-        # registry/history store.  During that startup window ARM has returned
-        # both 404 and 500 for this GET.  At the pre-trigger boundary only,
+        # registry/history store. During that startup window ARM has returned
+        # both 404 and 500 for this GET. At the pre-trigger boundary only,
         # either status therefore means "not ready yet" and is polled as a
-        # read.  Every other status and every later history read remains
-        # fail-closed; a persistent startup error reaches the existing bounded
-        # deadline without ever triggering the job.
+        # read. ARM can also throttle this exact read-only history endpoint
+        # with 429 before or after the trigger. Only the bounded canary callers
+        # opt into honoring its integer Retry-After value; all other statuses
+        # and direct history reads remain fail-closed.
+        if response.status == 429 and allow_transient_rate_limit:
+            retry_after = self._header(response, "Retry-After")
+            if not isinstance(retry_after, str) or re.fullmatch(
+                r"[1-9][0-9]*", retry_after
+            ) is None:
+                fail("WebJob history 429 Retry-After is absent or invalid")
+            retry_after_seconds = int(retry_after)
+            if retry_after_seconds > MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS:
+                fail("WebJob history 429 Retry-After exceeds the bounded maximum")
+            self._sleep_before_deadline(
+                float(retry_after_seconds),
+                "WebJob history 429 retry",
+                deadline=deadline,
+            )
+            return None
         if response.status in {404, 500} and allow_transient_startup_error:
             return None
         document = self._json_response(response, {200}, "WebJob history")
@@ -13806,6 +13824,7 @@ class AzureCliBootstrapTransport:
                 retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
                 failure_context="history-boundary",
                 allow_transient_startup_error=True,
+                allow_transient_rate_limit=True,
             )
             if self.clock() >= deadline:
                 fail("WebJob history readiness response crossed the authorization deadline")
@@ -13858,10 +13877,17 @@ class AzureCliBootstrapTransport:
                 deadline=deadline,
                 retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
                 failure_context="terminal-history",
+                allow_transient_rate_limit=True,
             )
             after_response = self.clock()
             if after_response >= deadline:
                 fail("WebJob history response crossed the authorization deadline")
+            if observed is None:
+                delay = min(1.0 + attempts * 0.25, 3.0)
+                if self.clock() + dt.timedelta(seconds=delay) >= deadline:
+                    fail("WebJob canary polling would cross the authorization deadline")
+                self.sleep(delay)
+                continue
             entries = observed["entries"]
             current = {item["historyId"]: item for item in entries}
             if any(current.get(key) != value for key, value in before.items()):

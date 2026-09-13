@@ -289,7 +289,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
-    def test_webjob_history_boundary_polls_transient_500_before_200(self):
+    def test_webjob_history_boundary_polls_transient_429_and_500_before_200(self):
         site = self.fixture.resources["bridgeSite"]
         current = [NOW]
         sleeps = []
@@ -298,6 +298,13 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             sleeps.append(seconds)
             current[0] += dt.timedelta(seconds=seconds)
 
+        throttled = bootstrap._RestResponse(
+            429,
+            bootstrap.canonical_json_bytes(
+                {"error": {"code": "TooManyRequests", "message": "Retry later"}}
+            ),
+            {"Content-Type": "application/json", "Retry-After": "4"},
+        )
         not_ready = bootstrap._RestResponse(
             500,
             bootstrap.canonical_json_bytes(
@@ -316,7 +323,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             {"Content-Type": "application/json"},
         )
         transport, session, _journal = self.transport(
-            [not_ready, ready],
+            [throttled, not_ready, ready],
             CONFIGURE,
             clock=lambda: current[0],
             sleep=sleep,
@@ -329,8 +336,8 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         )
 
         self.assertEqual(proof["entries"], [])
-        self.assertEqual(sleeps, [1.25])
-        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(sleeps, [4.0, 1.25, 1.5])
+        self.assertEqual(len(session.requests), 3)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
     def test_webjob_history_404_remains_terminal_outside_readiness_boundary(self):
@@ -359,35 +366,90 @@ class ControllerCanaryFailureTests(unittest.TestCase):
 
         self.assertEqual(len(session.requests), 1)
 
-    def test_webjob_history_500_remains_terminal_outside_readiness_boundary(self):
+    def test_webjob_history_429_and_500_remain_terminal_outside_bounded_canary(self):
         site = self.fixture.resources["bridgeSite"]
-        response = bootstrap._RestResponse(
-            500,
-            bootstrap.canonical_json_bytes(
-                {
-                    "error": {
-                        "code": "InternalServerError",
-                        "message": "WebJob history failed",
-                    }
-                }
-            ),
-            {"Content-Type": "application/json"},
-        )
-        transport, session, _journal = self.transport(
-            [response],
-            CONFIGURE,
-        )
+        for status, headers in (
+            (429, {"Content-Type": "application/json", "Retry-After": "4"}),
+            (500, {"Content-Type": "application/json"}),
+        ):
+            with self.subTest(status=status):
+                response = bootstrap._RestResponse(
+                    status,
+                    bootstrap.canonical_json_bytes(
+                        {"error": {"code": "ReadError", "message": "failed"}}
+                    ),
+                    headers,
+                )
+                transport, session, _journal = self.transport(
+                    [response],
+                    CONFIGURE,
+                )
 
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    f"WebJob history returned unexpected HTTP status {status}",
+                ):
+                    transport._read_webjob_history(
+                        site_resource_id=site["resourceId"],
+                        job_name="paperdesk-accepted-release-registry",
+                        deadline=NOW + dt.timedelta(seconds=300),
+                    )
+
+                self.assertEqual(len(session.requests), 1)
+
+    def test_webjob_history_429_retry_after_is_strict_and_bounded(self):
+        site = self.fixture.resources["bridgeSite"]
+        for value, message in (
+            (None, "absent or invalid"),
+            ("0", "absent or invalid"),
+            ("1.5", "absent or invalid"),
+            (
+                str(bootstrap.MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS + 1),
+                "exceeds the bounded maximum",
+            ),
+        ):
+            with self.subTest(value=value):
+                headers = {"Content-Type": "application/json"}
+                if value is not None:
+                    headers["Retry-After"] = value
+                response = bootstrap._RestResponse(429, b"", headers)
+                transport, session, _journal = self.transport(
+                    [response], CONFIGURE
+                )
+                with self.assertRaisesRegex(bootstrap.BootstrapError, message):
+                    transport._read_webjob_history(
+                        site_resource_id=site["resourceId"],
+                        job_name="paperdesk-accepted-release-registry",
+                        deadline=NOW + dt.timedelta(seconds=300),
+                        allow_transient_rate_limit=True,
+                    )
+                self.assertEqual(len(session.requests), 1)
+
+    def test_webjob_history_429_retry_after_cannot_cross_deadline(self):
+        site = self.fixture.resources["bridgeSite"]
+        current = [NOW]
+        response = bootstrap._RestResponse(
+            429,
+            b"",
+            {"Content-Type": "application/json", "Retry-After": "4"},
+        )
+        def throttled_response():
+            current[0] = NOW + dt.timedelta(seconds=92)
+            return response
+
+        transport, session, _journal = self.transport(
+            [throttled_response], CONFIGURE, clock=lambda: current[0]
+        )
         with self.assertRaisesRegex(
             bootstrap.BootstrapError,
-            "WebJob history returned unexpected HTTP status 500",
+            "protected cleanup reserve would be consumed before WebJob history 429 retry",
         ):
             transport._read_webjob_history(
                 site_resource_id=site["resourceId"],
                 job_name="paperdesk-accepted-release-registry",
-                deadline=NOW + dt.timedelta(seconds=300),
+                deadline=NOW + dt.timedelta(seconds=95),
+                allow_transient_rate_limit=True,
             )
-
         self.assertEqual(len(session.requests), 1)
 
     def test_bridge_site_retry_never_starts_without_full_deadline_envelope(self):
