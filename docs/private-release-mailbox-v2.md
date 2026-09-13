@@ -490,6 +490,8 @@ Activation is blocked until all of the following are independently proven:
 - at-least-91-day Locked policies for package, accepted, and result containers;
 - exact versioned Key Vault key/JWK proof, bridge read-only key role, signer-only
   sign role, and no unexpected sensitive assignment;
+- an exact stopped bridge with App Service WebJobs enabled; a recovered exact
+  bridge with that flag disabled receives one ETag-guarded repair before start;
 - immutable bootstrap receipt and separate full canonical terminal bundle; one
   fresh source-and-package-pinned WebJob invocation after an exact pre-run
   history boundary reaching terminal `Success` under the exact canary control

@@ -270,6 +270,7 @@ def _derive_terminal_s2_document_objects(
         "webConfig": {
             "alwaysOn": True,
             "linuxFxVersion": "PYTHON|3.12",
+            "webJobsEnabled": True,
             "ftpsState": "Disabled",
             "minTlsVersion": "1.2",
             "scmMinTlsVersion": "1.2",

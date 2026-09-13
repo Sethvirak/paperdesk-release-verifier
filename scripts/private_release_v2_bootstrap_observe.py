@@ -1294,6 +1294,7 @@ def _operation_admission(
         body = _body_mapping(envelope, operation_id)
         properties = _properties(envelope, operation_id)
         identity = body.get("identity")
+        site_config = properties.get("siteConfig")
         resources = {item["id"]: item for item in plan["resourceInventory"]}
         bridge = resources["bridgeSite"]
         if (
@@ -1310,6 +1311,8 @@ def _operation_admission(
             or not bootstrap._safe_bridge_outbound_vnet_routing(
                 properties.get("outboundVnetRouting")
             )
+            or not isinstance(site_config, Mapping)
+            or type(site_config.get("webJobsEnabled")) is not bool
         ):
             fail("existing bridge posture is outside the recovery boundary")
         prior = {}
@@ -1333,28 +1336,33 @@ def _operation_admission(
         else:
             identity_ids = bootstrap._validate_exact_bridge_uami_inventory(identity, prior)
             mode = "exact-five-user-assigned"
+        webjobs_mode = (
+            "enabled" if site_config["webJobsEnabled"] else "disabled"
+        )
         if operation_id == "createStoppedPrivateBridge":
             return "exact", _policy_checked_context(operation_id, policy, {
                 "executionDecision": "adopt-exact",
                 "adopted": {
                     "resourceId": body["id"], "name": body["name"],
                     "etag": _etag(envelope, operation_id),
-                        "bridgeIdentityMode": mode,
-                        "identityResourceIds": identity_ids,
-                        "identityProjectionSha256": bootstrap.sha256_bytes(
-                            bootstrap.canonical_json_bytes(identity)
-                        ),
+                    "bridgeIdentityMode": mode,
+                    "webJobsMode": webjobs_mode,
+                    "identityResourceIds": identity_ids,
+                    "identityProjectionSha256": bootstrap.sha256_bytes(
+                        bootstrap.canonical_json_bytes(identity)
+                    ),
                 },
             })
         bridge_facts = dependency_facts.get("createStoppedPrivateBridge")
         if (
             not isinstance(bridge_facts, Mapping)
             or bridge_facts.get("bridgeIdentityMode") != mode
+            or bridge_facts.get("webJobsMode") != webjobs_mode
             or bridge_facts.get("identityResourceIds") != identity_ids
             or bridge_facts.get("etag") != _etag(envelope, operation_id)
         ):
             fail("bridge attachment state changed during observation")
-        if mode == "exact-five-user-assigned":
+        if mode == "exact-five-user-assigned" and webjobs_mode == "enabled":
             return "exact", _policy_checked_context(operation_id, policy, {
                 "executionDecision": "adopt-exact",
                 "adopted": {

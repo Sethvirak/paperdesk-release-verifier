@@ -1441,6 +1441,7 @@ class ObserveTests(unittest.TestCase):
                         "allTraffic": True,
                         "applicationTraffic": True,
                     },
+                    "siteConfig": {"webJobsEnabled": True},
                 },
             },
         }
@@ -1471,6 +1472,23 @@ class ObserveTests(unittest.TestCase):
             attach_context["adopted"]["identityResourceIds"],
             create_context["adopted"]["identityResourceIds"],
         )
+
+        disabled = copy.deepcopy(envelope)
+        disabled["body"]["properties"]["siteConfig"]["webJobsEnabled"] = False
+        _status, disabled_create = observe._operation_admission(
+            operations["createStoppedPrivateBridge"], disabled, self.plan,
+            authorization, NOW, "203.0.113.10/32", create_policy,
+            dependency_facts,
+        )
+        self.assertEqual(disabled_create["adopted"]["webJobsMode"], "disabled")
+        disabled_dependencies = dict(dependency_facts)
+        disabled_dependencies["createStoppedPrivateBridge"] = disabled_create["adopted"]
+        _status, disabled_attach = observe._operation_admission(
+            operations["attachFiveUamisOnlyToBridge"], disabled, self.plan,
+            authorization, NOW, "203.0.113.10/32", attach_policy,
+            disabled_dependencies,
+        )
+        self.assertEqual(disabled_attach, {"executionDecision": "apply-exact"})
 
         invalid = {}
         missing = copy.deepcopy(envelope)
@@ -1503,6 +1521,9 @@ class ObserveTests(unittest.TestCase):
             "principalId"
         ] = "not-a-guid"
         invalid["malformed principal metadata"] = malformed_principal
+        missing_webjobs = copy.deepcopy(envelope)
+        del missing_webjobs["body"]["properties"]["siteConfig"]["webJobsEnabled"]
+        invalid["missing WebJobs posture"] = missing_webjobs
         for label, candidate in invalid.items():
             with self.subTest(label=label), self.assertRaises(
                 (observe.ObserveError, bootstrap.BootstrapError)
@@ -1584,6 +1605,7 @@ class ObserveTests(unittest.TestCase):
                                 "outboundVnetRouting": {
                                     "allTraffic": True, "applicationTraffic": True,
                                 },
+                                "siteConfig": {"webJobsEnabled": True},
                             },
                         },
                     )

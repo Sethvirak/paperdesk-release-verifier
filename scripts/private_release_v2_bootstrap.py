@@ -10410,6 +10410,7 @@ def _operation_context_policy(
             "name",
             "etag",
             "bridgeIdentityMode",
+            "webJobsMode",
             "identityResourceIds",
             "identityProjectionSha256",
         },
@@ -10637,6 +10638,8 @@ def _validate_operation_context(
                 "exact-five-user-assigned",
             }:
                 fail("adopted bridge identity mode is invalid")
+            if adopted["webJobsMode"] not in {"enabled", "disabled"}:
+                fail("adopted bridge WebJobs mode is invalid")
             identity_ids = adopted["identityResourceIds"]
             if (
                 not isinstance(identity_ids, list)
@@ -11205,8 +11208,13 @@ def validate_preflight_evidence(
             or attach_context["executionDecision"] != "apply-exact"
         ):
             fail("pristine bridge is not bound to one attachment mutation")
+    elif bridge_adopted["bridgeIdentityMode"] != "exact-five-user-assigned":
+        fail("recovered bridge attachment identity mode is invalid")
+    elif bridge_adopted["webJobsMode"] == "disabled":
+        if attach_context["executionDecision"] != "apply-exact":
+            fail("disabled WebJobs bridge is not bound to one repair mutation")
     elif (
-        bridge_adopted["bridgeIdentityMode"] != "exact-five-user-assigned"
+        bridge_adopted["webJobsMode"] != "enabled"
         or attach_context["executionDecision"] != "adopt-exact"
         or attach_context.get("adopted", {}).get("identityResourceIds")
         != bridge_adopted["identityResourceIds"]
@@ -14728,6 +14736,7 @@ class AzureCliBootstrapTransport:
             elif operation_id == "createStoppedPrivateBridge":
                 identity = projection_document.get("identity")
                 outbound = properties.get("outboundVnetRouting") if isinstance(properties, Mapping) else None
+                site_config = properties.get("siteConfig") if isinstance(properties, Mapping) else None
                 bridge_mode = (
                     runtime_facts.get("bridgeIdentityMode")
                     if runtime_facts is not None
@@ -14744,8 +14753,16 @@ class AzureCliBootstrapTransport:
                     != self.resources["integrationSubnet"]["resourceId"].lower()
                     or not _safe_bridge_outbound_vnet_routing(outbound)
                     or properties.get("state") != "Stopped"
+                    or not isinstance(site_config, Mapping)
                 ):
                     fail("stopped private bridge readback is not exact")
+                expected_webjobs = (
+                    runtime_facts.get("webJobsMode") == "enabled"
+                    if runtime_facts is not None
+                    else True
+                )
+                if site_config.get("webJobsEnabled") is not expected_webjobs:
+                    fail("stopped private bridge WebJobs posture changed")
                 if bridge_mode == "pristine-no-identity":
                     if not _safe_bridge_no_identity(identity):
                         fail("pristine bridge unexpectedly has an identity")
@@ -14765,6 +14782,7 @@ class AzureCliBootstrapTransport:
                     fail("stopped bridge identity projection changed")
             elif operation_id == "attachFiveUamisOnlyToBridge":
                 identity = projection_document.get("identity")
+                site_config = properties.get("siteConfig") if isinstance(properties, Mapping) else None
                 expected_ids = runtime_facts.get("identityResourceIds") if runtime_facts else None
                 if (
                     projection_document.get("kind") != "app,linux"
@@ -14780,6 +14798,8 @@ class AzureCliBootstrapTransport:
                         properties.get("outboundVnetRouting")
                     )
                     or not isinstance(expected_ids, list)
+                    or not isinstance(site_config, Mapping)
+                    or site_config.get("webJobsEnabled") is not True
                 ):
                     fail("bridge UAMI attachment readback is not exact")
                 observed_ids = _validate_exact_bridge_uami_inventory(
@@ -17176,6 +17196,7 @@ class AzureCliBootstrapTransport:
                         "siteConfig": {
                             "alwaysOn": True,
                             "linuxFxVersion": "PYTHON|3.12",
+                            "webJobsEnabled": True,
                             "ftpsState": "Disabled",
                             "minTlsVersion": "1.2",
                             "scmMinTlsVersion": "1.2",
@@ -17212,6 +17233,7 @@ class AzureCliBootstrapTransport:
                 "name": result.get("name"),
                 "etag": etag,
                 "bridgeIdentityMode": "pristine-no-identity",
+                "webJobsMode": "enabled",
                 "identityResourceIds": [],
                 "identityProjectionSha256": sha256_bytes(
                     canonical_json_bytes(current.get("identity"))
@@ -17240,7 +17262,8 @@ class AzureCliBootstrapTransport:
                     "identity": {
                         "type": "UserAssigned",
                         "userAssignedIdentities": {resource_id: {} for resource_id in identity_ids},
-                    }
+                    },
+                    "properties": {"siteConfig": {"webJobsEnabled": True}},
                 }
             )
             response = self._mutation_request(
