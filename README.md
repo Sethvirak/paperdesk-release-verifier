@@ -442,8 +442,11 @@ then remove only the executor-owned `/32` rule and exact temporary assignment. F
 readback must prove both are absent before the V2 site starts. It may not use a
 SAS, account key, Shared Key, broad CIDR, stale full-ACL restore, or public
 container. The stopped bridge posture requires App Service WebJobs enabled; an
-otherwise exact recovered bridge with that flag disabled is repaired by the
-existing ETag-guarded bridge attachment PATCH before startup. A fresh exact
+otherwise exact recovered bridge with that flag disabled is repaired by one
+adjacent-read-guarded Microsoft.Web identity PATCH followed by an independent
+exact stopped/private identity and WebJobs readback before startup. Because that
+site update exposes no supported conditional ETag, the exact authorization text
+accepts its bounded out-of-band concurrency and recovery residual. A fresh exact
 source-and-package-pinned WebJob invocation must start
 after the recorded pre-run history boundary and reach terminal `Success` under
 the exact canary control and settings. Its ARM invocation ID/start/end/status
