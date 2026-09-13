@@ -491,7 +491,10 @@ Activation is blocked until all of the following are independently proven:
 - exact versioned Key Vault key/JWK proof, bridge read-only key role, signer-only
   sign role, and no unexpected sensitive assignment;
 - an exact stopped bridge with App Service WebJobs enabled; a recovered exact
-  bridge with that flag disabled receives one ETag-guarded repair before start;
+  bridge with that flag disabled receives one adjacent-read-guarded repair and
+  an independent exact readback before start. Microsoft.Web does not expose a
+  supported conditional ETag for this site identity PATCH, so the authorization
+  explicitly accepts its bounded out-of-band concurrency and recovery residual;
 - immutable bootstrap receipt and separate full canonical terminal bundle; one
   fresh source-and-package-pinned WebJob invocation after an exact pre-run
   history boundary reaching terminal `Success` under the exact canary control

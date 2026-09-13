@@ -121,6 +121,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
             "virtualNetworkSubnetId": self.resources["integrationSubnet"]["resourceId"],
             "outboundVnetRouting": {"allTraffic": True, "applicationTraffic": True},
+            "webJobsEnabled": True,
             "identity": {"type": "None", "userAssignedIdentities": {}},
         }
         valid = self.envelope(operation_id, body)
@@ -129,6 +130,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
             ("publicNetworkAccess", "Enabled"),
             ("state", "Running"),
             ("httpsOnly", False),
+            ("webJobsEnabled", False),
         ):
             with self.subTest(field=field):
                 altered = copy.deepcopy(valid)
@@ -160,6 +162,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "imagePullTraffic": True,
                 "managedIdentityTraffic": True,
             },
+            "webJobsEnabled": True,
             "identity": None,
         }
         valid = self.envelope(operation_id, body)
@@ -186,6 +189,7 @@ class BootstrapSemanticRegressionTests(unittest.TestCase):
                 "applicationTraffic": True,
                 "contentShareTraffic": True,
             },
+            "webJobsEnabled": True,
             "identity": None,
         }
         variants = []
