@@ -77,6 +77,11 @@ MAX_READBACK_CONVERGENCE_SECONDS = 120
 # credential-plus-response envelopes without extending mutation readbacks.
 MAX_ADOPT_READBACK_CONVERGENCE_SECONDS = 300
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
+# Linux App Service startup/Kudu history readiness and the triggered WebJob
+# execution are distinct convergence phases.  Their 600+300 second windows fit
+# exactly inside the immutable 900-second self-test control.
+MAX_BOOTSTRAP_SELF_TEST_SECONDS = 900
+MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 600
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
 # A protected cleanup can reach lock restoration after its authorization has
@@ -5417,7 +5422,13 @@ def _bootstrap_self_test_timing(authorization: Mapping[str, Any], issued_at: str
     end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
     if not start <= issued < end:
         fail("bootstrap self-test issuance is outside live authorization")
-    return {"issuedAt": issued_at, "expiresAt": min(end, issued + dt.timedelta(seconds=900)).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+    return {
+        "issuedAt": issued_at,
+        "expiresAt": min(
+            end,
+            issued + dt.timedelta(seconds=MAX_BOOTSTRAP_SELF_TEST_SECONDS),
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    }
 
 
 def _validated_bootstrap_self_test_timing(authorization: Mapping[str, Any], projection: Mapping[str, Any]) -> dict[str, str]:
@@ -18797,14 +18808,17 @@ class AzureCliBootstrapTransport:
             site = self.resources["bridgeSite"]
             configure = self._proof_detail(state, "configureBridgeExactVersionedPackageAndCriticalSettings")
             timing = _validated_bootstrap_self_test_timing(self.authorization, configure)
-            canary_deadline = min(
+            canary_control_deadline = min(
                 parse_time(
                     self.authorization["validity"]["expiresAt"],
                     "authorization expiresAt",
                 ),
                 parse_time(timing["expiresAt"], "canary expiresAt"),
+            )
+            startup_deadline = min(
+                canary_control_deadline,
                 self.clock()
-                + dt.timedelta(seconds=MAX_CANARY_CONVERGENCE_SECONDS),
+                + dt.timedelta(seconds=MAX_CANARY_STARTUP_CONVERGENCE_SECONDS),
             )
             def require_live_canary() -> None:
                 if not parse_time(timing["issuedAt"], "canary issuedAt") <= self.clock() < parse_time(timing["expiresAt"], "canary expiresAt"):
@@ -18815,7 +18829,7 @@ class AzureCliBootstrapTransport:
                 site_resource_id=site["resourceId"],
                 expected_state="Stopped",
                 allow_expired_cleanup=False,
-                deadline=canary_deadline,
+                deadline=startup_deadline,
             )
             start_url = self._arm_url(site["resourceId"], "2025-03-01", "/start")
             stop_url = self._arm_url(site["resourceId"], "2025-03-01", "/stop")
@@ -18846,7 +18860,7 @@ class AzureCliBootstrapTransport:
                     site_resource_id=site["resourceId"],
                     expected_state="Running",
                     allow_expired_cleanup=False,
-                    deadline=canary_deadline,
+                    deadline=startup_deadline,
                     read_retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
                     read_failure_context="running-state",
                 )
@@ -18854,7 +18868,7 @@ class AzureCliBootstrapTransport:
                 boundary = self._wait_for_webjob_history_boundary(
                     site_resource_id=site["resourceId"],
                     job_name=job,
-                    deadline=canary_deadline,
+                    deadline=startup_deadline,
                 )
                 trigger_requested_at = self.clock()
                 require_live_canary()
@@ -18872,7 +18886,7 @@ class AzureCliBootstrapTransport:
                     job_name=job,
                     boundary=boundary,
                     trigger_requested_at=trigger_requested_at,
-                    deadline=canary_deadline,
+                    deadline=canary_control_deadline,
                 )
             except BaseException as exc:
                 primary_error = exc

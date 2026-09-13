@@ -8210,6 +8210,7 @@ class BootstrapTests(unittest.TestCase):
                     running_timeouts=0,
                     boundary_timeouts=0,
                     terminal_history_timeouts=0,
+                    running_settlement_seconds=0,
                 ):
                     self.requests = []
                     self.site_states = ["Stopped", "Running", "Stopped"]
@@ -8218,6 +8219,7 @@ class BootstrapTests(unittest.TestCase):
                     self.running_timeouts = running_timeouts
                     self.boundary_timeouts = boundary_timeouts
                     self.terminal_history_timeouts = terminal_history_timeouts
+                    self.running_settlement_seconds = running_settlement_seconds
 
                 def request(
                     self, method, url, *, body=None, headers=None, deadline=None
@@ -8286,6 +8288,10 @@ class BootstrapTests(unittest.TestCase):
                                 "Azure REST total response deadline expired"
                             )
                         state = self.site_states.pop(0)
+                        if state == "Running":
+                            current[0] += dt.timedelta(
+                                seconds=self.running_settlement_seconds
+                            )
                         return bootstrap._RestResponse(
                             200,
                             bootstrap.canonical_json_bytes(
@@ -8395,6 +8401,42 @@ class BootstrapTests(unittest.TestCase):
                 6,
             )
 
+            current[0] = NOW + dt.timedelta(seconds=3)
+            live_delay_session = Session(running_settlement_seconds=211)
+            live_delay_proof = build_transport(live_delay_session)._mutate(
+                operation, state
+            )
+            self.assertEqual(
+                live_delay_proof["terminalHistory"]["status"], "Success"
+            )
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            split_window_session = Session(
+                running_settlement_seconds=500,
+                terminal_history_timeouts=3,
+            )
+            split_window_proof = build_transport(split_window_session)._mutate(
+                operation, state
+            )
+            self.assertEqual(
+                split_window_proof["terminalHistory"]["status"], "Success"
+            )
+            self.assertGreater(
+                current[0],
+                NOW
+                + dt.timedelta(
+                    seconds=3
+                    + bootstrap.MAX_CANARY_STARTUP_CONVERGENCE_SECONDS
+                ),
+            )
+            self.assertLess(
+                current[0],
+                NOW
+                + dt.timedelta(
+                    seconds=bootstrap.MAX_BOOTSTRAP_SELF_TEST_SECONDS
+                ),
+            )
+
             for timeout_stage in ("boundary_timeouts", "terminal_history_timeouts"):
                 current[0] = NOW + dt.timedelta(seconds=3)
                 history_session = Session(**{timeout_stage: 3})
@@ -8455,7 +8497,8 @@ class BootstrapTests(unittest.TestCase):
                 current[0],
                 NOW
                 + dt.timedelta(
-                    seconds=3 + bootstrap.MAX_CANARY_CONVERGENCE_SECONDS
+                    seconds=3
+                    + bootstrap.MAX_CANARY_STARTUP_CONVERGENCE_SECONDS
                 ),
             )
 
