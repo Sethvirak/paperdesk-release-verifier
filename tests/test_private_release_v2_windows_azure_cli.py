@@ -463,6 +463,55 @@ class AzureCliExecutableTests(unittest.TestCase):
     def test_total_timeout_kills_slow_http_error_body_exchange(self):
         self._assert_slow_response_body_is_killed(409)
 
+    def test_exchange_preserves_duplicate_headers_and_exact_reader_rejects_them(self):
+        class DuplicateHeaderHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Location", "https://example.invalid/run-a")
+                self.send_header("Location", "https://example.invalid/run-b")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), DuplicateHeaderHandler
+        )
+        server.daemon_threads = True
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/duplicate",
+                method="GET",
+            )
+            response = bootstrap.AzureCliRestSession._run_exchange_subprocess(
+                request, 2.0
+            )
+            self.assertEqual(
+                [
+                    value
+                    for key, value in response.header_items or ()
+                    if key.lower() == "location"
+                ],
+                [
+                    "https://example.invalid/run-a",
+                    "https://example.invalid/run-b",
+                ],
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "Azure REST response Location header is ambiguous",
+            ):
+                bootstrap.AzureCliBootstrapTransport._header(
+                    response, "Location"
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

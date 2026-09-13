@@ -7236,6 +7236,7 @@ def _validate_operation_source_projection(
             "initialStopped",
             "running",
             "triggerStatus",
+            "triggerLocation",
             "triggerRequestedAt",
             "historyBoundary",
             "terminalHistory",
@@ -7293,11 +7294,84 @@ def _validate_operation_source_projection(
         stopped = site_state(body["stopped"], "Stopped", "final bridge state")
         boundary = _exact_keys(
             body["historyBoundary"],
-            {"observedAt", "entries", "entriesSha256", "responseSha256"},
+            {
+                "jobMetadata",
+                "observedAt",
+                "entries",
+                "entriesSha256",
+                "responseSha256",
+                "httpStatus",
+                "boundaryState",
+            },
             "WebJob history boundary",
         )
         if not isinstance(boundary["entries"], list):
             fail("WebJob history boundary entries are invalid")
+
+        job = _exact_keys(
+            boundary["jobMetadata"],
+            {
+                "observedAt",
+                "resourceId",
+                "name",
+                "type",
+                "runCommand",
+                "latestRunPresent",
+                "urlMetadata",
+                "historyUrlMetadata",
+                "settingsSha256",
+                "responseSha256",
+            },
+            "triggered WebJob discovery metadata",
+        )
+        expected_job_id = (
+            site_id
+            + "/triggeredwebjobs/paperdesk-accepted-release-registry"
+        )
+        expected_job_path = (
+            "/api/triggeredwebjobs/paperdesk-accepted-release-registry"
+        )
+        expected_job_host = resources["bridgeSite"]["name"] + ".scm.azurewebsites.net"
+
+        def job_url(value: Any, expected_path: str, label: str) -> None:
+            item = _exact_keys(
+                value,
+                {"scheme", "host", "path", "queryPresent"},
+                label,
+            )
+            if (
+                item["scheme"] != "https"
+                or item["host"] != expected_job_host
+                or item["path"] != expected_path
+                or item["queryPresent"] is not False
+            ):
+                fail(f"{label} is not exact")
+
+        job_url(job["urlMetadata"], expected_job_path, "triggered WebJob URL")
+        job_url(
+            job["historyUrlMetadata"],
+            expected_job_path + "/history",
+            "triggered WebJob history URL",
+        )
+        job_observed = parse_time(
+            job["observedAt"], "triggered WebJob discovery observedAt"
+        )
+        if (
+            str(job["resourceId"]).lower() != expected_job_id.lower()
+            or job["name"] != "paperdesk-accepted-release-registry"
+            or job["type"] != "triggered"
+            or job["runCommand"] != "run.sh"
+            or type(job["latestRunPresent"]) is not bool
+            or job["settingsSha256"]
+            != sha256_bytes(
+                canonical_json_bytes(
+                    {"is_singleton": True, "stopping_wait_time": 30}
+                )
+            )
+            or not auth_start <= job_observed <= auth_end
+        ):
+            fail("triggered WebJob discovery projection is not exact")
+        _sha256(job["responseSha256"], "triggered WebJob response digest")
 
         def history_item(value: Any, label: str) -> Mapping[str, Any]:
             item = _exact_keys(
@@ -7350,10 +7424,61 @@ def _validate_operation_source_projection(
             for index, item in enumerate(boundary["entries"])
         ]
         terminal = history_item(body["terminalHistory"], "fresh WebJob terminal history")
+        trigger_location = _exact_keys(
+            body["triggerLocation"],
+            {"scheme", "host", "path", "runId", "queryPresent"},
+            "WebJob trigger Location",
+        )
+        expected_trigger_prefix = (
+            "/api/triggeredwebjobs/paperdesk-accepted-release-registry/history/"
+        )
+        if (
+            trigger_location["scheme"] != "https"
+            or trigger_location["host"] != expected_job_host
+            or trigger_location["queryPresent"] is not False
+            or not isinstance(trigger_location["runId"], str)
+            or re.fullmatch(
+                r"[A-Za-z0-9._:-]{1,256}", trigger_location["runId"]
+            )
+            is None
+            or trigger_location["path"]
+            != expected_trigger_prefix + trigger_location["runId"]
+            or terminal["webJobsRunId"] != trigger_location["runId"]
+            or terminal["historyId"].lower()
+            != (
+                expected_job_id
+                + "/history/"
+                + trigger_location["runId"]
+            ).lower()
+        ):
+            fail("WebJob trigger Location and terminal history are not exact")
         if len({item["historyId"] for item in boundary_entries}) != len(boundary_entries):
             fail("WebJob history boundary contains duplicate entries")
         trigger_at = parse_time(body["triggerRequestedAt"], "WebJob trigger requestedAt")
         boundary_at = parse_time(boundary["observedAt"], "WebJob history boundary observedAt")
+        if (
+            type(boundary["httpStatus"]) is not int
+            or boundary["httpStatus"] not in {200, 404}
+            or boundary["boundaryState"]
+            != (
+                "history-present"
+                if boundary["httpStatus"] == 200
+                else "pristine-history-absent"
+            )
+            or (
+                boundary["httpStatus"] == 404
+                and (
+                    job["latestRunPresent"] is not False
+                    or boundary_entries
+                )
+            )
+            or (
+                boundary["httpStatus"] == 200
+                and bool(boundary_entries) is not job["latestRunPresent"]
+            )
+            or not job_observed <= boundary_at
+        ):
+            fail("WebJob pre-trigger history boundary is not exact")
         terminal_started = parse_time(terminal["startedAt"], "fresh WebJob start")
         terminal_ended = parse_time(terminal["endedAt"], "fresh WebJob end")
         terminal_observed = parse_time(
@@ -7377,7 +7502,8 @@ def _validate_operation_source_projection(
             body["resourceId"] != site_id
             or body["cleanupKey"] != "bounded-bridge-canary-start"
             or body["selfCleaned"] is not True
-            or body["triggerStatus"] not in {200, 202, 204}
+            or type(body["triggerStatus"]) is not int
+            or body["triggerStatus"] != 200
             or boundary["entriesSha256"]
             != sha256_bytes(canonical_json_bytes(boundary_entries))
             or _sha256(boundary["responseSha256"], "WebJob boundary response digest")
@@ -7404,6 +7530,7 @@ def _validate_operation_source_projection(
                 auth_start
                 <= parse_time(initial["observedAt"], "initial bridge observedAt")
                 <= parse_time(running["observedAt"], "running bridge observedAt")
+                <= job_observed
                 <= boundary_at
                 <= trigger_at
             )
@@ -11485,6 +11612,7 @@ class _RestResponse:
     body: bytes
     headers: Mapping[str, str]
     client_request_id: str | None = None
+    header_items: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -11705,6 +11833,7 @@ class AzureCliRestSession:
             status=status,
             body=response_body,
             headers={key: value for key, value in header_items},
+            header_items=tuple((key, value) for key, value in header_items),
         )
 
     @staticmethod
@@ -11949,6 +12078,7 @@ class AzureCliRestSession:
             response.body,
             dict(response.headers),
             client_request_id=client_request_id,
+            header_items=response.header_items,
         )
         if deadline is not None and self.clock() >= deadline:
             raise _LateRestResponse(result)
@@ -13634,10 +13764,17 @@ class AzureCliBootstrapTransport:
 
     @staticmethod
     def _header(response: _RestResponse, name: str) -> str | None:
-        return next(
-            (value for key, value in response.headers.items() if key.lower() == name.lower()),
-            None,
+        source = (
+            response.header_items
+            if response.header_items is not None
+            else tuple(response.headers.items())
         )
+        values = [
+            value for key, value in source if key.lower() == name.lower()
+        ]
+        if len(values) > 1:
+            fail(f"Azure REST response {name} header is ambiguous")
+        return values[0] if values else None
 
     @staticmethod
     def _timestamp(value: dt.datetime) -> str:
@@ -13738,7 +13875,7 @@ class AzureCliBootstrapTransport:
         deadline: dt.datetime,
         retry_delays: tuple[float | None, ...] | None = None,
         failure_context: str | None = None,
-        allow_transient_startup_error: bool = False,
+        allow_pristine_absence: bool = False,
         allow_transient_rate_limit: bool = False,
     ) -> Mapping[str, Any] | None:
         url = self._arm_url(
@@ -13753,15 +13890,12 @@ class AzureCliBootstrapTransport:
             retry_delays=retry_delays,
             failure_context=failure_context,
         )
-        # A newly started Linux App Service can report Running before Kudu has
-        # mounted the run-from-package content and initialized its WebJob
-        # registry/history store. During that startup window ARM has returned
-        # both 404 and 500 for this GET. At the pre-trigger boundary only,
-        # either status therefore means "not ready yet" and is polled as a
-        # read. ARM can also throttle this exact read-only history endpoint
-        # with 429 before or after the trigger. Only the bounded canary callers
-        # opt into honoring its integer Retry-After value; all other statuses
-        # and direct history reads remain fail-closed.
+        # Kudu creates /home/data/jobs/triggered/<job> during the first
+        # invocation.  Its history API therefore returns 404 for a discovered
+        # job whose exact metadata reports latest_run=null.  Only the adjacent
+        # pre-trigger boundary opts into that source-bound empty state.  ARM
+        # can also throttle this read-only endpoint with 429; only bounded
+        # canary callers honor its integer Retry-After value.
         if response.status == 429 and allow_transient_rate_limit:
             retry_after = self._header(response, "Retry-After")
             if not isinstance(retry_after, str) or re.fullmatch(
@@ -13777,8 +13911,17 @@ class AzureCliBootstrapTransport:
                 deadline=deadline,
             )
             return None
-        if response.status in {404, 500} and allow_transient_startup_error:
-            return None
+        if response.status == 404 and allow_pristine_absence:
+            observed_at = self.clock()
+            empty: list[Mapping[str, Any]] = []
+            return {
+                "observedAt": self._timestamp(observed_at),
+                "entries": empty,
+                "entriesSha256": sha256_bytes(canonical_json_bytes(empty)),
+                "responseSha256": _response_sha256(response),
+                "httpStatus": 404,
+                "boundaryState": "pristine-history-absent",
+            }
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
         if (
@@ -13806,6 +13949,151 @@ class AzureCliBootstrapTransport:
             "entries": projected,
             "entriesSha256": sha256_bytes(canonical_json_bytes(projected)),
             "responseSha256": _response_sha256(response),
+            "httpStatus": 200,
+            "boundaryState": "history-present",
+        }
+
+    @staticmethod
+    def _webjob_trigger_location_metadata(
+        value: Any, *, site_name: str, job_name: str
+    ) -> Mapping[str, Any]:
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            fail("WebJob trigger Location is absent or oversized")
+        parsed = urllib.parse.urlsplit(value)
+        expected_host = site_name.lower() + ".scm.azurewebsites.net"
+        expected_prefix = f"/api/triggeredwebjobs/{job_name}/history/"
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or (parsed.hostname or "").lower() != expected_host
+            or not parsed.path.startswith(expected_prefix)
+            or parsed.query
+            or parsed.fragment
+        ):
+            fail("WebJob trigger Location is not exact")
+        run_id = parsed.path[len(expected_prefix) :]
+        if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id) is None:
+            fail("WebJob trigger Location run ID is invalid")
+        return {
+            "scheme": "https",
+            "host": expected_host,
+            "path": parsed.path,
+            "runId": run_id,
+            "queryPresent": False,
+        }
+
+    def _read_triggered_webjob_metadata(
+        self,
+        *,
+        site_resource_id: str,
+        site_name: str,
+        job_name: str,
+        deadline: dt.datetime,
+        allow_transient_startup_error: bool = False,
+        allow_transient_rate_limit: bool = False,
+    ) -> Mapping[str, Any] | None:
+        response = self._read_request_with_transport_retry(
+            "GET",
+            self._arm_url(
+                site_resource_id,
+                "2025-05-01",
+                f"/triggeredwebjobs/{job_name}",
+            ),
+            deadline=deadline,
+            retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+            failure_context="job-discovery",
+        )
+        if response.status == 429 and allow_transient_rate_limit:
+            retry_after = self._header(response, "Retry-After")
+            if not isinstance(retry_after, str) or re.fullmatch(
+                r"[1-9][0-9]*", retry_after
+            ) is None:
+                fail("triggered WebJob discovery 429 Retry-After is absent or invalid")
+            retry_after_seconds = int(retry_after)
+            if retry_after_seconds > MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS:
+                fail(
+                    "triggered WebJob discovery 429 Retry-After exceeds the bounded maximum"
+                )
+            self._sleep_before_deadline(
+                float(retry_after_seconds),
+                "triggered WebJob discovery 429 retry",
+                deadline=deadline,
+            )
+            return None
+        if response.status in {404, 500} and allow_transient_startup_error:
+            return None
+        document = self._json_response(
+            response, {200}, "triggered WebJob discovery"
+        )
+        properties = document.get("properties")
+        expected_resource_id = (
+            site_resource_id + f"/triggeredwebjobs/{job_name}"
+        )
+        expected_host = site_name.lower() + ".scm.azurewebsites.net"
+
+        def endpoint(value: Any, expected_path: str, label: str) -> Mapping[str, Any]:
+            if not isinstance(value, str) or not value or len(value) > 4096:
+                fail(f"triggered WebJob {label} is absent or oversized")
+            parsed = urllib.parse.urlsplit(value)
+            if (
+                parsed.scheme != "https"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.port not in {None, 443}
+                or (parsed.hostname or "").lower() != expected_host
+                or parsed.path != expected_path
+                or parsed.query
+                or parsed.fragment
+            ):
+                fail(f"triggered WebJob {label} is not exact")
+            return {
+                "scheme": "https",
+                "host": expected_host,
+                "path": expected_path,
+                "queryPresent": False,
+            }
+
+        if not isinstance(properties, Mapping):
+            fail("triggered WebJob discovery properties are absent")
+        latest_run = properties.get("latest_run")
+        settings = properties.get("settings")
+        if (
+            str(document.get("id", "")).lower()
+            != expected_resource_id.lower()
+            or document.get("name") != f"{site_name}/{job_name}"
+            or document.get("type") != "Microsoft.Web/sites/triggeredwebjobs"
+            or properties.get("name") != job_name
+            or properties.get("type") != "triggered"
+            or properties.get("run_command") != "run.sh"
+            or "latest_run" not in properties
+            or properties.get("error") is not None
+            or "error" not in properties
+            or properties.get("using_sdk") is not False
+            or not isinstance(settings, Mapping)
+            or set(settings) != {"is_singleton", "stopping_wait_time"}
+            or type(settings.get("is_singleton")) is not bool
+            or settings.get("is_singleton") is not True
+            or type(settings.get("stopping_wait_time")) is not int
+            or settings.get("stopping_wait_time") != 30
+            or (latest_run is not None and not isinstance(latest_run, Mapping))
+        ):
+            fail("triggered WebJob discovery metadata is not exact")
+        job_path = f"/api/triggeredwebjobs/{job_name}"
+        return {
+            "observedAt": self._timestamp(self.clock()),
+            "resourceId": expected_resource_id,
+            "name": job_name,
+            "type": "triggered",
+            "runCommand": "run.sh",
+            "latestRunPresent": latest_run is not None,
+            "urlMetadata": endpoint(properties.get("url"), job_path, "URL"),
+            "historyUrlMetadata": endpoint(
+                properties.get("history_url"), job_path + "/history", "history URL"
+            ),
+            "settingsSha256": sha256_bytes(canonical_json_bytes(settings)),
+            "responseSha256": _response_sha256(response),
         }
 
     def _wait_for_webjob_history_boundary(
@@ -13820,19 +14108,55 @@ class AzureCliBootstrapTransport:
             if self.clock() >= deadline:
                 fail("WebJob history did not become ready before authorization expiry")
             attempts += 1
+            # Keep the job discovery and history reads adjacent.  If history
+            # throttles, repeat both reads rather than reusing an older
+            # latest_run=null observation to classify a later 404.
+            metadata = self._read_triggered_webjob_metadata(
+                site_resource_id=site_resource_id,
+                site_name=self.resources["bridgeSite"]["name"],
+                job_name=job_name,
+                deadline=deadline,
+                allow_transient_startup_error=True,
+                allow_transient_rate_limit=True,
+            )
+            if metadata is None:
+                delay = min(1.0 + attempts * 0.25, 3.0)
+                if self.clock() + dt.timedelta(seconds=delay) >= deadline:
+                    fail(
+                        "triggered WebJob discovery polling would cross the authorization deadline"
+                    )
+                self.sleep(delay)
+                continue
             observed = self._read_webjob_history(
                 site_resource_id=site_resource_id,
                 job_name=job_name,
                 deadline=deadline,
-                retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                # The adjacent metadata sample must classify this exact
+                # response.  A hidden transport retry could attach a later
+                # 404 to stale latest_run=null, so this boundary read is one
+                # transport attempt.  A new authorization can safely retry
+                # from a fresh pair after any ambiguity.
+                retry_delays=(None,),
                 failure_context="history-boundary",
-                allow_transient_startup_error=True,
+                allow_pristine_absence=metadata["latestRunPresent"] is False,
                 allow_transient_rate_limit=True,
             )
             if self.clock() >= deadline:
                 fail("WebJob history readiness response crossed the authorization deadline")
             if observed is not None:
-                return observed
+                if (
+                    (
+                        observed["httpStatus"] == 404
+                        and metadata["latestRunPresent"] is not False
+                    )
+                    or (
+                        observed["httpStatus"] == 200
+                        and bool(observed["entries"])
+                        is not metadata["latestRunPresent"]
+                    )
+                ):
+                    fail("WebJob metadata and history boundary disagree")
+                return {"jobMetadata": dict(metadata), **observed}
             delay = min(1.0 + attempts * 0.25, 3.0)
             if self.clock() + dt.timedelta(seconds=delay) >= deadline:
                 fail("WebJob history readiness polling would cross the authorization deadline")
@@ -18875,6 +19199,7 @@ class AzureCliBootstrapTransport:
             running: Mapping[str, Any] | None = None
             stopped: Mapping[str, Any] | None = None
             trigger_status: int | None = None
+            trigger_location: Mapping[str, Any] | None = None
             trigger_requested_at: dt.datetime | None = None
             try:
                 # Once the intent is durable, even an ambiguous transport
@@ -18906,9 +19231,14 @@ class AzureCliBootstrapTransport:
                     "POST",
                     run_url,
                     body=b"",
-                    expected={200, 202, 204},
+                    expected={200},
                 )
                 trigger_status = run.status
+                trigger_location = self._webjob_trigger_location_metadata(
+                    self._header(run, "Location"),
+                    site_name=site["name"],
+                    job_name=job,
+                )
                 primary_stage = "terminal-history"
                 canary = self._wait_for_fresh_webjob_success(
                     site_resource_id=site["resourceId"],
@@ -18962,8 +19292,20 @@ class AzureCliBootstrapTransport:
                 or stopped is None
                 or trigger_requested_at is None
                 or trigger_status is None
+                or trigger_location is None
             ):
                 fail("bridge canary proof is incomplete")
+            if (
+                canary["terminalHistory"]["webJobsRunId"]
+                != trigger_location["runId"]
+                or canary["terminalHistory"]["historyId"].lower()
+                != (
+                    site["resourceId"]
+                    + f"/triggeredwebjobs/{job}/history/"
+                    + str(trigger_location["runId"])
+                ).lower()
+            ):
+                fail("WebJob terminal history does not match the authorized trigger")
             configure = self._proof_detail(
                 state, "configureBridgeExactVersionedPackageAndCriticalSettings"
             )
@@ -18976,6 +19318,7 @@ class AzureCliBootstrapTransport:
                 "initialStopped": initial,
                 "running": running,
                 "triggerStatus": trigger_status,
+                "triggerLocation": dict(trigger_location),
                 "triggerRequestedAt": self._timestamp(trigger_requested_at),
                 "historyBoundary": canary["historyBoundary"],
                 "terminalHistory": canary["terminalHistory"],

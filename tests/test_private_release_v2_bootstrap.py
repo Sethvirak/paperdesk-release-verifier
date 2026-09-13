@@ -1364,9 +1364,35 @@ class _TerminalEvidenceFixture:
             "selfCleaned": True,
             "initialStopped": self.site_state("Stopped", NOW + dt.timedelta(minutes=5)),
             "running": self.site_state("Running", NOW + dt.timedelta(minutes=5, seconds=1)),
-            "triggerStatus": 202,
+            "triggerStatus": 200,
+            "triggerLocation": {
+                "scheme": "https",
+                "host": site["name"] + ".scm.azurewebsites.net",
+                "path": "/api/triggeredwebjobs/paperdesk-accepted-release-registry/history/fresh-run",
+                "runId": "fresh-run",
+                "queryPresent": False,
+            },
             "triggerRequestedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=3)),
-            "historyBoundary": {"observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=2)), "entries": [], "entriesSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes([])), "responseSha256": self.digest("webjob-boundary-response")},
+            "historyBoundary": {
+                "jobMetadata": {
+                    "observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=1, milliseconds=500)),
+                    "resourceId": site["resourceId"] + "/triggeredwebjobs/paperdesk-accepted-release-registry",
+                    "name": "paperdesk-accepted-release-registry",
+                    "type": "triggered",
+                    "runCommand": "run.sh",
+                    "latestRunPresent": False,
+                    "urlMetadata": {"scheme": "https", "host": site["name"] + ".scm.azurewebsites.net", "path": "/api/triggeredwebjobs/paperdesk-accepted-release-registry", "queryPresent": False},
+                    "historyUrlMetadata": {"scheme": "https", "host": site["name"] + ".scm.azurewebsites.net", "path": "/api/triggeredwebjobs/paperdesk-accepted-release-registry/history", "queryPresent": False},
+                    "settingsSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes({"is_singleton": True, "stopping_wait_time": 30})),
+                    "responseSha256": self.digest("webjob-discovery-response"),
+                },
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=2)),
+                "entries": [],
+                "entriesSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes([])),
+                "responseSha256": self.digest("webjob-boundary-response"),
+                "httpStatus": 404,
+                "boundaryState": "pristine-history-absent",
+            },
             "terminalHistory": terminal,
             "terminalHistoryObservedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=7)),
             "terminalHistoryEntriesSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes([terminal])),
@@ -8213,6 +8239,9 @@ class BootstrapTests(unittest.TestCase):
                     boundary_rate_limits=0,
                     terminal_history_rate_limits=0,
                     running_settlement_seconds=0,
+                    trigger_location_run_id="fresh-run",
+                    trigger_location_present=True,
+                    trigger_location_duplicate=False,
                 ):
                     self.requests = []
                     self.site_states = ["Stopped", "Running", "Stopped"]
@@ -8224,12 +8253,52 @@ class BootstrapTests(unittest.TestCase):
                     self.boundary_rate_limits = boundary_rate_limits
                     self.terminal_history_rate_limits = terminal_history_rate_limits
                     self.running_settlement_seconds = running_settlement_seconds
+                    self.trigger_location_run_id = trigger_location_run_id
+                    self.trigger_location_present = trigger_location_present
+                    self.trigger_location_duplicate = trigger_location_duplicate
 
                 def request(
                     self, method, url, *, body=None, headers=None, deadline=None
                 ):
                     self.requests.append((method, url, body, dict(headers or {})))
                     response_headers = {"Content-Type": "application/json"}
+                    if (
+                        method == "GET"
+                        and "/triggeredwebjobs/" in url
+                        and "/history?" not in url
+                    ):
+                        job_url = (
+                            "https://"
+                            + site["name"]
+                            + ".scm.azurewebsites.net/api/triggeredwebjobs/"
+                            + job
+                        )
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {
+                                    "id": site["resourceId"]
+                                    + f"/triggeredwebjobs/{job}",
+                                    "name": site["name"] + "/" + job,
+                                    "type": "Microsoft.Web/sites/triggeredwebjobs",
+                                    "properties": {
+                                        "name": job,
+                                        "type": "triggered",
+                                        "run_command": "run.sh",
+                                        "latest_run": None,
+                                        "url": job_url,
+                                        "history_url": job_url + "/history",
+                                        "error": None,
+                                        "using_sdk": False,
+                                        "settings": {
+                                            "is_singleton": True,
+                                            "stopping_wait_time": 30,
+                                        },
+                                    },
+                                }
+                            ),
+                            response_headers,
+                        )
                     if "/triggeredwebjobs/" in url and "/history?" in url:
                         history_timeouts = (
                             "boundary_timeouts"
@@ -8275,6 +8344,12 @@ class BootstrapTests(unittest.TestCase):
                                 },
                             )
                         self.history_reads += 1
+                        if self.history_reads == 1:
+                            return bootstrap._RestResponse(
+                                404,
+                                b"",
+                                response_headers,
+                            )
                         values = []
                         if self.history_reads > 1:
                             values = [
@@ -8332,6 +8407,30 @@ class BootstrapTests(unittest.TestCase):
                                 }
                             ),
                             response_headers,
+                        )
+                    if method == "POST" and url.split("?", 1)[0].endswith("/run"):
+                        run_headers = {}
+                        raw_headers = None
+                        if self.trigger_location_present:
+                            location = (
+                                "https://"
+                                + site["name"]
+                                + ".scm.azurewebsites.net/api/triggeredwebjobs/"
+                                + job
+                                + "/history/"
+                                + self.trigger_location_run_id
+                            )
+                            run_headers["Location"] = location
+                            if self.trigger_location_duplicate:
+                                raw_headers = (
+                                    ("Location", location),
+                                    ("Location", location + "-conflict"),
+                                )
+                        return bootstrap._RestResponse(
+                            200,
+                            b"",
+                            run_headers,
+                            header_items=raw_headers,
                         )
                     return bootstrap._RestResponse(202, b"", {})
 
@@ -8498,7 +8597,7 @@ class BootstrapTests(unittest.TestCase):
                 ),
             )
 
-            for timeout_stage in ("boundary_timeouts", "terminal_history_timeouts"):
+            for timeout_stage in ("terminal_history_timeouts",):
                 current[0] = NOW + dt.timedelta(seconds=3)
                 history_session = Session(**{timeout_stage: 3})
                 history_proof = build_transport(history_session)._mutate(operation, state)
@@ -8606,6 +8705,33 @@ class BootstrapTests(unittest.TestCase):
                 1,
             )
 
+            for trigger_session, expected_message in (
+                (
+                    Session(trigger_location_present=False),
+                    "WebJob trigger Location is absent or oversized",
+                ),
+                (
+                    Session(trigger_location_run_id="other-run"),
+                    "WebJob terminal history does not match the authorized trigger",
+                ),
+                (
+                    Session(trigger_location_duplicate=True),
+                    "Azure REST response Location header is ambiguous",
+                ),
+            ):
+                current[0] = NOW + dt.timedelta(seconds=3)
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    expected_message,
+                ):
+                    build_transport(trigger_session)._mutate(operation, state)
+                paths = [
+                    url.split("?", 1)[0]
+                    for _method, url, _body, _headers in trigger_session.requests
+                ]
+                self.assertEqual(sum(path.endswith("/run") for path in paths), 1)
+                self.assertEqual(sum(path.endswith("/stop") for path in paths), 1)
+
     def test_full_terminal_source_evidence_public_validator_accepts_exact_fixture(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
@@ -8616,6 +8742,55 @@ class BootstrapTests(unittest.TestCase):
             evidence=fixture["sourceEvidence"],
         )
         self.assertEqual(validated, fixture["sourceEvidence"])
+
+    def test_terminal_webjob_evidence_rejects_numeric_type_impostors(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        operation_id = "startBridgeForBoundedCanary"
+        contexts = {
+            item["operationId"]: item["context"]
+            for item in fixture["preflightProjection"]["operationAdmissions"]
+        }
+        original = fixture["operationProjections"][operation_id]
+        for label, mutate in (
+            (
+                "trigger status",
+                lambda projection: projection["projection"].__setitem__(
+                    "triggerStatus", 200.0
+                ),
+            ),
+            (
+                "boundary status",
+                lambda projection: projection["projection"][
+                    "historyBoundary"
+                ].__setitem__("httpStatus", 404.0),
+            ),
+            (
+                "job URL boolean",
+                lambda projection: projection["projection"]["historyBoundary"][
+                    "jobMetadata"
+                ]["urlMetadata"].__setitem__("queryPresent", 0),
+            ),
+            (
+                "trigger URL boolean",
+                lambda projection: projection["projection"][
+                    "triggerLocation"
+                ].__setitem__("queryPresent", 0),
+            ),
+        ):
+            with self.subTest(label=label):
+                altered = copy.deepcopy(original)
+                mutate(altered)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_operation_source_projection(
+                        altered,
+                        operation_id=operation_id,
+                        plan=fixture["plan"],
+                        authorization=fixture["authorization"],
+                        prior=fixture["operationProjections"],
+                        operation_context=contexts[operation_id],
+                        runtime_facts={},
+                    )
 
     @staticmethod
     def _terminal_journal_validation_inputs(fixture):
