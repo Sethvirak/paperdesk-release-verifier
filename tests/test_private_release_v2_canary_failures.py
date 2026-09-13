@@ -150,6 +150,38 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             }
         }
 
+    def webjob_metadata_response(self, *, latest_run=None, **changes):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        job_url = (
+            f"https://{site['name']}.scm.azurewebsites.net/"
+            f"api/triggeredwebjobs/{job}"
+        )
+        properties = {
+            "name": job,
+            "type": "triggered",
+            "run_command": "run.sh",
+            "latest_run": latest_run,
+            "url": job_url,
+            "history_url": job_url + "/history",
+            "error": None,
+            "using_sdk": False,
+            "settings": {"is_singleton": True, "stopping_wait_time": 30},
+        }
+        properties.update(changes)
+        return bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes(
+                {
+                    "id": site["resourceId"] + f"/triggeredwebjobs/{job}",
+                    "name": site["name"] + "/" + job,
+                    "type": "Microsoft.Web/sites/triggeredwebjobs",
+                    "properties": properties,
+                }
+            ),
+            {"Content-Type": "application/json"},
+        )
+
     def desired_bridge_settings(self, details):
         context = next(
             item["context"]
@@ -250,7 +282,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
-    def test_webjob_history_boundary_polls_transient_404_before_200(self):
+    def test_pristine_webjob_metadata_allows_adjacent_empty_history_404_boundary(self):
         site = self.fixture.resources["bridgeSite"]
         current = [NOW]
         sleeps = []
@@ -266,13 +298,8 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             ),
             {"Content-Type": "application/json"},
         )
-        ready = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes({"value": []}),
-            {"Content-Type": "application/json"},
-        )
         transport, session, _journal = self.transport(
-            [not_ready, ready],
+            [self.webjob_metadata_response(), not_ready],
             CONFIGURE,
             clock=lambda: current[0],
             sleep=sleep,
@@ -285,11 +312,14 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         )
 
         self.assertEqual(proof["entries"], [])
-        self.assertEqual(sleeps, [1.25])
+        self.assertEqual(proof["httpStatus"], 404)
+        self.assertEqual(proof["boundaryState"], "pristine-history-absent")
+        self.assertFalse(proof["jobMetadata"]["latestRunPresent"])
+        self.assertEqual(sleeps, [])
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
-    def test_webjob_history_boundary_polls_transient_429_and_500_before_200(self):
+    def test_webjob_history_boundary_retries_429_after_exact_pristine_discovery(self):
         site = self.fixture.resources["bridgeSite"]
         current = [NOW]
         sleeps = []
@@ -305,25 +335,14 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             ),
             {"Content-Type": "application/json", "Retry-After": "4"},
         )
-        not_ready = bootstrap._RestResponse(
-            500,
-            bootstrap.canonical_json_bytes(
-                {
-                    "error": {
-                        "code": "InternalServerError",
-                        "message": "WebJob history is initializing",
-                    }
-                }
-            ),
-            {"Content-Type": "application/json"},
-        )
-        ready = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes({"value": []}),
-            {"Content-Type": "application/json"},
-        )
+        absent = bootstrap._RestResponse(404, b"", {"Content-Type": "application/json"})
         transport, session, _journal = self.transport(
-            [throttled, not_ready, ready],
+            [
+                self.webjob_metadata_response(),
+                throttled,
+                self.webjob_metadata_response(),
+                absent,
+            ],
             CONFIGURE,
             clock=lambda: current[0],
             sleep=sleep,
@@ -336,9 +355,132 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         )
 
         self.assertEqual(proof["entries"], [])
-        self.assertEqual(sleeps, [4.0, 1.25, 1.5])
-        self.assertEqual(len(session.requests), 3)
+        self.assertEqual(proof["httpStatus"], 404)
+        self.assertEqual(sleeps, [4.0, 1.25])
+        self.assertEqual(len(session.requests), 4)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
+    def test_webjob_discovery_and_nonpristine_history_fail_closed(self):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        deadline = NOW + dt.timedelta(seconds=300)
+        for responses, expected in (
+            (
+                [bootstrap._RestResponse(401, b"", {})],
+                "triggered WebJob discovery returned unexpected HTTP status 401",
+            ),
+            (
+                [bootstrap._RestResponse(403, b"", {})],
+                "triggered WebJob discovery returned unexpected HTTP status 403",
+            ),
+            (
+                [
+                    self.webjob_metadata_response(latest_run={"id": "existing"}),
+                    bootstrap._RestResponse(404, b"", {}),
+                ],
+                "WebJob history returned unexpected HTTP status 404",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                transport, session, _journal = self.transport(
+                    responses, CONFIGURE
+                )
+                with self.assertRaisesRegex(bootstrap.BootstrapError, expected):
+                    transport._wait_for_webjob_history_boundary(
+                        site_resource_id=site["resourceId"],
+                        job_name=job,
+                        deadline=deadline,
+                    )
+                self.assertFalse(any(request[0] == "POST" for request in session.requests))
+
+    def test_webjob_discovery_polls_bounded_startup_statuses_before_exact_boundary(self):
+        site = self.fixture.resources["bridgeSite"]
+        current = [NOW]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            current[0] += dt.timedelta(seconds=seconds)
+
+        responses = [
+            bootstrap._RestResponse(404, b"", {}),
+            bootstrap._RestResponse(500, b"", {}),
+            bootstrap._RestResponse(
+                429,
+                b"",
+                {"Content-Type": "application/json", "Retry-After": "4"},
+            ),
+            self.webjob_metadata_response(),
+            bootstrap._RestResponse(404, b"", {}),
+        ]
+        transport, session, _journal = self.transport(
+            responses,
+            CONFIGURE,
+            clock=lambda: current[0],
+            sleep=sleep,
+        )
+        proof = transport._wait_for_webjob_history_boundary(
+            site_resource_id=site["resourceId"],
+            job_name="paperdesk-accepted-release-registry",
+            deadline=NOW + dt.timedelta(seconds=300),
+        )
+        self.assertEqual(proof["httpStatus"], 404)
+        self.assertEqual(sleeps, [1.25, 1.5, 4.0, 1.75])
+        self.assertEqual(len(session.requests), 5)
+        self.assertFalse(any(request[0] == "POST" for request in session.requests))
+
+    def test_webjob_discovery_rejects_metadata_drift_before_history(self):
+        site = self.fixture.resources["bridgeSite"]
+        for change in (
+            {"run_command": "other.sh"},
+            {"using_sdk": True},
+            {"history_url": "https://evil.example/history"},
+            {
+                "history_url": (
+                    "https://paperdesk-release-registry-bridge-v2-9c4e0d0d."
+                    "scm.azurewebsites.net/api/TriggeredWebJobs/"
+                    "paperdesk-accepted-release-registry/history"
+                )
+            },
+            {"settings": {"is_singleton": False, "stopping_wait_time": 30}},
+            {"settings": {"is_singleton": 1, "stopping_wait_time": 30}},
+            {"settings": {"is_singleton": True, "stopping_wait_time": 30.0}},
+        ):
+            with self.subTest(change=change):
+                transport, session, _journal = self.transport(
+                    [self.webjob_metadata_response(**change)], CONFIGURE
+                )
+                with self.assertRaises(bootstrap.BootstrapError):
+                    transport._wait_for_webjob_history_boundary(
+                        site_resource_id=site["resourceId"],
+                        job_name="paperdesk-accepted-release-registry",
+                        deadline=NOW + dt.timedelta(seconds=300),
+                    )
+                self.assertEqual(len(session.requests), 1)
+
+    def test_pristine_boundary_transport_ambiguity_does_not_reuse_metadata(self):
+        site = self.fixture.resources["bridgeSite"]
+        transport, session, _journal = self.transport(
+            [
+                self.webjob_metadata_response(),
+                bootstrap._RestTotalTimeout(
+                    "Azure REST total response deadline expired"
+                ),
+                bootstrap._RestResponse(404, b"", {}),
+            ],
+            CONFIGURE,
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "history-boundary read failed after 1 transport attempts",
+        ):
+            transport._wait_for_webjob_history_boundary(
+                site_resource_id=site["resourceId"],
+                job_name="paperdesk-accepted-release-registry",
+                deadline=NOW + dt.timedelta(seconds=300),
+            )
+        self.assertEqual(len(session.requests), 2)
+        self.assertFalse(any(request[0] == "POST" for request in session.requests))
 
     def test_webjob_history_404_remains_terminal_outside_readiness_boundary(self):
         site = self.fixture.resources["bridgeSite"]
