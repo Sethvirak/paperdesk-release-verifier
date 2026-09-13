@@ -52,6 +52,17 @@ EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
     "atomically exclude an out-of-band administrator write between their final adjacent "
     "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
     "definite success requires exact fresh stopped/private identity and WebJobs readback. "
+    "I authorize temporary enabling and exact disabling of only the bridge SCM "
+    "basic-auth publishing-credentials policy solely around the bounded WebJob canary. "
+    "I accept that this policy update exposes no supported conditional ETag, so it "
+    "cannot atomically exclude an out-of-band administrator write between the final "
+    "adjacent pre-read and PUT. Each policy PUT is issued at most once without retry, "
+    "and definite success requires a fresh disabled-policy readback after the bridge "
+    "is stopped. I also accept that process death, ambiguous transport, or a local "
+    "journal/fsync failure after enabling can leave SCM basic authentication enabled; "
+    "execution and any later release must stop until fresh reads prove the policy "
+    "disabled, the bridge stopped, and all related temporary access absent, and manual "
+    "cleanup may be required. "
     "I accept that App Service App Settings exposes no supported conditional ETag, so "
     "the exact full-map configuration PUT and any restoration "
     "cannot atomically exclude an out-of-band administrator write between their final "
@@ -1372,6 +1383,26 @@ class _TerminalEvidenceFixture:
                 "runId": "fresh-run",
                 "queryPresent": False,
             },
+            "scmBasicAuthInitial": {
+                "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
+                "allow": False,
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=100)),
+                "responseSha256": self.digest("scm-basic-auth-initial"),
+            },
+            "scmBasicAuthEnabled": {
+                "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
+                "allow": True,
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=200)),
+                "responseSha256": self.digest("scm-basic-auth-enabled"),
+            },
+            "scmBasicAuthRestored": {
+                "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
+                "allow": False,
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=100)),
+                "responseSha256": self.digest("scm-basic-auth-restored"),
+            },
+            "scmBasicAuthSelfCleaned": True,
+            "scmDisableMutationIssued": True,
             "triggerRequestedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=3)),
             "historyBoundary": {
                 "jobMetadata": {
@@ -1504,7 +1535,59 @@ class _TerminalEvidenceFixture:
                     return (1, target)
                 return (3, target)
 
-            for target, count in sorted(required.items(), key=mutation_order):
+            ordered_occurrences = [
+                (target, occurrence)
+                for target, count in sorted(required.items(), key=mutation_order)
+                for occurrence in range(count)
+            ]
+            if operation_id == "startBridgeForBoundedCanary":
+                site_id = self.resources["bridgeSite"]["resourceId"]
+                policy_target = bootstrap._normalized_mutation_target(
+                    "PUT",
+                    "https://management.azure.com"
+                    + site_id
+                    + "/basicPublishingCredentialsPolicies/scm"
+                    + "?api-version=2025-03-01",
+                )
+                ordered_occurrences = [
+                    (policy_target, 0),
+                    (
+                        bootstrap._normalized_mutation_target(
+                            "POST",
+                            "https://management.azure.com"
+                            + site_id
+                            + "/start?api-version=2025-03-01",
+                        ),
+                        0,
+                    ),
+                    (
+                        bootstrap._normalized_mutation_target(
+                            "POST",
+                            "https://management.azure.com"
+                            + site_id
+                            + "/triggeredwebjobs/"
+                            + "paperdesk-accepted-release-registry/run"
+                            + "?api-version=2025-05-01",
+                        ),
+                        0,
+                    ),
+                    (
+                        bootstrap._normalized_mutation_target(
+                            "POST",
+                            "https://management.azure.com"
+                            + site_id
+                            + "/stop?api-version=2025-03-01",
+                        ),
+                        0,
+                    ),
+                ]
+                if self.operations[operation_id]["projection"][
+                    "scmDisableMutationIssued"
+                ]:
+                    ordered_occurrences.append((policy_target, 1))
+            for mutation_index, (target, occurrence) in enumerate(
+                ordered_occurrences
+            ):
                 method, normalized_url = target.split(" ", 1)
                 target_url = exact_url(normalized_url)
                 if "/providers/microsoft.authorization/locks/" in target_url.lower():
@@ -1524,128 +1607,151 @@ class _TerminalEvidenceFixture:
                     target_url = ("https://management.azure.com"
                         + assignment_resource
                         + "?api-version=2022-04-01")
-                for occurrence in range(count):
-                    intent_sequence = len(journal) + 1
-                    intent_id = f"cloud-mutation-{intent_sequence:04d}"
-                    recorded = NOW + dt.timedelta(milliseconds=intent_sequence * 10)
-                    is_storage = (
-                        (urllib.parse.urlsplit(target_url).hostname or "").lower()
-                        == "mdspdbak2608089c4e.blob.core.windows.net"
+                intent_sequence = len(journal) + 1
+                intent_id = f"cloud-mutation-{intent_sequence:04d}"
+                recorded = NOW + dt.timedelta(milliseconds=intent_sequence * 10)
+                if operation_id == "startBridgeForBoundedCanary":
+                    canary_intent_times = (
+                        NOW + dt.timedelta(minutes=5, milliseconds=110),
+                        NOW + dt.timedelta(minutes=5, milliseconds=210),
+                        NOW + dt.timedelta(minutes=5, seconds=3, milliseconds=10),
+                        NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=10),
+                        NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=10),
                     )
-                    client_request_id = (
-                        self.guid(
-                            f"storage-client-request:{operation_id}:{target_url}:{occurrence}"
-                        )
-                        if is_storage
-                        else None
+                    recorded = canary_intent_times[mutation_index]
+                is_storage = (
+                    (urllib.parse.urlsplit(target_url).hostname or "").lower()
+                    == "mdspdbak2608089c4e.blob.core.windows.net"
+                )
+                client_request_id = (
+                    self.guid(
+                        f"storage-client-request:{operation_id}:{target_url}:{occurrence}"
                     )
-                    intent = {
-                        "sequence": intent_sequence,
-                        "phase": "intent",
-                        "intentId": intent_id,
-                        "operationId": operation_id,
-                        "temporary": operation_by_id[operation_id].get("temporary")
-                        is True,
-                        "method": method,
-                        "targetUrl": target_url,
-                        "requestBodySha256": self.digest(
-                            f"{operation_id}:{target_url}:{occurrence}:request"
-                        ),
-                        "clientRequestId": client_request_id,
-                        "status": None,
-                        "responseBodySha256": None,
-                        "etag": None,
-                        "versionId": None,
-                        "requestId": None,
-                        "serverDate": None,
-                        "storageErrorCode": None,
-                        "recordedAt": stamp(recorded),
-                    }
-                    if "/providers/microsoft.authorization/locks/" in target_url.lower():
-                        lock_proof = bootstrap._expected_deletion_lock_proof(operation_id)
-                        request_bytes = (b"" if method == "DELETE" else
-                            bootstrap.canonical_json_bytes({"properties": lock_proof["properties"]}))
-                        intent["requestBodySha256"] = bootstrap.sha256_bytes(request_bytes)
-                    journal.append(intent)
-                    if operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
-                        intent["requestBodySha256"] = self.operations[operation_id]["projection"]["settingsRequestBodySha256"]
-                    if operation_id in bootstrap.CONDITIONAL_STORAGE_CREATE_ROLES:
-                        intent["requestBodySha256"] = self.operations[operation_id][
-                            "projection"
-                        ]["bodySha256"]
-                    if operation_id == "exerciseControllerLeaseCanary":
-                        intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
-                    expected_worm_body_sha256 = (
-                        bootstrap._expected_worm_mutation_body_sha256(
-                            operation_id, method, target_url
-                        )
-                    )
-                    if expected_worm_body_sha256 is not None:
-                        intent["requestBodySha256"] = expected_worm_body_sha256
-                    result = copy.deepcopy(intent)
-                    versioned_headers = (
-                        self.operations[operation_id]["headers"]
-                        if operation_id
-                        in {
-                            "uploadVersionedBridgePackage",
-                            "createInitialIdleActivationFence",
-                            "createControllerLeaseCanaryBlob",
-                        }
-                        else {}
-                    )
-                    result.update(
-                        {
-                            "sequence": len(journal) + 1,
-                            "phase": "result",
-                            "status": (
-                                201
-                                if operation_id
-                                in {
-                                    "claimAzureSingleUseAuthorization",
-                                    "uploadVersionedBridgePackage",
-                                    "createInitialIdleActivationFence",
-                                    "createControllerLeaseCanaryBlob",
+                    if is_storage
+                    else None
+                )
+                intent = {
+                    "sequence": intent_sequence,
+                    "phase": "intent",
+                    "intentId": intent_id,
+                    "operationId": operation_id,
+                    "temporary": operation_by_id[operation_id].get("temporary")
+                    is True,
+                    "method": method,
+                    "targetUrl": target_url,
+                    "requestBodySha256": self.digest(
+                        f"{operation_id}:{target_url}:{occurrence}:request"
+                    ),
+                    "clientRequestId": client_request_id,
+                    "status": None,
+                    "responseBodySha256": None,
+                    "etag": None,
+                    "versionId": None,
+                    "requestId": None,
+                    "serverDate": None,
+                    "storageErrorCode": None,
+                    "recordedAt": stamp(recorded),
+                }
+                if "/providers/microsoft.authorization/locks/" in target_url.lower():
+                    lock_proof = bootstrap._expected_deletion_lock_proof(operation_id)
+                    request_bytes = (b"" if method == "DELETE" else
+                        bootstrap.canonical_json_bytes({"properties": lock_proof["properties"]}))
+                    intent["requestBodySha256"] = bootstrap.sha256_bytes(request_bytes)
+                journal.append(intent)
+                if operation_id == "configureBridgeExactVersionedPackageAndCriticalSettings":
+                    intent["requestBodySha256"] = self.operations[operation_id]["projection"]["settingsRequestBodySha256"]
+                if operation_id in bootstrap.CONDITIONAL_STORAGE_CREATE_ROLES:
+                    intent["requestBodySha256"] = self.operations[operation_id][
+                        "projection"
+                    ]["bodySha256"]
+                if operation_id == "exerciseControllerLeaseCanary":
+                    intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
+                if operation_id == "startBridgeForBoundedCanary":
+                    request_body = (
+                        bootstrap.canonical_json_bytes(
+                            {
+                                "properties": {
+                                    "allow": occurrence == 0
                                 }
-                                or (
-                                    operation_id
-                                    == "exerciseControllerLeaseCanary"
-                                    and occurrence
-                                    in {
-                                        0,
-                                        2
-                                        + self.plan["temporaryAccess"][
-                                            "leaseRenewals"
-                                        ],
-                                    }
-                                )
-                                else 200
-                            ),
-                            "responseBodySha256": self.digest(
-                                f"{operation_id}:{target_url}:{occurrence}:response"
-                            ),
-                            "etag": versioned_headers.get("etag"),
-                            "versionId": versioned_headers.get("versionId"),
-                            "requestId": (
-                                self.guid(
-                                    f"storage-service-request:{operation_id}:{target_url}:{occurrence}"
-                                )
-                                if is_storage
-                                else None
-                            ),
-                            "serverDate": (
-                                recorded.strftime(
-                                    "%a, %d %b %Y %H:%M:%S GMT"
-                                )
-                                if is_storage
-                                else None
-                            ),
-                            "storageErrorCode": "unknown" if is_storage else None,
-                            "recordedAt": stamp(
-                                recorded + dt.timedelta(milliseconds=5)
-                            ),
-                        }
+                            }
+                        )
+                        if method == "PUT"
+                        else b""
                     )
-                    journal.append(result)
+                    intent["requestBodySha256"] = bootstrap.sha256_bytes(
+                        request_body
+                    )
+                expected_worm_body_sha256 = (
+                    bootstrap._expected_worm_mutation_body_sha256(
+                        operation_id, method, target_url
+                    )
+                )
+                if expected_worm_body_sha256 is not None:
+                    intent["requestBodySha256"] = expected_worm_body_sha256
+                result = copy.deepcopy(intent)
+                versioned_headers = (
+                    self.operations[operation_id]["headers"]
+                    if operation_id
+                    in {
+                        "uploadVersionedBridgePackage",
+                        "createInitialIdleActivationFence",
+                        "createControllerLeaseCanaryBlob",
+                    }
+                    else {}
+                )
+                result.update(
+                    {
+                        "sequence": len(journal) + 1,
+                        "phase": "result",
+                        "status": (
+                            201
+                            if operation_id
+                            in {
+                                "claimAzureSingleUseAuthorization",
+                                "uploadVersionedBridgePackage",
+                                "createInitialIdleActivationFence",
+                                "createControllerLeaseCanaryBlob",
+                            }
+                            or (
+                                operation_id
+                                == "exerciseControllerLeaseCanary"
+                                and occurrence
+                                in {
+                                    0,
+                                    2
+                                    + self.plan["temporaryAccess"][
+                                        "leaseRenewals"
+                                    ],
+                                }
+                            )
+                            else 200
+                        ),
+                        "responseBodySha256": self.digest(
+                            f"{operation_id}:{target_url}:{occurrence}:response"
+                        ),
+                        "etag": versioned_headers.get("etag"),
+                        "versionId": versioned_headers.get("versionId"),
+                        "requestId": (
+                            self.guid(
+                                f"storage-service-request:{operation_id}:{target_url}:{occurrence}"
+                            )
+                            if is_storage
+                            else None
+                        ),
+                        "serverDate": (
+                            recorded.strftime(
+                                "%a, %d %b %Y %H:%M:%S GMT"
+                            )
+                            if is_storage
+                            else None
+                        ),
+                        "storageErrorCode": "unknown" if is_storage else None,
+                        "recordedAt": stamp(
+                            recorded + dt.timedelta(milliseconds=5)
+                        ),
+                    }
+                )
+                journal.append(result)
         return journal
 
     def postcondition_local(self, postcondition_id, journal):
@@ -8242,6 +8348,8 @@ class BootstrapTests(unittest.TestCase):
                     trigger_location_run_id="fresh-run",
                     trigger_location_present=True,
                     trigger_location_duplicate=False,
+                    discovery_status=200,
+                    disable_before_cleanup=False,
                 ):
                     self.requests = []
                     self.site_states = ["Stopped", "Running", "Stopped"]
@@ -8256,17 +8364,45 @@ class BootstrapTests(unittest.TestCase):
                     self.trigger_location_run_id = trigger_location_run_id
                     self.trigger_location_present = trigger_location_present
                     self.trigger_location_duplicate = trigger_location_duplicate
+                    self.discovery_status = discovery_status
+                    self.disable_before_cleanup = disable_before_cleanup
+                    self.scm_policy_enabled = False
 
                 def request(
                     self, method, url, *, body=None, headers=None, deadline=None
                 ):
                     self.requests.append((method, url, body, dict(headers or {})))
                     response_headers = {"Content-Type": "application/json"}
+                    if "/basicPublishingCredentialsPolicies/scm?" in url:
+                        policy = {
+                            "id": site["resourceId"]
+                            + "/basicPublishingCredentialsPolicies/scm",
+                            "name": "scm",
+                            "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+                            "properties": {"allow": self.scm_policy_enabled},
+                        }
+                        if method == "PUT":
+                            requested = json.loads((body or b"").decode("utf-8"))
+                            self.scm_policy_enabled = requested["properties"]["allow"]
+                            policy["properties"]["allow"] = self.scm_policy_enabled
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(policy),
+                            response_headers,
+                        )
                     if (
                         method == "GET"
                         and "/triggeredwebjobs/" in url
                         and "/history?" not in url
                     ):
+                        if self.discovery_status != 200:
+                            return bootstrap._RestResponse(
+                                self.discovery_status,
+                                bootstrap.canonical_json_bytes(
+                                    {"error": {"code": "Unauthorized"}}
+                                ),
+                                response_headers,
+                            )
                         job_url = (
                             "https://"
                             + site["name"]
@@ -8432,6 +8568,12 @@ class BootstrapTests(unittest.TestCase):
                             run_headers,
                             header_items=raw_headers,
                         )
+                    if (
+                        method == "POST"
+                        and url.split("?", 1)[0].endswith("/stop")
+                        and self.disable_before_cleanup
+                    ):
+                        self.scm_policy_enabled = False
                     return bootstrap._RestResponse(202, b"", {})
 
             def build_transport(session):
@@ -8489,6 +8631,8 @@ class BootstrapTests(unittest.TestCase):
             success_session = Session()
             proof = build_transport(success_session)._mutate(operation, state)
             self.assertTrue(proof["selfCleaned"])
+            self.assertTrue(proof["scmBasicAuthSelfCleaned"])
+            self.assertFalse(proof["scmBasicAuthRestored"]["allow"])
             self.assertEqual(proof["terminalHistory"]["status"], "Success")
             self.assertEqual(proof["stopped"]["state"], "Stopped")
             self.assertIn("not observed", proof["proofBoundary"])
@@ -8498,6 +8642,34 @@ class BootstrapTests(unittest.TestCase):
             ]
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in methods_and_paths),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    method == "PUT"
+                    and path.endswith("/basicPublishingCredentialsPolicies/scm")
+                    for method, path in methods_and_paths
+                ),
+                2,
+            )
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            already_disabled_session = Session(disable_before_cleanup=True)
+            already_disabled = build_transport(already_disabled_session)._mutate(
+                operation, state
+            )
+            self.assertFalse(already_disabled["scmDisableMutationIssued"])
+            self.assertFalse(already_disabled_session.scm_policy_enabled)
+            already_disabled_paths = [
+                (method, url.split("?", 1)[0])
+                for method, url, _body, _headers in already_disabled_session.requests
+            ]
+            self.assertEqual(
+                sum(
+                    method == "PUT"
+                    and path.endswith("/basicPublishingCredentialsPolicies/scm")
+                    for method, path in already_disabled_paths
+                ),
                 1,
             )
 
@@ -8704,6 +8876,37 @@ class BootstrapTests(unittest.TestCase):
                 ),
                 1,
             )
+            self.assertFalse(failed_session.scm_policy_enabled)
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            unauthorized_session = Session(discovery_status=401)
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "during history-boundary before terminal Success: "
+                "triggered WebJob discovery returned unexpected HTTP status 401",
+            ):
+                build_transport(unauthorized_session)._mutate(operation, state)
+            unauthorized_paths = [
+                (method, url.split("?", 1)[0])
+                for method, url, _body, _headers in unauthorized_session.requests
+            ]
+            self.assertEqual(
+                sum(path.endswith("/run") for _method, path in unauthorized_paths),
+                0,
+            )
+            self.assertEqual(
+                sum(path.endswith("/stop") for _method, path in unauthorized_paths),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    method == "PUT"
+                    and path.endswith("/basicPublishingCredentialsPolicies/scm")
+                    for method, path in unauthorized_paths
+                ),
+                2,
+            )
+            self.assertFalse(unauthorized_session.scm_policy_enabled)
 
             for trigger_session, expected_message in (
                 (
@@ -8808,11 +9011,30 @@ class BootstrapTests(unittest.TestCase):
     @staticmethod
     def _resequence_terminal_journal(journal):
         intent_ids = {}
+        canary_pair_index = -1
         for sequence, item in enumerate(journal, 1):
             item["sequence"] = sequence
             item["recordedAt"] = stamp(
                 NOW + dt.timedelta(milliseconds=sequence * 10)
             )
+            if item["operationId"] == "startBridgeForBoundedCanary":
+                if item["phase"] == "intent":
+                    canary_pair_index += 1
+                canary_intent_times = (
+                    NOW + dt.timedelta(minutes=5, milliseconds=110),
+                    NOW + dt.timedelta(minutes=5, milliseconds=210),
+                    NOW + dt.timedelta(minutes=5, seconds=3, milliseconds=10),
+                    NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=10),
+                    NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=10),
+                )
+                item["recordedAt"] = stamp(
+                    canary_intent_times[canary_pair_index]
+                    + (
+                        dt.timedelta(milliseconds=5)
+                        if item["phase"] == "result"
+                        else dt.timedelta()
+                    )
+                )
             old_intent_id = item["intentId"]
             if item["phase"] == "intent":
                 new_intent_id = f"cloud-mutation-{sequence:04d}"
@@ -9027,6 +9249,141 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(
             all(permanent[item]["outcome"] == "adopted-exact" for item in adopted)
         )
+
+    def test_terminal_journal_binds_bridge_canary_order_bodies_and_readback_times(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self.terminal_fixture(folder)
+        journal = fixture["sourceEvidence"]["productionBoundary"][
+            "mutationJournal"
+        ]
+        inputs = self._terminal_journal_validation_inputs(fixture)
+        canary_id = "startBridgeForBoundedCanary"
+        canary_entries = [
+            copy.deepcopy(item)
+            for item in journal
+            if item["operationId"] == canary_id
+        ]
+        self.assertEqual(len(canary_entries), 10)
+
+        body_drift = copy.deepcopy(journal)
+        drifted = 0
+        for item in body_drift:
+            if item["operationId"] == canary_id and item["method"] == "PUT":
+                item["requestBodySha256"] = "f" * 64
+                drifted += 1
+                if drifted == 2:
+                    break
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "bridge canary mutation order, body, or status",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(body_drift, **inputs)
+
+        for pair_index, invalid_status in ((0, 202), (2, 202), (3, 201), (4, 202)):
+            with self.subTest(pair_index=pair_index, invalid_status=invalid_status):
+                status_drift = copy.deepcopy(journal)
+                canary_results = [
+                    item
+                    for item in status_drift
+                    if item["operationId"] == canary_id
+                    and item["phase"] == "result"
+                ]
+                canary_results[pair_index]["status"] = invalid_status
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "bridge canary mutation order, body, or status",
+                ):
+                    bootstrap._validate_sanitized_mutation_journal(
+                        status_drift, **inputs
+                    )
+
+        pairs = [canary_entries[index : index + 2] for index in range(0, 10, 2)]
+        reordered_entries = [
+            item
+            for pair in (pairs[0], pairs[1], pairs[3], pairs[2], pairs[4])
+            for item in pair
+        ]
+        reordered = []
+        inserted = False
+        for item in journal:
+            if item["operationId"] == canary_id:
+                if not inserted:
+                    reordered.extend(copy.deepcopy(reordered_entries))
+                    inserted = True
+            else:
+                reordered.append(copy.deepcopy(item))
+        self._resequence_terminal_journal(reordered)
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "bridge canary mutation order, body, or status",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(reordered, **inputs)
+
+        interleaved = copy.deepcopy(journal)
+        foreign_pair = next(
+            interleaved[index : index + 2]
+            for index, item in enumerate(interleaved[:-1])
+            if item["phase"] == "intent"
+            and item["operationId"] == "extendAcceptedRetentionFrom30To91Days"
+        )
+        foreign_ids = {id(item) for item in foreign_pair}
+        interleaved = [
+            item for item in interleaved if id(item) not in foreign_ids
+        ]
+        enable_intent_index = next(
+            index
+            for index, item in enumerate(interleaved)
+            if item["operationId"] == canary_id and item["phase"] == "intent"
+        )
+        interleaved[
+            enable_intent_index + 1 : enable_intent_index + 1
+        ] = foreign_pair
+        self._resequence_terminal_journal(interleaved)
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "bridge canary writes are not one contiguous block",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(interleaved, **inputs)
+
+        time_drift = copy.deepcopy(journal)
+        enable_records = [
+            item
+            for item in time_drift
+            if item["operationId"] == canary_id
+        ][:2]
+        enable_records[0]["recordedAt"] = stamp(
+            NOW + dt.timedelta(minutes=5, milliseconds=50)
+        )
+        enable_records[1]["recordedAt"] = stamp(
+            NOW + dt.timedelta(minutes=5, milliseconds=60)
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "bridge canary journal timing is not cross-bound",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(time_drift, **inputs)
+
+        no_disable_projection = copy.deepcopy(fixture["operationProjections"])
+        no_disable_projection[canary_id]["projection"][
+            "scmDisableMutationIssued"
+        ] = False
+        no_disable_entries = [item for pair in pairs[:4] for item in pair]
+        no_disable = []
+        inserted = False
+        for item in journal:
+            if item["operationId"] == canary_id:
+                if not inserted:
+                    no_disable.extend(copy.deepcopy(no_disable_entries))
+                    inserted = True
+            else:
+                no_disable.append(copy.deepcopy(item))
+        self._resequence_terminal_journal(no_disable)
+        no_disable_inputs = dict(inputs)
+        no_disable_inputs["operation_projections"] = no_disable_projection
+        validated = bootstrap._validate_sanitized_mutation_journal(
+            no_disable, **no_disable_inputs
+        )
+        self.assertEqual(validated, no_disable)
 
     def test_terminal_journal_accepts_exact_no_effect_create_denial_prefixes(self):
         with tempfile.TemporaryDirectory() as folder:

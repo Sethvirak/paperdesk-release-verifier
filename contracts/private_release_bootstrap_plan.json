@@ -300,7 +300,7 @@
     {"id": "removeOwnedUploaderIpv4Rule", "kind": "temporary-remove-owned-exact", "target": "storageAccount", "temporary": true, "irreversible": false},
     {"id": "configureBridgeExactVersionedPackageAndCriticalSettings", "kind": "full-map-put-if-exact-old-state-only", "target": "bridgeSite", "temporary": false, "irreversible": false},
     {"id": "lockPackageRetentionAt91Days", "kind": "lock-retention-exact", "target": "packageContainer", "temporary": false, "irreversible": true},
-    {"id": "startBridgeForBoundedCanary", "kind": "start-run-poll-terminal-success-stop-in-finally", "target": "bridgeSite", "temporary": true, "irreversible": false},
+    {"id": "startBridgeForBoundedCanary", "kind": "enable-scm-basic-auth-start-run-poll-terminal-success-stop-disable-in-finally", "target": "bridgeSite", "temporary": true, "irreversible": false},
     {"id": "extendAcceptedRetentionFrom30To91Days", "kind": "extend-locked-retention-exact", "target": "acceptedContainer", "temporary": false, "irreversible": true},
     {"id": "extendResultRetentionFrom30To91Days", "kind": "extend-locked-retention-exact", "target": "resultContainer", "temporary": false, "irreversible": true},
     {"id": "detachWriterAndReaderFromLegacyBridge", "kind": "remove-exact-two-uami-attachments-from-legacy-bridge", "target": "legacyBridgeSite", "temporary": false, "irreversible": false},
