@@ -13704,7 +13704,8 @@ class AzureCliBootstrapTransport:
         deadline: dt.datetime,
         retry_delays: tuple[float | None, ...] | None = None,
         failure_context: str | None = None,
-    ) -> Mapping[str, Any]:
+        allow_transient_not_found: bool = False,
+    ) -> Mapping[str, Any] | None:
         url = self._arm_url(
             site_resource_id,
             "2025-05-01",
@@ -13717,6 +13718,13 @@ class AzureCliBootstrapTransport:
             retry_delays=retry_delays,
             failure_context=failure_context,
         )
+        # A newly started Linux App Service can report Running before Kudu has
+        # mounted the run-from-package content and registered its WebJobs.  At
+        # the pre-trigger boundary only, a 404 therefore means "not ready yet"
+        # and is polled as a read.  Every other status and every later history
+        # read remains fail-closed.
+        if response.status == 404 and allow_transient_not_found:
+            return None
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
         if (
@@ -13745,6 +13753,36 @@ class AzureCliBootstrapTransport:
             "entriesSha256": sha256_bytes(canonical_json_bytes(projected)),
             "responseSha256": _response_sha256(response),
         }
+
+    def _wait_for_webjob_history_boundary(
+        self,
+        *,
+        site_resource_id: str,
+        job_name: str,
+        deadline: dt.datetime,
+    ) -> Mapping[str, Any]:
+        attempts = 0
+        while attempts < 180:
+            if self.clock() >= deadline:
+                fail("WebJob history did not become ready before authorization expiry")
+            attempts += 1
+            observed = self._read_webjob_history(
+                site_resource_id=site_resource_id,
+                job_name=job_name,
+                deadline=deadline,
+                retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                failure_context="history-boundary",
+                allow_transient_not_found=True,
+            )
+            if self.clock() >= deadline:
+                fail("WebJob history readiness response crossed the authorization deadline")
+            if observed is not None:
+                return observed
+            delay = min(1.0 + attempts * 0.25, 3.0)
+            if self.clock() + dt.timedelta(seconds=delay) >= deadline:
+                fail("WebJob history readiness polling would cross the authorization deadline")
+            self.sleep(delay)
+        fail("WebJob history readiness exceeded the source-bounded polling attempts")
 
     def _wait_for_fresh_webjob_success(
         self,
@@ -18793,12 +18831,10 @@ class AzureCliBootstrapTransport:
                     read_failure_context="running-state",
                 )
                 primary_stage = "history-boundary"
-                boundary = self._read_webjob_history(
+                boundary = self._wait_for_webjob_history_boundary(
                     site_resource_id=site["resourceId"],
                     job_name=job,
                     deadline=canary_deadline,
-                    retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
-                    failure_context="history-boundary",
                 )
                 trigger_requested_at = self.clock()
                 require_live_canary()
