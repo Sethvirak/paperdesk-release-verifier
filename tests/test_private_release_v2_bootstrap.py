@@ -8440,6 +8440,37 @@ class BootstrapTests(unittest.TestCase):
                 live_delay_proof["terminalHistory"]["status"], "Success"
             )
 
+            self.assertEqual(
+                bootstrap.MAX_CANARY_STARTUP_CONVERGENCE_SECONDS, 710
+            )
+            self.assertEqual(
+                bootstrap.MAX_CANARY_CONVERGENCE_SECONDS, 300
+            )
+            current[0] = NOW + dt.timedelta(seconds=3)
+            old_cutoff_session = Session(running_settlement_seconds=511)
+            old_cutoff_proof = build_transport(old_cutoff_session)._mutate(
+                operation, state
+            )
+            self.assertEqual(
+                old_cutoff_proof["terminalHistory"]["status"], "Success"
+            )
+            old_cutoff_paths = [
+                (method, url.split("?", 1)[0])
+                for method, url, _body, _headers in old_cutoff_session.requests
+            ]
+            self.assertEqual(
+                sum(path.endswith("/start") for _method, path in old_cutoff_paths),
+                1,
+            )
+            self.assertEqual(
+                sum(path.endswith("/run") for _method, path in old_cutoff_paths),
+                1,
+            )
+            self.assertEqual(
+                sum(path.endswith("/stop") for _method, path in old_cutoff_paths),
+                1,
+            )
+
             current[0] = NOW + dt.timedelta(seconds=3)
             split_window_session = Session(
                 running_settlement_seconds=500,
@@ -8456,7 +8487,7 @@ class BootstrapTests(unittest.TestCase):
                 NOW
                 + dt.timedelta(
                     seconds=3
-                    + bootstrap.MAX_CANARY_STARTUP_CONVERGENCE_SECONDS
+                    + 600  # The prior startup ceiling that failed live.
                 ),
             )
             self.assertLess(

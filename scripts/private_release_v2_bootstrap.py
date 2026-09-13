@@ -78,10 +78,13 @@ MAX_READBACK_CONVERGENCE_SECONDS = 120
 MAX_ADOPT_READBACK_CONVERGENCE_SECONDS = 300
 MAX_STORAGE_DATA_PLANE_READINESS_SECONDS = 600
 # Linux App Service startup/Kudu history readiness and the triggered WebJob
-# execution are distinct convergence phases.  Their 600+300 second windows fit
-# exactly inside the immutable 900-second self-test control.
+# execution are distinct convergence phases.  Startup owns a 710-second local
+# ceiling because every read must still retain one full 90-second request
+# envelope.  The terminal phase retains its 300-second local ceiling. Both are
+# clipped by the same immutable 900-second self-test control, so unused startup
+# time is available to the terminal phase without extending total authority.
 MAX_BOOTSTRAP_SELF_TEST_SECONDS = 900
-MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 600
+MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 710
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS = 60
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
