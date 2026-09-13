@@ -8210,6 +8210,8 @@ class BootstrapTests(unittest.TestCase):
                     running_timeouts=0,
                     boundary_timeouts=0,
                     terminal_history_timeouts=0,
+                    boundary_rate_limits=0,
+                    terminal_history_rate_limits=0,
                     running_settlement_seconds=0,
                 ):
                     self.requests = []
@@ -8219,6 +8221,8 @@ class BootstrapTests(unittest.TestCase):
                     self.running_timeouts = running_timeouts
                     self.boundary_timeouts = boundary_timeouts
                     self.terminal_history_timeouts = terminal_history_timeouts
+                    self.boundary_rate_limits = boundary_rate_limits
+                    self.terminal_history_rate_limits = terminal_history_rate_limits
                     self.running_settlement_seconds = running_settlement_seconds
 
                 def request(
@@ -8232,6 +8236,11 @@ class BootstrapTests(unittest.TestCase):
                             if self.history_reads == 0
                             else "terminal_history_timeouts"
                         )
+                        history_rate_limits = (
+                            "boundary_rate_limits"
+                            if self.history_reads == 0
+                            else "terminal_history_rate_limits"
+                        )
                         if getattr(self, history_timeouts):
                             setattr(
                                 self,
@@ -8243,6 +8252,27 @@ class BootstrapTests(unittest.TestCase):
                             )
                             raise bootstrap._RestTotalTimeout(
                                 "Azure REST total response deadline expired"
+                            )
+                        if getattr(self, history_rate_limits):
+                            setattr(
+                                self,
+                                history_rate_limits,
+                                getattr(self, history_rate_limits) - 1,
+                            )
+                            return bootstrap._RestResponse(
+                                429,
+                                bootstrap.canonical_json_bytes(
+                                    {
+                                        "error": {
+                                            "code": "TooManyRequests",
+                                            "message": "Retry later",
+                                        }
+                                    }
+                                ),
+                                {
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "4",
+                                },
                             )
                         self.history_reads += 1
                         values = []
@@ -8465,6 +8495,35 @@ class BootstrapTests(unittest.TestCase):
                         path.endswith("/stop")
                         for _method, path in history_methods_and_paths
                     ),
+                    1,
+                )
+
+            for rate_limit_stage in (
+                "boundary_rate_limits",
+                "terminal_history_rate_limits",
+            ):
+                current[0] = NOW + dt.timedelta(seconds=3)
+                throttled_session = Session(**{rate_limit_stage: 2})
+                throttled_proof = build_transport(throttled_session)._mutate(
+                    operation, state
+                )
+                self.assertEqual(
+                    throttled_proof["terminalHistory"]["status"], "Success"
+                )
+                throttled_paths = [
+                    (method, url.split("?", 1)[0])
+                    for method, url, _body, _headers in throttled_session.requests
+                ]
+                self.assertEqual(
+                    sum(path.endswith("/start") for _method, path in throttled_paths),
+                    1,
+                )
+                self.assertEqual(
+                    sum(path.endswith("/run") for _method, path in throttled_paths),
+                    1,
+                )
+                self.assertEqual(
+                    sum(path.endswith("/stop") for _method, path in throttled_paths),
                     1,
                 )
 
