@@ -1622,6 +1622,73 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(result["renewals"], 1)
         self.assertEqual(result["releaseStatus"], 200)
 
+    def test_expiry_acquire_retries_exact_incident_denial_inside_its_deadline(self):
+        current = [NOW]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            current[0] += dt.timedelta(seconds=seconds)
+
+        responses = [
+            bootstrap._RestResponse(201, b"", {}),
+            bootstrap._RestResponse(200, b"", {}),
+            bootstrap._RestResponse(200, b"", {}),
+            lease_denial("abababab-abab-4bab-8bab-abababababab"),
+            bootstrap._RestResponse(201, b"", {}),
+            bootstrap._RestResponse(
+                200,
+                b"",
+                {
+                    "x-ms-lease-state": "expired",
+                    "x-ms-lease-status": "unlocked",
+                },
+            ),
+        ]
+        transport, session, journal = self.transport(
+            responses,
+            "exerciseControllerLeaseCanary",
+            clock=lambda: current[0],
+            sleep=sleep,
+        )
+        transport._active_protected_role_add = (
+            "addOwnedOperatorControllerCanaryRole"
+        )
+        state = {"proofs": {CREATE: {"details": {
+            "url": self.create_contract["expectedUrl"],
+            "etag": ETAG,
+            "sha256": bootstrap.sha256_bytes(self.canary_body()),
+            "cleanupKey": "controller-lease-canary-blob",
+        }}}}
+
+        result = transport._mutate(
+            self.fixture.mutations["exerciseControllerLeaseCanary"], state
+        )
+
+        self.assertEqual(
+            [request[3].get("x-ms-lease-action") for request in session.requests],
+            ["acquire", "renew", "release", "acquire", "acquire", None],
+        )
+        self.assertEqual(
+            session.deadlines[3:5],
+            [transport._controller_canary_expiry_acquire_deadline()] * 2,
+        )
+        for request in session.requests[3:5]:
+            self.assertEqual(
+                request[3]["x-ms-proposed-lease-id"],
+                self.plan["temporaryAccess"]["controllerExpiryLeaseId"],
+            )
+            self.assertEqual(
+                request[3]["x-ms-lease-duration"],
+                str(self.plan["temporaryAccess"]["leaseDurationSeconds"]),
+            )
+        self.assertEqual(sleeps, [1, 60])
+        self.assertEqual(
+            [item["phase"] for item in journal.records],
+            ["intent", "result"] * 5,
+        )
+        self.assertEqual(result["expiryFallback"]["pollAttempts"], 1)
+
     def test_fast_acquire_retry_cap_does_not_release_a_nonexistent_lease(self):
         current = [NOW]
         sleeps = []
@@ -2255,12 +2322,12 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             )
 
     def test_setup_past_ten_minutes_preserves_full_post_admission_reserve(self):
-        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 5272)
+        self.assertEqual(bootstrap.MAX_AUTHORIZATION_SECONDS, 5549)
         self.assertEqual(
             bootstrap.WORM_POLICY_ADJACENT_READ_ALLOWANCE_SECONDS, 270
         )
         self.assertEqual(
-            bootstrap.CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS, 4372
+            bootstrap.CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS, 4649
         )
         for seconds in (660, 899):
             with self.subTest(elapsed=seconds):
