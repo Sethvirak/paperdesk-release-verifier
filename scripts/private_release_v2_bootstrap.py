@@ -4745,6 +4745,12 @@ def _if_match_etag(value: Any, label: str) -> str:
     return etag if etag.startswith('"') else f'"{etag}"'
 
 
+def _microsoft_web_if_match_etag(value: Any, label: str) -> str:
+    """Preserve the exact strong ETag representation returned by Microsoft.Web."""
+
+    return _quoted_etag(value, label)
+
+
 def _unpaginated_graph_collection(
     value: Any, label: str
 ) -> list[Mapping[str, Any]]:
@@ -17012,7 +17018,7 @@ class AzureCliBootstrapTransport:
                 body=request_body,
                 headers={
                     "Content-Type": "application/json",
-                    "If-Match": _if_match_etag(
+                    "If-Match": _microsoft_web_if_match_etag(
                         context.get("etag"), "legacy bridge ETag"
                     ),
                 },
@@ -17304,7 +17310,7 @@ class AzureCliBootstrapTransport:
                 != bridge.get("identityProjectionSha256")
             ):
                 fail("bridge attachment adjacent identity projection drifted")
-            bridge_etag = _if_match_etag(
+            bridge_etag = _microsoft_web_if_match_etag(
                 self._header(adjacent_response, "ETag") or adjacent.get("etag"),
                 "bridge attachment adjacent ETag",
             )
