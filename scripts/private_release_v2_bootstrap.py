@@ -13704,7 +13704,7 @@ class AzureCliBootstrapTransport:
         deadline: dt.datetime,
         retry_delays: tuple[float | None, ...] | None = None,
         failure_context: str | None = None,
-        allow_transient_not_found: bool = False,
+        allow_transient_startup_error: bool = False,
     ) -> Mapping[str, Any] | None:
         url = self._arm_url(
             site_resource_id,
@@ -13719,11 +13719,14 @@ class AzureCliBootstrapTransport:
             failure_context=failure_context,
         )
         # A newly started Linux App Service can report Running before Kudu has
-        # mounted the run-from-package content and registered its WebJobs.  At
-        # the pre-trigger boundary only, a 404 therefore means "not ready yet"
-        # and is polled as a read.  Every other status and every later history
-        # read remains fail-closed.
-        if response.status == 404 and allow_transient_not_found:
+        # mounted the run-from-package content and initialized its WebJob
+        # registry/history store.  During that startup window ARM has returned
+        # both 404 and 500 for this GET.  At the pre-trigger boundary only,
+        # either status therefore means "not ready yet" and is polled as a
+        # read.  Every other status and every later history read remains
+        # fail-closed; a persistent startup error reaches the existing bounded
+        # deadline without ever triggering the job.
+        if response.status in {404, 500} and allow_transient_startup_error:
             return None
         document = self._json_response(response, {200}, "WebJob history")
         values = document.get("value")
@@ -13772,7 +13775,7 @@ class AzureCliBootstrapTransport:
                 deadline=deadline,
                 retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
                 failure_context="history-boundary",
-                allow_transient_not_found=True,
+                allow_transient_startup_error=True,
             )
             if self.clock() >= deadline:
                 fail("WebJob history readiness response crossed the authorization deadline")
