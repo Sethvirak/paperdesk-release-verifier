@@ -17243,9 +17243,6 @@ class AzureCliBootstrapTransport:
         if operation_id == "attachFiveUamisOnlyToBridge":
             site = self.resources["bridgeSite"]
             bridge = self._proof_detail(state, "createStoppedPrivateBridge")
-            bridge_etag = _if_match_etag(
-                bridge.get("etag"), "current bridge ETag"
-            )
             identity_ids = [
                 self._identity_detail(state, name)["resourceId"]
                 for name in (
@@ -17257,6 +17254,60 @@ class AzureCliBootstrapTransport:
                 )
             ]
             target_url = self._arm_url(site["resourceId"], "2025-03-01")
+            adjacent_response = self._read_request_with_transport_retry(
+                "GET", target_url
+            )
+            adjacent = self._json_response(
+                adjacent_response, {200}, "bridge attachment adjacent precondition"
+            )
+            adjacent_properties = adjacent.get("properties")
+            adjacent_site_config = (
+                adjacent_properties.get("siteConfig")
+                if isinstance(adjacent_properties, Mapping)
+                else None
+            )
+            adjacent_identity = adjacent.get("identity")
+            expected_webjobs = bridge.get("webJobsMode") == "enabled"
+            if (
+                str(adjacent.get("id", "")).lower() != site["resourceId"].lower()
+                or adjacent.get("name") != site["name"]
+                or adjacent.get("kind") != "app,linux"
+                or not isinstance(adjacent_properties, Mapping)
+                or adjacent_properties.get("httpsOnly") is not True
+                or adjacent_properties.get("state") != "Stopped"
+                or adjacent_properties.get("publicNetworkAccess") != "Disabled"
+                or str(adjacent_properties.get("serverFarmId", "")).lower()
+                != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
+                or str(adjacent_properties.get("virtualNetworkSubnetId", "")).lower()
+                != self.resources["integrationSubnet"]["resourceId"].lower()
+                or not _safe_bridge_outbound_vnet_routing(
+                    adjacent_properties.get("outboundVnetRouting")
+                )
+                or not isinstance(adjacent_site_config, Mapping)
+                or adjacent_site_config.get("webJobsEnabled") is not expected_webjobs
+            ):
+                fail("bridge attachment adjacent precondition drifted")
+            bridge_mode = bridge.get("bridgeIdentityMode")
+            if bridge_mode == "pristine-no-identity":
+                if not _safe_bridge_no_identity(adjacent_identity):
+                    fail("bridge attachment adjacent identity drifted")
+            elif bridge_mode == "exact-five-user-assigned":
+                observed_ids = _validate_exact_bridge_uami_inventory(
+                    adjacent_identity, self._validated_source_projections
+                )
+                if observed_ids != bridge.get("identityResourceIds"):
+                    fail("bridge attachment adjacent identity drifted")
+            else:
+                fail("bridge attachment adjacent precondition lacks one recovery mode")
+            if (
+                sha256_bytes(canonical_json_bytes(adjacent_identity))
+                != bridge.get("identityProjectionSha256")
+            ):
+                fail("bridge attachment adjacent identity projection drifted")
+            bridge_etag = _if_match_etag(
+                self._header(adjacent_response, "ETag") or adjacent.get("etag"),
+                "bridge attachment adjacent ETag",
+            )
             request_body = canonical_json_bytes(
                 {
                     "identity": {
