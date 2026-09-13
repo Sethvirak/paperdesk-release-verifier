@@ -5351,12 +5351,34 @@ class BootstrapTests(unittest.TestCase):
             bootstrap.AzureCliBootstrapTransport._mutate
         )
         self.assertEqual(source.count("_if_match_etag("), 7)
+        self.assertEqual(source.count("_microsoft_web_if_match_etag("), 2)
         worm_response_source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._exact_immutability_policy_response
         )
         self.assertEqual(worm_response_source.count("_if_match_etag("), 2)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
+
+    def test_microsoft_web_if_match_etag_preserves_the_validated_wire_value(self):
+        self.assertEqual(
+            bootstrap._microsoft_web_if_match_etag(
+                "1DD432F2A06DE40", "raw Microsoft.Web ETag"
+            ),
+            "1DD432F2A06DE40",
+        )
+        self.assertEqual(
+            bootstrap._microsoft_web_if_match_etag(
+                '"already-quoted"', "quoted Microsoft.Web ETag"
+            ),
+            '"already-quoted"',
+        )
+        for malformed in ("", "abc", 'W/"weak"', '"unterminated'):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                bootstrap.BootstrapError, "strong ETag token"
+            ):
+                bootstrap._microsoft_web_if_match_etag(
+                    malformed, "malformed Microsoft.Web ETag"
+                )
 
     def test_package_worm_context_binds_one_exact_mutation_branch(self):
         authorization = {"authorizationId": AUTH_ID}
@@ -5545,7 +5567,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(
             request.call_args.kwargs["headers"]["If-Match"],
-            '"1DD39E07D4DEFAA"',
+            "1DD39E07D4DEFAA",
         )
         with mock.patch.object(
             transport, "_read_request_with_transport_retry",
