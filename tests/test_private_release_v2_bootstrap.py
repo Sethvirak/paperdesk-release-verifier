@@ -8601,6 +8601,7 @@ class BootstrapTests(unittest.TestCase):
             *pairs[1],
             *denial(pairs[2], "controller-release-denial"),
             *pairs[2],
+            *denial(pairs[3], "controller-expiry-acquire-denial"),
             *pairs[3],
         ]
         first = next(
@@ -8773,7 +8774,7 @@ class BootstrapTests(unittest.TestCase):
         ]
         self.assertEqual(
             [item["status"] for item in results],
-            [403, 201, 403, 200, 403, 200, 201],
+            [403, 201, 403, 200, 403, 200, 403, 201],
         )
 
         rejected = copy.deepcopy(journal)

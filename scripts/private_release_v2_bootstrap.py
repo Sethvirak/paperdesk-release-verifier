@@ -126,14 +126,14 @@ PROTECTED_ROLE_ASSIGNMENT_DELETE_RESERVE_SECONDS = (
 )
 # After the successful conditional canary create, the nominal controller exercise and every
 # owned failure path use one staged window before protected-role cleanup:
-# fast acquire, renew, fast release, expiry acquire, an ambiguity release or finite
+# fast acquire, renew, fast release, bounded expiry acquire, an ambiguity release or finite
 # expiry observation, identity resolution when needed, conditional DELETE, one
 # safe DELETE replay, container inventory, exact blob absence, and a local
 # journal margin. Deadlines below bind every request to its own envelope.
 CONTROLLER_CANARY_LEASE_DURATION_SECONDS = 60
 CONTROLLER_CANARY_CLEANUP_RESERVE_SECONDS = (
-    18 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
-    + 3 * sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+    21 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+    + 4 * sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
     + CONTROLLER_CANARY_LEASE_DURATION_SECONDS
     + 30
 )
@@ -2432,7 +2432,7 @@ def _validated_controller_lease_denial_sequences(
     authorization_id: str,
     source_sha: str,
 ) -> set[int]:
-    """Validate bounded 403 prefixes for fast acquire, renew, and release."""
+    """Validate bounded 403 prefixes for every reviewed lease action."""
 
     operation_id = "exerciseControllerLeaseCanary"
     indexed = [
@@ -2460,7 +2460,7 @@ def _validated_controller_lease_denial_sequences(
         200,
         201,
     ]
-    maximum_denials = 3 * (MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1)
+    maximum_denials = 4 * (MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1)
     if (
         positions != list(range(positions[0], positions[0] + len(positions)))
         or len(records) % 2 != 0
@@ -2505,13 +2505,15 @@ def _validated_controller_lease_denial_sequences(
         status = result.get("status")
         if status == 403:
             # One or more denials may precede only the fast acquire, required
-            # renew success, and the immediately following release success.
+            # renew success, immediately following release, and finite-expiry
+            # acquire success.
             if (
                 success_index
                 not in {
                     0,
                     1,
                     1 + int(plan["temporaryAccess"]["leaseRenewals"]),
+                    2 + int(plan["temporaryAccess"]["leaseRenewals"]),
                 }
                 or denial_count_for_action
                 >= MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS - 1
@@ -12631,7 +12633,11 @@ class AzureCliBootstrapTransport:
 
     def _controller_canary_expiry_acquire_deadline(self) -> dt.datetime:
         return self._controller_canary_release_deadline() + dt.timedelta(
-            seconds=STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+            seconds=(
+                MAX_CONTROLLER_LEASE_ACTION_ATTEMPTS
+                * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS
+                + sum(CONTROLLER_LEASE_ACTION_BACKOFF_SECONDS)
+            )
         )
 
     def _controller_canary_expiry_release_deadline(self) -> dt.datetime:
@@ -13423,11 +13429,16 @@ class AzureCliBootstrapTransport:
         expected_status = {"acquire": 201, "renew": 200, "release": 200}.get(
             action
         )
-        expected_deadline = {
-            "acquire": self._controller_canary_fast_acquire_deadline(),
-            "renew": self._controller_canary_fast_renew_deadline(),
-            "release": self._controller_canary_release_deadline(),
-        }.get(action)
+        if action == "acquire" and lease_id == self.plan["temporaryAccess"][
+            "controllerExpiryLeaseId"
+        ]:
+            expected_deadline = self._controller_canary_expiry_acquire_deadline()
+        else:
+            expected_deadline = {
+                "acquire": self._controller_canary_fast_acquire_deadline(),
+                "renew": self._controller_canary_fast_renew_deadline(),
+                "release": self._controller_canary_release_deadline(),
+            }.get(action)
         lease_window_is_exact = (
             lease_window_started is None
             if action == "acquire"
@@ -13440,7 +13451,15 @@ class AzureCliBootstrapTransport:
             != "addOwnedOperatorControllerCanaryRole"
             or url != expected_url
             or expected_status is None
-            or lease_id != self.plan["temporaryAccess"]["controllerLeaseId"]
+            or lease_id
+            not in {
+                self.plan["temporaryAccess"]["controllerLeaseId"],
+                self.plan["temporaryAccess"]["controllerExpiryLeaseId"],
+            }
+            or (
+                lease_id == self.plan["temporaryAccess"]["controllerExpiryLeaseId"]
+                and action != "acquire"
+            )
             or not lease_window_is_exact
             or request_deadline != expected_deadline
         ):
@@ -18341,20 +18360,18 @@ class AzureCliBootstrapTransport:
 
             expiry_acquired_at = None
             try:
-                self._mutation_request(
-                    "PUT",
+                (
+                    _response,
+                    _expiry_lease_window_started,
+                    expiry_acquire_completed,
+                ) = self._controller_lease_action_when_ready(
                     query_url,
-                    body=b"",
-                    headers={
-                        "x-ms-version": "2023-11-03",
-                        "x-ms-proposed-lease-id": expiry_lease_id,
-                        "x-ms-lease-duration": str(duration),
-                        "x-ms-lease-action": "acquire",
-                    },
-                    expected={201},
-                    deadline=self._controller_canary_expiry_acquire_deadline(),
+                    action="acquire",
+                    lease_id=expiry_lease_id,
+                    lease_window_started=None,
+                    request_deadline=self._controller_canary_expiry_acquire_deadline(),
                 )
-                expiry_acquired_at = observed_stamp()
+                expiry_acquired_at = observed_stamp(expiry_acquire_completed)
             except BaseException:
                 # The request may have reached Storage even when the response
                 # or local result-journal write was ambiguous.  The proposed
