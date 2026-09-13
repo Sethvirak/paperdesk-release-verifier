@@ -5455,7 +5455,15 @@ class BootstrapTests(unittest.TestCase):
         state = {
             "proofs": {
                 "createStoppedPrivateBridge": {
-                    "details": {"etag": "1DD39E07D4DEF60"}
+                    "details": {
+                        "etag": "1DD39E07D4DEF60",
+                        "bridgeIdentityMode": "pristine-no-identity",
+                        "webJobsMode": "enabled",
+                        "identityResourceIds": [],
+                        "identityProjectionSha256": bootstrap.sha256_bytes(
+                            bootstrap.canonical_json_bytes(None)
+                        ),
+                    }
                 },
                 "createBridgeIdentity": {
                     "details": {
@@ -5505,19 +5513,45 @@ class BootstrapTests(unittest.TestCase):
             ),
             {"ETag": "1DD39E07D4DEF61"},
         )
+        adjacent_response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": resources["bridgeSite"]["resourceId"],
+                "name": resources["bridgeSite"]["name"],
+                "kind": "app,linux",
+                "identity": None,
+                "properties": {
+                    "httpsOnly": True,
+                    "state": "Stopped",
+                    "publicNetworkAccess": "Disabled",
+                    "serverFarmId": resources["bridgeAppServicePlan"]["resourceId"],
+                    "virtualNetworkSubnetId": resources["integrationSubnet"]["resourceId"],
+                    "outboundVnetRouting": {
+                        "allTraffic": True,
+                        "applicationTraffic": True,
+                    },
+                    "siteConfig": {"webJobsEnabled": True},
+                },
+            }),
+            {"ETag": "1DD39E07D4DEFAA"},
+        )
         with mock.patch.object(
+            transport, "_read_request_with_transport_retry",
+            return_value=adjacent_response,
+        ), mock.patch.object(
             transport, "_mutation_request", return_value=attach_response
         ) as request:
             transport._mutate(attach, state)
         self.assertEqual(request.call_count, 1)
         self.assertEqual(
             request.call_args.kwargs["headers"]["If-Match"],
-            '"1DD39E07D4DEF60"',
+            '"1DD39E07D4DEFAA"',
         )
         with mock.patch.object(
-            transport,
-            "_mutation_request",
-            return_value=bootstrap._RestResponse(
+            transport, "_read_request_with_transport_retry",
+            return_value=adjacent_response,
+        ), mock.patch.object(
+            transport, "_mutation_request", return_value=bootstrap._RestResponse(
                 412, bootstrap.canonical_json_bytes({"error": "precondition"}), {}
             ),
         ) as rejected:
@@ -5768,7 +5802,7 @@ class BootstrapTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
                 validate(candidate)
 
-    def test_pristine_attachment_patches_once_then_get_proves_same_etag_and_digest(self):
+    def test_recovered_attachment_uses_adjacent_etag_then_get_proves_result(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
         projection = build_projection(self.plan, self.package)
@@ -5797,11 +5831,29 @@ class BootstrapTests(unittest.TestCase):
             )},
         }
         body["properties"]["siteConfig"] = {"webJobsEnabled": True}
+        adjacent_body = copy.deepcopy(body)
+        adjacent_body["properties"]["siteConfig"]["webJobsEnabled"] = False
+        adjacent_response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes(adjacent_body),
+            {"ETag": '"adjacent-attach"'},
+        )
         response = bootstrap._RestResponse(
             200, bootstrap.canonical_json_bytes(body), {"ETag": '"after-attach"'}
         )
-        transport.session.request.return_value = response
-        state = {"proofs": {"createStoppedPrivateBridge": {"details": {"etag": '"before-attach"'}}}}
+        transport.session.request.side_effect = [adjacent_response, response]
+        state = {"proofs": {"createStoppedPrivateBridge": {"details": {
+            "etag": '"before-attach"',
+            "bridgeIdentityMode": "exact-five-user-assigned",
+            "webJobsMode": "disabled",
+            "identityResourceIds": sorted(
+                item.lower()
+                for item in attached["identity"]["userAssignedIdentities"]
+            ),
+            "identityProjectionSha256": bootstrap.sha256_bytes(
+                bootstrap.canonical_json_bytes(attached["identity"])
+            ),
+        }}}}
         for operation_id, resource_key in (
             ("createBridgeIdentity", "bridgeIdentity"),
             ("adoptExistingRegistryWriterIdentity", "registryWriterIdentity"),
@@ -5816,15 +5868,47 @@ class BootstrapTests(unittest.TestCase):
             result = transport.apply_operation(attach, state)
         patch.assert_called_once()
         self.assertEqual(patch.call_args.args[0], "PATCH")
-        self.assertEqual(patch.call_args.kwargs["headers"]["If-Match"], '"before-attach"')
+        self.assertEqual(patch.call_args.kwargs["headers"]["If-Match"], '"adjacent-attach"')
         request_body = json.loads(patch.call_args.kwargs["body"])
         self.assertIs(request_body["properties"]["siteConfig"]["webJobsEnabled"], True)
-        self.assertEqual(transport.session.request.call_count, 1)
+        self.assertEqual(transport.session.request.call_count, 2)
         self.assertEqual(result["details"]["expectedEtag"], '"after-attach"')
         self.assertEqual(
             result["details"]["identityProjectionSha256"],
             bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(attached["identity"])),
         )
+
+        for label, alter in (
+            (
+                "running",
+                lambda candidate: candidate["properties"].__setitem__(
+                    "state", "Running"
+                ),
+            ),
+            (
+                "webjobs-enabled",
+                lambda candidate: candidate["properties"]["siteConfig"].__setitem__(
+                    "webJobsEnabled", True
+                ),
+            ),
+            (
+                "identity-missing",
+                lambda candidate: candidate.__setitem__("identity", None),
+            ),
+        ):
+            candidate = copy.deepcopy(adjacent_body)
+            alter(candidate)
+            transport.session.reset_mock()
+            transport.session.request.side_effect = [bootstrap._RestResponse(
+                200,
+                bootstrap.canonical_json_bytes(candidate),
+                {"ETag": '"candidate-adjacent"'},
+            )]
+            with self.subTest(label=label), mock.patch.object(
+                transport, "_mutation_request"
+            ) as rejected_patch, self.assertRaises(bootstrap.BootstrapError):
+                transport._mutate(attach, state)
+            rejected_patch.assert_not_called()
 
     def _custom_role_retry_transport(self, member_state, responses):
         projection = build_projection(self.plan, self.package)
