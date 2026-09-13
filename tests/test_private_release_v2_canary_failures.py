@@ -289,6 +289,50 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
+    def test_webjob_history_boundary_polls_transient_500_before_200(self):
+        site = self.fixture.resources["bridgeSite"]
+        current = [NOW]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            current[0] += dt.timedelta(seconds=seconds)
+
+        not_ready = bootstrap._RestResponse(
+            500,
+            bootstrap.canonical_json_bytes(
+                {
+                    "error": {
+                        "code": "InternalServerError",
+                        "message": "WebJob history is initializing",
+                    }
+                }
+            ),
+            {"Content-Type": "application/json"},
+        )
+        ready = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({"value": []}),
+            {"Content-Type": "application/json"},
+        )
+        transport, session, _journal = self.transport(
+            [not_ready, ready],
+            CONFIGURE,
+            clock=lambda: current[0],
+            sleep=sleep,
+        )
+
+        proof = transport._wait_for_webjob_history_boundary(
+            site_resource_id=site["resourceId"],
+            job_name="paperdesk-accepted-release-registry",
+            deadline=NOW + dt.timedelta(seconds=300),
+        )
+
+        self.assertEqual(proof["entries"], [])
+        self.assertEqual(sleeps, [1.25])
+        self.assertEqual(len(session.requests), 2)
+        self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
     def test_webjob_history_404_remains_terminal_outside_readiness_boundary(self):
         site = self.fixture.resources["bridgeSite"]
         response = bootstrap._RestResponse(
@@ -306,6 +350,37 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         with self.assertRaisesRegex(
             bootstrap.BootstrapError,
             "WebJob history returned unexpected HTTP status 404",
+        ):
+            transport._read_webjob_history(
+                site_resource_id=site["resourceId"],
+                job_name="paperdesk-accepted-release-registry",
+                deadline=NOW + dt.timedelta(seconds=300),
+            )
+
+        self.assertEqual(len(session.requests), 1)
+
+    def test_webjob_history_500_remains_terminal_outside_readiness_boundary(self):
+        site = self.fixture.resources["bridgeSite"]
+        response = bootstrap._RestResponse(
+            500,
+            bootstrap.canonical_json_bytes(
+                {
+                    "error": {
+                        "code": "InternalServerError",
+                        "message": "WebJob history failed",
+                    }
+                }
+            ),
+            {"Content-Type": "application/json"},
+        )
+        transport, session, _journal = self.transport(
+            [response],
+            CONFIGURE,
+        )
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "WebJob history returned unexpected HTTP status 500",
         ):
             transport._read_webjob_history(
                 site_resource_id=site["resourceId"],
