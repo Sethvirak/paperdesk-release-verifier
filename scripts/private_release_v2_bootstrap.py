@@ -745,6 +745,17 @@ BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
     "atomically exclude an out-of-band administrator write between their final adjacent "
     "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
     "definite success requires exact fresh stopped/private identity and WebJobs readback. "
+    "I authorize temporary enabling and exact disabling of only the bridge SCM "
+    "basic-auth publishing-credentials policy solely around the bounded WebJob canary. "
+    "I accept that this policy update exposes no supported conditional ETag, so it "
+    "cannot atomically exclude an out-of-band administrator write between the final "
+    "adjacent pre-read and PUT. Each policy PUT is issued at most once without retry, "
+    "and definite success requires a fresh disabled-policy readback after the bridge "
+    "is stopped. I also accept that process death, ambiguous transport, or a local "
+    "journal/fsync failure after enabling can leave SCM basic authentication enabled; "
+    "execution and any later release must stop until fresh reads prove the policy "
+    "disabled, the bridge stopped, and all related temporary access absent, and manual "
+    "cleanup may be required. "
     "I accept that App Service App Settings exposes no supported conditional ETag, so "
     "the exact full-map configuration PUT and any restoration "
     "cannot atomically exclude an out-of-band administrator write between their final "
@@ -1681,6 +1692,7 @@ def _mutation_target_allowed(
             },
             "startBridgeForBoundedCanary": {
                 ("POST", site_id + "/start"),
+                ("PUT", site_id + "/basicPublishingCredentialsPolicies/scm"),
                 (
                     "POST",
                     site_id
@@ -2310,9 +2322,19 @@ def _expected_terminal_mutation_targets(
         return one("POST", arm(policy_id, "2025-06-01", "/extend"))
     if operation_id == "startBridgeForBoundedCanary":
         site_id = resources["bridgeSite"]["resourceId"]
-        return Counter(
+        source_projection = operation_projections.get(operation_id, {}).get(
+            "projection", {}
+        )
+        required = Counter(
             _normalized_mutation_target(method, url)
             for method, url in (
+                (
+                    "PUT",
+                    arm(
+                        site_id + "/basicPublishingCredentialsPolicies/scm",
+                        "2025-03-01",
+                    ),
+                ),
                 ("POST", arm(site_id, "2025-03-01", "/start")),
                 (
                     "POST",
@@ -2324,7 +2346,25 @@ def _expected_terminal_mutation_targets(
                 ),
                 ("POST", arm(site_id, "2025-03-01", "/stop")),
             )
-        ), Counter()
+        )
+        disable_issued = (
+            source_projection.get("scmDisableMutationIssued")
+            if isinstance(source_projection, Mapping)
+            else None
+        )
+        if type(disable_issued) is not bool:
+            fail("terminal bridge canary SCM disable path is not exact")
+        if disable_issued:
+            required[
+                _normalized_mutation_target(
+                    "PUT",
+                    arm(
+                        site_id + "/basicPublishingCredentialsPolicies/scm",
+                        "2025-03-01",
+                    ),
+                )
+            ] += 1
+        return required, Counter()
     fail(f"terminal journal has no exact write cardinality for {operation_id}")
 
 
@@ -2656,6 +2696,140 @@ def _validate_terminal_mutation_coverage(
                     expected_body = canonical_json_bytes({"properties": lock_proof["properties"]}) if item["method"] == "PUT" else b""
                     if item["requestBodySha256"] != sha256_bytes(expected_body):
                         fail("cleanup lock mutation body differs from exact reviewed protection")
+
+    canary_id = "startBridgeForBoundedCanary"
+    canary_projection = operation_projections.get(canary_id, {}).get(
+        "projection", {}
+    )
+    if not isinstance(canary_projection, Mapping):
+        fail("terminal bridge canary journal lacks its source projection")
+    site_id = next(
+        item["resourceId"]
+        for item in plan["resourceInventory"]
+        if item["id"] == "bridgeSite"
+    )
+    policy_url = (
+        "https://management.azure.com"
+        + site_id
+        + "/basicPublishingCredentialsPolicies/scm?api-version=2025-03-01"
+    )
+    start_url = (
+        "https://management.azure.com" + site_id + "/start?api-version=2025-03-01"
+    )
+    run_url = (
+        "https://management.azure.com"
+        + site_id
+        + "/triggeredwebjobs/paperdesk-accepted-release-registry/run"
+        + "?api-version=2025-05-01"
+    )
+    stop_url = (
+        "https://management.azure.com" + site_id + "/stop?api-version=2025-03-01"
+    )
+    empty_sha = sha256_bytes(b"")
+    expected_canary_pairs = [
+        (
+            "PUT",
+            policy_url,
+            sha256_bytes(
+                canonical_json_bytes({"properties": {"allow": True}})
+            ),
+            canary_projection.get("scmBasicAuthInitial", {}).get("observedAt"),
+            canary_projection.get("scmBasicAuthEnabled", {}).get("observedAt"),
+            {200},
+        ),
+        (
+            "POST",
+            start_url,
+            empty_sha,
+            canary_projection.get("scmBasicAuthEnabled", {}).get("observedAt"),
+            canary_projection.get("running", {}).get("observedAt"),
+            {200, 202},
+        ),
+        (
+            "POST",
+            run_url,
+            empty_sha,
+            canary_projection.get("triggerRequestedAt"),
+            canary_projection.get("terminalHistoryObservedAt"),
+            {200},
+        ),
+        (
+            "POST",
+            stop_url,
+            empty_sha,
+            canary_projection.get("terminalHistoryObservedAt"),
+            canary_projection.get("stopped", {}).get("observedAt"),
+            {200, 202},
+        ),
+    ]
+    disable_issued = canary_projection.get("scmDisableMutationIssued")
+    if type(disable_issued) is not bool:
+        fail("terminal bridge canary SCM disable path is not exact")
+    if disable_issued:
+        expected_canary_pairs.append(
+            (
+                "PUT",
+                policy_url,
+                sha256_bytes(
+                    canonical_json_bytes({"properties": {"allow": False}})
+                ),
+                canary_projection.get("stopped", {}).get("observedAt"),
+                canary_projection.get("scmBasicAuthRestored", {}).get(
+                    "observedAt"
+                ),
+                {200},
+            )
+        )
+    canary_records = [
+        item for item in journal if item.get("operationId") == canary_id
+    ]
+    if len(canary_records) != 2 * len(expected_canary_pairs):
+        fail("terminal bridge canary mutation sequence is incomplete")
+    canary_positions = [
+        index
+        for index, item in enumerate(journal)
+        if item.get("operationId") == canary_id
+    ]
+    if canary_positions != list(
+        range(canary_positions[0], canary_positions[0] + len(canary_positions))
+    ):
+        fail("terminal bridge canary writes are not one contiguous block")
+    for index, (
+        method,
+        url,
+        body_sha,
+        lower_raw,
+        upper_raw,
+        expected_statuses,
+    ) in enumerate(
+        expected_canary_pairs
+    ):
+        intent, result = canary_records[index * 2 : index * 2 + 2]
+        expected_target = _normalized_mutation_target(method, url)
+        if (
+            intent.get("phase") != "intent"
+            or result.get("phase") != "result"
+            or _normalized_mutation_target(
+                str(intent.get("method")), str(intent.get("targetUrl"))
+            )
+            != expected_target
+            or _normalized_mutation_target(
+                str(result.get("method")), str(result.get("targetUrl"))
+            )
+            != expected_target
+            or intent.get("requestBodySha256") != body_sha
+            or result.get("requestBodySha256") != body_sha
+            or result.get("status") not in expected_statuses
+        ):
+            fail(
+                "terminal bridge canary mutation order, body, or status is not exact"
+            )
+        lower = parse_time(lower_raw, "bridge canary journal lower boundary")
+        upper = parse_time(upper_raw, "bridge canary journal upper boundary")
+        intent_at = parse_time(intent.get("recordedAt"), "bridge canary intent")
+        result_at = parse_time(result.get("recordedAt"), "bridge canary result")
+        if not lower <= intent_at <= result_at <= upper:
+            fail("terminal bridge canary journal timing is not cross-bound")
 
     result_positions: dict[str, list[int]] = {}
     for index, item in enumerate(journal):
@@ -7237,6 +7411,11 @@ def _validate_operation_source_projection(
             "running",
             "triggerStatus",
             "triggerLocation",
+            "scmBasicAuthInitial",
+            "scmBasicAuthEnabled",
+            "scmBasicAuthRestored",
+            "scmBasicAuthSelfCleaned",
+            "scmDisableMutationIssued",
             "triggerRequestedAt",
             "historyBoundary",
             "terminalHistory",
@@ -7292,6 +7471,35 @@ def _validate_operation_source_projection(
         initial = site_state(body["initialStopped"], "Stopped", "initial bridge state")
         running = site_state(body["running"], "Running", "running bridge state")
         stopped = site_state(body["stopped"], "Stopped", "final bridge state")
+
+        def scm_policy(
+            value: Any, expected_allow: bool, label: str
+        ) -> Mapping[str, Any]:
+            item = _exact_keys(
+                value,
+                {"resourceId", "allow", "observedAt", "responseSha256"},
+                label,
+            )
+            expected_id = site_id + "/basicPublishingCredentialsPolicies/scm"
+            observed = parse_time(item["observedAt"], f"{label} observedAt")
+            if (
+                str(item["resourceId"]).lower() != expected_id.lower()
+                or item["allow"] is not expected_allow
+                or not auth_start <= observed <= auth_end
+            ):
+                fail(f"{label} is not exact")
+            _sha256(item["responseSha256"], f"{label} response digest")
+            return item
+
+        scm_initial = scm_policy(
+            body["scmBasicAuthInitial"], False, "initial SCM basic-auth policy"
+        )
+        scm_enabled = scm_policy(
+            body["scmBasicAuthEnabled"], True, "enabled SCM basic-auth policy"
+        )
+        scm_restored = scm_policy(
+            body["scmBasicAuthRestored"], False, "restored SCM basic-auth policy"
+        )
         boundary = _exact_keys(
             body["historyBoundary"],
             {
@@ -7502,6 +7710,8 @@ def _validate_operation_source_projection(
             body["resourceId"] != site_id
             or body["cleanupKey"] != "bounded-bridge-canary-start"
             or body["selfCleaned"] is not True
+            or body["scmBasicAuthSelfCleaned"] is not True
+            or type(body["scmDisableMutationIssued"]) is not bool
             or type(body["triggerStatus"]) is not int
             or body["triggerStatus"] != 200
             or boundary["entriesSha256"]
@@ -7529,6 +7739,8 @@ def _validate_operation_source_projection(
             or not (
                 auth_start
                 <= parse_time(initial["observedAt"], "initial bridge observedAt")
+                <= parse_time(scm_initial["observedAt"], "initial SCM policy observedAt")
+                <= parse_time(scm_enabled["observedAt"], "enabled SCM policy observedAt")
                 <= parse_time(running["observedAt"], "running bridge observedAt")
                 <= job_observed
                 <= boundary_at
@@ -7540,10 +7752,17 @@ def _validate_operation_source_projection(
             or terminal_ended > terminal_observed + dt.timedelta(seconds=5)
             or parse_time(stopped["observedAt"], "stopped bridge observedAt")
             < terminal_observed
+            or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
+            < parse_time(stopped["observedAt"], "stopped bridge observedAt")
             or parse_time(stopped["observedAt"], "stopped bridge observedAt")
             > auth_end
+            or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
+            > auth_end
         ):
-            fail("bridge terminal canary did not succeed and finally stop")
+            fail(
+                "bridge terminal canary did not succeed, finally stop, and restore "
+                "disabled SCM basic authentication"
+            )
     elif family == "worm-policy-projection":
         adopted_exact = context.get("executionDecision") == "adopt-exact"
         if adopted_exact:
@@ -14096,6 +14315,43 @@ class AzureCliBootstrapTransport:
             "responseSha256": _response_sha256(response),
         }
 
+    def _read_scm_basic_auth_policy(
+        self,
+        *,
+        site_resource_id: str,
+        deadline: dt.datetime,
+        expected_allow: bool | None,
+        label: str,
+    ) -> Mapping[str, Any]:
+        policy_id = site_resource_id + "/basicPublishingCredentialsPolicies/scm"
+        response = self._read_request_with_transport_retry(
+            "GET",
+            self._arm_url(policy_id, "2025-03-01"),
+            deadline=deadline,
+            retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+            failure_context="scm-basic-auth-policy",
+        )
+        document = self._json_response(response, {200}, label)
+        properties = document.get("properties")
+        allow = properties.get("allow") if isinstance(properties, Mapping) else None
+        if (
+            str(document.get("id", "")).lower() != policy_id.lower()
+            or document.get("name") != "scm"
+            or document.get("type")
+            != "Microsoft.Web/sites/basicPublishingCredentialsPolicies"
+            or not isinstance(properties, Mapping)
+            or set(properties) != {"allow"}
+            or type(allow) is not bool
+            or (expected_allow is not None and allow is not expected_allow)
+        ):
+            fail(f"{label} is not exact")
+        return {
+            "resourceId": policy_id,
+            "allow": allow,
+            "observedAt": self._timestamp(self.clock()),
+            "responseSha256": _response_sha256(response),
+        }
+
     def _wait_for_webjob_history_boundary(
         self,
         *,
@@ -15569,6 +15825,13 @@ class AzureCliBootstrapTransport:
                 if (
                     runtime_facts is None
                     or runtime_facts.get("selfCleaned") is not True
+                    or runtime_facts.get("scmBasicAuthSelfCleaned") is not True
+                    or runtime_facts.get("scmBasicAuthInitial", {}).get("allow")
+                    is not False
+                    or runtime_facts.get("scmBasicAuthEnabled", {}).get("allow")
+                    is not True
+                    or runtime_facts.get("scmBasicAuthRestored", {}).get("allow")
+                    is not False
                     or runtime_facts.get("terminalHistory", {}).get("status")
                     != "Success"
                     or not isinstance(properties, Mapping)
@@ -19191,17 +19454,55 @@ class AzureCliBootstrapTransport:
                 "2025-05-01",
                 f"/triggeredwebjobs/{job}/run",
             )
+            scm_policy_id = (
+                site["resourceId"]
+                + "/basicPublishingCredentialsPolicies/scm"
+            )
+            scm_policy_url = self._arm_url(scm_policy_id, "2025-03-01")
+            scm_disabled_body = canonical_json_bytes(
+                {"properties": {"allow": False}}
+            )
+            scm_enabled_body = canonical_json_bytes(
+                {"properties": {"allow": True}}
+            )
             start_attempted = False
+            scm_enable_attempted = False
             primary_error: BaseException | None = None
             primary_stage = "start"
             stop_error: BaseException | None = None
+            scm_restore_error: BaseException | None = None
+            scm_disable_mutation_issued = False
             canary: Mapping[str, Any] | None = None
             running: Mapping[str, Any] | None = None
             stopped: Mapping[str, Any] | None = None
+            scm_initial: Mapping[str, Any] | None = None
+            scm_enabled: Mapping[str, Any] | None = None
+            scm_restored: Mapping[str, Any] | None = None
             trigger_status: int | None = None
             trigger_location: Mapping[str, Any] | None = None
             trigger_requested_at: dt.datetime | None = None
             try:
+                primary_stage = "scm-basic-auth-enable"
+                scm_initial = self._read_scm_basic_auth_policy(
+                    site_resource_id=site["resourceId"],
+                    deadline=startup_deadline,
+                    expected_allow=False,
+                    label="bridge SCM basic-auth precondition",
+                )
+                scm_enable_attempted = True
+                self._mutation_request(
+                    "PUT",
+                    scm_policy_url,
+                    body=scm_enabled_body,
+                    headers={"Content-Type": "application/json"},
+                    expected={200},
+                )
+                scm_enabled = self._read_scm_basic_auth_policy(
+                    site_resource_id=site["resourceId"],
+                    deadline=startup_deadline,
+                    expected_allow=True,
+                    label="bridge SCM basic-auth enabled readback",
+                )
                 # Once the intent is durable, even an ambiguous transport
                 # failure is followed by an exact stop in the cleanup path.
                 require_live_canary()
@@ -19272,10 +19573,48 @@ class AzureCliBootstrapTransport:
                         )
                     except BaseException as exc:
                         stop_error = exc
+                if scm_enable_attempted:
+                    try:
+                        before_restore = self._read_scm_basic_auth_policy(
+                            site_resource_id=site["resourceId"],
+                            deadline=(
+                                self.clock()
+                                + dt.timedelta(
+                                    seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                )
+                            ),
+                            expected_allow=None,
+                            label="bridge SCM basic-auth rollback classification",
+                        )
+                        if before_restore["allow"] is True:
+                            scm_disable_mutation_issued = True
+                            self._mutation_request(
+                                "PUT",
+                                scm_policy_url,
+                                body=scm_disabled_body,
+                                headers={"Content-Type": "application/json"},
+                                expected={200},
+                                cleanup=True,
+                            )
+                            scm_restored = self._read_scm_basic_auth_policy(
+                                site_resource_id=site["resourceId"],
+                                deadline=(
+                                    self.clock()
+                                    + dt.timedelta(
+                                        seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                    )
+                                ),
+                                expected_allow=False,
+                                label="bridge SCM basic-auth restored readback",
+                            )
+                        else:
+                            scm_restored = before_restore
+                    except BaseException as exc:
+                        scm_restore_error = exc
             if primary_error is not None:
-                if stop_error is not None:
+                if stop_error is not None or scm_restore_error is not None:
                     raise BootstrapError(
-                        "bridge canary failed and exact finally-stop also failed; "
+                        "bridge canary failed and exact finally cleanup also failed; "
                         "the durable mutation journal requires operator recovery"
                     ) from primary_error
                 raise BootstrapError(
@@ -19286,6 +19625,11 @@ class AzureCliBootstrapTransport:
                 raise BootstrapError(
                     "bridge canary reached terminal Success but exact finally-stop failed"
                 ) from stop_error
+            if scm_restore_error is not None:
+                raise BootstrapError(
+                    "bridge canary reached terminal Success but exact SCM basic-auth "
+                    "restoration failed"
+                ) from scm_restore_error
             if (
                 canary is None
                 or running is None
@@ -19293,6 +19637,9 @@ class AzureCliBootstrapTransport:
                 or trigger_requested_at is None
                 or trigger_status is None
                 or trigger_location is None
+                or scm_initial is None
+                or scm_enabled is None
+                or scm_restored is None
             ):
                 fail("bridge canary proof is incomplete")
             if (
@@ -19319,6 +19666,11 @@ class AzureCliBootstrapTransport:
                 "running": running,
                 "triggerStatus": trigger_status,
                 "triggerLocation": dict(trigger_location),
+                "scmBasicAuthInitial": dict(scm_initial),
+                "scmBasicAuthEnabled": dict(scm_enabled),
+                "scmBasicAuthRestored": dict(scm_restored),
+                "scmBasicAuthSelfCleaned": True,
+                "scmDisableMutationIssued": scm_disable_mutation_issued,
                 "triggerRequestedAt": self._timestamp(trigger_requested_at),
                 "historyBoundary": canary["historyBoundary"],
                 "terminalHistory": canary["terminalHistory"],
