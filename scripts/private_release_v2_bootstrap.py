@@ -731,11 +731,6 @@ DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "all related temporary access absent, and manual cleanup may be required."
 )
 BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
-    "I accept that Microsoft.Web Web Apps Update exposes no supported conditional ETag "
-    "for the bridge identity PATCHes, so the exact identity and WebJobs updates cannot "
-    "atomically exclude an out-of-band administrator write between their final adjacent "
-    "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
-    "definite success requires exact fresh stopped/private identity and WebJobs readback. "
     "I accept that App Service App Settings exposes no supported conditional ETag, so "
     "the exact full-map configuration PUT and any restoration "
     "cannot atomically exclude an out-of-band administrator write between their final "
@@ -1361,59 +1356,6 @@ def _validate_exact_bridge_uami_inventory(
             != expected_principal_id
         ):
             fail("terminal bridge UAMI metadata is not cross-bound")
-    return sorted(expected)
-
-
-def _validate_exact_legacy_bridge_uami_inventory(
-    identity: Any, prior: Mapping[str, Mapping[str, Any]]
-) -> list[str]:
-    """Validate the legacy bridge's exact writer and reader UAMI attachment."""
-
-    if (
-        not isinstance(identity, Mapping)
-        or not set(identity).issubset(BRIDGE_NO_IDENTITY_FIELDS)
-        or identity.get("type") != "UserAssigned"
-        or identity.get("principalId") is not None
-        or identity.get("tenantId") is not None
-    ):
-        fail("legacy bridge outer identity posture is invalid")
-    attached = identity.get("userAssignedIdentities")
-    expected: dict[str, tuple[str, str]] = {}
-    for dependency in (
-        "adoptExistingRegistryWriterIdentity",
-        "adoptExistingRegistryReaderIdentity",
-    ):
-        projection = prior.get(dependency, {}).get("projection", {})
-        resource_id = projection.get("id")
-        if not isinstance(resource_id, str):
-            fail("legacy bridge UAMI dependency is absent")
-        expected[resource_id.lower()] = (
-            _guid(projection.get("clientId"), f"{dependency} legacy clientId").lower(),
-            _guid(
-                projection.get("principalId"), f"{dependency} legacy principalId"
-            ).lower(),
-        )
-    if (
-        len(expected) != 2
-        or not isinstance(attached, Mapping)
-        or len(attached) != 2
-        or {str(item).lower() for item in attached} != set(expected)
-    ):
-        fail("legacy bridge UAMI inventory is not sole and exact")
-    for resource_id, value in attached.items():
-        value = _exact_keys(
-            value,
-            {"clientId", "principalId"},
-            "legacy bridge UAMI metadata",
-        )
-        expected_client_id, expected_principal_id = expected[str(resource_id).lower()]
-        if (
-            _guid(value["clientId"], "legacy bridge UAMI clientId").lower()
-            != expected_client_id
-            or _guid(value["principalId"], "legacy bridge UAMI principalId").lower()
-            != expected_principal_id
-        ):
-            fail("legacy bridge UAMI metadata is not cross-bound")
     return sorted(expected)
 
 
@@ -4803,6 +4745,12 @@ def _if_match_etag(value: Any, label: str) -> str:
     return etag if etag.startswith('"') else f'"{etag}"'
 
 
+def _microsoft_web_if_match_etag(value: Any, label: str) -> str:
+    """Preserve the exact strong ETag representation returned by Microsoft.Web."""
+
+    return _quoted_etag(value, label)
+
+
 def _unpaginated_graph_collection(
     value: Any, label: str
 ) -> list[Mapping[str, Any]]:
@@ -6637,7 +6585,6 @@ def _validate_operation_source_projection(
             "serverFarmId",
             "virtualNetworkSubnetId",
             "outboundVnetRouting",
-            "webJobsEnabled",
             "identity",
         }
         body = _exact_keys(body, required, f"{operation_id} webapp posture")
@@ -6651,9 +6598,6 @@ def _validate_operation_source_projection(
             bridge_mode = operation_context.get("adopted", {}).get(
                 "bridgeIdentityMode", "pristine-no-identity"
             )
-            webjobs_mode = operation_context.get("adopted", {}).get(
-                "webJobsMode", "enabled"
-            )
             if (
                 body["kind"] != "app,linux"
                 or body["httpsOnly"] is not True
@@ -6666,8 +6610,6 @@ def _validate_operation_source_projection(
                 or not _safe_bridge_outbound_vnet_routing(
                     body["outboundVnetRouting"]
                 )
-                or webjobs_mode not in {"enabled", "disabled"}
-                or body["webJobsEnabled"] is not (webjobs_mode == "enabled")
             ):
                 fail("terminal bridge creation posture is unsafe")
             if bridge_mode == "pristine-no-identity":
@@ -6690,25 +6632,16 @@ def _validate_operation_source_projection(
                 or not _safe_bridge_outbound_vnet_routing(
                     body["outboundVnetRouting"]
                 )
-                or body["webJobsEnabled"] is not True
             ):
                 fail("terminal bridge UAMI attachment posture is unsafe")
             _validate_exact_bridge_uami_inventory(identity, prior)
         elif operation_id == "detachWriterAndReaderFromLegacyBridge":
             if (
-                body["kind"] != "app,linux"
-                or body["httpsOnly"] is not True
-                or body["state"] != "Stopped"
+                body["state"] != "Stopped"
                 or body["publicNetworkAccess"] != "Disabled"
-                or str(body["serverFarmId"]).lower()
-                != resources["bridgeAppServicePlan"]["resourceId"].lower()
-                or str(body["virtualNetworkSubnetId"]).lower()
-                != resources["integrationSubnet"]["resourceId"].lower()
-                or not _safe_bridge_outbound_vnet_routing(
-                    body["outboundVnetRouting"]
-                )
-                or body["webJobsEnabled"] is not True
-                or not _safe_bridge_no_identity(identity)
+                or not isinstance(identity, Mapping)
+                or identity.get("type") not in {None, "None"}
+                or identity.get("userAssignedIdentities") not in (None, {})
             ):
                 fail("terminal legacy bridge retirement posture is unsafe")
     elif family == "storage-network-acl-redacted-projection":
@@ -14177,7 +14110,6 @@ class AzureCliBootstrapTransport:
             "detachWriterAndReaderFromLegacyBridge",
         }:
             outbound = properties.get("outboundVnetRouting") if isinstance(properties, Mapping) else None
-            site_config = properties.get("siteConfig") if isinstance(properties, Mapping) else None
             retained = {
                 "id": projection_document.get("id"),
                 "name": projection_document.get("name"),
@@ -14190,9 +14122,6 @@ class AzureCliBootstrapTransport:
                 "serverFarmId": properties.get("serverFarmId") if isinstance(properties, Mapping) else None,
                 "virtualNetworkSubnetId": properties.get("virtualNetworkSubnetId") if isinstance(properties, Mapping) else None,
                 "outboundVnetRouting": outbound,
-                "webJobsEnabled": site_config.get("webJobsEnabled")
-                if isinstance(site_config, Mapping)
-                else None,
                 "identity": projection_document.get("identity"),
             }
             family = "webapp-nonsecret-posture"
@@ -14900,29 +14829,11 @@ class AzureCliBootstrapTransport:
                     fail("bridge UAMI attachment ETag or projection drifted")
             elif operation_id == "detachWriterAndReaderFromLegacyBridge":
                 identity = projection_document.get("identity")
-                site_config = (
-                    properties.get("siteConfig")
-                    if isinstance(properties, Mapping)
-                    else None
-                )
-                if (
-                    projection_document.get("kind") != "app,linux"
-                    or not isinstance(properties, Mapping)
-                    or properties.get("httpsOnly") is not True
-                    or properties.get("state") != "Stopped"
-                    or properties.get("publicNetworkAccess") != "Disabled"
-                    or str(properties.get("serverFarmId", "")).lower()
-                    != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
-                    or str(properties.get("virtualNetworkSubnetId", "")).lower()
-                    != self.resources["integrationSubnet"]["resourceId"].lower()
-                    or not _safe_bridge_outbound_vnet_routing(
-                        properties.get("outboundVnetRouting")
-                    )
-                    or not isinstance(site_config, Mapping)
-                    or site_config.get("webJobsEnabled") is not True
-                    or not _safe_bridge_no_identity(identity)
+                if isinstance(identity, Mapping) and (
+                    identity.get("type") not in {"None", None}
+                    or identity.get("userAssignedIdentities") not in (None, {})
                 ):
-                    fail("legacy bridge detach readback is not exact")
+                    fail("legacy bridge still has a user-assigned identity")
             elif operation_id in {"addOwnedUploaderIpv4Rule", "removeOwnedUploaderIpv4Rule"}:
                 network_acls = properties.get("networkAcls") if isinstance(properties, Mapping) else None
                 normalized_network_acls = (
@@ -16931,47 +16842,6 @@ class AzureCliBootstrapTransport:
             fail("created UAMI readback is invalid")
         return details
 
-    def _exact_bridge_site_response(
-        self,
-        response: _RestResponse,
-        *,
-        site_key: str,
-        expected_webjobs: bool,
-        label: str,
-    ) -> tuple[Mapping[str, Any], Any, str]:
-        """Validate one fresh full bridge-site response around an unguarded PATCH."""
-
-        site = self.resources[site_key]
-        document = self._json_response(response, {200}, label)
-        properties = document.get("properties")
-        site_config = (
-            properties.get("siteConfig")
-            if isinstance(properties, Mapping)
-            else None
-        )
-        if (
-            str(document.get("id", "")).lower() != site["resourceId"].lower()
-            or document.get("name") != site["name"]
-            or document.get("kind") != "app,linux"
-            or not isinstance(properties, Mapping)
-            or properties.get("httpsOnly") is not True
-            or properties.get("state") != "Stopped"
-            or properties.get("publicNetworkAccess") != "Disabled"
-            or str(properties.get("serverFarmId", "")).lower()
-            != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
-            or str(properties.get("virtualNetworkSubnetId", "")).lower()
-            != self.resources["integrationSubnet"]["resourceId"].lower()
-            or not _safe_bridge_outbound_vnet_routing(
-                properties.get("outboundVnetRouting")
-            )
-            or not isinstance(site_config, Mapping)
-            or site_config.get("webJobsEnabled") is not expected_webjobs
-        ):
-            fail(f"{label} posture drifted")
-        etag = self._header(response, "ETag") or document.get("etag")
-        _quoted_etag(etag, f"{label} ETag")
-        return document, document.get("identity"), etag
-
     def _mutate(self, operation: Mapping[str, Any], state: Mapping[str, Any]) -> Mapping[str, Any]:
         operation_id = operation["id"]
         context = self._admission_context(operation_id)
@@ -17141,38 +17011,20 @@ class AzureCliBootstrapTransport:
         if operation_id == "detachWriterAndReaderFromLegacyBridge":
             legacy = self.resources["legacyBridgeSite"]
             target_url = self._arm_url(legacy["resourceId"], "2025-03-01")
-            adjacent_response = self._read_request_with_transport_retry(
-                "GET", target_url
-            )
-            _, adjacent_identity, _ = self._exact_bridge_site_response(
-                adjacent_response,
-                site_key="legacyBridgeSite",
-                expected_webjobs=True,
-                label="legacy bridge detach adjacent precondition",
-            )
-            _validate_exact_legacy_bridge_uami_inventory(
-                adjacent_identity, self._validated_source_projections
-            )
             request_body = canonical_json_bytes({"identity": {"type": "None"}})
             response = self._mutation_request(
                 "PATCH",
                 target_url,
                 body=request_body,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "If-Match": _microsoft_web_if_match_etag(
+                        context.get("etag"), "legacy bridge ETag"
+                    ),
+                },
                 expected={200},
             )
             self._json_response(response, {200}, "legacy bridge identity detach")
-            readback_response = self._read_request_with_transport_retry(
-                "GET", target_url
-            )
-            _, readback_identity, _ = self._exact_bridge_site_response(
-                readback_response,
-                site_key="legacyBridgeSite",
-                expected_webjobs=True,
-                label="legacy bridge detach fresh readback",
-            )
-            if not _safe_bridge_no_identity(readback_identity):
-                fail("legacy bridge detach fresh identity readback is not exact")
             return {"resourceId": legacy["resourceId"], "detached": ["registryWriterIdentity", "registryReaderIdentity"]}
 
         if operation_id in {
@@ -17411,13 +17263,36 @@ class AzureCliBootstrapTransport:
             adjacent_response = self._read_request_with_transport_retry(
                 "GET", target_url
             )
-            expected_webjobs = bridge.get("webJobsMode") == "enabled"
-            _, adjacent_identity, _ = self._exact_bridge_site_response(
-                adjacent_response,
-                site_key="bridgeSite",
-                expected_webjobs=expected_webjobs,
-                label="bridge attachment adjacent precondition",
+            adjacent = self._json_response(
+                adjacent_response, {200}, "bridge attachment adjacent precondition"
             )
+            adjacent_properties = adjacent.get("properties")
+            adjacent_site_config = (
+                adjacent_properties.get("siteConfig")
+                if isinstance(adjacent_properties, Mapping)
+                else None
+            )
+            adjacent_identity = adjacent.get("identity")
+            expected_webjobs = bridge.get("webJobsMode") == "enabled"
+            if (
+                str(adjacent.get("id", "")).lower() != site["resourceId"].lower()
+                or adjacent.get("name") != site["name"]
+                or adjacent.get("kind") != "app,linux"
+                or not isinstance(adjacent_properties, Mapping)
+                or adjacent_properties.get("httpsOnly") is not True
+                or adjacent_properties.get("state") != "Stopped"
+                or adjacent_properties.get("publicNetworkAccess") != "Disabled"
+                or str(adjacent_properties.get("serverFarmId", "")).lower()
+                != self.resources["bridgeAppServicePlan"]["resourceId"].lower()
+                or str(adjacent_properties.get("virtualNetworkSubnetId", "")).lower()
+                != self.resources["integrationSubnet"]["resourceId"].lower()
+                or not _safe_bridge_outbound_vnet_routing(
+                    adjacent_properties.get("outboundVnetRouting")
+                )
+                or not isinstance(adjacent_site_config, Mapping)
+                or adjacent_site_config.get("webJobsEnabled") is not expected_webjobs
+            ):
+                fail("bridge attachment adjacent precondition drifted")
             bridge_mode = bridge.get("bridgeIdentityMode")
             if bridge_mode == "pristine-no-identity":
                 if not _safe_bridge_no_identity(adjacent_identity):
@@ -17435,6 +17310,10 @@ class AzureCliBootstrapTransport:
                 != bridge.get("identityProjectionSha256")
             ):
                 fail("bridge attachment adjacent identity projection drifted")
+            bridge_etag = _microsoft_web_if_match_etag(
+                self._header(adjacent_response, "ETag") or adjacent.get("etag"),
+                "bridge attachment adjacent ETag",
+            )
             request_body = canonical_json_bytes(
                 {
                     "identity": {
@@ -17448,33 +17327,19 @@ class AzureCliBootstrapTransport:
                 "PATCH",
                 target_url,
                 body=request_body,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "If-Match": bridge_etag},
                 expected={200},
             )
-            self._json_response(response, {200}, "bridge UAMI attachment")
-            readback_response = self._read_request_with_transport_retry(
-                "GET", target_url
-            )
-            _, readback_identity, readback_etag = self._exact_bridge_site_response(
-                readback_response,
-                site_key="bridgeSite",
-                expected_webjobs=True,
-                label="bridge UAMI attachment fresh readback",
-            )
-            observed_ids = _validate_exact_bridge_uami_inventory(
-                readback_identity, self._validated_source_projections
-            )
-            if observed_ids != sorted(item.lower() for item in identity_ids):
-                fail("bridge UAMI attachment fresh identity readback is not exact")
+            result = self._json_response(response, {200}, "bridge UAMI attachment")
             return {
                 "resourceId": site["resourceId"],
                 "identityResourceIds": sorted(item.lower() for item in identity_ids),
                 "expectedEtag": _if_match_etag(
-                    readback_etag,
+                    self._header(response, "ETag") or result.get("etag"),
                     "bridge attachment response ETag",
                 ),
                 "identityProjectionSha256": sha256_bytes(
-                    canonical_json_bytes(readback_identity)
+                    canonical_json_bytes(result.get("identity"))
                 ),
             }
 

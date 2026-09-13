@@ -1287,62 +1287,6 @@ def _operation_admission(
             },
         )
 
-    if status == 200 and operation_id == "detachWriterAndReaderFromLegacyBridge":
-        body = _body_mapping(envelope, operation_id)
-        properties = _properties(envelope, operation_id)
-        identity = body.get("identity")
-        site_config = properties.get("siteConfig")
-        resources = {item["id"]: item for item in plan["resourceInventory"]}
-        legacy = resources["legacyBridgeSite"]
-        if (
-            str(body.get("id", "")).lower() != legacy["resourceId"].lower()
-            or body.get("name") != legacy["name"]
-            or body.get("kind") != "app,linux"
-            or properties.get("state") != "Stopped"
-            or properties.get("httpsOnly") is not True
-            or properties.get("publicNetworkAccess") != "Disabled"
-            or str(properties.get("serverFarmId", "")).lower()
-            != resources["bridgeAppServicePlan"]["resourceId"].lower()
-            or str(properties.get("virtualNetworkSubnetId", "")).lower()
-            != resources["integrationSubnet"]["resourceId"].lower()
-            or not bootstrap._safe_bridge_outbound_vnet_routing(
-                properties.get("outboundVnetRouting")
-            )
-            or not isinstance(site_config, Mapping)
-            or site_config.get("webJobsEnabled") is not True
-        ):
-            fail("legacy bridge posture is outside the resumable detach boundary")
-        if bootstrap._safe_bridge_no_identity(identity):
-            return "exact", _policy_checked_context(
-                operation_id,
-                policy,
-                {"executionDecision": "adopt-exact", "adopted": {}},
-            )
-        prior = {}
-        for dependency in (
-            "adoptExistingRegistryWriterIdentity",
-            "adoptExistingRegistryReaderIdentity",
-        ):
-            facts = dependency_facts.get(dependency)
-            if not isinstance(facts, Mapping):
-                fail("legacy bridge identity dependency is absent")
-            prior[dependency] = {
-                "projection": {
-                    "id": facts.get("resourceId"),
-                    "clientId": facts.get("clientId"),
-                    "principalId": facts.get("principalId"),
-                }
-            }
-        bootstrap._validate_exact_legacy_bridge_uami_inventory(identity, prior)
-        return "exact", _policy_checked_context(
-            operation_id,
-            policy,
-            {
-                "executionDecision": "apply-exact",
-                "etag": _etag(envelope, operation_id),
-            },
-        )
-
     if status == 200 and operation_id in {
         "createStoppedPrivateBridge",
         "attachFiveUamisOnlyToBridge",
@@ -1694,6 +1638,8 @@ def _operation_admission(
         if not isinstance(credential_id, str) or not GUID.fullmatch(credential_id):
             fail("legacy FIC response has no exact object ID")
         context["legacyFederatedCredentialId"] = credential_id
+    elif operation_id == "detachWriterAndReaderFromLegacyBridge":
+        context["etag"] = _etag(envelope, operation_id)
     elif operation_id == "createSigningKeyVersion":
         context["expiresAt"] = _stamp(observed_at + dt.timedelta(days=60))
     elif operation_id == "removeOwnedUploaderIpv4Rule":

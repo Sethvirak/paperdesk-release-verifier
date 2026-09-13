@@ -47,11 +47,6 @@ EXPECTED_DELETION_LOCK_RESIDUAL_ACCEPTANCE = (
     "all related temporary access absent, and manual cleanup may be required."
 )
 EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
-    "I accept that Microsoft.Web Web Apps Update exposes no supported conditional ETag "
-    "for the bridge identity PATCHes, so the exact identity and WebJobs updates cannot "
-    "atomically exclude an out-of-band administrator write between their final adjacent "
-    "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
-    "definite success requires exact fresh stopped/private identity and WebJobs readback. "
     "I accept that App Service App Settings exposes no supported conditional ETag, so "
     "the exact full-map configuration PUT and any restoration "
     "cannot atomically exclude an out-of-band administrator write between their final "
@@ -776,7 +771,6 @@ class _TerminalEvidenceFixture:
             "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
             "virtualNetworkSubnetId": self.resources["integrationSubnet"]["resourceId"],
             "outboundVnetRouting": {"allTraffic": True, "applicationTraffic": True},
-            "webJobsEnabled": True,
             "identity": identity,
         }
 
@@ -5356,13 +5350,35 @@ class BootstrapTests(unittest.TestCase):
         source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._mutate
         )
-        self.assertEqual(source.count("_if_match_etag("), 5)
+        self.assertEqual(source.count("_if_match_etag("), 7)
+        self.assertEqual(source.count("_microsoft_web_if_match_etag("), 2)
         worm_response_source = inspect.getsource(
             bootstrap.AzureCliBootstrapTransport._exact_immutability_policy_response
         )
         self.assertEqual(worm_response_source.count("_if_match_etag("), 2)
         self.assertNotIn('"If-Match": str(', source)
         self.assertNotIn('"If-Match": current_etag', source)
+
+    def test_microsoft_web_if_match_etag_preserves_the_validated_wire_value(self):
+        self.assertEqual(
+            bootstrap._microsoft_web_if_match_etag(
+                "1DD432F2A06DE40", "raw Microsoft.Web ETag"
+            ),
+            "1DD432F2A06DE40",
+        )
+        self.assertEqual(
+            bootstrap._microsoft_web_if_match_etag(
+                '"already-quoted"', "quoted Microsoft.Web ETag"
+            ),
+            '"already-quoted"',
+        )
+        for malformed in ("", "abc", 'W/"weak"', '"unterminated'):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                bootstrap.BootstrapError, "strong ETag token"
+            ):
+                bootstrap._microsoft_web_if_match_etag(
+                    malformed, "malformed Microsoft.Web ETag"
+                )
 
     def test_package_worm_context_binds_one_exact_mutation_branch(self):
         authorization = {"authorizationId": AUTH_ID}
@@ -5419,9 +5435,7 @@ class BootstrapTests(unittest.TestCase):
                     "lockPackageRetentionAt91Days", context, authorization
                 )
 
-    def test_unsupported_web_writes_use_adjacent_guards_but_no_fake_cas(self):
-        with tempfile.TemporaryDirectory() as folder:
-            fixture = self.terminal_fixture(folder)
+    def test_supported_bridge_resource_write_uses_etag_but_app_settings_uses_no_fake_cas(self):
         projection = build_projection(self.plan, self.package)
         configure_context = next(
             item["context"]
@@ -5457,11 +5471,6 @@ class BootstrapTests(unittest.TestCase):
             clock=lambda: NOW,
             session=session,
         )
-        prior = {
-            item["operationId"]: item["sourceProjection"]
-            for item in fixture["sourceEvidence"]["allOperationProjections"]
-        }
-        transport._validated_source_projections.update(prior)
         resources = {
             item["id"]: item for item in self.plan["resourceInventory"]
         }
@@ -5548,60 +5557,21 @@ class BootstrapTests(unittest.TestCase):
             }),
             {"ETag": "1DD39E07D4DEFAA"},
         )
-        readback_body = json.loads(attach_response.body)
-        readback_body.update({
-            "id": resources["bridgeSite"]["resourceId"],
-            "name": resources["bridgeSite"]["name"],
-            "kind": "app,linux",
-            "properties": {
-                "httpsOnly": True,
-                "state": "Stopped",
-                "publicNetworkAccess": "Disabled",
-                "serverFarmId": resources["bridgeAppServicePlan"]["resourceId"],
-                "virtualNetworkSubnetId": resources["integrationSubnet"]["resourceId"],
-                "outboundVnetRouting": {
-                    "allTraffic": True,
-                    "applicationTraffic": True,
-                },
-                "siteConfig": {"webJobsEnabled": True},
-            },
-        })
-        for key in (
-            "bridgeIdentity", "registryWriterIdentity", "registryReaderIdentity",
-            "signerIdentity", "productionActivationIdentity",
-        ):
-            resource_id = resources[key]["resourceId"]
-            dependency = {
-                "bridgeIdentity": "createBridgeIdentity",
-                "registryWriterIdentity": "adoptExistingRegistryWriterIdentity",
-                "registryReaderIdentity": "adoptExistingRegistryReaderIdentity",
-                "signerIdentity": "createSignerIdentity",
-                "productionActivationIdentity": "createProductionActivationIdentity",
-            }[key]
-            metadata = prior[dependency]["projection"]
-            readback_body["identity"]["userAssignedIdentities"][resource_id] = {
-                "clientId": metadata["clientId"],
-                "principalId": metadata["principalId"],
-            }
-        readback_response = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes(readback_body),
-            {"ETag": "1DD39E07D4DEF61"},
-        )
         with mock.patch.object(
             transport, "_read_request_with_transport_retry",
-            side_effect=[adjacent_response, readback_response],
+            return_value=adjacent_response,
         ), mock.patch.object(
             transport, "_mutation_request", return_value=attach_response
         ) as request:
             transport._mutate(attach, state)
         self.assertEqual(request.call_count, 1)
-        self.assertEqual(request.call_args.kwargs["headers"], {
-            "Content-Type": "application/json"
-        })
+        self.assertEqual(
+            request.call_args.kwargs["headers"]["If-Match"],
+            "1DD39E07D4DEFAA",
+        )
         with mock.patch.object(
             transport, "_read_request_with_transport_retry",
-            side_effect=[adjacent_response],
+            return_value=adjacent_response,
         ), mock.patch.object(
             transport, "_mutation_request", return_value=bootstrap._RestResponse(
                 412, bootstrap.canonical_json_bytes({"error": "precondition"}), {}
@@ -5610,16 +5580,6 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(bootstrap.BootstrapError):
                 transport._mutate(attach, state)
         self.assertEqual(rejected.call_count, 1)
-
-        with mock.patch.object(
-            transport, "_read_request_with_transport_retry",
-            side_effect=[adjacent_response, adjacent_response],
-        ), mock.patch.object(
-            transport, "_mutation_request", return_value=attach_response
-        ) as third_state:
-            with self.assertRaises(bootstrap.BootstrapError):
-                transport._mutate(attach, state)
-        self.assertEqual(third_state.call_count, 1)
 
         configure = next(
             item
@@ -5864,7 +5824,7 @@ class BootstrapTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(bootstrap.BootstrapError):
                 validate(candidate)
 
-    def test_recovered_attachment_uses_adjacent_guard_then_fresh_get_proves_result(self):
+    def test_recovered_attachment_uses_adjacent_etag_then_get_proves_result(self):
         with tempfile.TemporaryDirectory() as folder:
             fixture = self.terminal_fixture(folder)
         projection = build_projection(self.plan, self.package)
@@ -5903,7 +5863,7 @@ class BootstrapTests(unittest.TestCase):
         response = bootstrap._RestResponse(
             200, bootstrap.canonical_json_bytes(body), {"ETag": '"after-attach"'}
         )
-        transport.session.request.side_effect = [adjacent_response, response, response]
+        transport.session.request.side_effect = [adjacent_response, response]
         state = {"proofs": {"createStoppedPrivateBridge": {"details": {
             "etag": '"before-attach"',
             "bridgeIdentityMode": "exact-five-user-assigned",
@@ -5930,12 +5890,10 @@ class BootstrapTests(unittest.TestCase):
             result = transport.apply_operation(attach, state)
         patch.assert_called_once()
         self.assertEqual(patch.call_args.args[0], "PATCH")
-        self.assertEqual(
-            patch.call_args.kwargs["headers"], {"Content-Type": "application/json"}
-        )
+        self.assertEqual(patch.call_args.kwargs["headers"]["If-Match"], '"adjacent-attach"')
         request_body = json.loads(patch.call_args.kwargs["body"])
         self.assertIs(request_body["properties"]["siteConfig"]["webJobsEnabled"], True)
-        self.assertEqual(transport.session.request.call_count, 3)
+        self.assertEqual(transport.session.request.call_count, 2)
         self.assertEqual(result["details"]["expectedEtag"], '"after-attach"')
         self.assertEqual(
             result["details"]["identityProjectionSha256"],
@@ -5973,133 +5931,6 @@ class BootstrapTests(unittest.TestCase):
             ) as rejected_patch, self.assertRaises(bootstrap.BootstrapError):
                 transport._mutate(attach, state)
             rejected_patch.assert_not_called()
-
-    def test_legacy_detach_uses_exact_adjacent_and_fresh_guards_without_fake_cas(self):
-        with tempfile.TemporaryDirectory() as folder:
-            fixture = self.terminal_fixture(folder)
-        projection = build_projection(self.plan, self.package)
-        receipt = Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}"
-        authorization = build_authorization(
-            self.plan, self.plan_sha, self.package, projection, receipt
-        )
-        transport = bootstrap.AzureCliBootstrapTransport(
-            authorization=authorization,
-            plan=self.plan,
-            package=self.package,
-            preflight={"projection": projection},
-            clock=lambda: NOW,
-            session=mock.Mock(),
-        )
-        prior = {
-            item["operationId"]: item["sourceProjection"]
-            for item in fixture["sourceEvidence"]["allOperationProjections"]
-        }
-        transport._validated_source_projections.update(prior)
-        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
-        identities = {}
-        for dependency in (
-            "adoptExistingRegistryWriterIdentity",
-            "adoptExistingRegistryReaderIdentity",
-        ):
-            identity = prior[dependency]["projection"]
-            identities[identity["id"]] = {
-                "clientId": identity["clientId"],
-                "principalId": identity["principalId"],
-            }
-        shell = {
-            "id": resources["legacyBridgeSite"]["resourceId"],
-            "name": resources["legacyBridgeSite"]["name"],
-            "kind": "app,linux",
-            "properties": {
-                "httpsOnly": True,
-                "state": "Stopped",
-                "publicNetworkAccess": "Disabled",
-                "serverFarmId": resources["bridgeAppServicePlan"]["resourceId"],
-                "virtualNetworkSubnetId": resources["integrationSubnet"]["resourceId"],
-                "outboundVnetRouting": {
-                    "allTraffic": True,
-                    "applicationTraffic": True,
-                },
-                "siteConfig": {"webJobsEnabled": True},
-            },
-        }
-        adjacent_body = copy.deepcopy(shell)
-        adjacent_body["identity"] = {
-            "type": "UserAssigned",
-            "userAssignedIdentities": identities,
-        }
-        readback_body = copy.deepcopy(shell)
-        readback_body["identity"] = {"type": "None"}
-        adjacent = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes(adjacent_body),
-            {"ETag": "1DD3953F06A0B95"},
-        )
-        readback = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes(readback_body),
-            {"ETag": "1DD3953F06A0B96"},
-        )
-        response = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes({"identity": {"type": "None"}}),
-            {"ETag": "1DD3953F06A0B96"},
-        )
-        operation = next(
-            item for item in self.plan["mutations"]
-            if item["id"] == "detachWriterAndReaderFromLegacyBridge"
-        )
-        with mock.patch.object(
-            transport,
-            "_read_request_with_transport_retry",
-            side_effect=[adjacent, readback],
-        ), mock.patch.object(
-            transport, "_mutation_request", return_value=response
-        ) as patch:
-            result = transport._mutate(operation, {})
-        patch.assert_called_once()
-        self.assertEqual(
-            patch.call_args.kwargs["headers"], {"Content-Type": "application/json"}
-        )
-        self.assertEqual(
-            result,
-            {
-                "resourceId": resources["legacyBridgeSite"]["resourceId"],
-                "detached": ["registryWriterIdentity", "registryReaderIdentity"],
-            },
-        )
-
-        drifted_body = copy.deepcopy(adjacent_body)
-        drifted_body["identity"]["userAssignedIdentities"][
-            "/subscriptions/example/resourceGroups/example/providers/"
-            "Microsoft.ManagedIdentity/userAssignedIdentities/unreviewed"
-        ] = {"clientId": str(uuid.uuid4()), "principalId": str(uuid.uuid4())}
-        drifted = bootstrap._RestResponse(
-            200,
-            bootstrap.canonical_json_bytes(drifted_body),
-            {"ETag": "1DD3953F06A0B97"},
-        )
-        with mock.patch.object(
-            transport, "_read_request_with_transport_retry", return_value=drifted
-        ), mock.patch.object(transport, "_mutation_request") as blocked:
-            with self.assertRaisesRegex(
-                bootstrap.BootstrapError, "not sole and exact"
-            ):
-                transport._mutate(operation, {})
-        blocked.assert_not_called()
-
-        with mock.patch.object(
-            transport,
-            "_read_request_with_transport_retry",
-            side_effect=[adjacent, adjacent],
-        ), mock.patch.object(
-            transport, "_mutation_request", return_value=response
-        ) as third_state:
-            with self.assertRaisesRegex(
-                bootstrap.BootstrapError, "fresh identity readback"
-            ):
-                transport._mutate(operation, {})
-        self.assertEqual(third_state.call_count, 1)
 
     def _custom_role_retry_transport(self, member_state, responses):
         projection = build_projection(self.plan, self.package)

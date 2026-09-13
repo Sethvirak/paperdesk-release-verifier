@@ -329,36 +329,8 @@ class FakeReadOnlySession:
             headers = {"ETag": '"legacy-etag"'}
             body = {
                 "id": self.resources["legacyBridgeSite"]["resourceId"],
-                "name": self.resources["legacyBridgeSite"]["name"],
-                "type": "Microsoft.Web/sites",
-                "kind": "app,linux",
-                "identity": {
-                    "type": "UserAssigned",
-                    "principalId": None,
-                    "tenantId": None,
-                    "userAssignedIdentities": {
-                        writer["resourceId"]: {
-                            "clientId": writer["clientId"],
-                            "principalId": writer["principalId"],
-                        },
-                        reader["resourceId"]: {
-                            "clientId": reader["clientId"],
-                            "principalId": reader["principalId"],
-                        },
-                    },
-                },
-                "properties": {
-                    "state": "Stopped",
-                    "httpsOnly": True,
-                    "publicNetworkAccess": "Disabled",
-                    "serverFarmId": self.resources["bridgeAppServicePlan"]["resourceId"],
-                    "virtualNetworkSubnetId": self.resources["integrationSubnet"]["resourceId"],
-                    "outboundVnetRouting": {
-                        "allTraffic": True,
-                        "applicationTraffic": True,
-                    },
-                    "siteConfig": {"webJobsEnabled": True},
-                },
+                "name": "paperdesk-release-registry-bridge-9c4e0d0d",
+                "properties": {"state": "Stopped"},
             }
         elif request.url == (
             "https://management.azure.com"
@@ -1074,10 +1046,6 @@ class ObserveTests(unittest.TestCase):
                 "App Service App Settings exposes no supported conditional ETag",
                 template["requiredResidualRiskAcceptance"]["exactConfirmationText"],
             )
-            self.assertIn(
-                "Microsoft.Web Web Apps Update exposes no supported conditional ETag",
-                template["requiredResidualRiskAcceptance"]["exactConfirmationText"],
-            )
             self.assertEqual(
                 template["ceremonyRequirements"],
                 [
@@ -1417,117 +1385,6 @@ class ObserveTests(unittest.TestCase):
                         observe.ObserveError, "found a retired temporary role"
                     ):
                         self.build(folder, PresentRetiredRoleSession(self.plan))
-
-    def test_legacy_detach_admission_is_resumable_and_already_detached_is_zero_write(self):
-        with tempfile.TemporaryDirectory() as folder:
-            _session, _preflight, template = self.build(folder)
-        authorization = self.promote_template(template)
-        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
-        dependency_facts = {}
-        attached = {}
-        for dependency, key in (
-            ("adoptExistingRegistryWriterIdentity", "registryWriterIdentity"),
-            ("adoptExistingRegistryReaderIdentity", "registryReaderIdentity"),
-        ):
-            resource = resources[key]
-            dependency_facts[dependency] = {
-                "resourceId": resource["resourceId"],
-                "clientId": resource["clientId"],
-                "principalId": resource["principalId"],
-            }
-            attached[resource["resourceId"]] = {
-                "clientId": resource["clientId"],
-                "principalId": resource["principalId"],
-            }
-        legacy = resources["legacyBridgeSite"]
-        body = {
-            "id": legacy["resourceId"],
-            "name": legacy["name"],
-            "type": "Microsoft.Web/sites",
-            "kind": "app,linux",
-            "identity": {
-                "type": "UserAssigned",
-                "principalId": None,
-                "tenantId": None,
-                "userAssignedIdentities": attached,
-            },
-            "properties": {
-                "state": "Stopped",
-                "httpsOnly": True,
-                "publicNetworkAccess": "Disabled",
-                "serverFarmId": resources["bridgeAppServicePlan"]["resourceId"],
-                "virtualNetworkSubnetId": resources["integrationSubnet"]["resourceId"],
-                "outboundVnetRouting": {
-                    "allTraffic": True,
-                    "applicationTraffic": True,
-                },
-                "siteConfig": {"webJobsEnabled": True},
-            },
-        }
-        envelope = {
-            "status": 200,
-            "headers": {"etag": '"legacy-etag"'},
-            "body": body,
-        }
-        operation = next(
-            item for item in self.plan["mutations"]
-            if item["id"] == "detachWriterAndReaderFromLegacyBridge"
-        )
-        policy = bootstrap._operation_context_policy(
-            operation["id"], self.plan, authorization
-        )
-        status, apply_context = observe._operation_admission(
-            operation, envelope, self.plan, authorization, NOW,
-            "203.0.113.10/32", policy, dependency_facts,
-        )
-        self.assertEqual(status, "exact")
-        self.assertEqual(
-            apply_context,
-            {"executionDecision": "apply-exact", "etag": '"legacy-etag"'},
-        )
-
-        detached = copy.deepcopy(envelope)
-        detached["body"]["identity"] = {"type": "None"}
-        status, adopt_context = observe._operation_admission(
-            operation, detached, self.plan, authorization, NOW,
-            "203.0.113.10/32", policy, dependency_facts,
-        )
-        self.assertEqual(status, "exact")
-        self.assertEqual(
-            adopt_context,
-            {"executionDecision": "adopt-exact", "adopted": {}},
-        )
-        transport = object.__new__(bootstrap.AzureCliBootstrapTransport)
-        transport.admissions = {
-            operation["id"]: {
-                "context": adopt_context,
-                "desiredProbeIds": [],
-            }
-        }
-        transport._prove_adopt_probe_ids = mock.Mock(return_value=[])
-        with mock.patch.object(
-            bootstrap.AzureCliBootstrapTransport, "_mutate"
-        ) as mutate:
-            result = transport.apply_operation(operation, {})
-        mutate.assert_not_called()
-        self.assertEqual(result["status"], "adopted-exact")
-
-        third_state = copy.deepcopy(envelope)
-        third_state["body"]["identity"]["userAssignedIdentities"][
-            "/subscriptions/00000000-0000-0000-0000-000000000000/"
-            "resourceGroups/extra/providers/Microsoft.ManagedIdentity/"
-            "userAssignedIdentities/extra"
-        ] = {
-            "clientId": "11111111-1111-4111-8111-111111111111",
-            "principalId": "22222222-2222-4222-8222-222222222222",
-        }
-        with self.assertRaises(
-            (observe.ObserveError, bootstrap.BootstrapError)
-        ):
-            observe._operation_admission(
-                operation, third_state, self.plan, authorization, NOW,
-                "203.0.113.10/32", policy, dependency_facts,
-            )
 
     def test_exact_five_bridge_recovery_is_jointly_admitted_without_attach_write(self):
         with tempfile.TemporaryDirectory() as folder:
