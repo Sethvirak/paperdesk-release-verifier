@@ -241,6 +241,12 @@ BRIDGE_SETTINGS_OWNER_OPERATION_ID = (
     "configureBridgeExactVersionedPackageAndCriticalSettings"
 )
 BRIDGE_SETTINGS_CLEANUP_KEY = "bridge-app-settings-prestate"
+UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME = (
+    "unresolved-public-network-enable.json"
+)
+PUBLIC_NETWORK_INCIDENT_ROOT = Path(
+    r"C:\ProgramData\PaperDeskReleaseCeremonies-20260905-a75d00e9"
+)
 PROTECTED_ROLE_LIFECYCLES = {
     "addOwnedOperatorControllerCanaryRole": "removeOwnedOperatorControllerCanaryRole",
     "addOwnedUploaderPackageRole": "removeOwnedUploaderPackageRole",
@@ -745,13 +751,35 @@ BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
     "atomically exclude an out-of-band administrator write between their final adjacent "
     "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
     "definite success requires exact fresh stopped/private identity and WebJobs readback. "
+    "I authorize temporary enabling and exact disabling of only the bridge public-network "
+    "access property solely around the bounded WebJob canary. I accept that this site "
+    "PATCH exposes no supported conditional ETag, so it cannot atomically exclude an "
+    "out-of-band administrator write between the final adjacent pre-read and PATCH. "
+    "The executor must prove the SCM policy disabled before enabling public-network "
+    "access, then issue one pre-canary stop at most once without retry and prove the "
+    "enabled bridge stopped before enabling SCM. Each public-network PATCH is issued at "
+    "most once without retry. A 202 response must bind one exact Azure-AsyncOperation "
+    "URL under Azure ARM and reach terminal Succeeded through bounded read-only polling "
+    "before "
+    "the executor classifies live state, and definite success "
+    "requires prompt exact Disabled readback during cleanup followed by a fresh "
+    "stopped-bridge proof. I accept that a "
+    "public-network update can restart the Linux bridge, so the executor may issue one "
+    "separately journaled post-restoration stop at most once without retry and must prove "
+    "the bridge freshly stopped after public-network restoration. I also accept that "
+    "process death, ambiguous transport, or a local journal/fsync failure after enabling "
+    "can leave the bridge public endpoint enabled; execution and any later release must "
+    "stop until fresh reads prove public-network access Disabled, the SCM policy disabled, "
+    "the bridge stopped, and all related temporary access absent, and manual cleanup may "
+    "be required. "
     "I authorize temporary enabling and exact disabling of only the bridge SCM "
     "basic-auth publishing-credentials policy solely around the bounded WebJob canary. "
     "I accept that this policy update exposes no supported conditional ETag, so it "
     "cannot atomically exclude an out-of-band administrator write between the final "
     "adjacent pre-read and PUT. Each policy PUT is issued at most once without retry, "
-    "and definite success requires a fresh disabled-policy readback after the bridge "
-    "is stopped. I also accept that process death, ambiguous transport, or a local "
+    "and definite success requires prompt exact disabled-policy readback during cleanup "
+    "followed by a fresh stopped-bridge proof. I also accept that process death, "
+    "ambiguous transport, or a local "
     "journal/fsync failure after enabling can leave SCM basic authentication enabled; "
     "execution and any later release must stop until fresh reads prove the policy "
     "disabled, the bridge stopped, and all related temporary access absent, and manual "
@@ -1691,6 +1719,7 @@ def _mutation_target_allowed(
                 ("PUT", site_id + "/config/appsettings")
             },
             "startBridgeForBoundedCanary": {
+                ("PATCH", site_id),
                 ("POST", site_id + "/start"),
                 ("PUT", site_id + "/basicPublishingCredentialsPolicies/scm"),
                 (
@@ -2328,6 +2357,7 @@ def _expected_terminal_mutation_targets(
         required = Counter(
             _normalized_mutation_target(method, url)
             for method, url in (
+                ("PATCH", arm(site_id, "2025-03-01")),
                 (
                     "PUT",
                     arm(
@@ -2362,6 +2392,37 @@ def _expected_terminal_mutation_targets(
                         site_id + "/basicPublishingCredentialsPolicies/scm",
                         "2025-03-01",
                     ),
+                )
+            ] += 1
+        public_network_disable_issued = (
+            source_projection.get("publicNetworkAccessDisableMutationIssued")
+            if isinstance(source_projection, Mapping)
+            else None
+        )
+        required[
+            _normalized_mutation_target(
+                "POST", arm(site_id, "2025-03-01", "/stop")
+            )
+        ] += 1
+        if type(public_network_disable_issued) is not bool:
+            fail("terminal bridge canary public-network disable path is not exact")
+        if public_network_disable_issued:
+            required[
+                _normalized_mutation_target(
+                    "PATCH", arm(site_id, "2025-03-01")
+                )
+            ] += 1
+        post_restore_stop_issued = (
+            source_projection.get("postRestoreStopMutationIssued")
+            if isinstance(source_projection, Mapping)
+            else None
+        )
+        if type(post_restore_stop_issued) is not bool:
+            fail("terminal bridge canary post-restoration stop path is not exact")
+        if post_restore_stop_issued:
+            required[
+                _normalized_mutation_target(
+                    "POST", arm(site_id, "2025-03-01", "/stop")
                 )
             ] += 1
         return required, Counter()
@@ -2713,6 +2774,9 @@ def _validate_terminal_mutation_coverage(
         + site_id
         + "/basicPublishingCredentialsPolicies/scm?api-version=2025-03-01"
     )
+    site_url = (
+        "https://management.azure.com" + site_id + "?api-version=2025-03-01"
+    )
     start_url = (
         "https://management.azure.com" + site_id + "/start?api-version=2025-03-01"
     )
@@ -2727,6 +2791,38 @@ def _validate_terminal_mutation_coverage(
     )
     empty_sha = sha256_bytes(b"")
     expected_canary_pairs = [
+        (
+            "PATCH",
+            site_url,
+            sha256_bytes(
+                canonical_json_bytes(
+                    {"properties": {"publicNetworkAccess": "Enabled"}}
+                )
+            ),
+            canary_projection.get("publicNetworkAccessInitial", {}).get(
+                "observedAt"
+            ),
+            canary_projection.get("publicNetworkAccessEnabled", {}).get(
+                "observedAt"
+            ),
+            {
+                canary_projection.get(
+                    "publicNetworkAccessEnableAsyncOperation", {}
+                ).get("responseStatus")
+            },
+        ),
+        (
+            "POST",
+            stop_url,
+            empty_sha,
+            canary_projection.get("publicNetworkAccessInitial", {}).get(
+                "observedAt"
+            ),
+            canary_projection.get("publicNetworkAccessEnabled", {}).get(
+                "observedAt"
+            ),
+            {200, 202},
+        ),
         (
             "PUT",
             policy_url,
@@ -2758,7 +2854,7 @@ def _validate_terminal_mutation_coverage(
             stop_url,
             empty_sha,
             canary_projection.get("terminalHistoryObservedAt"),
-            canary_projection.get("stopped", {}).get("observedAt"),
+            canary_projection.get("scmBasicAuthRestored", {}).get("observedAt"),
             {200, 202},
         ),
     ]
@@ -2773,11 +2869,57 @@ def _validate_terminal_mutation_coverage(
                 sha256_bytes(
                     canonical_json_bytes({"properties": {"allow": False}})
                 ),
-                canary_projection.get("stopped", {}).get("observedAt"),
+                canary_projection.get("terminalHistoryObservedAt"),
                 canary_projection.get("scmBasicAuthRestored", {}).get(
                     "observedAt"
                 ),
                 {200},
+            )
+        )
+    public_network_disable_issued = canary_projection.get(
+        "publicNetworkAccessDisableMutationIssued"
+    )
+    if type(public_network_disable_issued) is not bool:
+        fail("terminal bridge canary public-network disable path is not exact")
+    if public_network_disable_issued:
+        expected_canary_pairs.append(
+            (
+                "PATCH",
+                site_url,
+                sha256_bytes(
+                    canonical_json_bytes(
+                        {"properties": {"publicNetworkAccess": "Disabled"}}
+                    )
+                ),
+                canary_projection.get("scmBasicAuthRestored", {}).get(
+                    "observedAt"
+                ),
+                canary_projection.get("publicNetworkAccessRestored", {}).get(
+                    "observedAt"
+                ),
+                {
+                    canary_projection.get(
+                        "publicNetworkAccessDisableAsyncOperation", {}
+                    ).get("responseStatus")
+                },
+            )
+        )
+    post_restore_stop_issued = canary_projection.get(
+        "postRestoreStopMutationIssued"
+    )
+    if type(post_restore_stop_issued) is not bool:
+        fail("terminal bridge canary post-restoration stop path is not exact")
+    if post_restore_stop_issued:
+        expected_canary_pairs.append(
+            (
+                "POST",
+                stop_url,
+                empty_sha,
+                canary_projection.get("publicNetworkAccessRestored", {}).get(
+                    "observedAt"
+                ),
+                canary_projection.get("stopped", {}).get("observedAt"),
+                {200, 202},
             )
         )
     canary_records = [
@@ -2830,6 +2972,51 @@ def _validate_terminal_mutation_coverage(
         result_at = parse_time(result.get("recordedAt"), "bridge canary result")
         if not lower <= intent_at <= result_at <= upper:
             fail("terminal bridge canary journal timing is not cross-bound")
+        if method == "PATCH" and url == site_url:
+            enabled_body_sha = sha256_bytes(
+                canonical_json_bytes(
+                    {"properties": {"publicNetworkAccess": "Enabled"}}
+                )
+            )
+            async_field = (
+                "publicNetworkAccessEnableAsyncOperation"
+                if body_sha == enabled_body_sha
+                else "publicNetworkAccessDisableAsyncOperation"
+            )
+            async_evidence = canary_projection.get(async_field)
+            if not isinstance(async_evidence, Mapping):
+                fail("terminal bridge canary lacks asynchronous operation evidence")
+            expected_header_name = (
+                async_evidence.get("monitorHeaderName")
+                if result.get("status") == 202
+                else None
+            )
+            expected_header_value = (
+                async_evidence.get("monitorUrl")
+                if result.get("status") == 202
+                else None
+            )
+            if (
+                result.get("asyncOperationHeaderName") != expected_header_name
+                or result.get("asyncOperationHeaderValue") != expected_header_value
+            ):
+                fail(
+                    "terminal bridge canary asynchronous response header is not cross-bound"
+                )
+            if result.get("status") == 202:
+                terminal_at = parse_time(
+                    async_evidence.get("terminalObservedAt"),
+                    "bridge canary asynchronous terminal observation",
+                )
+                if not result_at <= terminal_at <= upper:
+                    fail(
+                        "terminal bridge canary asynchronous timing is not cross-bound"
+                    )
+        elif (
+            result.get("asyncOperationHeaderName") is not None
+            or result.get("asyncOperationHeaderValue") is not None
+        ):
+            fail("terminal bridge canary non-PATCH result has asynchronous evidence")
 
     result_positions: dict[str, list[int]] = {}
     for index, item in enumerate(journal):
@@ -3008,6 +3195,8 @@ def _sanitize_mutation_journal(
                 "intentId",
                 "status",
                 "responseBodySha256",
+                "asyncOperationHeaderName",
+                "asyncOperationHeaderValue",
                 "etag",
                 "versionId",
                 "requestId",
@@ -3100,6 +3289,8 @@ def _sanitize_mutation_journal(
         request_id: str | None = None
         server_date: str | None = None
         storage_error_code: str | None = None
+        async_operation_header_name: str | None = None
+        async_operation_header_value: str | None = None
         if phase == "intent":
             if is_storage:
                 if client_request_id in storage_intent_client_request_ids:
@@ -3127,6 +3318,36 @@ def _sanitize_mutation_journal(
             response_sha = _sha256(
                 value.get("responseBodySha256"), "mutation response digest"
             )
+            async_operation_header_name = value.get("asyncOperationHeaderName")
+            async_operation_header_value = value.get("asyncOperationHeaderValue")
+            if (
+                (async_operation_header_name is None)
+                is not (async_operation_header_value is None)
+            ):
+                fail("mutation result asynchronous header evidence is incomplete")
+            if async_operation_header_name is not None:
+                if (
+                    status != 202
+                    or async_operation_header_name != "Azure-AsyncOperation"
+                    or not isinstance(async_operation_header_value, str)
+                    or len(async_operation_header_value) > 8192
+                ):
+                    fail("mutation result asynchronous header evidence is invalid")
+                async_parsed = urllib.parse.urlsplit(async_operation_header_value)
+                try:
+                    async_port = async_parsed.port
+                except ValueError:
+                    fail("mutation result asynchronous header URL is invalid")
+                if (
+                    async_parsed.scheme != "https"
+                    or async_port not in {None, 443}
+                    or async_parsed.username is not None
+                    or async_parsed.password is not None
+                    or async_parsed.fragment
+                    or not async_parsed.path.startswith("/")
+                    or not async_parsed.query
+                ):
+                    fail("mutation result asynchronous header URL is invalid")
             etag = value.get("etag")
             version_id = value.get("versionId")
             if etag is not None:
@@ -3169,6 +3390,8 @@ def _sanitize_mutation_journal(
                 "clientRequestId": client_request_id,
                 "status": status,
                 "responseBodySha256": response_sha,
+                "asyncOperationHeaderName": async_operation_header_name,
+                "asyncOperationHeaderValue": async_operation_header_value,
                 "etag": etag,
                 "versionId": version_id,
                 "requestId": request_id,
@@ -3225,6 +3448,8 @@ def _validate_sanitized_mutation_journal(
         "clientRequestId",
         "status",
         "responseBodySha256",
+        "asyncOperationHeaderName",
+        "asyncOperationHeaderValue",
         "etag",
         "versionId",
         "requestId",
@@ -3317,6 +3542,8 @@ def _validate_sanitized_mutation_journal(
                 intent_id != expected_intent
                 or item["status"] is not None
                 or item["responseBodySha256"] is not None
+                or item["asyncOperationHeaderName"] is not None
+                or item["asyncOperationHeaderValue"] is not None
                 or item["etag"] is not None
                 or item["versionId"] is not None
                 or item["requestId"] is not None
@@ -3355,6 +3582,33 @@ def _validate_sanitized_mutation_journal(
             if observed < intent_times[str(intent_id)]:
                 fail("sanitized mutation result predates its exact intent")
             _sha256(item["responseBodySha256"], "sanitized journal response digest")
+            async_header_name = item["asyncOperationHeaderName"]
+            async_header_value = item["asyncOperationHeaderValue"]
+            if (async_header_name is None) is not (async_header_value is None):
+                fail("sanitized journal asynchronous header evidence is incomplete")
+            if async_header_name is not None:
+                if (
+                    item["status"] != 202
+                    or async_header_name != "Azure-AsyncOperation"
+                    or not isinstance(async_header_value, str)
+                    or len(async_header_value) > 8192
+                ):
+                    fail("sanitized journal asynchronous header evidence is invalid")
+                async_parsed = urllib.parse.urlsplit(async_header_value)
+                try:
+                    async_port = async_parsed.port
+                except ValueError:
+                    fail("sanitized journal asynchronous header URL is invalid")
+                if (
+                    async_parsed.scheme != "https"
+                    or async_port not in {None, 443}
+                    or async_parsed.username is not None
+                    or async_parsed.password is not None
+                    or async_parsed.fragment
+                    or not async_parsed.path.startswith("/")
+                    or not async_parsed.query
+                ):
+                    fail("sanitized journal asynchronous header URL is invalid")
             if item["etag"] is not None:
                 _quoted_etag(item["etag"], "sanitized journal ETag")
             if item["versionId"] is not None and (
@@ -7412,10 +7666,19 @@ def _validate_operation_source_projection(
             "triggerStatus",
             "triggerLocation",
             "scmBasicAuthInitial",
+            "scmBasicAuthPrePublicNetwork",
             "scmBasicAuthEnabled",
             "scmBasicAuthRestored",
             "scmBasicAuthSelfCleaned",
             "scmDisableMutationIssued",
+            "publicNetworkAccessInitial",
+            "publicNetworkAccessEnabled",
+            "publicNetworkAccessEnableAsyncOperation",
+            "publicNetworkAccessRestored",
+            "publicNetworkAccessDisableAsyncOperation",
+            "publicNetworkAccessSelfCleaned",
+            "publicNetworkAccessDisableMutationIssued",
+            "postRestoreStopMutationIssued",
             "triggerRequestedAt",
             "historyBoundary",
             "terminalHistory",
@@ -7494,12 +7757,145 @@ def _validate_operation_source_projection(
         scm_initial = scm_policy(
             body["scmBasicAuthInitial"], False, "initial SCM basic-auth policy"
         )
+        scm_pre_public_network = scm_policy(
+            body["scmBasicAuthPrePublicNetwork"],
+            False,
+            "pre-public-network SCM basic-auth policy",
+        )
         scm_enabled = scm_policy(
             body["scmBasicAuthEnabled"], True, "enabled SCM basic-auth policy"
         )
         scm_restored = scm_policy(
             body["scmBasicAuthRestored"], False, "restored SCM basic-auth policy"
         )
+        def public_network(
+            value: Any,
+            expected_access: str,
+            expected_state: str | None,
+            label: str,
+        ) -> Mapping[str, Any]:
+            item = _exact_keys(
+                value,
+                {
+                    "resourceId",
+                    "publicNetworkAccess",
+                    "state",
+                    "observedAt",
+                    "responseSha256",
+                },
+                label,
+            )
+            observed = parse_time(item["observedAt"], f"{label} observedAt")
+            if (
+                str(item["resourceId"]).lower() != site_id.lower()
+                or item["publicNetworkAccess"] != expected_access
+                or item["state"] not in {"Running", "Stopped"}
+                or (
+                    expected_state is not None
+                    and item["state"] != expected_state
+                )
+                or not auth_start <= observed <= auth_end
+            ):
+                fail(f"{label} is not exact")
+            _sha256(item["responseSha256"], f"{label} response digest")
+            return item
+
+        public_initial = public_network(
+            body["publicNetworkAccessInitial"],
+            "Disabled",
+            "Stopped",
+            "initial bridge public-network access",
+        )
+        public_enabled = public_network(
+            body["publicNetworkAccessEnabled"],
+            "Enabled",
+            "Stopped",
+            "enabled bridge public-network access",
+        )
+        public_restored = public_network(
+            body["publicNetworkAccessRestored"],
+            "Disabled",
+            None,
+            "restored bridge public-network access",
+        )
+
+        def arm_async_operation(value: Any, label: str) -> Mapping[str, Any]:
+            item = _exact_keys(
+                value,
+                {
+                    "mode",
+                    "responseStatus",
+                    "monitorHeaderName",
+                    "monitorUrl",
+                    "pollAttempts",
+                    "terminalStatus",
+                    "terminalObservedAt",
+                    "terminalResponseSha256",
+                },
+                label,
+            )
+            if item["responseStatus"] == 200:
+                if item != {
+                    "mode": "synchronous",
+                    "responseStatus": 200,
+                    "monitorHeaderName": None,
+                    "monitorUrl": None,
+                    "pollAttempts": 0,
+                    "terminalStatus": None,
+                    "terminalObservedAt": None,
+                    "terminalResponseSha256": None,
+                }:
+                    fail(f"{label} synchronous evidence is not exact")
+                return item
+            if item["responseStatus"] != 202 or item["mode"] != "arm-async":
+                fail(f"{label} response status is not exact")
+            if item["monitorHeaderName"] != "Azure-AsyncOperation":
+                fail(f"{label} monitor header name is not exact")
+            monitor_url = item["monitorUrl"]
+            if not isinstance(monitor_url, str):
+                fail(f"{label} monitor URL is not exact")
+            parsed = urllib.parse.urlsplit(monitor_url)
+            try:
+                monitor_port = parsed.port
+            except ValueError:
+                fail(f"{label} monitor URL is outside Azure ARM")
+            if (
+                parsed.scheme != "https"
+                or (parsed.hostname or "").lower() != "management.azure.com"
+                or monitor_port not in {None, 443}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or not parsed.path.startswith("/")
+                or not parsed.query
+                or len(monitor_url) > 8192
+                or type(item["pollAttempts"]) is not int
+                or not 1 <= item["pollAttempts"] <= 64
+                or item["terminalStatus"] != "Succeeded"
+            ):
+                fail(f"{label} asynchronous evidence is not exact")
+            terminal_at = parse_time(
+                item["terminalObservedAt"], f"{label} terminal observedAt"
+            )
+            if not auth_start <= terminal_at <= auth_end:
+                fail(f"{label} terminal observedAt is outside authorization")
+            _sha256(
+                item["terminalResponseSha256"], f"{label} terminal response digest"
+            )
+            return item
+
+        public_enable_async = arm_async_operation(
+            body["publicNetworkAccessEnableAsyncOperation"],
+            "public-network enable operation",
+        )
+        public_disable_async = None
+        if body["publicNetworkAccessDisableMutationIssued"] is True:
+            public_disable_async = arm_async_operation(
+                body["publicNetworkAccessDisableAsyncOperation"],
+                "public-network disable operation",
+            )
+        elif body["publicNetworkAccessDisableAsyncOperation"] is not None:
+            fail("public-network disable operation exists without a mutation")
         boundary = _exact_keys(
             body["historyBoundary"],
             {
@@ -7712,6 +8108,46 @@ def _validate_operation_source_projection(
             or body["selfCleaned"] is not True
             or body["scmBasicAuthSelfCleaned"] is not True
             or type(body["scmDisableMutationIssued"]) is not bool
+            or body["publicNetworkAccessSelfCleaned"] is not True
+            or type(body["publicNetworkAccessDisableMutationIssued"]) is not bool
+            or (
+                public_enable_async["responseStatus"] == 202
+                and not (
+                    parse_time(
+                        public_initial["observedAt"],
+                        "initial public-network observedAt",
+                    )
+                    <= parse_time(
+                        public_enable_async["terminalObservedAt"],
+                        "public-network enable terminal observedAt",
+                    )
+                    <= parse_time(
+                        public_enabled["observedAt"],
+                        "enabled public-network observedAt",
+                    )
+                )
+            )
+            or (
+                public_disable_async is not None
+                and public_disable_async["responseStatus"] == 202
+                and not (
+                    parse_time(
+                        scm_restored["observedAt"],
+                        "restored SCM policy observedAt",
+                    )
+                    <= parse_time(
+                        public_disable_async["terminalObservedAt"],
+                        "public-network disable terminal observedAt",
+                    )
+                    <= parse_time(
+                        public_restored["observedAt"],
+                        "restored public-network observedAt",
+                    )
+                )
+            )
+            or type(body["postRestoreStopMutationIssued"]) is not bool
+            or body["postRestoreStopMutationIssued"]
+            is not (public_restored["state"] == "Running")
             or type(body["triggerStatus"]) is not int
             or body["triggerStatus"] != 200
             or boundary["entriesSha256"]
@@ -7739,6 +8175,12 @@ def _validate_operation_source_projection(
             or not (
                 auth_start
                 <= parse_time(initial["observedAt"], "initial bridge observedAt")
+                <= parse_time(
+                    scm_pre_public_network["observedAt"],
+                    "pre-public-network SCM policy observedAt",
+                )
+                <= parse_time(public_initial["observedAt"], "initial public-network observedAt")
+                <= parse_time(public_enabled["observedAt"], "enabled public-network observedAt")
                 <= parse_time(scm_initial["observedAt"], "initial SCM policy observedAt")
                 <= parse_time(scm_enabled["observedAt"], "enabled SCM policy observedAt")
                 <= parse_time(running["observedAt"], "running bridge observedAt")
@@ -7753,15 +8195,21 @@ def _validate_operation_source_projection(
             or parse_time(stopped["observedAt"], "stopped bridge observedAt")
             < terminal_observed
             or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
-            < parse_time(stopped["observedAt"], "stopped bridge observedAt")
+            < terminal_observed
+            or parse_time(public_restored["observedAt"], "restored public-network observedAt")
+            < parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
+            or parse_time(stopped["observedAt"], "stopped bridge observedAt")
+            < parse_time(public_restored["observedAt"], "restored public-network observedAt")
             or parse_time(stopped["observedAt"], "stopped bridge observedAt")
             > auth_end
             or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
             > auth_end
+            or parse_time(public_restored["observedAt"], "restored public-network observedAt")
+            > auth_end
         ):
             fail(
                 "bridge terminal canary did not succeed, finally stop, and restore "
-                "disabled SCM basic authentication"
+                "disabled SCM basic authentication and public-network access"
             )
     elif family == "worm-policy-projection":
         adopted_exact = context.get("executionDecision") == "adopt-exact"
@@ -10889,6 +11337,8 @@ def _operation_context_policy(
             "preAppSettingsSha256",
             "bootstrapSelfTestStaticControl",
         }
+    elif operation_id == "startBridgeForBoundedCanary":
+        observed_fields.add("scmBasicAuthAllowed")
     elif operation_id in {"createCustomRoleDefinitions", "createExactRoleAssignments"}:
         observed_fields.add("memberStates")
         if operation_id == "createCustomRoleDefinitions":
@@ -11226,6 +11676,11 @@ def _validate_operation_context(
             != _bootstrap_self_test_static_control(authorization)
         ):
             fail("bridge app-settings prestate or self-test control is unsafe")
+    if (
+        operation_id == "startBridgeForBoundedCanary"
+        and context["scmBasicAuthAllowed"] is not False
+    ):
+        fail("bridge canary preflight does not prove SCM basic auth disabled")
     if operation_id in {"createCustomRoleDefinitions", "createExactRoleAssignments"}:
         if operation_id == "createCustomRoleDefinitions":
             expected_members = {
@@ -11487,6 +11942,39 @@ def validate_preflight_evidence(
                 or any(item not in probe_map or probe_map[item]["phase"] != phase for item in ids)
             ):
                 fail("operation admission probe binding is invalid")
+        if operation_id == "startBridgeForBoundedCanary":
+            bridge_site_url = _validator_contract(
+                f"operation:{operation_id}", plan, authorization
+            )["expectedUrl"]
+            bridge_resource_id = next(
+                item["resourceId"]
+                for item in plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            scm_policy_url = (
+                "https://management.azure.com"
+                + bridge_resource_id
+                + "/basicPublishingCredentialsPolicies/scm"
+                + "?api-version=2025-03-01"
+            )
+            canary_probes = [probe_map[item] for item in admission["probeIds"]]
+            probes_by_url = {
+                item["url"]: item
+                for item in canary_probes
+                if item["method"] == "GET"
+                and item["requestBodySha256"] is None
+            }
+            expected_status = 404 if admission["status"] == "absent" else 200
+            if (
+                admission["status"] not in {"absent", "exact"}
+                or len(canary_probes) != 2
+                or set(probes_by_url) != {bridge_site_url, scm_policy_url}
+                or probes_by_url[bridge_site_url]["status"] != expected_status
+                or probes_by_url[scm_policy_url]["status"] != expected_status
+            ):
+                fail(
+                    "bridge canary admission is not bound to exact site and SCM policy probes"
+                )
         if operation_id in {
             "lockPackageRetentionAt91Days",
             "extendAcceptedRetentionFrom30To91Days",
@@ -13201,6 +13689,9 @@ class AzureCliBootstrapTransport:
             self._header(response, "x-ms-request-id"),
             self._header(response, "Date"),
         )
+        async_header_name, async_header_value = self._async_operation_response_header(
+            response, strict=False
+        )
         self._ledger.append_cloud_mutation(
             {
                 "schemaVersion": 1,
@@ -13214,6 +13705,8 @@ class AzureCliBootstrapTransport:
                 "clientRequestId": response.client_request_id,
                 "status": response.status,
                 "responseBodySha256": sha256_bytes(response.body),
+                "asyncOperationHeaderName": async_header_name,
+                "asyncOperationHeaderValue": async_header_value,
                 "etag": self._header(response, "ETag"),
                 "versionId": self._header(response, "x-ms-version-id"),
                 "requestId": (
@@ -13996,6 +14489,26 @@ class AzureCliBootstrapTransport:
         return values[0] if values else None
 
     @staticmethod
+    def _async_operation_response_header(
+        response: _RestResponse, *, strict: bool
+    ) -> tuple[str | None, str | None]:
+        if response.status != 202:
+            return None, None
+        source = (
+            response.header_items
+            if response.header_items is not None
+            else tuple(response.headers.items())
+        )
+        matches = [
+            value for key, value in source if key.lower() == "azure-asyncoperation"
+        ]
+        if len(matches) != 1:
+            if strict:
+                fail("HTTP 202 lacks one exact Azure-AsyncOperation URL")
+            return None, None
+        return "Azure-AsyncOperation", matches[0]
+
+    @staticmethod
     def _timestamp(value: dt.datetime) -> str:
         return (
             value.astimezone(dt.timezone.utc)
@@ -14351,6 +14864,130 @@ class AzureCliBootstrapTransport:
             "observedAt": self._timestamp(self.clock()),
             "responseSha256": _response_sha256(response),
         }
+
+    def _read_site_public_network_access(
+        self,
+        *,
+        site_resource_id: str,
+        deadline: dt.datetime,
+        expected_access: str | None,
+        expected_state: str | None,
+        label: str,
+    ) -> Mapping[str, Any]:
+        response = self._read_request_with_transport_retry(
+            "GET",
+            self._arm_url(site_resource_id, "2025-03-01"),
+            deadline=deadline,
+            retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+            failure_context="site-public-network-access",
+        )
+        document = self._json_response(response, {200}, label)
+        properties = document.get("properties")
+        access = (
+            properties.get("publicNetworkAccess")
+            if isinstance(properties, Mapping)
+            else None
+        )
+        state = properties.get("state") if isinstance(properties, Mapping) else None
+        if (
+            str(document.get("id", "")).lower() != site_resource_id.lower()
+            or document.get("name") != self.resources["bridgeSite"]["name"]
+            or document.get("type") != "Microsoft.Web/sites"
+            or not isinstance(properties, Mapping)
+            or access not in {"Enabled", "Disabled"}
+            or state not in {"Running", "Stopped"}
+            or (expected_state is not None and state != expected_state)
+            or (expected_access is not None and access != expected_access)
+        ):
+            fail(f"{label} is not exact")
+        return {
+            "resourceId": site_resource_id,
+            "publicNetworkAccess": access,
+            "state": state,
+            "observedAt": self._timestamp(self.clock()),
+            "responseSha256": _response_sha256(response),
+        }
+
+    def _await_arm_async_operation(
+        self,
+        response: _RestResponse,
+        *,
+        deadline: dt.datetime,
+        label: str,
+    ) -> Mapping[str, Any]:
+        if response.status != 202:
+            return {
+                "mode": "synchronous",
+                "responseStatus": response.status,
+                "monitorHeaderName": None,
+                "monitorUrl": None,
+                "pollAttempts": 0,
+                "terminalStatus": None,
+                "terminalObservedAt": None,
+                "terminalResponseSha256": None,
+            }
+        try:
+            monitor_header_name, async_url = self._async_operation_response_header(
+                response, strict=True
+            )
+        except BootstrapError as exc:
+            raise BootstrapError(
+                f"{label} HTTP 202 lacks one exact Azure-AsyncOperation URL"
+            ) from exc
+        if monitor_header_name is None or async_url is None:
+            fail(f"{label} HTTP 202 lacks one exact Azure-AsyncOperation URL")
+        parsed = urllib.parse.urlsplit(async_url)
+        try:
+            async_port = parsed.port
+        except ValueError:
+            fail(f"{label} asynchronous operation URL is outside Azure ARM")
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "management.azure.com"
+            or async_port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+            or not parsed.query
+            or len(async_url) > 8192
+        ):
+            fail(f"{label} asynchronous operation URL is outside Azure ARM")
+        for attempt in range(1, 65):
+            if self.clock() >= deadline:
+                fail(f"{label} asynchronous operation crossed the readback deadline")
+            poll = self._read_request_with_transport_retry(
+                "GET",
+                async_url,
+                deadline=deadline,
+                retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                failure_context=f"{label}-async-operation",
+            )
+            if poll.status == 202 and not poll.body:
+                status = "InProgress"
+            else:
+                document = self._json_response(
+                    poll, {200, 202}, f"{label} asynchronous operation"
+                )
+                status = document.get("status")
+            if status == "Succeeded":
+                return {
+                    "mode": "arm-async",
+                    "responseStatus": 202,
+                    "monitorHeaderName": monitor_header_name,
+                    "monitorUrl": async_url,
+                    "pollAttempts": attempt,
+                    "terminalStatus": "Succeeded",
+                    "terminalObservedAt": self._timestamp(self.clock()),
+                    "terminalResponseSha256": _response_sha256(poll),
+                }
+            if status not in {"Accepted", "InProgress", "Running"}:
+                fail(f"{label} asynchronous operation did not succeed")
+            delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
+            if self.clock() + dt.timedelta(seconds=delay) >= deadline:
+                fail(f"{label} asynchronous operation would cross the readback deadline")
+            self.sleep(delay)
+        fail(f"{label} asynchronous operation exceeded bounded attempts")
 
     def _wait_for_webjob_history_boundary(
         self,
@@ -15828,17 +16465,36 @@ class AzureCliBootstrapTransport:
                     or runtime_facts.get("scmBasicAuthSelfCleaned") is not True
                     or runtime_facts.get("scmBasicAuthInitial", {}).get("allow")
                     is not False
+                    or runtime_facts.get("scmBasicAuthPrePublicNetwork", {}).get(
+                        "allow"
+                    )
+                    is not False
                     or runtime_facts.get("scmBasicAuthEnabled", {}).get("allow")
                     is not True
                     or runtime_facts.get("scmBasicAuthRestored", {}).get("allow")
                     is not False
+                    or runtime_facts.get("publicNetworkAccessSelfCleaned") is not True
+                    or runtime_facts.get("publicNetworkAccessInitial", {}).get(
+                        "publicNetworkAccess"
+                    )
+                    != "Disabled"
+                    or runtime_facts.get("publicNetworkAccessEnabled", {}).get(
+                        "publicNetworkAccess"
+                    )
+                    != "Enabled"
+                    or runtime_facts.get("publicNetworkAccessRestored", {}).get(
+                        "publicNetworkAccess"
+                    )
+                    != "Disabled"
                     or runtime_facts.get("terminalHistory", {}).get("status")
                     != "Success"
                     or not isinstance(properties, Mapping)
                     or properties.get("state") != "Stopped"
+                    or properties.get("publicNetworkAccess") != "Disabled"
                 ):
                     fail(
-                        "bridge canary lacks fresh terminal Success or finally-stop readback"
+                        "bridge canary lacks fresh terminal Success, disabled public "
+                        "network access, or finally-stop readback"
                     )
             elif operation_id == "createSolePublisherFicToSignedBootstrapSource":
                 credentials = projection_document.get("federatedIdentityCredentials")
@@ -19449,6 +20105,7 @@ class AzureCliBootstrapTransport:
             )
             start_url = self._arm_url(site["resourceId"], "2025-03-01", "/start")
             stop_url = self._arm_url(site["resourceId"], "2025-03-01", "/stop")
+            site_url = self._arm_url(site["resourceId"], "2025-03-01")
             run_url = self._arm_url(
                 site["resourceId"],
                 "2025-05-01",
@@ -19465,23 +20122,112 @@ class AzureCliBootstrapTransport:
             scm_enabled_body = canonical_json_bytes(
                 {"properties": {"allow": True}}
             )
+            public_network_disabled_body = canonical_json_bytes(
+                {"properties": {"publicNetworkAccess": "Disabled"}}
+            )
+            public_network_enabled_body = canonical_json_bytes(
+                {"properties": {"publicNetworkAccess": "Enabled"}}
+            )
             start_attempted = False
             scm_enable_attempted = False
+            public_network_enable_attempted = False
+            public_network_enable_completed = False
             primary_error: BaseException | None = None
             primary_stage = "start"
             stop_error: BaseException | None = None
+            final_stop_error: BaseException | None = None
             scm_restore_error: BaseException | None = None
+            public_network_restore_error: BaseException | None = None
             scm_disable_mutation_issued = False
+            public_network_disable_mutation_issued = False
+            post_restore_stop_mutation_issued = False
             canary: Mapping[str, Any] | None = None
             running: Mapping[str, Any] | None = None
             stopped: Mapping[str, Any] | None = None
             scm_initial: Mapping[str, Any] | None = None
+            scm_pre_public_network: Mapping[str, Any] | None = None
             scm_enabled: Mapping[str, Any] | None = None
             scm_restored: Mapping[str, Any] | None = None
+            public_network_initial: Mapping[str, Any] | None = None
+            public_network_enabled: Mapping[str, Any] | None = None
+            public_network_restored: Mapping[str, Any] | None = None
+            public_network_enable_async: Mapping[str, Any] | None = None
+            public_network_disable_async: Mapping[str, Any] | None = None
+            public_network_enable_response: _RestResponse | None = None
+            public_network_enable_resolution_error: BaseException | None = None
+            public_network_incident_marker_created = False
             trigger_status: int | None = None
             trigger_location: Mapping[str, Any] | None = None
             trigger_requested_at: dt.datetime | None = None
             try:
+                primary_stage = "public-network-enable"
+                scm_pre_public_network = self._read_scm_basic_auth_policy(
+                    site_resource_id=site["resourceId"],
+                    deadline=startup_deadline,
+                    expected_allow=False,
+                    label="bridge SCM basic-auth pre-public-network precondition",
+                )
+                public_network_initial = self._read_site_public_network_access(
+                    site_resource_id=site["resourceId"],
+                    deadline=startup_deadline,
+                    expected_access="Disabled",
+                    expected_state="Stopped",
+                    label="bridge public-network precondition",
+                )
+                if self._ledger is None:
+                    fail("public-network enable lacks its durable ledger")
+                self._ledger.write_unresolved_public_network_enable(
+                    {
+                        "schemaVersion": 1,
+                        "status": "unresolved-public-network-enable",
+                        "authorizationId": self.authorization["authorizationId"],
+                        "sourceSha": self.authorization["source"]["mergedMain"][
+                            "commitSha"
+                        ],
+                        "siteResourceId": site["resourceId"],
+                        "enableMutationTargetUrl": site_url,
+                        "responseStatus": None,
+                        "asyncOperationHeaderName": None,
+                        "asyncOperationHeaderValue": None,
+                        "recordedAt": self._timestamp(self.clock()),
+                    }
+                )
+                public_network_incident_marker_created = True
+                public_network_enable_attempted = True
+                public_network_enable_response = self._mutation_request(
+                    "PATCH",
+                    site_url,
+                    body=public_network_enabled_body,
+                    headers={"Content-Type": "application/json"},
+                    expected={200, 202},
+                )
+                public_network_enable_async = self._await_arm_async_operation(
+                    public_network_enable_response,
+                    deadline=startup_deadline,
+                    label="bridge public-network enable",
+                )
+                public_network_enable_completed = True
+                self._mutation_request(
+                    "POST",
+                    stop_url,
+                    body=b"",
+                    expected={200, 202},
+                )
+                self._wait_for_site_state(
+                    site_resource_id=site["resourceId"],
+                    expected_state="Stopped",
+                    allow_expired_cleanup=False,
+                    deadline=startup_deadline,
+                    read_retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                    read_failure_context="public-network-restop",
+                )
+                public_network_enabled = self._read_site_public_network_access(
+                    site_resource_id=site["resourceId"],
+                    deadline=startup_deadline,
+                    expected_access="Enabled",
+                    expected_state="Stopped",
+                    label="bridge public-network enabled readback",
+                )
                 primary_stage = "scm-basic-auth-enable"
                 scm_initial = self._read_scm_basic_auth_policy(
                     site_resource_id=site["resourceId"],
@@ -19560,17 +20306,6 @@ class AzureCliBootstrapTransport:
                             expected={200, 202},
                             cleanup=True,
                         )
-                        stopped = self._wait_for_site_state(
-                            site_resource_id=site["resourceId"],
-                            expected_state="Stopped",
-                            allow_expired_cleanup=True,
-                            deadline=(
-                                self.clock()
-                                + dt.timedelta(
-                                    seconds=MAX_CANARY_CONVERGENCE_SECONDS
-                                )
-                            ),
-                        )
                     except BaseException as exc:
                         stop_error = exc
                 if scm_enable_attempted:
@@ -19611,8 +20346,143 @@ class AzureCliBootstrapTransport:
                             scm_restored = before_restore
                     except BaseException as exc:
                         scm_restore_error = exc
+                if public_network_enable_attempted:
+                    try:
+                        if (
+                            not public_network_enable_completed
+                            and public_network_enable_response is not None
+                        ):
+                            try:
+                                public_network_enable_async = (
+                                    self._await_arm_async_operation(
+                                        public_network_enable_response,
+                                        deadline=(
+                                            self.clock()
+                                            + dt.timedelta(
+                                                seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                            )
+                                        ),
+                                        label=(
+                                            "bridge public-network enable cleanup "
+                                            "resolution"
+                                        ),
+                                    )
+                                )
+                                public_network_enable_completed = True
+                            except BaseException as exc:
+                                public_network_enable_resolution_error = exc
+                        before_network_restore = None
+                        if public_network_enable_completed:
+                            before_network_restore = self._read_site_public_network_access(
+                                site_resource_id=site["resourceId"],
+                                deadline=(
+                                    self.clock()
+                                    + dt.timedelta(
+                                        seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                    )
+                                ),
+                                expected_access=None,
+                                expected_state=None,
+                                label="bridge public-network rollback classification",
+                            )
+                        if (
+                            not public_network_enable_completed
+                            or before_network_restore["publicNetworkAccess"] == "Enabled"
+                        ):
+                            public_network_disable_mutation_issued = True
+                            public_network_disable_response = self._mutation_request(
+                                "PATCH",
+                                site_url,
+                                body=public_network_disabled_body,
+                                headers={"Content-Type": "application/json"},
+                                expected={200, 202},
+                                cleanup=True,
+                            )
+                            public_network_disable_async = self._await_arm_async_operation(
+                                public_network_disable_response,
+                                deadline=(
+                                    self.clock()
+                                    + dt.timedelta(
+                                        seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                    )
+                                ),
+                                label="bridge public-network disable",
+                            )
+                            public_network_restored = self._read_site_public_network_access(
+                                site_resource_id=site["resourceId"],
+                                deadline=(
+                                    self.clock()
+                                    + dt.timedelta(
+                                        seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                    )
+                                ),
+                                expected_access="Disabled",
+                                expected_state=None,
+                                label="bridge public-network restored readback",
+                            )
+                        else:
+                            public_network_restored = before_network_restore
+                    except BaseException as exc:
+                        public_network_restore_error = exc
+                    if not public_network_enable_completed:
+                        unresolved_error = BootstrapError(
+                            "the accepted public-network enable operation remains "
+                            "durably unresolved after forced-disable cleanup"
+                        )
+                        if public_network_enable_resolution_error is not None:
+                            unresolved_error.__cause__ = (
+                                public_network_enable_resolution_error
+                            )
+                        if public_network_restore_error is None:
+                            public_network_restore_error = unresolved_error
+                if public_network_enable_attempted and public_network_restored is not None:
+                    try:
+                        if public_network_restored["state"] != "Stopped":
+                            post_restore_stop_mutation_issued = True
+                            self._mutation_request(
+                                "POST",
+                                stop_url,
+                                body=b"",
+                                expected={200, 202},
+                                cleanup=True,
+                            )
+                        stopped = self._wait_for_site_state(
+                            site_resource_id=site["resourceId"],
+                            expected_state="Stopped",
+                            allow_expired_cleanup=True,
+                            deadline=(
+                                self.clock()
+                                + dt.timedelta(
+                                    seconds=MAX_CANARY_CONVERGENCE_SECONDS
+                                )
+                            ),
+                        )
+                        if public_network_enable_completed:
+                            if (
+                                public_network_restored["publicNetworkAccess"]
+                                != "Disabled"
+                                or stopped["state"] != "Stopped"
+                            ):
+                                fail(
+                                    "public-network incident cannot be cleared without "
+                                    "exact Disabled and Stopped proof"
+                                )
+                            if self._ledger is None:
+                                fail(
+                                    "public-network incident cannot be cleared without "
+                                    "its durable ledger"
+                                )
+                            self._ledger.clear_unresolved_public_network_enable()
+                            public_network_incident_marker_created = False
+                    except BaseException as exc:
+                        final_stop_error = exc
             if primary_error is not None:
-                if stop_error is not None or scm_restore_error is not None:
+                if (
+                    stop_error is not None
+                    or scm_restore_error is not None
+                    or public_network_restore_error is not None
+                    or final_stop_error is not None
+                ):
                     raise BootstrapError(
                         "bridge canary failed and exact finally cleanup also failed; "
                         "the durable mutation journal requires operator recovery"
@@ -19630,6 +20500,16 @@ class AzureCliBootstrapTransport:
                     "bridge canary reached terminal Success but exact SCM basic-auth "
                     "restoration failed"
                 ) from scm_restore_error
+            if public_network_restore_error is not None:
+                raise BootstrapError(
+                    "bridge canary reached terminal Success but exact public-network "
+                    "restoration failed"
+                ) from public_network_restore_error
+            if final_stop_error is not None:
+                raise BootstrapError(
+                    "bridge canary reached terminal Success but fresh post-restoration "
+                    "finally-stop proof failed"
+                ) from final_stop_error
             if (
                 canary is None
                 or running is None
@@ -19638,8 +20518,15 @@ class AzureCliBootstrapTransport:
                 or trigger_status is None
                 or trigger_location is None
                 or scm_initial is None
+                or scm_pre_public_network is None
                 or scm_enabled is None
                 or scm_restored is None
+                or public_network_initial is None
+                or public_network_enabled is None
+                or public_network_restored is None
+                or public_network_enable_async is None
+                or public_network_disable_async is None
+                or public_network_incident_marker_created
             ):
                 fail("bridge canary proof is incomplete")
             if (
@@ -19667,10 +20554,25 @@ class AzureCliBootstrapTransport:
                 "triggerStatus": trigger_status,
                 "triggerLocation": dict(trigger_location),
                 "scmBasicAuthInitial": dict(scm_initial),
+                "scmBasicAuthPrePublicNetwork": dict(scm_pre_public_network),
                 "scmBasicAuthEnabled": dict(scm_enabled),
                 "scmBasicAuthRestored": dict(scm_restored),
                 "scmBasicAuthSelfCleaned": True,
                 "scmDisableMutationIssued": scm_disable_mutation_issued,
+                "publicNetworkAccessInitial": dict(public_network_initial),
+                "publicNetworkAccessEnabled": dict(public_network_enabled),
+                "publicNetworkAccessEnableAsyncOperation": dict(
+                    public_network_enable_async
+                ),
+                "publicNetworkAccessRestored": dict(public_network_restored),
+                "publicNetworkAccessDisableAsyncOperation": dict(
+                    public_network_disable_async
+                ),
+                "publicNetworkAccessSelfCleaned": True,
+                "publicNetworkAccessDisableMutationIssued": (
+                    public_network_disable_mutation_issued
+                ),
+                "postRestoreStopMutationIssued": post_restore_stop_mutation_issued,
                 "triggerRequestedAt": self._timestamp(trigger_requested_at),
                 "historyBoundary": canary["historyBoundary"],
                 "terminalHistory": canary["terminalHistory"],
@@ -21177,6 +22079,117 @@ class AzureCliBootstrapTransport:
             "sourceProjection": source_projection,
         }
 
+def _validate_unresolved_public_network_enable_incident(
+    value: Any, *, expected_directory_name: str
+) -> dict[str, Any]:
+    incident = dict(
+        _exact_keys(
+            value,
+            {
+                "schemaVersion",
+                "status",
+                "authorizationId",
+                "sourceSha",
+                "siteResourceId",
+                "enableMutationTargetUrl",
+                "responseStatus",
+                "asyncOperationHeaderName",
+                "asyncOperationHeaderValue",
+                "recordedAt",
+            },
+            "unresolved public-network enable incident",
+        )
+    )
+    expected_authorization_id = expected_directory_name.removeprefix(
+        "paperdesk-private-release-v2-bootstrap-"
+    )
+    if (
+        incident["schemaVersion"] != 1
+        or incident["status"] != "unresolved-public-network-enable"
+        or incident["authorizationId"] != expected_authorization_id
+        or not GUID.fullmatch(str(incident["authorizationId"]))
+        or not SHA40.fullmatch(str(incident["sourceSha"]))
+        or not isinstance(incident["siteResourceId"], str)
+        or not incident["siteResourceId"].lower().endswith(
+            "/providers/microsoft.web/sites/"
+            "paperdesk-release-registry-bridge-v2-9c4e0d0d"
+        )
+        or incident["enableMutationTargetUrl"]
+        != (
+            "https://management.azure.com"
+            + incident["siteResourceId"]
+            + "?api-version=2025-03-01"
+        )
+        or incident["responseStatus"] not in {None, 202}
+        or (
+            (incident["asyncOperationHeaderName"] is None)
+            is not (incident["asyncOperationHeaderValue"] is None)
+        )
+    ):
+        fail("unresolved public-network enable incident is not exact")
+    if incident["asyncOperationHeaderName"] is not None:
+        if (
+            incident["responseStatus"] != 202
+            or incident["asyncOperationHeaderName"] != "Azure-AsyncOperation"
+            or not isinstance(incident["asyncOperationHeaderValue"], str)
+            or len(incident["asyncOperationHeaderValue"]) > 8192
+        ):
+            fail("unresolved public-network enable incident header is invalid")
+        parsed = urllib.parse.urlsplit(incident["asyncOperationHeaderValue"])
+        try:
+            port = parsed.port
+        except ValueError:
+            fail("unresolved public-network enable incident header is invalid")
+        if (
+            parsed.scheme != "https"
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+            or not parsed.query
+        ):
+            fail("unresolved public-network enable incident header is invalid")
+    parse_time(incident["recordedAt"], "unresolved public-network incident timestamp")
+    return incident
+
+
+def _reject_prior_unresolved_public_network_enable_incidents(
+    receipt_directory: Path,
+    *,
+    incident_root: Path,
+) -> None:
+    if not incident_root.is_dir() or incident_root.is_symlink():
+        fail("source-fixed incident root must already exist as one real directory")
+    try:
+        resolved_root = incident_root.resolve(strict=True)
+        resolved_parent = receipt_directory.parent.resolve(strict=True)
+    except OSError as exc:
+        raise BootstrapError("public-network incident root cannot be resolved") from exc
+    if resolved_parent != resolved_root:
+        fail("authorization receipt directory is outside the source-fixed incident root")
+    for candidate in sorted(
+        resolved_root.glob("paperdesk-private-release-v2-bootstrap-*")
+    ):
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        marker = candidate / UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME
+        if not marker.exists():
+            continue
+        if not marker.is_file() or marker.is_symlink():
+            fail("unresolved public-network enable incident marker is unsafe")
+        value, raw = load_json(marker, require_canonical=True)
+        incident = _validate_unresolved_public_network_enable_incident(
+            value, expected_directory_name=candidate.name
+        )
+        if canonical_json_bytes(incident) != raw:
+            fail("unresolved public-network enable incident is not canonical")
+        fail(
+            "a prior public-network enable operation remains durably unresolved; "
+            "fresh Azure bootstrap is NO-GO pending reviewed recovery"
+        )
+
+
 @dataclasses.dataclass
 class UseLedger:
     directory: Path
@@ -21218,6 +22231,34 @@ class UseLedger:
         except BaseException:
             # The directory itself remains as the durable consumed marker.
             raise
+        self._fsync_directory(self.directory)
+
+    def write_unresolved_public_network_enable(
+        self, document: Mapping[str, Any]
+    ) -> Path:
+        validated = _validate_unresolved_public_network_enable_incident(
+            document, expected_directory_name=self.directory.name
+        )
+        target = self.directory / UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_json_bytes(validated))
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._fsync_directory(self.directory)
+        return target
+
+    def clear_unresolved_public_network_enable(self) -> None:
+        target = self.directory / UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME
+        if not target.is_file() or target.is_symlink():
+            fail("unresolved public-network enable incident marker is absent or unsafe")
+        value, raw = load_json(target, require_canonical=True)
+        validated = _validate_unresolved_public_network_enable_incident(
+            value, expected_directory_name=self.directory.name
+        )
+        if canonical_json_bytes(validated) != raw:
+            fail("unresolved public-network enable incident is not canonical")
+        target.unlink()
         self._fsync_directory(self.directory)
 
     @classmethod
@@ -22189,6 +23230,7 @@ class BootstrapExecutor:
         transport: BootstrapTransport,
         now: Callable[[], dt.datetime],
         source_validator: Callable[[Mapping[str, Any]], Mapping[str, Any]] = validate_local_source,
+        incident_root: Path = PUBLIC_NETWORK_INCIDENT_ROOT,
     ) -> None:
         self.plan = plan
         self.plan_sha256 = plan_sha256
@@ -22198,11 +23240,16 @@ class BootstrapExecutor:
         self.transport = transport
         self.now = now
         self.source_validator = source_validator
+        self.incident_root = incident_root
 
     def run(self) -> BootstrapResult:
         current = self.now()
         if not self.authorization.not_before <= current <= self.authorization.expires_at:
             fail("authorization expired before execution admission")
+        _reject_prior_unresolved_public_network_enable_incidents(
+            self.authorization.receipt_directory,
+            incident_root=self.incident_root,
+        )
 
         def require_live_authorization(label: str) -> None:
             observed = self.now()

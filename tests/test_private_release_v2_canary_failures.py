@@ -729,6 +729,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             transport=transport,
             now=now,
             source_validator=self.source,
+            incident_root=validated.receipt_directory.parent,
         )
 
     def test_definitive_409_create_does_not_reconcile_or_claim_ownership(self):

@@ -37,6 +37,7 @@ class PackageFailureReceiptTests(unittest.TestCase):
                 plan=self.plan, plan_sha256=self.plan_sha, package=self.package,
                 authorization=validated, preflight=preflight, transport=transport,
                 now=lambda: fixtures.NOW, source_validator=self.harness.source,
+                incident_root=validated.receipt_directory.parent,
             )
             original_apply = transport.apply_operation
             original_compensate = transport.compensate_temporary

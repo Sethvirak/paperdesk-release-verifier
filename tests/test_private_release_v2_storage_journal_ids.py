@@ -75,6 +75,12 @@ class StorageJournalClientRequestIdTests(unittest.TestCase):
                         "intentId": item["intentId"],
                         "status": item["status"],
                         "responseBodySha256": item["responseBodySha256"],
+                        "asyncOperationHeaderName": item[
+                            "asyncOperationHeaderName"
+                        ],
+                        "asyncOperationHeaderValue": item[
+                            "asyncOperationHeaderValue"
+                        ],
                         "etag": item["etag"],
                         "versionId": item["versionId"],
                         "requestId": item["requestId"],
