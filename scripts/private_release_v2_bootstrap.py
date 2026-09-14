@@ -42,9 +42,11 @@ import xml.etree.ElementTree as ET
 try:
     from scripts import build_private_release_bridge_package as package_builder
     from scripts import private_release_v2_cleanup_locks as cleanup_locks
+    from scripts import private_release_v2_webjob_evidence as webjob_evidence
 except ModuleNotFoundError:  # direct ``python scripts/...`` execution
     import build_private_release_bridge_package as package_builder  # type: ignore
     import private_release_v2_cleanup_locks as cleanup_locks  # type: ignore
+    import private_release_v2_webjob_evidence as webjob_evidence  # type: ignore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +89,8 @@ MAX_BOOTSTRAP_SELF_TEST_SECONDS = 900
 MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 710
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS = 60
+MAX_CANARY_FINAL_HISTORY_SECONDS = 180
+WEBJOB_TRIGGER_USER_AGENT_PREFIX = "PaperDeskV2Bootstrap/"
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
 # A protected cleanup can reach lock restoration after its authorization has
 # expired.  Give only the read-only restoration classification and readback
@@ -1483,6 +1487,24 @@ def _guid(value: Any, label: str) -> str:
     return value
 
 
+def _validated_webjob_trigger_user_agent(
+    value: Any, authorization_id: str
+) -> str:
+    """Validate one authorization-bound UUID4 WebJob trigger User-Agent."""
+
+    _guid(authorization_id, "WebJob trigger User-Agent authorization ID")
+    expected_prefix = WEBJOB_TRIGGER_USER_AGENT_PREFIX + authorization_id + "."
+    if not isinstance(value, str) or not value.startswith(expected_prefix):
+        fail("WebJob trigger User-Agent is not authorization-bound")
+    request_id = value[len(expected_prefix) :]
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        request_id,
+    ) is None:
+        fail("WebJob trigger User-Agent does not contain an exact UUID4")
+    return value
+
+
 def _graph_app_role_assignment_id(value: Any, label: str) -> str:
     """Validate a Microsoft Graph appRoleAssignment resource identifier.
 
@@ -2790,6 +2812,18 @@ def _validate_terminal_mutation_coverage(
         "https://management.azure.com" + site_id + "/stop?api-version=2025-03-01"
     )
     empty_sha = sha256_bytes(b"")
+    trigger_correlation = canary_projection.get("triggerCorrelation")
+    if not isinstance(trigger_correlation, Mapping):
+        fail("terminal bridge canary lacks its trigger correlation")
+    trigger_user_agent = _validated_webjob_trigger_user_agent(
+        trigger_correlation.get("userAgent"), authorization_id
+    )
+    trigger_response_at = parse_time(
+        trigger_correlation.get("responseObservedAt"),
+        "WebJob trigger response observation",
+    )
+    if trigger_correlation.get("responseBodySha256") != empty_sha:
+        fail("WebJob trigger response body digest is not exact")
     expected_canary_pairs = [
         (
             "PATCH",
@@ -2966,12 +3000,27 @@ def _validate_terminal_mutation_coverage(
             fail(
                 "terminal bridge canary mutation order, body, or status is not exact"
             )
+        is_trigger_pair = method == "POST" and url == run_url
+        if is_trigger_pair:
+            if any(
+                "webJobTriggerUserAgent" not in item
+                or item.get("webJobTriggerUserAgent") != trigger_user_agent
+                for item in (intent, result)
+            ):
+                fail("terminal WebJob trigger journal User-Agent is not cross-bound")
+        elif any("webJobTriggerUserAgent" in item for item in (intent, result)):
+            fail("non-trigger bridge canary journal contains a User-Agent")
         lower = parse_time(lower_raw, "bridge canary journal lower boundary")
         upper = parse_time(upper_raw, "bridge canary journal upper boundary")
         intent_at = parse_time(intent.get("recordedAt"), "bridge canary intent")
         result_at = parse_time(result.get("recordedAt"), "bridge canary result")
         if not lower <= intent_at <= result_at <= upper:
             fail("terminal bridge canary journal timing is not cross-bound")
+        if is_trigger_pair and (
+            result.get("responseBodySha256") != empty_sha
+            or result_at > trigger_response_at
+        ):
+            fail("terminal WebJob trigger response is not cross-bound")
         if method == "PATCH" and url == site_url:
             enabled_body_sha = sha256_bytes(
                 canonical_json_bytes(
@@ -3145,6 +3194,31 @@ def _expected_permanent_outcome(
     return "updated-exact"
 
 
+def _is_webjob_trigger_journal_record(
+    operation_id: Any, method: Any, target_url: Any
+) -> bool:
+    if (
+        operation_id != "startBridgeForBoundedCanary"
+        or method != "POST"
+        or not isinstance(target_url, str)
+    ):
+        return False
+    parsed = urllib.parse.urlsplit(target_url)
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == "management.azure.com"
+        and parsed.port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.fragment == ""
+        and parsed.path.lower().endswith(
+            "/triggeredwebjobs/paperdesk-accepted-release-registry/run"
+        )
+        and urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        == [("api-version", "2025-05-01")]
+    )
+
+
 def _sanitize_mutation_journal(
     records: Any,
     *,
@@ -3203,7 +3277,11 @@ def _sanitize_mutation_journal(
                 "serverDate",
                 "storageErrorCode",
             }
-        if set(value) != expected_keys or value.get("schemaVersion") != 1:
+        if (
+            not expected_keys.issubset(value)
+            or set(value) - expected_keys - {"webJobTriggerUserAgent"}
+            or value.get("schemaVersion") != 1
+        ):
             fail("mutation journal record fields are not exact")
         operation_id = value.get("operationId")
         operation = mutation_by_id.get(operation_id)
@@ -3241,6 +3319,19 @@ def _sanitize_mutation_journal(
             operation_contexts=operation_contexts,
         ):
             fail("mutation journal target is outside the source-owned operation contract")
+        is_webjob_trigger = _is_webjob_trigger_journal_record(
+            operation_id, method, target_url
+        )
+        if is_webjob_trigger:
+            if "webJobTriggerUserAgent" not in value:
+                fail("WebJob trigger mutation lacks its exact User-Agent")
+            webjob_trigger_user_agent = _validated_webjob_trigger_user_agent(
+                value["webJobTriggerUserAgent"], authorization_id
+            )
+        else:
+            if "webJobTriggerUserAgent" in value:
+                fail("non-WebJob-trigger mutation contains a User-Agent")
+            webjob_trigger_user_agent = None
         _sha256(value.get("requestBodySha256"), "mutation request body digest")
         expected_worm_body_sha256 = _expected_worm_mutation_body_sha256(
             str(operation_id), str(method), target_url
@@ -3309,6 +3400,8 @@ def _sanitize_mutation_journal(
                 or value.get("targetUrl") != intent.get("targetUrl")
                 or value.get("requestBodySha256") != intent.get("requestBodySha256")
                 or value.get("clientRequestId") != intent.get("clientRequestId")
+                or value.get("webJobTriggerUserAgent")
+                != intent.get("webJobTriggerUserAgent")
                 or value.get("temporary") is not intent.get("temporary")
             ):
                 fail("mutation result is not bound to one prior intent")
@@ -3377,8 +3470,7 @@ def _sanitize_mutation_journal(
             results.add(str(intent_id))
         else:
             fail("mutation journal phase is invalid")
-        sanitized.append(
-            {
+        sanitized_record = {
                 "sequence": sequence,
                 "phase": phase,
                 "intentId": intent_id,
@@ -3399,7 +3491,9 @@ def _sanitize_mutation_journal(
                 "storageErrorCode": storage_error_code,
                 "recordedAt": value["recordedAt"],
             }
-        )
+        if webjob_trigger_user_agent is not None:
+            sanitized_record["webJobTriggerUserAgent"] = webjob_trigger_user_agent
+        sanitized.append(sanitized_record)
     unresolved = sorted(set(intents) - results)
     if unresolved:
         fail("mutation journal contains an intent without a result")
@@ -3473,7 +3567,13 @@ def _validate_sanitized_mutation_journal(
         fail("sanitized journal execution bounds are reversed")
     canonical: list[dict[str, Any]] = []
     for sequence, raw in enumerate(value, 1):
-        item = dict(_exact_keys(raw, required, "sanitized mutation journal record"))
+        if (
+            not isinstance(raw, Mapping)
+            or not required.issubset(raw)
+            or set(raw) - required - {"webJobTriggerUserAgent"}
+        ):
+            fail("sanitized mutation journal record fields are not exact")
+        item = dict(raw)
         operation_id = item["operationId"]
         operation = mutation_by_id.get(operation_id)
         if (
@@ -3494,6 +3594,17 @@ def _validate_sanitized_mutation_journal(
             )
         ):
             fail("sanitized mutation journal target or operation classification drifted")
+        is_webjob_trigger = _is_webjob_trigger_journal_record(
+            operation_id, item["method"], item["targetUrl"]
+        )
+        if is_webjob_trigger:
+            if "webJobTriggerUserAgent" not in item:
+                fail("sanitized WebJob trigger mutation lacks its exact User-Agent")
+            _validated_webjob_trigger_user_agent(
+                item["webJobTriggerUserAgent"], authorization["authorizationId"]
+            )
+        elif "webJobTriggerUserAgent" in item:
+            fail("sanitized non-WebJob-trigger mutation contains a User-Agent")
         _sha256(item["requestBodySha256"], "sanitized journal request digest")
         expected_worm_body_sha256 = _expected_worm_mutation_body_sha256(
             operation_id, item["method"], item["targetUrl"]
@@ -3575,6 +3686,8 @@ def _validate_sanitized_mutation_journal(
                         "clientRequestId",
                     )
                 )
+                or item.get("webJobTriggerUserAgent")
+                != intent.get("webJobTriggerUserAgent")
                 or type(item["status"]) is not int
                 or not 200 <= item["status"] <= 599
             ):
@@ -7657,560 +7770,16 @@ def _validate_operation_source_projection(
         ):
             fail("app-settings terminal projection is not exact")
     elif family == "fresh-webjob-terminal-success-finally-stopped":
-        required = {
-            "resourceId",
-            "cleanupKey",
-            "selfCleaned",
-            "initialStopped",
-            "running",
-            "triggerStatus",
-            "triggerLocation",
-            "scmBasicAuthInitial",
-            "scmBasicAuthPrePublicNetwork",
-            "scmBasicAuthEnabled",
-            "scmBasicAuthRestored",
-            "scmBasicAuthSelfCleaned",
-            "scmDisableMutationIssued",
-            "publicNetworkAccessInitial",
-            "publicNetworkAccessEnabled",
-            "publicNetworkAccessEnableAsyncOperation",
-            "publicNetworkAccessRestored",
-            "publicNetworkAccessDisableAsyncOperation",
-            "publicNetworkAccessSelfCleaned",
-            "publicNetworkAccessDisableMutationIssued",
-            "postRestoreStopMutationIssued",
-            "triggerRequestedAt",
-            "historyBoundary",
-            "terminalHistory",
-            "terminalHistoryObservedAt",
-            "terminalHistoryEntriesSha256",
-            "terminalHistoryResponseSha256",
-            "pollAttempts",
-            "stopped",
-            "package",
-            "settingsSha256",
-            "bootstrapSelfTestControlSha256",
-            "activationFence",
-            "proofBoundary",
-        }
-        body = _exact_keys(body, required, "bridge WebJob canary projection")
-        site_id = resources["bridgeSite"]["resourceId"]
-        upload = prior.get("uploadVersionedBridgePackage", {}).get("projection", {})
-        configure = prior.get(
-            "configureBridgeExactVersionedPackageAndCriticalSettings", {}
-        ).get("projection", {})
-        fence = prior.get("createInitialIdleActivationFence", {}).get("projection", {})
-        auth_start = parse_time(authorization["validity"]["notBefore"], "authorization notBefore")
-        auth_end = parse_time(authorization["validity"]["expiresAt"], "authorization expiresAt")
-
-        control_timing = _validated_bootstrap_self_test_timing(authorization, configure)
-        control_start = parse_time(control_timing["issuedAt"], "canary control issuedAt")
-        control_end = parse_time(control_timing["expiresAt"], "canary control expiresAt")
-
-        def site_state(value: Any, expected_state: str, label: str) -> Mapping[str, Any]:
-            item = _exact_keys(
-                value,
-                {"attempts", "observedAt", "resourceId", "state", "projectionSha256"},
-                label,
-            )
-            stamp = parse_time(item["observedAt"], f"{label} observedAt")
-            expected_projection = {
-                "id": site_id,
-                "name": resources["bridgeSite"]["name"],
-                "state": expected_state,
-            }
-            if (
-                type(item["attempts"]) is not int
-                or not 1 <= item["attempts"] <= 64
-                or str(item["resourceId"]).lower() != site_id.lower()
-                or item["state"] != expected_state
-                or item["projectionSha256"]
-                != sha256_bytes(canonical_json_bytes(expected_projection))
-                or not auth_start <= stamp <= auth_end
-            ):
-                fail(f"{label} is not an exact site-state readback")
-            return item
-
-        initial = site_state(body["initialStopped"], "Stopped", "initial bridge state")
-        running = site_state(body["running"], "Running", "running bridge state")
-        stopped = site_state(body["stopped"], "Stopped", "final bridge state")
-
-        def scm_policy(
-            value: Any, expected_allow: bool, label: str
-        ) -> Mapping[str, Any]:
-            item = _exact_keys(
-                value,
-                {"resourceId", "allow", "observedAt", "responseSha256"},
-                label,
-            )
-            expected_id = site_id + "/basicPublishingCredentialsPolicies/scm"
-            observed = parse_time(item["observedAt"], f"{label} observedAt")
-            if (
-                str(item["resourceId"]).lower() != expected_id.lower()
-                or item["allow"] is not expected_allow
-                or not auth_start <= observed <= auth_end
-            ):
-                fail(f"{label} is not exact")
-            _sha256(item["responseSha256"], f"{label} response digest")
-            return item
-
-        scm_initial = scm_policy(
-            body["scmBasicAuthInitial"], False, "initial SCM basic-auth policy"
+        configure = prior.get("configureBridgeExactVersionedPackageAndCriticalSettings", {}).get("projection", {})
+        webjob_evidence.validate_canary_projection(
+            body, resources=resources, prior=prior, authorization=authorization,
+            control_timing=_validated_bootstrap_self_test_timing(authorization, configure),
+            fail=fail, exact_keys=_exact_keys, parse_time=parse_time,
+            canonical_json_bytes=canonical_json_bytes, sha256_bytes=sha256_bytes,
+            validate_sha256=_sha256, max_final_history_seconds=MAX_CANARY_FINAL_HISTORY_SECONDS,
+            azure_request_envelope_seconds=AZURE_CLI_REQUEST_TIMEOUT_SECONDS + AZURE_REST_RESPONSE_TIMEOUT_SECONDS,
+            user_agent_prefix=WEBJOB_TRIGGER_USER_AGENT_PREFIX,
         )
-        scm_pre_public_network = scm_policy(
-            body["scmBasicAuthPrePublicNetwork"],
-            False,
-            "pre-public-network SCM basic-auth policy",
-        )
-        scm_enabled = scm_policy(
-            body["scmBasicAuthEnabled"], True, "enabled SCM basic-auth policy"
-        )
-        scm_restored = scm_policy(
-            body["scmBasicAuthRestored"], False, "restored SCM basic-auth policy"
-        )
-        def public_network(
-            value: Any,
-            expected_access: str,
-            expected_state: str | None,
-            label: str,
-        ) -> Mapping[str, Any]:
-            item = _exact_keys(
-                value,
-                {
-                    "resourceId",
-                    "publicNetworkAccess",
-                    "state",
-                    "observedAt",
-                    "responseSha256",
-                },
-                label,
-            )
-            observed = parse_time(item["observedAt"], f"{label} observedAt")
-            if (
-                str(item["resourceId"]).lower() != site_id.lower()
-                or item["publicNetworkAccess"] != expected_access
-                or item["state"] not in {"Running", "Stopped"}
-                or (
-                    expected_state is not None
-                    and item["state"] != expected_state
-                )
-                or not auth_start <= observed <= auth_end
-            ):
-                fail(f"{label} is not exact")
-            _sha256(item["responseSha256"], f"{label} response digest")
-            return item
-
-        public_initial = public_network(
-            body["publicNetworkAccessInitial"],
-            "Disabled",
-            "Stopped",
-            "initial bridge public-network access",
-        )
-        public_enabled = public_network(
-            body["publicNetworkAccessEnabled"],
-            "Enabled",
-            "Stopped",
-            "enabled bridge public-network access",
-        )
-        public_restored = public_network(
-            body["publicNetworkAccessRestored"],
-            "Disabled",
-            None,
-            "restored bridge public-network access",
-        )
-
-        def arm_async_operation(value: Any, label: str) -> Mapping[str, Any]:
-            item = _exact_keys(
-                value,
-                {
-                    "mode",
-                    "responseStatus",
-                    "monitorHeaderName",
-                    "monitorUrl",
-                    "pollAttempts",
-                    "terminalStatus",
-                    "terminalObservedAt",
-                    "terminalResponseSha256",
-                },
-                label,
-            )
-            if item["responseStatus"] == 200:
-                if item != {
-                    "mode": "synchronous",
-                    "responseStatus": 200,
-                    "monitorHeaderName": None,
-                    "monitorUrl": None,
-                    "pollAttempts": 0,
-                    "terminalStatus": None,
-                    "terminalObservedAt": None,
-                    "terminalResponseSha256": None,
-                }:
-                    fail(f"{label} synchronous evidence is not exact")
-                return item
-            if item["responseStatus"] != 202 or item["mode"] != "arm-async":
-                fail(f"{label} response status is not exact")
-            if item["monitorHeaderName"] != "Azure-AsyncOperation":
-                fail(f"{label} monitor header name is not exact")
-            monitor_url = item["monitorUrl"]
-            if not isinstance(monitor_url, str):
-                fail(f"{label} monitor URL is not exact")
-            parsed = urllib.parse.urlsplit(monitor_url)
-            try:
-                monitor_port = parsed.port
-            except ValueError:
-                fail(f"{label} monitor URL is outside Azure ARM")
-            if (
-                parsed.scheme != "https"
-                or (parsed.hostname or "").lower() != "management.azure.com"
-                or monitor_port not in {None, 443}
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.fragment
-                or not parsed.path.startswith("/")
-                or not parsed.query
-                or len(monitor_url) > 8192
-                or type(item["pollAttempts"]) is not int
-                or not 1 <= item["pollAttempts"] <= 64
-                or item["terminalStatus"] != "Succeeded"
-            ):
-                fail(f"{label} asynchronous evidence is not exact")
-            terminal_at = parse_time(
-                item["terminalObservedAt"], f"{label} terminal observedAt"
-            )
-            if not auth_start <= terminal_at <= auth_end:
-                fail(f"{label} terminal observedAt is outside authorization")
-            _sha256(
-                item["terminalResponseSha256"], f"{label} terminal response digest"
-            )
-            return item
-
-        public_enable_async = arm_async_operation(
-            body["publicNetworkAccessEnableAsyncOperation"],
-            "public-network enable operation",
-        )
-        public_disable_async = None
-        if body["publicNetworkAccessDisableMutationIssued"] is True:
-            public_disable_async = arm_async_operation(
-                body["publicNetworkAccessDisableAsyncOperation"],
-                "public-network disable operation",
-            )
-        elif body["publicNetworkAccessDisableAsyncOperation"] is not None:
-            fail("public-network disable operation exists without a mutation")
-        boundary = _exact_keys(
-            body["historyBoundary"],
-            {
-                "jobMetadata",
-                "observedAt",
-                "entries",
-                "entriesSha256",
-                "responseSha256",
-                "httpStatus",
-                "boundaryState",
-            },
-            "WebJob history boundary",
-        )
-        if not isinstance(boundary["entries"], list):
-            fail("WebJob history boundary entries are invalid")
-
-        job = _exact_keys(
-            boundary["jobMetadata"],
-            {
-                "observedAt",
-                "resourceId",
-                "name",
-                "type",
-                "runCommand",
-                "latestRunPresent",
-                "urlMetadata",
-                "historyUrlMetadata",
-                "settingsSha256",
-                "responseSha256",
-            },
-            "triggered WebJob discovery metadata",
-        )
-        expected_job_id = (
-            site_id
-            + "/triggeredwebjobs/paperdesk-accepted-release-registry"
-        )
-        expected_job_path = (
-            "/api/triggeredwebjobs/paperdesk-accepted-release-registry"
-        )
-        expected_job_host = resources["bridgeSite"]["name"] + ".scm.azurewebsites.net"
-
-        def job_url(value: Any, expected_path: str, label: str) -> None:
-            item = _exact_keys(
-                value,
-                {"scheme", "host", "path", "queryPresent"},
-                label,
-            )
-            if (
-                item["scheme"] != "https"
-                or item["host"] != expected_job_host
-                or item["path"] != expected_path
-                or item["queryPresent"] is not False
-            ):
-                fail(f"{label} is not exact")
-
-        job_url(job["urlMetadata"], expected_job_path, "triggered WebJob URL")
-        job_url(
-            job["historyUrlMetadata"],
-            expected_job_path + "/history",
-            "triggered WebJob history URL",
-        )
-        job_observed = parse_time(
-            job["observedAt"], "triggered WebJob discovery observedAt"
-        )
-        if (
-            str(job["resourceId"]).lower() != expected_job_id.lower()
-            or job["name"] != "paperdesk-accepted-release-registry"
-            or job["type"] != "triggered"
-            or job["runCommand"] != "run.sh"
-            or type(job["latestRunPresent"]) is not bool
-            or job["settingsSha256"]
-            != sha256_bytes(
-                canonical_json_bytes(
-                    {"is_singleton": True, "stopping_wait_time": 30}
-                )
-            )
-            or not auth_start <= job_observed <= auth_end
-        ):
-            fail("triggered WebJob discovery projection is not exact")
-        _sha256(job["responseSha256"], "triggered WebJob response digest")
-
-        def history_item(value: Any, label: str) -> Mapping[str, Any]:
-            item = _exact_keys(
-                value,
-                {
-                    "historyId",
-                    "webJobsRunId",
-                    "status",
-                    "startedAt",
-                    "endedAt",
-                    "outputUrlMetadata",
-                },
-                label,
-            )
-            expected_prefix = (
-                site_id + "/triggeredwebjobs/paperdesk-accepted-release-registry/history/"
-            ).lower()
-            if (
-                not isinstance(item["historyId"], str)
-                or not item["historyId"].lower().startswith(expected_prefix)
-                or not isinstance(item["webJobsRunId"], str)
-                or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", item["webJobsRunId"])
-                is None
-                or item["status"]
-                not in {"Initializing", "Running", "Success", "Failed", "Aborted"}
-            ):
-                fail(f"{label} identity or state is invalid")
-            started = parse_time(item["startedAt"], f"{label} startedAt")
-            if item["status"] in {"Success", "Failed", "Aborted"}:
-                ended = parse_time(item["endedAt"], f"{label} endedAt")
-                output = _exact_keys(
-                    item["outputUrlMetadata"],
-                    {"scheme", "host", "pathSha256", "queryPresent"},
-                    f"{label} output URL metadata",
-                )
-                if (
-                    ended < started
-                    or output["scheme"] != "https"
-                    or not str(output["host"]).endswith(".scm.azurewebsites.net")
-                    or output["queryPresent"] is not False
-                ):
-                    fail(f"{label} terminal/output projection is invalid")
-                _sha256(output["pathSha256"], f"{label} output path digest")
-            elif item["endedAt"] is not None or item["outputUrlMetadata"] is not None:
-                fail(f"{label} nonterminal projection contains terminal fields")
-            return item
-
-        boundary_entries = [
-            history_item(item, f"WebJob history boundary entry {index}")
-            for index, item in enumerate(boundary["entries"])
-        ]
-        terminal = history_item(body["terminalHistory"], "fresh WebJob terminal history")
-        trigger_location = _exact_keys(
-            body["triggerLocation"],
-            {"scheme", "host", "path", "runId", "queryPresent"},
-            "WebJob trigger Location",
-        )
-        expected_trigger_prefix = (
-            "/api/triggeredwebjobs/paperdesk-accepted-release-registry/history/"
-        )
-        if (
-            trigger_location["scheme"] != "https"
-            or trigger_location["host"] != expected_job_host
-            or trigger_location["queryPresent"] is not False
-            or not isinstance(trigger_location["runId"], str)
-            or re.fullmatch(
-                r"[A-Za-z0-9._:-]{1,256}", trigger_location["runId"]
-            )
-            is None
-            or trigger_location["path"]
-            != expected_trigger_prefix + trigger_location["runId"]
-            or terminal["webJobsRunId"] != trigger_location["runId"]
-            or terminal["historyId"].lower()
-            != (
-                expected_job_id
-                + "/history/"
-                + trigger_location["runId"]
-            ).lower()
-        ):
-            fail("WebJob trigger Location and terminal history are not exact")
-        if len({item["historyId"] for item in boundary_entries}) != len(boundary_entries):
-            fail("WebJob history boundary contains duplicate entries")
-        trigger_at = parse_time(body["triggerRequestedAt"], "WebJob trigger requestedAt")
-        boundary_at = parse_time(boundary["observedAt"], "WebJob history boundary observedAt")
-        if (
-            type(boundary["httpStatus"]) is not int
-            or boundary["httpStatus"] not in {200, 404}
-            or boundary["boundaryState"]
-            != (
-                "history-present"
-                if boundary["httpStatus"] == 200
-                else "pristine-history-absent"
-            )
-            or (
-                boundary["httpStatus"] == 404
-                and (
-                    job["latestRunPresent"] is not False
-                    or boundary_entries
-                )
-            )
-            or (
-                boundary["httpStatus"] == 200
-                and bool(boundary_entries) is not job["latestRunPresent"]
-            )
-            or not job_observed <= boundary_at
-        ):
-            fail("WebJob pre-trigger history boundary is not exact")
-        terminal_started = parse_time(terminal["startedAt"], "fresh WebJob start")
-        terminal_ended = parse_time(terminal["endedAt"], "fresh WebJob end")
-        terminal_observed = parse_time(
-            body["terminalHistoryObservedAt"], "fresh WebJob observedAt"
-        )
-        combined_entries = sorted(
-            [*boundary_entries, terminal], key=lambda item: item["historyId"]
-        )
-        expected_package = {
-            key: upload.get(key)
-            for key in ("blob", "etag", "versionId", "url", "sha256", "size")
-        }
-        expected_fence = {
-            key: fence.get(key) for key in ("url", "etag", "versionId", "sha256")
-        }
-        expected_boundary_text = (
-            "terminal Success proves execution of the exact source/package-pinned "
-            "bootstrap branch; HTTP health and literal stdout marker bytes were not observed"
-        )
-        if (
-            body["resourceId"] != site_id
-            or body["cleanupKey"] != "bounded-bridge-canary-start"
-            or body["selfCleaned"] is not True
-            or body["scmBasicAuthSelfCleaned"] is not True
-            or type(body["scmDisableMutationIssued"]) is not bool
-            or body["publicNetworkAccessSelfCleaned"] is not True
-            or type(body["publicNetworkAccessDisableMutationIssued"]) is not bool
-            or (
-                public_enable_async["responseStatus"] == 202
-                and not (
-                    parse_time(
-                        public_initial["observedAt"],
-                        "initial public-network observedAt",
-                    )
-                    <= parse_time(
-                        public_enable_async["terminalObservedAt"],
-                        "public-network enable terminal observedAt",
-                    )
-                    <= parse_time(
-                        public_enabled["observedAt"],
-                        "enabled public-network observedAt",
-                    )
-                )
-            )
-            or (
-                public_disable_async is not None
-                and public_disable_async["responseStatus"] == 202
-                and not (
-                    parse_time(
-                        scm_restored["observedAt"],
-                        "restored SCM policy observedAt",
-                    )
-                    <= parse_time(
-                        public_disable_async["terminalObservedAt"],
-                        "public-network disable terminal observedAt",
-                    )
-                    <= parse_time(
-                        public_restored["observedAt"],
-                        "restored public-network observedAt",
-                    )
-                )
-            )
-            or type(body["postRestoreStopMutationIssued"]) is not bool
-            or body["postRestoreStopMutationIssued"]
-            is not (public_restored["state"] == "Running")
-            or type(body["triggerStatus"]) is not int
-            or body["triggerStatus"] != 200
-            or boundary["entriesSha256"]
-            != sha256_bytes(canonical_json_bytes(boundary_entries))
-            or _sha256(boundary["responseSha256"], "WebJob boundary response digest")
-            != boundary["responseSha256"]
-            or terminal["historyId"]
-            in {item["historyId"] for item in boundary_entries}
-            or terminal["status"] != "Success"
-            or body["terminalHistoryEntriesSha256"]
-            != sha256_bytes(canonical_json_bytes(combined_entries))
-            or _sha256(
-                body["terminalHistoryResponseSha256"],
-                "WebJob terminal response digest",
-            )
-            != body["terminalHistoryResponseSha256"]
-            or type(body["pollAttempts"]) is not int
-            or not 1 <= body["pollAttempts"] <= 180
-            or body["package"] != expected_package
-            or body["settingsSha256"] != configure.get("settingsSha256")
-            or body["bootstrapSelfTestControlSha256"]
-            != configure.get("bootstrapSelfTestControlSha256")
-            or body["activationFence"] != expected_fence
-            or body["proofBoundary"] != expected_boundary_text
-            or not (
-                auth_start
-                <= parse_time(initial["observedAt"], "initial bridge observedAt")
-                <= parse_time(
-                    scm_pre_public_network["observedAt"],
-                    "pre-public-network SCM policy observedAt",
-                )
-                <= parse_time(public_initial["observedAt"], "initial public-network observedAt")
-                <= parse_time(public_enabled["observedAt"], "enabled public-network observedAt")
-                <= parse_time(scm_initial["observedAt"], "initial SCM policy observedAt")
-                <= parse_time(scm_enabled["observedAt"], "enabled SCM policy observedAt")
-                <= parse_time(running["observedAt"], "running bridge observedAt")
-                <= job_observed
-                <= boundary_at
-                <= trigger_at
-            )
-            or terminal_started < trigger_at - dt.timedelta(seconds=5)
-            or not control_start <= trigger_at < control_end
-            or not control_start <= terminal_started <= terminal_ended < control_end
-            or terminal_ended > terminal_observed + dt.timedelta(seconds=5)
-            or parse_time(stopped["observedAt"], "stopped bridge observedAt")
-            < terminal_observed
-            or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
-            < terminal_observed
-            or parse_time(public_restored["observedAt"], "restored public-network observedAt")
-            < parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
-            or parse_time(stopped["observedAt"], "stopped bridge observedAt")
-            < parse_time(public_restored["observedAt"], "restored public-network observedAt")
-            or parse_time(stopped["observedAt"], "stopped bridge observedAt")
-            > auth_end
-            or parse_time(scm_restored["observedAt"], "restored SCM policy observedAt")
-            > auth_end
-            or parse_time(public_restored["observedAt"], "restored public-network observedAt")
-            > auth_end
-        ):
-            fail(
-                "bridge terminal canary did not succeed, finally stop, and restore "
-                "disabled SCM basic authentication and public-network access"
-            )
     elif family == "worm-policy-projection":
         adopted_exact = context.get("executionDecision") == "adopt-exact"
         if adopted_exact:
@@ -13678,6 +13247,8 @@ class AzureCliBootstrapTransport:
         response: _RestResponse,
         request_body: bytes | None,
         intent_id: str,
+        *,
+        webjob_trigger_user_agent: str | None = None,
     ) -> None:
         if self._ledger is None or self._active_operation_id is None:
             fail("cloud mutation occurred before the durable journal was bound")
@@ -13702,6 +13273,8 @@ class AzureCliBootstrapTransport:
                 "method": method,
                 "targetUrl": url,
                 "requestBodySha256": sha256_bytes(request_body or b""),
+                **({"webJobTriggerUserAgent": webjob_trigger_user_agent}
+                   if webjob_trigger_user_agent is not None else {}),
                 "clientRequestId": response.client_request_id,
                 "status": response.status,
                 "responseBodySha256": sha256_bytes(response.body),
@@ -13866,6 +13439,7 @@ class AzureCliBootstrapTransport:
         deadline: dt.datetime | None = None,
         intent_callback: Callable[[], None] | None = None,
         ambiguous_server_error: bool = False,
+        webjob_trigger_user_agent: str | None = None,
     ) -> _RestResponse:
         if self._ledger is None or self._active_operation_id is None:
             fail("cloud mutation occurred before the durable journal was bound")
@@ -13895,6 +13469,24 @@ class AzureCliBootstrapTransport:
             request_deadline, "cloud mutation request"
         )
         request_headers = dict(headers or {})
+        is_webjob_trigger = False
+        if self._active_operation_id == "startBridgeForBoundedCanary":
+            expected_run_url = self._arm_url(
+                next(item["resourceId"] for item in self.plan["resourceInventory"]
+                     if item["id"] == "bridgeSite"),
+                "2025-05-01",
+                "/triggeredwebjobs/paperdesk-accepted-release-registry/run",
+            )
+            is_webjob_trigger = method == "POST" and url == expected_run_url
+        if is_webjob_trigger:
+            if body != b"" or any(key.lower() == "user-agent" for key in request_headers):
+                fail("WebJob trigger body or caller-supplied User-Agent is not exact")
+            webjob_trigger_user_agent = _validated_webjob_trigger_user_agent(
+                webjob_trigger_user_agent, self.authorization["authorizationId"]
+            )
+            request_headers["User-Agent"] = webjob_trigger_user_agent
+        elif webjob_trigger_user_agent is not None:
+            fail("WebJob trigger User-Agent is outside the exact run operation")
         parsed = urllib.parse.urlsplit(url)
         is_storage = (
             parsed.scheme == "https"
@@ -13929,6 +13521,8 @@ class AzureCliBootstrapTransport:
                 "method": method,
                 "targetUrl": url,
                 "requestBodySha256": sha256_bytes(body or b""),
+                **({"webJobTriggerUserAgent": webjob_trigger_user_agent}
+                   if webjob_trigger_user_agent is not None else {}),
                 "clientRequestId": client_request_id,
                 "authorizationSha256": sha256_bytes(canonical_json_bytes(self.authorization)),
                 "sourceSha": self.authorization["source"]["mergedMain"]["commitSha"],
@@ -13951,7 +13545,8 @@ class AzureCliBootstrapTransport:
         def record_result(observed_response: _RestResponse) -> None:
             try:
                 self._record_mutation(
-                    method, url, observed_response, body, intent_id
+                    method, url, observed_response, body, intent_id,
+                    webjob_trigger_user_agent=webjob_trigger_user_agent,
                 )
             except Exception as journal_error:
                 if is_storage and client_request_id is not None:
@@ -14568,6 +14163,7 @@ class AzureCliBootstrapTransport:
         run = runs[0]
         run_id = run.get("web_job_id")
         status = run.get("status")
+        trigger = run.get("trigger")
         started_at = run.get("start_time")
         ended_at = run.get("end_time")
         if (
@@ -14576,6 +14172,9 @@ class AzureCliBootstrapTransport:
             or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id)
             or status
             not in {"Initializing", "Running", "Success", "Failed", "Aborted"}
+            or not isinstance(trigger, str)
+            or not trigger
+            or len(trigger.encode("utf-8")) > 1024
             or not isinstance(started_at, str)
         ):
             fail("WebJob history run projection is not exact")
@@ -14593,6 +14192,7 @@ class AzureCliBootstrapTransport:
         return {
             "historyId": history_id,
             "webJobsRunId": run_id,
+            "triggerSha256": sha256_bytes(trigger.encode("utf-8")),
             "status": status,
             "startedAt": started_at,
             "endedAt": ended_at if terminal else None,
@@ -14686,19 +14286,54 @@ class AzureCliBootstrapTransport:
         }
 
     @staticmethod
-    def _webjob_trigger_location_metadata(
-        value: Any, *, site_name: str, job_name: str
+    def _webjob_trigger_correlation_metadata(
+        response: _RestResponse,
+        *,
+        site_name: str,
+        job_name: str,
+        observed_at: str,
+        user_agent: str,
     ) -> Mapping[str, Any]:
+        if not isinstance(user_agent, str) or re.fullmatch(
+            r"PaperDeskV2Bootstrap/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\."
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            user_agent,
+        ) is None:
+            fail("WebJob trigger User-Agent is not exact")
+        if type(response.status) is not int or response.status != 200 or response.body != b"":
+            fail("WebJob trigger is not an exact HTTP 200 empty-body response")
+        value = AzureCliBootstrapTransport._header(response, "Location")
+        # Microsoft.Web contracts HTTP 200 without a Location guarantee. Kudu
+        # records the request User-Agent in history.trigger; require that exact
+        # correlation as well as a unique fresh run. A missing history write
+        # therefore cannot substitute an unrelated successful invocation.
+        # Never downgrade a present but invalid Location.
+        expected_trigger_sha256 = sha256_bytes(
+            ("External - " + user_agent).encode("utf-8")
+        )
+        if value is None:
+            return {
+                "mode": "arm-200-empty-body-history-trigger",
+                "userAgent": user_agent,
+                "expectedHistoryTriggerSha256": expected_trigger_sha256,
+                "responseBodySha256": sha256_bytes(b""),
+                "responseObservedAt": observed_at,
+                "location": None,
+            }
         if not isinstance(value, str) or not value or len(value) > 4096:
-            fail("WebJob trigger Location is absent or oversized")
+            fail("WebJob trigger Location is empty or oversized")
         parsed = urllib.parse.urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError:
+            fail("WebJob trigger Location port is invalid")
         expected_host = site_name.lower() + ".scm.azurewebsites.net"
         expected_prefix = f"/api/triggeredwebjobs/{job_name}/history/"
         if (
             parsed.scheme != "https"
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.port not in {None, 443}
+            or port not in {None, 443}
             or (parsed.hostname or "").lower() != expected_host
             or not parsed.path.startswith(expected_prefix)
             or parsed.query
@@ -14709,11 +14344,18 @@ class AzureCliBootstrapTransport:
         if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id) is None:
             fail("WebJob trigger Location run ID is invalid")
         return {
-            "scheme": "https",
-            "host": expected_host,
-            "path": parsed.path,
-            "runId": run_id,
-            "queryPresent": False,
+            "mode": "location-header-and-history-trigger",
+            "userAgent": user_agent,
+            "expectedHistoryTriggerSha256": expected_trigger_sha256,
+            "responseBodySha256": sha256_bytes(b""),
+            "responseObservedAt": observed_at,
+            "location": {
+                "scheme": "https",
+                "host": expected_host,
+                "path": parsed.path,
+                "runId": run_id,
+                "queryPresent": False,
+            },
         }
 
     def _read_triggered_webjob_metadata(
@@ -15067,6 +14709,7 @@ class AzureCliBootstrapTransport:
         job_name: str,
         boundary: Mapping[str, Any],
         trigger_requested_at: dt.datetime,
+        expected_trigger_sha256: str,
         deadline: dt.datetime,
     ) -> Mapping[str, Any]:
         before_entries = boundary.get("entries")
@@ -15121,6 +14764,8 @@ class AzureCliBootstrapTransport:
                 fail("WebJob canary produced an ambiguous fresh history set")
             if len(fresh_ids) == 1:
                 fresh = current[next(iter(fresh_ids))]
+                if fresh["triggerSha256"] != expected_trigger_sha256:
+                    fail("fresh WebJob history does not match the request trigger token")
                 start = parse_time(fresh["startedAt"], "fresh WebJob start")
                 if start < trigger_requested_at - dt.timedelta(seconds=5):
                     fail("fresh WebJob run predates the authorized trigger")
@@ -15143,6 +14788,44 @@ class AzureCliBootstrapTransport:
                 fail("WebJob canary polling would cross the authorization deadline")
             self.sleep(delay)
         fail("WebJob canary exceeded the source-bounded polling attempts")
+
+    def _read_final_webjob_history(
+        self,
+        *,
+        site_resource_id: str,
+        job_name: str,
+        canary: Mapping[str, Any],
+        deadline: dt.datetime,
+    ) -> Mapping[str, Any]:
+        # Read only after the canary stop is proven, while SCM is still
+        # available. An extra, removed, or changed run invalidates attribution.
+        # This census has no readiness/status retry and cannot delay exposure
+        # cleanup beyond its small, separate deadline.
+        if self.clock() >= deadline:
+            fail("final WebJob history census deadline expired")
+        observed = self._read_webjob_history(
+            site_resource_id=site_resource_id,
+            job_name=job_name,
+            deadline=deadline,
+            retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+            failure_context="final-history-census",
+        )
+        if self.clock() >= deadline:
+            fail("final WebJob history census response crossed its deadline")
+        expected_entries = sorted(
+            [*canary["historyBoundary"]["entries"], canary["terminalHistory"]],
+            key=lambda item: item["historyId"],
+        )
+        if (
+            observed is None
+            or observed["httpStatus"] != 200
+            or observed["boundaryState"] != "history-present"
+            or observed["entries"] != expected_entries
+            or observed["entriesSha256"]
+            != sha256_bytes(canonical_json_bytes(expected_entries))
+        ):
+            fail("final WebJob history census drifted or contains an extra run")
+        return observed
 
     def _wait_for_site_state(
         self,
@@ -20161,7 +19844,9 @@ class AzureCliBootstrapTransport:
             public_network_enable_resolution_error: BaseException | None = None
             public_network_incident_marker_created = False
             trigger_status: int | None = None
-            trigger_location: Mapping[str, Any] | None = None
+            trigger_correlation: Mapping[str, Any] | None = None
+            pre_scm_restore_stopped: Mapping[str, Any] | None = None
+            final_history: Mapping[str, Any] | None = None
             trigger_requested_at: dt.datetime | None = None
             try:
                 primary_stage = "public-network-enable"
@@ -20278,17 +19963,25 @@ class AzureCliBootstrapTransport:
                 trigger_requested_at = self.clock()
                 require_live_canary()
                 primary_stage = "trigger"
+                trigger_user_agent = (
+                    WEBJOB_TRIGGER_USER_AGENT_PREFIX
+                    + self.authorization["authorizationId"]
+                    + "." + str(uuid.uuid4())
+                )
                 run = self._mutation_request(
                     "POST",
                     run_url,
                     body=b"",
+                    webjob_trigger_user_agent=trigger_user_agent,
                     expected={200},
                 )
                 trigger_status = run.status
-                trigger_location = self._webjob_trigger_location_metadata(
-                    self._header(run, "Location"),
+                trigger_correlation = self._webjob_trigger_correlation_metadata(
+                    run,
                     site_name=site["name"],
                     job_name=job,
+                    observed_at=self._timestamp(self.clock()),
+                    user_agent=trigger_user_agent,
                 )
                 primary_stage = "terminal-history"
                 canary = self._wait_for_fresh_webjob_success(
@@ -20296,8 +19989,20 @@ class AzureCliBootstrapTransport:
                     job_name=job,
                     boundary=boundary,
                     trigger_requested_at=trigger_requested_at,
+                    expected_trigger_sha256=trigger_correlation["expectedHistoryTriggerSha256"],
                     deadline=canary_control_deadline,
                 )
+                location = trigger_correlation["location"]
+                if location is not None and (
+                    canary["terminalHistory"]["webJobsRunId"] != location["runId"]
+                    or canary["terminalHistory"]["historyId"].lower()
+                    != (
+                        site["resourceId"]
+                        + f"/triggeredwebjobs/{job}/history/"
+                        + location["runId"]
+                    ).lower()
+                ):
+                    fail("WebJob terminal history does not match the authorized trigger")
             except BaseException as exc:
                 primary_error = exc
             finally:
@@ -20312,6 +20017,30 @@ class AzureCliBootstrapTransport:
                         )
                     except BaseException as exc:
                         stop_error = exc
+                if primary_error is None and stop_error is None and canary is not None:
+                    try:
+                        primary_stage = "final-history-census"
+                        census_deadline = min(
+                            self._authorization_expiry(),
+                            self.clock()
+                            + dt.timedelta(seconds=MAX_CANARY_FINAL_HISTORY_SECONDS),
+                        )
+                        pre_scm_restore_stopped = self._wait_for_site_state(
+                            site_resource_id=site["resourceId"],
+                            expected_state="Stopped",
+                            allow_expired_cleanup=False,
+                            deadline=census_deadline,
+                            read_retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                            read_failure_context="pre-census-stopped",
+                        )
+                        final_history = self._read_final_webjob_history(
+                            site_resource_id=site["resourceId"],
+                            job_name=job,
+                            canary=canary,
+                            deadline=census_deadline,
+                        )
+                    except BaseException as exc:
+                        primary_error = exc
                 if scm_enable_attempted:
                     try:
                         before_restore = self._read_scm_basic_auth_policy(
@@ -20520,7 +20249,9 @@ class AzureCliBootstrapTransport:
                 or stopped is None
                 or trigger_requested_at is None
                 or trigger_status is None
-                or trigger_location is None
+                or trigger_correlation is None
+                or pre_scm_restore_stopped is None
+                or final_history is None
                 or scm_initial is None
                 or scm_pre_public_network is None
                 or scm_enabled is None
@@ -20533,17 +20264,6 @@ class AzureCliBootstrapTransport:
                 or public_network_incident_marker_created
             ):
                 fail("bridge canary proof is incomplete")
-            if (
-                canary["terminalHistory"]["webJobsRunId"]
-                != trigger_location["runId"]
-                or canary["terminalHistory"]["historyId"].lower()
-                != (
-                    site["resourceId"]
-                    + f"/triggeredwebjobs/{job}/history/"
-                    + str(trigger_location["runId"])
-                ).lower()
-            ):
-                fail("WebJob terminal history does not match the authorized trigger")
             configure = self._proof_detail(
                 state, "configureBridgeExactVersionedPackageAndCriticalSettings"
             )
@@ -20556,7 +20276,9 @@ class AzureCliBootstrapTransport:
                 "initialStopped": initial,
                 "running": running,
                 "triggerStatus": trigger_status,
-                "triggerLocation": dict(trigger_location),
+                "triggerCorrelation": dict(trigger_correlation),
+                "preScmRestoreStopped": dict(pre_scm_restore_stopped),
+                "finalHistoryCensus": dict(final_history),
                 "scmBasicAuthInitial": dict(scm_initial),
                 "scmBasicAuthPrePublicNetwork": dict(scm_pre_public_network),
                 "scmBasicAuthEnabled": dict(scm_enabled),

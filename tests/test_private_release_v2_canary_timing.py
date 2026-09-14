@@ -130,6 +130,8 @@ class CanaryTimingTests(unittest.TestCase):
             body = copy.deepcopy(original)
             body["terminalHistory"].update(startedAt=stamp(started), endedAt=stamp(ended))
             body["terminalHistoryEntriesSha256"] = b.sha256_bytes(b.canonical_json_bytes([body["terminalHistory"]]))
+            body["finalHistoryCensus"]["entries"] = [body["terminalHistory"]]
+            body["finalHistoryCensus"]["entriesSha256"] = body["terminalHistoryEntriesSha256"]
             if accepted:
                 f.envelope(operation, body)
             else:
