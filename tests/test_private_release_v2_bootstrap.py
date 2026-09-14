@@ -52,13 +52,35 @@ EXPECTED_BRIDGE_CONFIG_HARD_DEATH_RESIDUAL_ACCEPTANCE = (
     "atomically exclude an out-of-band administrator write between their final adjacent "
     "pre-read and PATCH. Each identity PATCH is issued at most once without retry, and "
     "definite success requires exact fresh stopped/private identity and WebJobs readback. "
+    "I authorize temporary enabling and exact disabling of only the bridge public-network "
+    "access property solely around the bounded WebJob canary. I accept that this site "
+    "PATCH exposes no supported conditional ETag, so it cannot atomically exclude an "
+    "out-of-band administrator write between the final adjacent pre-read and PATCH. "
+    "The executor must prove the SCM policy disabled before enabling public-network "
+    "access, then issue one pre-canary stop at most once without retry and prove the "
+    "enabled bridge stopped before enabling SCM. Each public-network PATCH is issued at "
+    "most once without retry. A 202 response must bind one exact Azure-AsyncOperation "
+    "URL under Azure ARM and reach terminal Succeeded through bounded read-only polling "
+    "before "
+    "the executor classifies live state, and definite success "
+    "requires prompt exact Disabled readback during cleanup followed by a fresh "
+    "stopped-bridge proof. I accept that a "
+    "public-network update can restart the Linux bridge, so the executor may issue one "
+    "separately journaled post-restoration stop at most once without retry and must prove "
+    "the bridge freshly stopped after public-network restoration. I also accept that "
+    "process death, ambiguous transport, or a local journal/fsync failure after enabling "
+    "can leave the bridge public endpoint enabled; execution and any later release must "
+    "stop until fresh reads prove public-network access Disabled, the SCM policy disabled, "
+    "the bridge stopped, and all related temporary access absent, and manual cleanup may "
+    "be required. "
     "I authorize temporary enabling and exact disabling of only the bridge SCM "
     "basic-auth publishing-credentials policy solely around the bounded WebJob canary. "
     "I accept that this policy update exposes no supported conditional ETag, so it "
     "cannot atomically exclude an out-of-band administrator write between the final "
     "adjacent pre-read and PUT. Each policy PUT is issued at most once without retry, "
-    "and definite success requires a fresh disabled-policy readback after the bridge "
-    "is stopped. I also accept that process death, ambiguous transport, or a local "
+    "and definite success requires prompt exact disabled-policy readback during cleanup "
+    "followed by a fresh stopped-bridge proof. I also accept that process death, "
+    "ambiguous transport, or a local "
     "journal/fsync failure after enabling can leave SCM basic authentication enabled; "
     "execution and any later release must stop until fresh reads prove the policy "
     "disabled, the bridge stopped, and all related temporary access absent, and manual "
@@ -325,6 +347,8 @@ def build_projection(plan, package, *, adopt_operations=()):
                     context_authorization
                 ),
             })
+        elif operation_id == "startBridgeForBoundedCanary":
+            value["scmBasicAuthAllowed"] = False
         elif operation_id == "createCustomRoleDefinitions":
             stable_package_definition_ids = {
                 item["definitionId"]
@@ -523,6 +547,34 @@ def build_projection(plan, package, *, adopt_operations=()):
                 "validatorContract": None,
             })
             preflight_probe_ids.append(lock_probe_id)
+        if operation["id"] == "startBridgeForBoundedCanary":
+            bridge_resource_id = next(
+                item["resourceId"]
+                for item in plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            scm_probe_id = f"pre-{index}-{operation['id']}-scm-policy"
+            probes.append(
+                {
+                    "id": scm_probe_id,
+                    "phase": "preflight",
+                    "method": "GET",
+                    "url": (
+                        "https://management.azure.com"
+                        + bridge_resource_id
+                        + "/basicPublishingCredentialsPolicies/scm"
+                        + "?api-version=2025-03-01"
+                    ),
+                    "requestBodySha256": None,
+                    "status": 200,
+                    "responseSha256": bootstrap.sha256_bytes(
+                        f"pre-scm-policy-{index}".encode()
+                    ),
+                    "validatorId": None,
+                    "validatorContract": None,
+                }
+            )
+            preflight_probe_ids.append(scm_probe_id)
         admissions.append(
             {
                 "operationId": operation["id"],
@@ -1389,6 +1441,12 @@ class _TerminalEvidenceFixture:
                 "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=100)),
                 "responseSha256": self.digest("scm-basic-auth-initial"),
             },
+            "scmBasicAuthPrePublicNetwork": {
+                "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
+                "allow": False,
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=20)),
+                "responseSha256": self.digest("scm-basic-auth-pre-public-network"),
+            },
             "scmBasicAuthEnabled": {
                 "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
                 "allow": True,
@@ -1403,6 +1461,50 @@ class _TerminalEvidenceFixture:
             },
             "scmBasicAuthSelfCleaned": True,
             "scmDisableMutationIssued": True,
+            "publicNetworkAccessInitial": {
+                "resourceId": site["resourceId"],
+                "publicNetworkAccess": "Disabled",
+                "state": "Stopped",
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=40)),
+                "responseSha256": self.digest("public-network-initial"),
+            },
+            "publicNetworkAccessEnabled": {
+                "resourceId": site["resourceId"],
+                "publicNetworkAccess": "Enabled",
+                "state": "Stopped",
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, milliseconds=80)),
+                "responseSha256": self.digest("public-network-enabled"),
+            },
+            "publicNetworkAccessEnableAsyncOperation": {
+                "mode": "synchronous",
+                "responseStatus": 200,
+                "monitorHeaderName": None,
+                "monitorUrl": None,
+                "pollAttempts": 0,
+                "terminalStatus": None,
+                "terminalObservedAt": None,
+                "terminalResponseSha256": None,
+            },
+            "publicNetworkAccessRestored": {
+                "resourceId": site["resourceId"],
+                "publicNetworkAccess": "Disabled",
+                "state": "Stopped",
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=200)),
+                "responseSha256": self.digest("public-network-restored"),
+            },
+            "publicNetworkAccessSelfCleaned": True,
+            "publicNetworkAccessDisableMutationIssued": True,
+            "publicNetworkAccessDisableAsyncOperation": {
+                "mode": "synchronous",
+                "responseStatus": 200,
+                "monitorHeaderName": None,
+                "monitorUrl": None,
+                "pollAttempts": 0,
+                "terminalStatus": None,
+                "terminalObservedAt": None,
+                "terminalResponseSha256": None,
+            },
+            "postRestoreStopMutationIssued": False,
             "triggerRequestedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=3)),
             "historyBoundary": {
                 "jobMetadata": {
@@ -1429,7 +1531,7 @@ class _TerminalEvidenceFixture:
             "terminalHistoryEntriesSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes([terminal])),
             "terminalHistoryResponseSha256": self.digest("webjob-terminal-response"),
             "pollAttempts": 2,
-            "stopped": self.site_state("Stopped", NOW + dt.timedelta(minutes=5, seconds=8)),
+            "stopped": self.site_state("Stopped", NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=300)),
             "package": {key: upload[key] for key in ("blob", "etag", "versionId", "url", "sha256", "size")},
             "settingsSha256": self.operations["configureBridgeExactVersionedPackageAndCriticalSettings"]["projection"]["settingsSha256"],
             "bootstrapSelfTestControlSha256": self.operations["configureBridgeExactVersionedPackageAndCriticalSettings"]["projection"]["bootstrapSelfTestControlSha256"],
@@ -1549,7 +1651,23 @@ class _TerminalEvidenceFixture:
                     + "/basicPublishingCredentialsPolicies/scm"
                     + "?api-version=2025-03-01",
                 )
+                site_target = bootstrap._normalized_mutation_target(
+                    "PATCH",
+                    "https://management.azure.com"
+                    + site_id
+                    + "?api-version=2025-03-01",
+                )
                 ordered_occurrences = [
+                    (site_target, 0),
+                    (
+                        bootstrap._normalized_mutation_target(
+                            "POST",
+                            "https://management.azure.com"
+                            + site_id
+                            + "/stop?api-version=2025-03-01",
+                        ),
+                        0,
+                    ),
                     (policy_target, 0),
                     (
                         bootstrap._normalized_mutation_target(
@@ -1578,13 +1696,31 @@ class _TerminalEvidenceFixture:
                             + site_id
                             + "/stop?api-version=2025-03-01",
                         ),
-                        0,
+                        1,
                     ),
                 ]
                 if self.operations[operation_id]["projection"][
                     "scmDisableMutationIssued"
                 ]:
                     ordered_occurrences.append((policy_target, 1))
+                if self.operations[operation_id]["projection"][
+                    "publicNetworkAccessDisableMutationIssued"
+                ]:
+                    ordered_occurrences.append((site_target, 1))
+                if self.operations[operation_id]["projection"][
+                    "postRestoreStopMutationIssued"
+                ]:
+                    ordered_occurrences.append(
+                        (
+                            bootstrap._normalized_mutation_target(
+                                "POST",
+                                "https://management.azure.com"
+                                + site_id
+                                + "/stop?api-version=2025-03-01",
+                            ),
+                            2,
+                        )
+                    )
             for mutation_index, (target, occurrence) in enumerate(
                 ordered_occurrences
             ):
@@ -1612,11 +1748,14 @@ class _TerminalEvidenceFixture:
                 recorded = NOW + dt.timedelta(milliseconds=intent_sequence * 10)
                 if operation_id == "startBridgeForBoundedCanary":
                     canary_intent_times = (
+                        NOW + dt.timedelta(minutes=5, milliseconds=50),
+                        NOW + dt.timedelta(minutes=5, milliseconds=60),
                         NOW + dt.timedelta(minutes=5, milliseconds=110),
                         NOW + dt.timedelta(minutes=5, milliseconds=210),
                         NOW + dt.timedelta(minutes=5, seconds=3, milliseconds=10),
                         NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=10),
                         NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=10),
+                        NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=110),
                     )
                     recorded = canary_intent_times[mutation_index]
                 is_storage = (
@@ -1645,6 +1784,8 @@ class _TerminalEvidenceFixture:
                     "clientRequestId": client_request_id,
                     "status": None,
                     "responseBodySha256": None,
+                    "asyncOperationHeaderName": None,
+                    "asyncOperationHeaderValue": None,
                     "etag": None,
                     "versionId": None,
                     "requestId": None,
@@ -1667,7 +1808,18 @@ class _TerminalEvidenceFixture:
                 if operation_id == "exerciseControllerLeaseCanary":
                     intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
                 if operation_id == "startBridgeForBoundedCanary":
-                    request_body = (
+                    if method == "PATCH":
+                        request_body = bootstrap.canonical_json_bytes(
+                            {
+                                "properties": {
+                                    "publicNetworkAccess": (
+                                        "Enabled" if occurrence == 0 else "Disabled"
+                                    )
+                                }
+                            }
+                        )
+                    else:
+                        request_body = (
                         bootstrap.canonical_json_bytes(
                             {
                                 "properties": {
@@ -1677,7 +1829,7 @@ class _TerminalEvidenceFixture:
                         )
                         if method == "PUT"
                         else b""
-                    )
+                        )
                     intent["requestBodySha256"] = bootstrap.sha256_bytes(
                         request_body
                     )
@@ -6547,6 +6699,108 @@ class BootstrapTests(unittest.TestCase):
                 authorization,
             )
 
+    def test_canary_preflight_requires_exact_site_and_scm_policy_probe_pair(self):
+        base = build_projection(self.plan, self.package)
+
+        def canary_parts(projection):
+            admission = next(
+                item
+                for item in projection["operationAdmissions"]
+                if item["operationId"] == "startBridgeForBoundedCanary"
+            )
+            attached = {
+                item["id"]: item
+                for item in projection["probes"]
+                if item["id"] in admission["probeIds"]
+            }
+            return admission, attached
+
+        def reject(candidate):
+            with tempfile.TemporaryDirectory() as folder:
+                authorization = build_authorization(
+                    self.plan,
+                    self.plan_sha,
+                    self.package,
+                    candidate,
+                    Path(folder) / "receipt",
+                )
+                preflight = {
+                    "schemaVersion": 1,
+                    "status": "observed-read-only",
+                    "observedAt": authorization["observedPreflight"]["observedAt"],
+                    "projection": candidate,
+                    "projectionSha256": authorization["observedPreflight"]["sha256"],
+                }
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "exact site and SCM policy probes",
+                ):
+                    bootstrap.validate_preflight_evidence(
+                        preflight, authorization, self.plan
+                    )
+
+        removed = copy.deepcopy(base)
+        admission, attached = canary_parts(removed)
+        scm_probe = next(
+            item
+            for item in attached.values()
+            if "/basicPublishingCredentialsPolicies/scm?" in item["url"]
+        )
+        admission["probeIds"].remove(scm_probe["id"])
+        removed["probes"] = [
+            item for item in removed["probes"] if item["id"] != scm_probe["id"]
+        ]
+        reject(removed)
+
+        substituted = copy.deepcopy(base)
+        admission, attached = canary_parts(substituted)
+        scm_probe = next(
+            item
+            for item in attached.values()
+            if "/basicPublishingCredentialsPolicies/scm?" in item["url"]
+        )
+        unrelated_probe = next(
+            item
+            for item in substituted["probes"]
+            if item["phase"] == "preflight"
+            and item["method"] == "GET"
+            and item["id"] not in admission["probeIds"]
+        )
+        admission["probeIds"][admission["probeIds"].index(scm_probe["id"])] = (
+            unrelated_probe["id"]
+        )
+        reject(substituted)
+
+        for label, mutate in (
+            (
+                "scm-status",
+                lambda admission, attached: next(
+                    item
+                    for item in attached.values()
+                    if "/basicPublishingCredentialsPolicies/scm?" in item["url"]
+                ).__setitem__("status", 404),
+            ),
+            (
+                "site-status",
+                lambda admission, attached: next(
+                    item
+                    for item in attached.values()
+                    if "/basicPublishingCredentialsPolicies/scm?" not in item["url"]
+                ).__setitem__("status", 404),
+            ),
+            (
+                "admission-status",
+                lambda admission, _attached: admission.__setitem__(
+                    "status", "owned-present"
+                ),
+            ),
+        ):
+            candidate = copy.deepcopy(base)
+            admission, attached = canary_parts(candidate)
+            mutate(admission, attached)
+            with self.subTest(label=label):
+                reject(candidate)
+
     def test_controller_lock_handcrafted_adoption_is_rejected_by_policy_and_preflight(self):
         projection = build_projection(self.plan, self.package)
         receipt = Path("C:/outside") / (
@@ -7122,6 +7376,7 @@ class BootstrapTests(unittest.TestCase):
             transport=transport,
             now=clock,
             source_validator=self.source,
+            incident_root=validated.receipt_directory.parent,
         )
 
     def test_default_describe_never_constructs_transport(self):
@@ -8042,6 +8297,7 @@ class BootstrapTests(unittest.TestCase):
                 transport=transport,
                 now=clock,
                 source_validator=self.source,
+                incident_root=validated.receipt_directory.parent,
             )
             with self.assertRaisesRegex(bootstrap.BootstrapError, "authorization expired"):
                 executor.run()
@@ -8109,6 +8365,7 @@ class BootstrapTests(unittest.TestCase):
                 transport=transport,
                 now=lambda: current[0],
                 source_validator=self.source,
+                incident_root=validated.receipt_directory.parent,
             )
             with (
                 mock.patch.object(transport, "apply_operation", side_effect=apply),
@@ -8328,10 +8585,28 @@ class BootstrapTests(unittest.TestCase):
             class Journal:
                 def __init__(self):
                     self.items = []
+                    self.unresolved_public_network_incidents = []
+                    self.cleared_public_network_incidents = 0
 
                 def append_cloud_mutation(self, item):
                     self.items.append(copy.deepcopy(item))
                     return Path(f"cloud-mutation-{len(self.items):04d}.json")
+
+                def write_unresolved_public_network_enable(self, item):
+                    self.unresolved_public_network_incidents.append(
+                        copy.deepcopy(item)
+                    )
+                    return Path(
+                        bootstrap.UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME
+                    )
+
+                def clear_unresolved_public_network_enable(self):
+                    if len(self.unresolved_public_network_incidents) != 1:
+                        raise bootstrap.BootstrapError(
+                            "test public-network incident marker is absent"
+                        )
+                    self.unresolved_public_network_incidents.clear()
+                    self.cleared_public_network_incidents += 1
 
             current = [NOW + dt.timedelta(seconds=3)]
 
@@ -8350,9 +8625,17 @@ class BootstrapTests(unittest.TestCase):
                     trigger_location_duplicate=False,
                     discovery_status=200,
                     disable_before_cleanup=False,
+                    restart_on_public_disable=False,
+                    fault_stage=None,
+                    public_patch_status=200,
+                    stop_settlement_reads=0,
+                    enable_async_header_mode="exact",
+                    enable_async_terminal_status="Succeeded",
+                    fail_public_disable=False,
                 ):
                     self.requests = []
-                    self.site_states = ["Stopped", "Running", "Stopped"]
+                    self.site_state = "Stopped"
+                    self.public_network_access = "Disabled"
                     self.history_reads = 0
                     self.terminal_status = terminal_status
                     self.running_timeouts = running_timeouts
@@ -8366,14 +8649,78 @@ class BootstrapTests(unittest.TestCase):
                     self.trigger_location_duplicate = trigger_location_duplicate
                     self.discovery_status = discovery_status
                     self.disable_before_cleanup = disable_before_cleanup
+                    self.restart_on_public_disable = restart_on_public_disable
+                    self.fault_stage = fault_stage
+                    self.public_patch_status = public_patch_status
+                    self.stop_settlement_reads = stop_settlement_reads
+                    self.enable_async_header_mode = enable_async_header_mode
+                    self.enable_async_terminal_status = enable_async_terminal_status
+                    self.fail_public_disable = fail_public_disable
                     self.scm_policy_enabled = False
+                    self.scm_policy_gets = 0
+                    self.scm_pre_read_failures_remaining = 4
+                    self.fault_fired = False
+                    self.stop_requests = 0
+                    self.pending_stop_reads = 0
+                    self.public_network_async_poll_count = 0
+                    self.public_network_operation_count = 0
+                    self.public_network_operations = {}
 
                 def request(
                     self, method, url, *, body=None, headers=None, deadline=None
                 ):
                     self.requests.append((method, url, body, dict(headers or {})))
                     response_headers = {"Content-Type": "application/json"}
+                    if method == "GET" and url in self.public_network_operations:
+                        operation_state = self.public_network_operations[url]
+                        operation_state["reads"] += 1
+                        self.public_network_async_poll_count += 1
+                        if operation_state["reads"] == 1:
+                            return bootstrap._RestResponse(
+                                200,
+                                bootstrap.canonical_json_bytes(
+                                    {"status": "InProgress"}
+                                ),
+                                response_headers,
+                            )
+                        if (
+                            operation_state["access"] == "Enabled"
+                            and operation_state["terminalStatus"] != "Succeeded"
+                        ):
+                            operation_state["complete"] = True
+                            return bootstrap._RestResponse(
+                                200,
+                                bootstrap.canonical_json_bytes(
+                                    {"status": operation_state["terminalStatus"]}
+                                ),
+                                response_headers,
+                            )
+                        self.public_network_access = operation_state["access"]
+                        operation_state["complete"] = True
+                        if self.public_network_access == "Enabled" or (
+                            self.public_network_access == "Disabled"
+                            and self.restart_on_public_disable
+                        ):
+                            self.site_state = "Running"
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {"status": "Succeeded"}
+                            ),
+                            response_headers,
+                        )
                     if "/basicPublishingCredentialsPolicies/scm?" in url:
+                        if method == "GET":
+                            self.scm_policy_gets += 1
+                            if (
+                                self.fault_stage == "scm-pre-read"
+                                and self.scm_policy_gets >= 2
+                                and self.scm_pre_read_failures_remaining > 0
+                            ):
+                                self.scm_pre_read_failures_remaining -= 1
+                                raise bootstrap._RestTotalTimeout(
+                                    "Azure REST total response deadline expired"
+                                )
                         policy = {
                             "id": site["resourceId"]
                             + "/basicPublishingCredentialsPolicies/scm",
@@ -8385,6 +8732,15 @@ class BootstrapTests(unittest.TestCase):
                             requested = json.loads((body or b"").decode("utf-8"))
                             self.scm_policy_enabled = requested["properties"]["allow"]
                             policy["properties"]["allow"] = self.scm_policy_enabled
+                            if (
+                                self.fault_stage == "scm-enable"
+                                and self.scm_policy_enabled
+                                and not self.fault_fired
+                            ):
+                                self.fault_fired = True
+                                raise bootstrap._RestTotalTimeout(
+                                    "Azure REST total response deadline expired"
+                                )
                         return bootstrap._RestResponse(
                             200,
                             bootstrap.canonical_json_bytes(policy),
@@ -8520,7 +8876,11 @@ class BootstrapTests(unittest.TestCase):
                     if method == "GET" and url.startswith(
                         f"https://management.azure.com{site['resourceId']}?"
                     ):
-                        if self.site_states[0] == "Running" and self.running_timeouts:
+                        if self.pending_stop_reads:
+                            self.pending_stop_reads -= 1
+                            if self.pending_stop_reads == 0:
+                                self.site_state = "Stopped"
+                        if self.site_state == "Running" and self.running_timeouts:
                             self.running_timeouts -= 1
                             current[0] += dt.timedelta(
                                 seconds=bootstrap.AZURE_REST_RESPONSE_TIMEOUT_SECONDS
@@ -8528,7 +8888,7 @@ class BootstrapTests(unittest.TestCase):
                             raise bootstrap._RestTotalTimeout(
                                 "Azure REST total response deadline expired"
                             )
-                        state = self.site_states.pop(0)
+                        state = self.site_state
                         if state == "Running":
                             current[0] += dt.timedelta(
                                 seconds=self.running_settlement_seconds
@@ -8539,10 +8899,95 @@ class BootstrapTests(unittest.TestCase):
                                 {
                                     "id": site["resourceId"],
                                     "name": site["name"],
-                                    "properties": {"state": state},
+                                    "type": "Microsoft.Web/sites",
+                                    "properties": {
+                                        "state": state,
+                                        "publicNetworkAccess": self.public_network_access,
+                                    },
                                 }
                             ),
                             response_headers,
+                        )
+                    if method == "PATCH" and url.startswith(
+                        f"https://management.azure.com{site['resourceId']}?"
+                    ):
+                        requested = json.loads((body or b"").decode("utf-8"))
+                        requested_access = requested["properties"][
+                            "publicNetworkAccess"
+                        ]
+                        if not self._ledger.unresolved_public_network_incidents:
+                            raise AssertionError(
+                                "public-network incident marker was not durable before PATCH"
+                            )
+                        if requested_access == "Disabled" and self.fail_public_disable:
+                            raise bootstrap._RestTotalTimeout(
+                                "Azure REST total response deadline expired"
+                            )
+                        if self.public_patch_status == 202:
+                            self.public_network_operation_count += 1
+                            async_url = (
+                                "https://management.azure.com/providers/Microsoft.Web/"
+                                "locations/southeastasia/operations/public-network-"
+                                f"{self.public_network_operation_count}"
+                                "?api-version=2025-03-01"
+                            )
+                            self.public_network_operations[async_url] = {
+                                "access": requested_access,
+                                "reads": 0,
+                                "terminalStatus": (
+                                    self.enable_async_terminal_status
+                                    if requested_access == "Enabled"
+                                    else "Succeeded"
+                                ),
+                                "complete": False,
+                            }
+                            async_headers = {
+                                "Azure-AsyncOperation": async_url
+                            }
+                            async_header_items = None
+                            if requested_access == "Enabled":
+                                if self.enable_async_header_mode == "missing":
+                                    async_headers = {}
+                                elif self.enable_async_header_mode == "ambiguous":
+                                    async_header_items = (
+                                        ("Azure-AsyncOperation", async_url),
+                                        (
+                                            "azure-asyncoperation",
+                                            async_url + "&alternate=true",
+                                        ),
+                                    )
+                                elif self.enable_async_header_mode == "location":
+                                    async_headers = {"Location": async_url}
+                                elif self.enable_async_header_mode == "foreign":
+                                    async_headers = {
+                                        "Azure-AsyncOperation": (
+                                            "https://example.invalid/operations/enable"
+                                            "?api-version=2025-03-01"
+                                        )
+                                    }
+                            return bootstrap._RestResponse(
+                                202,
+                                b"",
+                                async_headers,
+                                header_items=async_header_items,
+                            )
+                        self.public_network_access = requested_access
+                        if requested_access == "Enabled" or (
+                            requested_access == "Disabled"
+                            and self.restart_on_public_disable
+                        ):
+                            self.site_state = "Running"
+                        if (
+                            self.fault_stage == "public-network-patch"
+                            and self.public_network_access == "Enabled"
+                            and not self.fault_fired
+                        ):
+                            self.fault_fired = True
+                            raise bootstrap._RestTotalTimeout(
+                                "Azure REST total response deadline expired"
+                            )
+                        return bootstrap._RestResponse(
+                            self.public_patch_status, b"", {}
                         )
                     if method == "POST" and url.split("?", 1)[0].endswith("/run"):
                         run_headers = {}
@@ -8571,9 +9016,28 @@ class BootstrapTests(unittest.TestCase):
                     if (
                         method == "POST"
                         and url.split("?", 1)[0].endswith("/stop")
-                        and self.disable_before_cleanup
                     ):
-                        self.scm_policy_enabled = False
+                        self.stop_requests += 1
+                        if (
+                            self.fault_stage == "pre-canary-stop"
+                            and self.stop_requests == 1
+                            and not self.fault_fired
+                        ):
+                            self.fault_fired = True
+                            raise bootstrap._RestTotalTimeout(
+                                "Azure REST total response deadline expired"
+                            )
+                        if self.stop_settlement_reads:
+                            self.pending_stop_reads = self.stop_settlement_reads
+                        else:
+                            self.site_state = "Stopped"
+                        if self.disable_before_cleanup:
+                            self.scm_policy_enabled = False
+                    if (
+                        method == "POST"
+                        and url.split("?", 1)[0].endswith("/start")
+                    ):
+                        self.site_state = "Running"
                     return bootstrap._RestResponse(202, b"", {})
 
             def build_transport(session):
@@ -8591,6 +9055,7 @@ class BootstrapTests(unittest.TestCase):
                 }
                 transport.session = session
                 transport._ledger = Journal()
+                session._ledger = transport._ledger
                 transport._active_operation_id = operation["id"]
                 transport.clock = lambda: current[0]
                 transport.sleep = lambda seconds: current.__setitem__(
@@ -8632,7 +9097,12 @@ class BootstrapTests(unittest.TestCase):
             proof = build_transport(success_session)._mutate(operation, state)
             self.assertTrue(proof["selfCleaned"])
             self.assertTrue(proof["scmBasicAuthSelfCleaned"])
+            self.assertTrue(proof["publicNetworkAccessSelfCleaned"])
             self.assertFalse(proof["scmBasicAuthRestored"]["allow"])
+            self.assertEqual(
+                proof["publicNetworkAccessRestored"]["publicNetworkAccess"],
+                "Disabled",
+            )
             self.assertEqual(proof["terminalHistory"]["status"], "Success")
             self.assertEqual(proof["stopped"]["state"], "Stopped")
             self.assertIn("not observed", proof["proofBoundary"])
@@ -8642,7 +9112,7 @@ class BootstrapTests(unittest.TestCase):
             ]
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in methods_and_paths),
-                1,
+                2,
             )
             self.assertEqual(
                 sum(
@@ -8652,6 +9122,288 @@ class BootstrapTests(unittest.TestCase):
                 ),
                 2,
             )
+            self.assertEqual(
+                sum(
+                    method == "PATCH"
+                    and path.lower().endswith(site["resourceId"].lower())
+                    for method, path in methods_and_paths
+                ),
+                2,
+            )
+            self.assertEqual(success_session.public_network_access, "Disabled")
+            self.assertEqual(
+                success_session._ledger.cleared_public_network_incidents,
+                1,
+            )
+            self.assertEqual(
+                success_session._ledger.unresolved_public_network_incidents,
+                [],
+            )
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            restarted_session = Session(restart_on_public_disable=True)
+            restarted = build_transport(restarted_session)._mutate(operation, state)
+            self.assertTrue(restarted["postRestoreStopMutationIssued"])
+            self.assertEqual(restarted["stopped"]["state"], "Stopped")
+            restarted_paths = [
+                (method, url.split("?", 1)[0])
+                for method, url, _body, _headers in restarted_session.requests
+            ]
+            self.assertEqual(
+                sum(path.endswith("/stop") for _method, path in restarted_paths),
+                3,
+            )
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            asynchronous_session = Session(
+                public_patch_status=202,
+                stop_settlement_reads=2,
+            )
+            asynchronous = build_transport(asynchronous_session)._mutate(
+                operation, state
+            )
+            self.assertEqual(asynchronous["terminalHistory"]["status"], "Success")
+            self.assertEqual(asynchronous["stopped"]["state"], "Stopped")
+            self.assertEqual(asynchronous_session.public_network_access, "Disabled")
+            self.assertEqual(asynchronous_session.public_network_async_poll_count, 4)
+            self.assertEqual(
+                asynchronous["publicNetworkAccessEnableAsyncOperation"][
+                    "terminalStatus"
+                ],
+                "Succeeded",
+            )
+            self.assertEqual(
+                asynchronous["publicNetworkAccessDisableAsyncOperation"][
+                    "terminalStatus"
+                ],
+                "Succeeded",
+            )
+
+            async_transport = build_transport(Session())
+            for label, async_response in (
+                (
+                    "missing",
+                    bootstrap._RestResponse(202, b"", {}),
+                ),
+                (
+                    "ambiguous",
+                    bootstrap._RestResponse(
+                        202,
+                        b"",
+                        {},
+                        header_items=(
+                            (
+                                "Azure-AsyncOperation",
+                                "https://management.azure.com/operations/one"
+                                "?api-version=2025-03-01",
+                            ),
+                            (
+                                "azure-asyncoperation",
+                                "https://management.azure.com/operations/two"
+                                "?api-version=2025-03-01",
+                            ),
+                        ),
+                    ),
+                ),
+                (
+                    "location-only",
+                    bootstrap._RestResponse(
+                        202,
+                        b"",
+                        {
+                            "Location": (
+                                "https://management.azure.com/operations/one"
+                                "?api-version=2025-03-01"
+                            )
+                        },
+                    ),
+                ),
+                (
+                    "foreign-host",
+                    bootstrap._RestResponse(
+                        202,
+                        b"",
+                        {
+                            "Azure-AsyncOperation": (
+                                "https://example.invalid/operations/one"
+                                "?api-version=2025-03-01"
+                            )
+                        },
+                    ),
+                ),
+            ):
+                with self.subTest(async_header=label), self.assertRaises(
+                    bootstrap.BootstrapError
+                ):
+                    async_transport._await_arm_async_operation(
+                        async_response,
+                        deadline=NOW + dt.timedelta(seconds=30),
+                        label="test site PATCH",
+                    )
+
+            for header_mode, terminal_status in (
+                ("missing", "Succeeded"),
+                ("ambiguous", "Succeeded"),
+                ("location", "Succeeded"),
+                ("foreign", "Succeeded"),
+                ("exact", "Failed"),
+            ):
+                current[0] = NOW + dt.timedelta(seconds=3)
+                unresolved_session = Session(
+                    public_patch_status=202,
+                    enable_async_header_mode=header_mode,
+                    enable_async_terminal_status=terminal_status,
+                )
+                unresolved_transport = build_transport(unresolved_session)
+                with self.subTest(
+                    header_mode=header_mode,
+                    terminal_status=terminal_status,
+                ), self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "exact finally cleanup also failed",
+                ):
+                    unresolved_transport._mutate(operation, state)
+                unresolved_paths = [
+                    (method, url.split("?", 1)[0])
+                    for method, url, _body, _headers in unresolved_session.requests
+                ]
+                self.assertEqual(
+                    sum(path.endswith("/start") for _method, path in unresolved_paths),
+                    0,
+                )
+                self.assertEqual(
+                    sum(path.endswith("/run") for _method, path in unresolved_paths),
+                    0,
+                )
+                self.assertEqual(
+                    sum(
+                        method == "PATCH"
+                        and path.lower().endswith(site["resourceId"].lower())
+                        for method, path in unresolved_paths
+                    ),
+                    2,
+                )
+                self.assertEqual(unresolved_session.public_network_access, "Disabled")
+                self.assertEqual(unresolved_session.site_state, "Stopped")
+                self.assertFalse(unresolved_session.scm_policy_enabled)
+                self.assertEqual(
+                    len(
+                        unresolved_transport._ledger.unresolved_public_network_incidents
+                    ),
+                    1,
+                )
+                if terminal_status == "Succeeded":
+                    unresolved_enable_url = next(
+                        iter(unresolved_session.public_network_operations)
+                    )
+                    unresolved_session.request("GET", unresolved_enable_url)
+                    unresolved_session.request("GET", unresolved_enable_url)
+                    self.assertEqual(
+                        unresolved_session.public_network_access,
+                        "Enabled",
+                    )
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            failed_disable_session = Session(
+                public_patch_status=202,
+                enable_async_header_mode="missing",
+                fail_public_disable=True,
+            )
+            failed_disable_transport = build_transport(failed_disable_session)
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "exact finally cleanup also failed",
+            ):
+                failed_disable_transport._mutate(operation, state)
+            self.assertEqual(
+                len(
+                    failed_disable_transport._ledger
+                    .unresolved_public_network_incidents
+                ),
+                1,
+            )
+            self.assertEqual(
+                failed_disable_transport._ledger.cleared_public_network_incidents,
+                0,
+            )
+            incident = (
+                failed_disable_transport._ledger
+                .unresolved_public_network_incidents[0]
+            )
+            incident_root = Path(folder) / "incident-root"
+            incident_root.mkdir()
+            prior = incident_root / (
+                "paperdesk-private-release-v2-bootstrap-"
+                + incident["authorizationId"]
+            )
+            prior.mkdir()
+            (
+                prior / bootstrap.UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME
+            ).write_bytes(bootstrap.canonical_json_bytes(incident))
+            fresh = incident_root / (
+                "paperdesk-private-release-v2-bootstrap-"
+                "22222222-2222-4222-8222-222222222222"
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "fresh Azure bootstrap is NO-GO pending reviewed recovery",
+            ):
+                bootstrap._reject_prior_unresolved_public_network_enable_incidents(
+                    fresh,
+                    incident_root=incident_root,
+                )
+
+            for fault_stage in (
+                "public-network-patch",
+                "pre-canary-stop",
+                "scm-pre-read",
+                "scm-enable",
+            ):
+                current[0] = NOW + dt.timedelta(seconds=3)
+                fault_session = Session(
+                    fault_stage=fault_stage,
+                    restart_on_public_disable=True,
+                )
+                expected_failure = (
+                    "exact finally cleanup also failed"
+                    if fault_stage == "public-network-patch"
+                    else "before terminal Success"
+                )
+                with self.subTest(fault_stage=fault_stage), self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    expected_failure,
+                ):
+                    build_transport(fault_session)._mutate(operation, state)
+                fault_paths = [
+                    (method, url.split("?", 1)[0])
+                    for method, url, _body, _headers in fault_session.requests
+                ]
+                self.assertEqual(
+                    sum(path.endswith("/start") for _method, path in fault_paths),
+                    0,
+                )
+                self.assertEqual(
+                    sum(path.endswith("/run") for _method, path in fault_paths),
+                    0,
+                )
+                self.assertEqual(
+                    sum(
+                        method == "PATCH"
+                        and path.lower().endswith(site["resourceId"].lower())
+                        for method, path in fault_paths
+                    ),
+                    2,
+                )
+                self.assertGreaterEqual(
+                    sum(path.endswith("/stop") for _method, path in fault_paths),
+                    1,
+                )
+                self.assertEqual(fault_session.site_state, "Stopped")
+                self.assertEqual(
+                    fault_session.public_network_access,
+                    "Disabled",
+                )
+                self.assertFalse(fault_session.scm_policy_enabled)
 
             current[0] = NOW + dt.timedelta(seconds=3)
             already_disabled_session = Session(disable_before_cleanup=True)
@@ -8691,7 +9443,7 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in retried_methods_and_paths),
-                1,
+                2,
             )
             self.assertEqual(
                 sum(
@@ -8699,7 +9451,7 @@ class BootstrapTests(unittest.TestCase):
                     and path.lower().endswith(site["resourceId"].lower())
                     for method, path in retried_methods_and_paths
                 ),
-                6,
+                11,
             )
 
             current[0] = NOW + dt.timedelta(seconds=3)
@@ -8739,7 +9491,7 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in old_cutoff_paths),
-                1,
+                2,
             )
 
             current[0] = NOW + dt.timedelta(seconds=3)
@@ -8797,7 +9549,7 @@ class BootstrapTests(unittest.TestCase):
                         path.endswith("/stop")
                         for _method, path in history_methods_and_paths
                     ),
-                    1,
+                    2,
                 )
 
             for rate_limit_stage in (
@@ -8825,8 +9577,8 @@ class BootstrapTests(unittest.TestCase):
                     1,
                 )
                 self.assertEqual(
-                    sum(path.endswith("/stop") for _method, path in throttled_paths),
-                    1,
+                sum(path.endswith("/stop") for _method, path in throttled_paths),
+                2,
                 )
 
             current[0] = NOW + dt.timedelta(seconds=3)
@@ -8852,7 +9604,7 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in exhausted_methods_and_paths),
-                1,
+                2,
             )
             self.assertLess(
                 current[0],
@@ -8874,9 +9626,10 @@ class BootstrapTests(unittest.TestCase):
                     url.split("?", 1)[0].endswith("/stop")
                     for _method, url, _body, _headers in failed_session.requests
                 ),
-                1,
+                2,
             )
             self.assertFalse(failed_session.scm_policy_enabled)
+            self.assertEqual(failed_session.public_network_access, "Disabled")
 
             current[0] = NOW + dt.timedelta(seconds=3)
             unauthorized_session = Session(discovery_status=401)
@@ -8896,7 +9649,7 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertEqual(
                 sum(path.endswith("/stop") for _method, path in unauthorized_paths),
-                1,
+                2,
             )
             self.assertEqual(
                 sum(
@@ -8907,6 +9660,7 @@ class BootstrapTests(unittest.TestCase):
                 2,
             )
             self.assertFalse(unauthorized_session.scm_policy_enabled)
+            self.assertEqual(unauthorized_session.public_network_access, "Disabled")
 
             for trigger_session, expected_message in (
                 (
@@ -8933,7 +9687,112 @@ class BootstrapTests(unittest.TestCase):
                     for _method, url, _body, _headers in trigger_session.requests
                 ]
                 self.assertEqual(sum(path.endswith("/run") for path in paths), 1)
-                self.assertEqual(sum(path.endswith("/stop") for path in paths), 1)
+                self.assertEqual(sum(path.endswith("/stop") for path in paths), 2)
+
+    def test_prior_unresolved_public_network_enable_blocks_fresh_bootstrap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder)
+            prior_id = "11111111-1111-4111-8111-111111111111"
+            prior = parent / f"paperdesk-private-release-v2-bootstrap-{prior_id}"
+            prior.mkdir()
+            site_id = next(
+                item["resourceId"]
+                for item in self.plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            marker = {
+                "schemaVersion": 1,
+                "status": "unresolved-public-network-enable",
+                "authorizationId": prior_id,
+                "sourceSha": HEAD,
+                "siteResourceId": site_id,
+                "enableMutationTargetUrl": (
+                    "https://management.azure.com"
+                    + site_id
+                    + "?api-version=2025-03-01"
+                ),
+                "responseStatus": 202,
+                "asyncOperationHeaderName": "Azure-AsyncOperation",
+                "asyncOperationHeaderValue": (
+                    "https://management.azure.com/providers/Microsoft.Web/locations/"
+                    "southeastasia/operations/unresolved?api-version=2025-03-01"
+                ),
+                "recordedAt": stamp(NOW),
+            }
+            (prior / bootstrap.UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME).write_bytes(
+                bootstrap.canonical_json_bytes(marker)
+            )
+            fresh = parent / (
+                "paperdesk-private-release-v2-bootstrap-"
+                "22222222-2222-4222-8222-222222222222"
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "fresh Azure bootstrap is NO-GO pending reviewed recovery",
+            ):
+                bootstrap._reject_prior_unresolved_public_network_enable_incidents(
+                    fresh,
+                    incident_root=parent,
+                )
+            other_root = parent / "other-root"
+            other_root.mkdir()
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "outside the source-fixed incident root",
+            ):
+                bootstrap._reject_prior_unresolved_public_network_enable_incidents(
+                    fresh,
+                    incident_root=other_root,
+                )
+
+    def test_public_network_incident_marker_is_create_only_and_cleared_exactly(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder)
+            ledger = bootstrap.UseLedger(
+                directory=parent
+                / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}",
+                authorization_id=AUTH_ID,
+                authorization_sha256="a" * 64,
+                source_sha=HEAD,
+                plan_sha256=self.plan_sha,
+                claimed_at=stamp(NOW),
+            )
+            ledger.claim()
+            site_id = next(
+                item["resourceId"]
+                for item in self.plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            marker = {
+                "schemaVersion": 1,
+                "status": "unresolved-public-network-enable",
+                "authorizationId": AUTH_ID,
+                "sourceSha": HEAD,
+                "siteResourceId": site_id,
+                "enableMutationTargetUrl": (
+                    "https://management.azure.com"
+                    + site_id
+                    + "?api-version=2025-03-01"
+                ),
+                "responseStatus": None,
+                "asyncOperationHeaderName": None,
+                "asyncOperationHeaderValue": None,
+                "recordedAt": stamp(NOW),
+            }
+            marker_path = ledger.write_unresolved_public_network_enable(marker)
+            self.assertEqual(
+                marker_path.read_bytes(),
+                bootstrap.canonical_json_bytes(marker),
+            )
+            with self.assertRaises(FileExistsError):
+                ledger.write_unresolved_public_network_enable(marker)
+            ledger.clear_unresolved_public_network_enable()
+            self.assertFalse(marker_path.exists())
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "marker is absent or unsafe",
+            ):
+                ledger.clear_unresolved_public_network_enable()
 
     def test_full_terminal_source_evidence_public_validator_accepts_exact_fixture(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -9021,11 +9880,14 @@ class BootstrapTests(unittest.TestCase):
                 if item["phase"] == "intent":
                     canary_pair_index += 1
                 canary_intent_times = (
+                    NOW + dt.timedelta(minutes=5, milliseconds=50),
+                    NOW + dt.timedelta(minutes=5, milliseconds=60),
                     NOW + dt.timedelta(minutes=5, milliseconds=110),
                     NOW + dt.timedelta(minutes=5, milliseconds=210),
                     NOW + dt.timedelta(minutes=5, seconds=3, milliseconds=10),
                     NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=10),
                     NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=10),
+                    NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=110),
                 )
                 item["recordedAt"] = stamp(
                     canary_intent_times[canary_pair_index]
@@ -9263,7 +10125,7 @@ class BootstrapTests(unittest.TestCase):
             for item in journal
             if item["operationId"] == canary_id
         ]
-        self.assertEqual(len(canary_entries), 10)
+        self.assertEqual(len(canary_entries), 16)
 
         body_drift = copy.deepcopy(journal)
         drifted = 0
@@ -9279,7 +10141,16 @@ class BootstrapTests(unittest.TestCase):
         ):
             bootstrap._validate_sanitized_mutation_journal(body_drift, **inputs)
 
-        for pair_index, invalid_status in ((0, 202), (2, 202), (3, 201), (4, 202)):
+        for pair_index, invalid_status in (
+            (0, 202),
+            (1, 201),
+            (2, 202),
+            (3, 201),
+            (4, 201),
+            (5, 201),
+            (6, 202),
+            (7, 202),
+        ):
             with self.subTest(pair_index=pair_index, invalid_status=invalid_status):
                 status_drift = copy.deepcopy(journal)
                 canary_results = [
@@ -9297,10 +10168,155 @@ class BootstrapTests(unittest.TestCase):
                         status_drift, **inputs
                     )
 
-        pairs = [canary_entries[index : index + 2] for index in range(0, 10, 2)]
+        asynchronous_site_updates = copy.deepcopy(journal)
+        asynchronous_inputs = copy.deepcopy(inputs)
+        asynchronous_projection = asynchronous_inputs["operation_projections"][
+            canary_id
+        ]["projection"]
+        asynchronous_projection["publicNetworkAccessEnableAsyncOperation"] = {
+            "mode": "arm-async",
+            "responseStatus": 202,
+            "monitorHeaderName": "Azure-AsyncOperation",
+            "monitorUrl": (
+                "https://management.azure.com/providers/Microsoft.Web/locations/"
+                "southeastasia/operations/enable?api-version=2025-03-01"
+            ),
+            "pollAttempts": 2,
+            "terminalStatus": "Succeeded",
+            "terminalObservedAt": stamp(
+                NOW + dt.timedelta(minutes=5, milliseconds=60)
+            ),
+            "terminalResponseSha256": bootstrap.sha256_bytes(
+                b"enable-async-terminal"
+            ),
+        }
+        asynchronous_projection["publicNetworkAccessDisableAsyncOperation"] = {
+            "mode": "arm-async",
+            "responseStatus": 202,
+            "monitorHeaderName": "Azure-AsyncOperation",
+            "monitorUrl": (
+                "https://management.azure.com/providers/Microsoft.Web/locations/"
+                "southeastasia/operations/disable?api-version=2025-03-01"
+            ),
+            "pollAttempts": 2,
+            "terminalStatus": "Succeeded",
+            "terminalObservedAt": stamp(
+                NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=150)
+            ),
+            "terminalResponseSha256": bootstrap.sha256_bytes(
+                b"disable-async-terminal"
+            ),
+        }
+        bootstrap._validate_operation_source_projection(
+            asynchronous_inputs["operation_projections"][canary_id],
+            operation_id=canary_id,
+            plan=asynchronous_inputs["plan"],
+            authorization=asynchronous_inputs["authorization"],
+            prior=asynchronous_inputs["operation_projections"],
+            operation_context=asynchronous_inputs["operation_contexts"][canary_id],
+            runtime_facts={},
+        )
+        canary_results = [
+            item
+            for item in asynchronous_site_updates
+            if item["operationId"] == canary_id and item["phase"] == "result"
+        ]
+        canary_results[0]["status"] = 202
+        canary_results[7]["status"] = 202
+        for result_index, projection_field in (
+            (0, "publicNetworkAccessEnableAsyncOperation"),
+            (7, "publicNetworkAccessDisableAsyncOperation"),
+        ):
+            canary_results[result_index]["asyncOperationHeaderName"] = (
+                asynchronous_projection[projection_field]["monitorHeaderName"]
+            )
+            canary_results[result_index]["asyncOperationHeaderValue"] = (
+                asynchronous_projection[projection_field]["monitorUrl"]
+            )
+        self.assertEqual(
+            bootstrap._validate_sanitized_mutation_journal(
+                asynchronous_site_updates, **asynchronous_inputs
+            ),
+            asynchronous_site_updates,
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "bridge canary mutation order, body, or status",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(
+                journal, **asynchronous_inputs
+            )
+        header_drift = copy.deepcopy(asynchronous_site_updates)
+        header_drift_results = [
+            item
+            for item in header_drift
+            if item["operationId"] == canary_id and item["phase"] == "result"
+        ]
+        header_drift_results[0]["asyncOperationHeaderValue"] = (
+            "https://management.azure.com/providers/Microsoft.Web/locations/"
+            "southeastasia/operations/other?api-version=2025-03-01"
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "asynchronous response header is not cross-bound",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(
+                header_drift, **asynchronous_inputs
+            )
+        causality_drift_inputs = copy.deepcopy(asynchronous_inputs)
+        causality_drift_inputs["operation_projections"][canary_id]["projection"][
+            "publicNetworkAccessEnableAsyncOperation"
+        ]["terminalObservedAt"] = stamp(
+            NOW + dt.timedelta(minutes=5, milliseconds=50)
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "asynchronous timing is not cross-bound",
+        ):
+            bootstrap._validate_sanitized_mutation_journal(
+                asynchronous_site_updates, **causality_drift_inputs
+            )
+
+        for field, invalid_value in (
+            ("monitorUrl", "https://example.invalid/operation?api-version=1"),
+            ("pollAttempts", 0),
+            ("terminalStatus", "Failed"),
+            (
+                "terminalObservedAt",
+                stamp(NOW + dt.timedelta(minutes=5, seconds=1)),
+            ),
+        ):
+            with self.subTest(async_evidence_field=field):
+                drifted_inputs = copy.deepcopy(asynchronous_inputs)
+                drifted_inputs["operation_projections"][canary_id]["projection"][
+                    "publicNetworkAccessEnableAsyncOperation"
+                ][field] = invalid_value
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_operation_source_projection(
+                        drifted_inputs["operation_projections"][canary_id],
+                        operation_id=canary_id,
+                        plan=drifted_inputs["plan"],
+                        authorization=drifted_inputs["authorization"],
+                        prior=drifted_inputs["operation_projections"],
+                        operation_context=drifted_inputs["operation_contexts"][
+                            canary_id
+                        ],
+                        runtime_facts={},
+                    )
+
+        pairs = [canary_entries[index : index + 2] for index in range(0, 16, 2)]
         reordered_entries = [
             item
-            for pair in (pairs[0], pairs[1], pairs[3], pairs[2], pairs[4])
+            for pair in (
+                pairs[0],
+                pairs[1],
+                pairs[2],
+                pairs[4],
+                pairs[3],
+                pairs[5],
+                pairs[6],
+                pairs[7],
+            )
             for item in pair
         ]
         reordered = []
@@ -9352,10 +10368,10 @@ class BootstrapTests(unittest.TestCase):
             if item["operationId"] == canary_id
         ][:2]
         enable_records[0]["recordedAt"] = stamp(
-            NOW + dt.timedelta(minutes=5, milliseconds=50)
+            NOW + dt.timedelta(minutes=5, milliseconds=20)
         )
         enable_records[1]["recordedAt"] = stamp(
-            NOW + dt.timedelta(minutes=5, milliseconds=60)
+            NOW + dt.timedelta(minutes=5, milliseconds=30)
         )
         with self.assertRaisesRegex(
             bootstrap.BootstrapError,
@@ -9367,7 +10383,9 @@ class BootstrapTests(unittest.TestCase):
         no_disable_projection[canary_id]["projection"][
             "scmDisableMutationIssued"
         ] = False
-        no_disable_entries = [item for pair in pairs[:4] for item in pair]
+        no_disable_entries = [
+            item for pair in (*pairs[:6], *pairs[7:]) for item in pair
+        ]
         no_disable = []
         inserted = False
         for item in journal:
@@ -9378,6 +10396,15 @@ class BootstrapTests(unittest.TestCase):
             else:
                 no_disable.append(copy.deepcopy(item))
         self._resequence_terminal_journal(no_disable)
+        no_disable_canary = [
+            item for item in no_disable if item["operationId"] == canary_id
+        ]
+        no_disable_canary[-2]["recordedAt"] = stamp(
+            NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=110)
+        )
+        no_disable_canary[-1]["recordedAt"] = stamp(
+            NOW + dt.timedelta(minutes=5, seconds=8, milliseconds=115)
+        )
         no_disable_inputs = dict(inputs)
         no_disable_inputs["operation_projections"] = no_disable_projection
         validated = bootstrap._validate_sanitized_mutation_journal(

@@ -142,7 +142,10 @@ class CanaryTimingTests(unittest.TestCase):
         session = Session([
             b._RestResponse(200, b"", {}),
             b._RestResponse(202, b"", {}),
+            b._RestResponse(200, b"", {}),
             b._RestResponse(202, b"", {}),
+            b._RestResponse(202, b"", {}),
+            b._RestResponse(200, b"", {}),
             b._RestResponse(200, b"", {}),
         ])
         transport.session = session
@@ -158,7 +161,16 @@ class CanaryTimingTests(unittest.TestCase):
         )
         policy_reads = [
             {"resourceId": policy_id, "allow": allow}
-            for allow in (False, True, True, False)
+            for allow in (False, False, True, True, False)
+        ]
+        site_id = self.fixture.resources["bridgeSite"]["resourceId"]
+        public_network_reads = [
+            {
+                "resourceId": site_id,
+                "publicNetworkAccess": access,
+                "state": "Stopped",
+            }
+            for access in ("Disabled", "Enabled", "Enabled", "Disabled")
         ]
         with mock.patch.object(
             transport, "_wait_for_site_state", side_effect=site_state
@@ -166,20 +178,27 @@ class CanaryTimingTests(unittest.TestCase):
             transport,
             "_read_scm_basic_auth_policy",
             side_effect=policy_reads,
+        ), mock.patch.object(
+            transport,
+            "_read_site_public_network_access",
+            side_effect=public_network_reads,
         ), mock.patch.object(transport, "_read_webjob_history", return_value={}):
             with self.assertRaises(b.BootstrapError):
                 transport._mutate(self.fixture.mutations["startBridgeForBoundedCanary"], state)
-        self.assertEqual(len(session.requests), 4)
-        self.assertIn("/basicPublishingCredentialsPolicies/scm?", session.requests[0][1])
-        self.assertIn("/start?", session.requests[1][1])
-        self.assertIn("/stop?", session.requests[2][1])
-        self.assertIn("/basicPublishingCredentialsPolicies/scm?", session.requests[3][1])
+        self.assertEqual(len(session.requests), 7)
+        self.assertIn("?api-version=2025-03-01", session.requests[0][1])
+        self.assertIn("/stop?", session.requests[1][1])
+        self.assertIn("/basicPublishingCredentialsPolicies/scm?", session.requests[2][1])
+        self.assertIn("/start?", session.requests[3][1])
+        self.assertIn("/stop?", session.requests[4][1])
+        self.assertIn("/basicPublishingCredentialsPolicies/scm?", session.requests[5][1])
+        self.assertIn("?api-version=2025-03-01", session.requests[6][1])
         self.assertEqual(
             [request[0] for request in session.requests],
-            ["PUT", "POST", "POST", "PUT"],
+            ["PATCH", "POST", "PUT", "POST", "POST", "PUT", "PATCH"],
         )
         self.assertFalse(any("/run?" in request[1] for request in session.requests))
-        self.assertEqual(len(journal.records), 8)
+        self.assertEqual(len(journal.records), 14)
 
     def test_provider_deadline_blocks_acquire_and_renew_but_allows_finally_release(self):
         base = dt.datetime(2026, 8, 30, tzinfo=dt.timezone.utc)

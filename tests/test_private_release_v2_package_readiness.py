@@ -54,12 +54,24 @@ class MemoryJournal:
     def __init__(self):
         self.records = []
         self.fail_result = False
+        self.unresolved_public_network_incidents = []
 
     def append_cloud_mutation(self, value):
         if self.fail_result and value.get("phase") == "result":
             raise OSError("simulated Storage result-journal failure")
         self.records.append(copy.deepcopy(value))
         return Path(f"cloud-mutation-{len(self.records):04d}.json")
+
+    def write_unresolved_public_network_enable(self, value):
+        self.unresolved_public_network_incidents.append(copy.deepcopy(value))
+        return Path(bootstrap.UNRESOLVED_PUBLIC_NETWORK_ENABLE_FILENAME)
+
+    def clear_unresolved_public_network_enable(self):
+        if len(self.unresolved_public_network_incidents) != 1:
+            raise bootstrap.BootstrapError(
+                "test public-network incident marker is absent"
+            )
+        self.unresolved_public_network_incidents.clear()
 
 
 class PackageReadinessTests(unittest.TestCase):

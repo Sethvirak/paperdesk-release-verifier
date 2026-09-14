@@ -1139,6 +1139,7 @@ def _operation_admission(
     graph_service_principal_envelope: Mapping[str, Any] | None = None,
     stable_package_role_definitions: Mapping[str, Mapping[str, Any]] | None = None,
     stable_fence_role_definition: Mapping[str, Any] | None = None,
+    scm_policy_envelope: Mapping[str, Any] | None = None,
     incident_fence_receipt_directory: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Derive an admission from source policy plus exact read-only prestate.
@@ -1227,6 +1228,61 @@ def _operation_admission(
                 {"executionDecision": "apply-exact"},
             )
         fail(f"{operation_id} preflight returned unsupported status {status}")
+
+    if operation_id == "startBridgeForBoundedCanary":
+        if not isinstance(scm_policy_envelope, Mapping):
+            fail("bridge canary requires exact site and SCM policy preflight reads")
+        if status == 404:
+            if scm_policy_envelope.get("status") != 404:
+                fail("absent bridge has an unexpected SCM basic-auth policy")
+            return "absent", _policy_checked_context(
+                operation_id,
+                policy,
+                {
+                    "executionDecision": "apply-exact",
+                    "scmBasicAuthAllowed": False,
+                },
+            )
+        if status != 200:
+            fail("bridge canary requires exact site and SCM policy preflight reads")
+        policy_body = _body_mapping(
+            scm_policy_envelope, "bridge SCM basic-auth policy"
+        )
+        site_body = _body_mapping(envelope, "bridge canary site")
+        site_properties = site_body.get("properties")
+        policy_properties = policy_body.get("properties")
+        resources = {item["id"]: item for item in plan["resourceInventory"]}
+        expected_policy_id = (
+            resources["bridgeSite"]["resourceId"]
+            + "/basicPublishingCredentialsPolicies/scm"
+        )
+        if (
+            str(site_body.get("id", "")).lower()
+            != resources["bridgeSite"]["resourceId"].lower()
+            or site_body.get("name") != resources["bridgeSite"]["name"]
+            or site_body.get("type") != "Microsoft.Web/sites"
+            or not isinstance(site_properties, Mapping)
+            or site_properties.get("state") != "Stopped"
+            or site_properties.get("publicNetworkAccess") != "Disabled"
+            or scm_policy_envelope.get("status") != 200
+            or str(policy_body.get("id", "")).lower()
+            != expected_policy_id.lower()
+            or policy_body.get("name") != "scm"
+            or policy_body.get("type")
+            != "Microsoft.Web/sites/basicPublishingCredentialsPolicies"
+            or not isinstance(policy_properties, Mapping)
+            or set(policy_properties) != {"allow"}
+            or policy_properties.get("allow") is not False
+        ):
+            fail("bridge SCM basic-auth policy is not freshly disabled")
+        return "exact", _policy_checked_context(
+            operation_id,
+            policy,
+            {
+                "executionDecision": "apply-exact",
+                "scmBasicAuthAllowed": False,
+            },
+        )
 
     if operation_id in bootstrap.PACKAGE_ROLE_OPERATIONS:
         if status != 404:
@@ -1929,6 +1985,21 @@ def build_read_only_observation(
             operation_requests[("GET", definition_url)] = ReadRequest(
                 method="GET", url=definition_url
             )
+        if operation["id"] == "startBridgeForBoundedCanary":
+            bridge = next(
+                item
+                for item in plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            scm_url = (
+                "https://management.azure.com"
+                + bridge["resourceId"]
+                + "/basicPublishingCredentialsPolicies/scm"
+                + "?api-version=2025-03-01"
+            )
+            operation_requests[("GET", scm_url)] = ReadRequest(
+                method="GET", url=scm_url
+            )
         if operation["id"] in bootstrap.PACKAGE_ROLE_OPERATIONS:
             for assignment_resource in bootstrap._temporary_package_assignment_resources(
                 plan
@@ -1978,6 +2049,7 @@ def build_read_only_observation(
         graph_service_principal_envelope: Mapping[str, Any] | None = None
         stable_package_role_definitions: dict[str, Mapping[str, Any]] | None = None
         stable_fence_role_definition: dict[str, Any] | None = None
+        scm_policy_envelope: Mapping[str, Any] | None = None
         extra_preflight_probes: list[dict[str, Any]] = []
         if operation["id"] == "claimAzureSingleUseAuthorization":
             lock_request = ReadRequest(method="GET", url=bootstrap._cleanup_lock_inventory_url())
@@ -2171,6 +2243,34 @@ def build_read_only_observation(
                     graph_service_principal_envelope,
                 )
             )
+        if operation["id"] == "startBridgeForBoundedCanary":
+            bridge = next(
+                item
+                for item in plan["resourceInventory"]
+                if item["id"] == "bridgeSite"
+            )
+            scm_request = ReadRequest(
+                method="GET",
+                url=(
+                    "https://management.azure.com"
+                    + bridge["resourceId"]
+                    + "/basicPublishingCredentialsPolicies/scm"
+                    + "?api-version=2025-03-01"
+                ),
+            )
+            scm_key = (scm_request.method, scm_request.url)
+            if scm_key not in cache:
+                cache[scm_key] = _normalize_response(
+                    scm_request, session.read(scm_request)
+                )
+            scm_policy_envelope = cache[scm_key]
+            extra_preflight_probes.append(
+                _preflight_probe(
+                    f"preflight-{index:02d}-scm-policy",
+                    scm_request,
+                    scm_policy_envelope,
+                )
+            )
         status, context = _operation_admission(
             operation,
             envelope,
@@ -2184,6 +2284,7 @@ def build_read_only_observation(
             graph_service_principal_envelope,
             stable_package_role_definitions,
             stable_fence_role_definition,
+            scm_policy_envelope,
             incident_fence_receipt_directory,
         )
         pre_id = f"preflight-{index:02d}"

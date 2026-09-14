@@ -134,6 +134,7 @@ class FakeReadOnlySession:
         role_authority_drift=False,
         stable_fence_absent=False,
         stable_fence_drift=False,
+        scm_policy_allow=None,
     ):
         self.plan = bootstrap.bind_temporary_role_ids(plan, AUTHORIZATION_ID)
         self.drift = drift
@@ -142,6 +143,7 @@ class FakeReadOnlySession:
         self.role_authority_drift = role_authority_drift
         self.stable_fence_absent = stable_fence_absent
         self.stable_fence_drift = stable_fence_drift
+        self.scm_policy_allow = scm_policy_allow
         self.requests = []
         self.envelopes = {}
         self.resources = {item["id"]: item for item in plan["resourceInventory"]}
@@ -322,6 +324,25 @@ class FakeReadOnlySession:
             status = 200
             headers = {"ETag": '"storage-etag"'}
             body = {"properties": {"networkAcls": self._network_acls()}}
+        elif request.url == (
+            "https://management.azure.com"
+            + self.resources["bridgeSite"]["resourceId"]
+            + "/basicPublishingCredentialsPolicies/scm?api-version=2025-03-01"
+        ):
+            if self.scm_policy_allow is None:
+                status = 404
+                body = {}
+            else:
+                status = 200
+                body = {
+                    "id": (
+                        self.resources["bridgeSite"]["resourceId"]
+                        + "/basicPublishingCredentialsPolicies/scm"
+                    ),
+                    "name": "scm",
+                    "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+                    "properties": {"allow": self.scm_policy_allow},
+                }
         elif request.url.startswith(
             f"https://management.azure.com{self.resources['legacyBridgeSite']['resourceId']}?"
         ):
@@ -1681,6 +1702,7 @@ class ObserveTests(unittest.TestCase):
         class ExactFiveBridgeSession(FakeReadOnlySession):
             def __init__(self, plan):
                 super().__init__(plan)
+                self.scm_policy_allow = False
                 self.live_ids = {}
                 for key in (
                     "bridgeIdentity", "registryWriterIdentity",
@@ -1781,6 +1803,59 @@ class ObserveTests(unittest.TestCase):
         bootstrap.validate_preflight_evidence(
             preflight, self.promote_template(template), self.plan
         )
+
+    def test_bridge_canary_observer_rejects_enabled_scm_basic_auth(self):
+        resources = {item["id"]: item for item in self.plan["resourceInventory"]}
+        bridge = resources["bridgeSite"]
+        operation = next(
+            item
+            for item in self.plan["mutations"]
+            if item["id"] == "startBridgeForBoundedCanary"
+        )
+        policy = bootstrap._operation_context_policy(
+            operation["id"], self.plan, {}
+        )
+        site_envelope = {
+            "status": 200,
+            "headers": {},
+            "body": {
+                "id": bridge["resourceId"],
+                "name": bridge["name"],
+                "type": "Microsoft.Web/sites",
+                "properties": {
+                    "state": "Stopped",
+                    "publicNetworkAccess": "Disabled",
+                },
+            },
+        }
+        scm_envelope = {
+            "status": 200,
+            "headers": {},
+            "body": {
+                "id": (
+                    bridge["resourceId"]
+                    + "/basicPublishingCredentialsPolicies/scm"
+                ),
+                "name": "scm",
+                "type": "Microsoft.Web/sites/basicPublishingCredentialsPolicies",
+                "properties": {"allow": True},
+            },
+        }
+        with self.assertRaisesRegex(
+            observe.ObserveError,
+            "bridge SCM basic-auth policy is not freshly disabled",
+        ):
+            observe._operation_admission(
+                operation,
+                site_envelope,
+                self.plan,
+                {},
+                NOW,
+                "203.0.113.10/32",
+                policy,
+                {},
+                scm_policy_envelope=scm_envelope,
+            )
 
     def test_full_observer_rejects_fixed_registry_live_identity_id_drift(self):
         for field in ("clientId", "principalId"):
