@@ -9636,7 +9636,7 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 bootstrap.BootstrapError,
                 "during history-boundary before terminal Success: "
-                "triggered WebJob discovery returned unexpected HTTP status 401",
+                "WebJob history readiness exceeded the source-bounded polling attempts",
             ):
                 build_transport(unauthorized_session)._mutate(operation, state)
             unauthorized_paths = [

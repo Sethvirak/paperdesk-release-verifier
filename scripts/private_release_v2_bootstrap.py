@@ -14754,7 +14754,11 @@ class AzureCliBootstrapTransport:
                 deadline=deadline,
             )
             return None
-        if response.status in {404, 500} and allow_transient_startup_error:
+        # The Microsoft.Web proxy can return 401 while the freshly enabled SCM
+        # policy and the restarted Kudu worker converge.  Treat it as readiness
+        # only inside the already bounded startup loop.  Outside that loop, 401
+        # remains a terminal authentication failure.
+        if response.status in {401, 404, 500} and allow_transient_startup_error:
             return None
         document = self._json_response(
             response, {200}, "triggered WebJob discovery"
