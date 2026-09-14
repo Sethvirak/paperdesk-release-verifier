@@ -1413,9 +1413,14 @@ class _TerminalEvidenceFixture:
         )
 
         site = self.resources["bridgeSite"]
+        trigger_user_agent = (
+            bootstrap.WEBJOB_TRIGGER_USER_AGENT_PREFIX + AUTH_ID
+            + ".11111111-1111-4111-8111-111111111111"
+        )
         terminal = {
             "historyId": site["resourceId"] + "/triggeredwebjobs/paperdesk-accepted-release-registry/history/fresh-run",
             "webJobsRunId": "fresh-run",
+            "triggerSha256": bootstrap.sha256_bytes(("External - " + trigger_user_agent).encode("utf-8")),
             "status": "Success",
             "startedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=4)),
             "endedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=6)),
@@ -1428,12 +1433,28 @@ class _TerminalEvidenceFixture:
             "initialStopped": self.site_state("Stopped", NOW + dt.timedelta(minutes=5)),
             "running": self.site_state("Running", NOW + dt.timedelta(minutes=5, seconds=1)),
             "triggerStatus": 200,
-            "triggerLocation": {
+            "triggerCorrelation": {
+                "mode": "location-header-and-history-trigger",
+                "userAgent": trigger_user_agent,
+                "expectedHistoryTriggerSha256": terminal["triggerSha256"],
+                "responseBodySha256": bootstrap.sha256_bytes(b""),
+                "responseObservedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=3, milliseconds=20)),
+                "location": {
                 "scheme": "https",
                 "host": site["name"] + ".scm.azurewebsites.net",
                 "path": "/api/triggeredwebjobs/paperdesk-accepted-release-registry/history/fresh-run",
                 "runId": "fresh-run",
                 "queryPresent": False,
+                },
+            },
+            "preScmRestoreStopped": self.site_state("Stopped", NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=100)),
+            "finalHistoryCensus": {
+                "observedAt": stamp(NOW + dt.timedelta(minutes=5, seconds=7, milliseconds=200)),
+                "entries": [terminal],
+                "entriesSha256": bootstrap.sha256_bytes(bootstrap.canonical_json_bytes([terminal])),
+                "responseSha256": self.digest("webjob-final-census"),
+                "httpStatus": 200,
+                "boundaryState": "history-present",
             },
             "scmBasicAuthInitial": {
                 "resourceId": site["resourceId"] + "/basicPublishingCredentialsPolicies/scm",
@@ -1808,6 +1829,8 @@ class _TerminalEvidenceFixture:
                 if operation_id == "exerciseControllerLeaseCanary":
                     intent["requestBodySha256"] = bootstrap.sha256_bytes(b"")
                 if operation_id == "startBridgeForBoundedCanary":
+                    if method == "POST" and "/triggeredwebjobs/" in target_url:
+                        intent["webJobTriggerUserAgent"] = self.operations[operation_id]["projection"]["triggerCorrelation"]["userAgent"]
                     if method == "PATCH":
                         request_body = bootstrap.canonical_json_bytes(
                             {
@@ -1903,6 +1926,8 @@ class _TerminalEvidenceFixture:
                         ),
                     }
                 )
+                if "webJobTriggerUserAgent" in intent:
+                    result["responseBodySha256"] = bootstrap.sha256_bytes(b"")
                 journal.append(result)
         return journal
 
@@ -8623,6 +8648,9 @@ class BootstrapTests(unittest.TestCase):
                     trigger_location_run_id="fresh-run",
                     trigger_location_present=True,
                     trigger_location_duplicate=False,
+                    trigger_body=b"",
+                    history_trigger_mode="exact",
+                    late_extra_run=False,
                     discovery_status=200,
                     disable_before_cleanup=False,
                     restart_on_public_disable=False,
@@ -8647,6 +8675,11 @@ class BootstrapTests(unittest.TestCase):
                     self.trigger_location_run_id = trigger_location_run_id
                     self.trigger_location_present = trigger_location_present
                     self.trigger_location_duplicate = trigger_location_duplicate
+                    self.trigger_body = trigger_body
+                    self.history_trigger_mode = history_trigger_mode
+                    self.late_extra_run = late_extra_run
+                    self.trigger_user_agent = None
+                    self.run_started_at = None
                     self.discovery_status = discovery_status
                     self.disable_before_cleanup = disable_before_cleanup
                     self.restart_on_public_disable = restart_on_public_disable
@@ -8852,10 +8885,16 @@ class BootstrapTests(unittest.TestCase):
                                             {
                                                 "web_job_name": job,
                                                 "web_job_id": "fresh-run",
+                                                "trigger": (
+                                                    "External - " + self.trigger_user_agent
+                                                    if self.history_trigger_mode == "exact"
+                                                    else None if self.history_trigger_mode == "missing"
+                                                    else "External - unrelated-trigger"
+                                                ),
                                                 "status": self.terminal_status,
-                                                "start_time": stamp(current[0]),
+                                                "start_time": stamp(self.run_started_at),
                                                 "end_time": stamp(
-                                                    current[0] + dt.timedelta(seconds=2)
+                                                    self.run_started_at + dt.timedelta(seconds=2)
                                                 ),
                                                 "output_url": (
                                                     "https://paperdesk-release-registry-bridge-v2-"
@@ -8868,6 +8907,11 @@ class BootstrapTests(unittest.TestCase):
                                     },
                                 }
                             ]
+                        if self.late_extra_run and self.stop_requests >= 2 and values:
+                            extra = copy.deepcopy(values[0])
+                            extra["id"] = history_id.replace("fresh-run", "later-run")
+                            extra["properties"]["runs"][0]["web_job_id"] = "later-run"
+                            values.append(extra)
                         return bootstrap._RestResponse(
                             200,
                             bootstrap.canonical_json_bytes({"value": values}),
@@ -8990,6 +9034,8 @@ class BootstrapTests(unittest.TestCase):
                             self.public_patch_status, b"", {}
                         )
                     if method == "POST" and url.split("?", 1)[0].endswith("/run"):
+                        self.trigger_user_agent = headers["User-Agent"]
+                        self.run_started_at = current[0]
                         run_headers = {}
                         raw_headers = None
                         if self.trigger_location_present:
@@ -9009,7 +9055,7 @@ class BootstrapTests(unittest.TestCase):
                                 )
                         return bootstrap._RestResponse(
                             200,
-                            b"",
+                            self.trigger_body,
                             run_headers,
                             header_items=raw_headers,
                         )
@@ -9139,6 +9185,25 @@ class BootstrapTests(unittest.TestCase):
                 success_session._ledger.unresolved_public_network_incidents,
                 [],
             )
+            self.assertEqual(proof["triggerCorrelation"]["userAgent"], success_session.trigger_user_agent)
+            stop_indexes = [i for i, (m, u, _, _) in enumerate(success_session.requests)
+                            if m == "POST" and u.split("?", 1)[0].endswith("/stop")]
+            census_indexes = [i for i, (m, u, _, _) in enumerate(success_session.requests)
+                              if m == "GET" and "/history?" in u]
+            scm_disable_index = next(i for i, (m, u, body, _) in enumerate(success_session.requests)
+                                     if m == "PUT" and "/basicPublishingCredentialsPolicies/scm?" in u
+                                     and json.loads(body)["properties"]["allow"] is False)
+            self.assertLess(stop_indexes[-1], census_indexes[-1])
+            self.assertLess(census_indexes[-1], scm_disable_index)
+            current[0] = NOW + dt.timedelta(seconds=3)
+            absent_location = Session(trigger_location_present=False)
+            absent_proof = build_transport(absent_location)._mutate(operation, state)
+            self.assertEqual(absent_proof["triggerCorrelation"]["mode"], "arm-200-empty-body-history-trigger")
+            self.assertIsNone(absent_proof["triggerCorrelation"]["location"])
+            self.assertEqual(absent_proof["finalHistoryCensus"]["entries"], [absent_proof["terminalHistory"]])
+            self.assertEqual(absent_location.stop_requests, 2)
+            self.assertFalse(absent_location.scm_policy_enabled)
+            self.assertEqual(absent_location.public_network_access, "Disabled")
 
             current[0] = NOW + dt.timedelta(seconds=3)
             restarted_session = Session(restart_on_public_disable=True)
@@ -9451,7 +9516,7 @@ class BootstrapTests(unittest.TestCase):
                     and path.lower().endswith(site["resourceId"].lower())
                     for method, path in retried_methods_and_paths
                 ),
-                11,
+                12,
             )
 
             current[0] = NOW + dt.timedelta(seconds=3)
@@ -9664,8 +9729,20 @@ class BootstrapTests(unittest.TestCase):
 
             for trigger_session, expected_message in (
                 (
-                    Session(trigger_location_present=False),
-                    "WebJob trigger Location is absent or oversized",
+                    Session(trigger_location_present=False, trigger_body=b"{}"),
+                    "WebJob trigger is not an exact HTTP 200 empty-body response",
+                ),
+                (
+                    Session(trigger_location_present=False, history_trigger_mode="wrong"),
+                    "fresh WebJob history does not match the request trigger token",
+                ),
+                (
+                    Session(trigger_location_present=False, history_trigger_mode="missing"),
+                    "WebJob history run projection is not exact",
+                ),
+                (
+                    Session(trigger_location_present=False, late_extra_run=True),
+                    "final WebJob history census drifted or contains an extra run",
                 ),
                 (
                     Session(trigger_location_run_id="other-run"),
@@ -9836,8 +9913,8 @@ class BootstrapTests(unittest.TestCase):
             (
                 "trigger URL boolean",
                 lambda projection: projection["projection"][
-                    "triggerLocation"
-                ].__setitem__("queryPresent", 0),
+                    "triggerCorrelation"
+                ]["location"].__setitem__("queryPresent", 0),
             ),
         ):
             with self.subTest(label=label):

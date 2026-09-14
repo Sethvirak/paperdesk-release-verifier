@@ -461,6 +461,25 @@ only after every reversible proof has passed and only when the authorization
 explicitly names those mutations. The current production routing projection is
 observed but not changed during bootstrap.
 
+The ARM WebJob trigger returns exactly HTTP 200 with an empty body. Because
+the [ARM run API](https://learn.microsoft.com/en-us/rest/api/appservice/web-apps/run-triggered-web-job?view=rest-appservice-2025-05-01)
+does not contract a `Location` header, an absent header is accepted only with
+request correlation: the one POST sends an authorization-bound random UUID in
+its `User-Agent`, recorded in the durable intent before the request. Kudu records
+that agent in history `trigger`; the unique fresh successful run must contain
+the exact expected trigger digest. A present `Location` must also bind the same
+run; an empty, duplicate, malformed, or foreign header never selects the absent
+header path. ARM forwarding of this header is not a documented guarantee, so a
+missing or changed history trigger fails closed and follows normal cleanup.
+
+After the stop request and fresh `Stopped` proof, one bounded final history
+census must still equal the original history plus the same terminal run before
+SCM and public access are restored to disabled. Missing history, pagination,
+an extra run, or changed history fails with cleanup. This is uniqueness at the
+census observation, not a claim that an out-of-band administrator cannot invoke
+Kudu afterward. The trigger is never retried, and the existing control deadline
+and one-use authorization remain unchanged.
+
 The canary's maximum 15-minute lifetime starts just before the final settings
 precondition read, rather than at preflight preparation. Its expiry
 is still clipped to the unchanged outer bootstrap authorization. Retained
