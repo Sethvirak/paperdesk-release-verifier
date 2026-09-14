@@ -360,15 +360,11 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(len(session.requests), 4)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
-    def test_webjob_discovery_and_nonpristine_history_fail_closed(self):
+    def test_webjob_forbidden_discovery_and_nonpristine_history_fail_closed(self):
         site = self.fixture.resources["bridgeSite"]
         job = "paperdesk-accepted-release-registry"
         deadline = NOW + dt.timedelta(seconds=300)
         for responses, expected in (
-            (
-                [bootstrap._RestResponse(401, b"", {})],
-                "triggered WebJob discovery returned unexpected HTTP status 401",
-            ),
             (
                 [bootstrap._RestResponse(403, b"", {})],
                 "triggered WebJob discovery returned unexpected HTTP status 403",
@@ -393,6 +389,25 @@ class ControllerCanaryFailureTests(unittest.TestCase):
                     )
                 self.assertFalse(any(request[0] == "POST" for request in session.requests))
 
+    def test_webjob_unauthorized_discovery_is_terminal_outside_startup_boundary(self):
+        site = self.fixture.resources["bridgeSite"]
+        transport, session, _journal = self.transport(
+            [bootstrap._RestResponse(401, b"", {})], CONFIGURE
+        )
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "triggered WebJob discovery returned unexpected HTTP status 401",
+        ):
+            transport._read_triggered_webjob_metadata(
+                site_resource_id=site["resourceId"],
+                site_name=site["name"],
+                job_name="paperdesk-accepted-release-registry",
+                deadline=NOW + dt.timedelta(seconds=300),
+            )
+
+        self.assertEqual(len(session.requests), 1)
+
     def test_webjob_discovery_polls_bounded_startup_statuses_before_exact_boundary(self):
         site = self.fixture.resources["bridgeSite"]
         current = [NOW]
@@ -403,6 +418,7 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             current[0] += dt.timedelta(seconds=seconds)
 
         responses = [
+            bootstrap._RestResponse(401, b"", {}),
             bootstrap._RestResponse(404, b"", {}),
             bootstrap._RestResponse(500, b"", {}),
             bootstrap._RestResponse(
@@ -425,8 +441,8 @@ class ControllerCanaryFailureTests(unittest.TestCase):
             deadline=NOW + dt.timedelta(seconds=300),
         )
         self.assertEqual(proof["httpStatus"], 404)
-        self.assertEqual(sleeps, [1.25, 1.5, 4.0, 1.75])
-        self.assertEqual(len(session.requests), 5)
+        self.assertEqual(sleeps, [1.25, 1.5, 1.75, 4.0, 2.0])
+        self.assertEqual(len(session.requests), 6)
         self.assertFalse(any(request[0] == "POST" for request in session.requests))
 
     def test_webjob_discovery_rejects_metadata_drift_before_history(self):
