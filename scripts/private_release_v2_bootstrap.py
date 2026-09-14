@@ -14141,63 +14141,78 @@ class AzureCliBootstrapTransport:
         *,
         site_resource_id: str,
         job_name: str,
-    ) -> Mapping[str, Any]:
+    ) -> list[Mapping[str, Any]]:
         if not isinstance(value, Mapping):
             fail("WebJob history entry is not one object")
         history_id = value.get("id")
         properties = value.get("properties")
         runs = properties.get("runs") if isinstance(properties, Mapping) else None
+        history_collection_id = (
+            site_resource_id + f"/triggeredwebjobs/{job_name}/history"
+        )
+        history_id_lower = history_id.lower() if isinstance(history_id, str) else None
+        history_collection_id_lower = history_collection_id.lower()
+        is_collection = history_id_lower == history_collection_id_lower
+        is_child = (
+            isinstance(history_id_lower, str)
+            and history_id_lower.startswith(history_collection_id_lower + "/")
+        )
         if (
             not isinstance(history_id, str)
-            or not history_id.lower().startswith(
-                (
-                    site_resource_id
-                    + f"/triggeredwebjobs/{job_name}/history/"
-                ).lower()
-            )
+            or not (is_collection or is_child)
             or not isinstance(runs, list)
-            or len(runs) != 1
-            or not isinstance(runs[0], Mapping)
+            or len(runs) > 1000
+            or (is_child and len(runs) != 1)
+            or any(not isinstance(run, Mapping) for run in runs)
         ):
             fail("WebJob history entry identity is not exact")
-        run = runs[0]
-        run_id = run.get("web_job_id")
-        status = run.get("status")
-        trigger = run.get("trigger")
-        started_at = run.get("start_time")
-        ended_at = run.get("end_time")
-        if (
-            run.get("web_job_name") != job_name
-            or not isinstance(run_id, str)
-            or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id)
-            or status
-            not in {"Initializing", "Running", "Success", "Failed", "Aborted"}
-            or not isinstance(trigger, str)
-            or not trigger
-            or len(trigger.encode("utf-8")) > 1024
-            or not isinstance(started_at, str)
-        ):
-            fail("WebJob history run projection is not exact")
-        start = parse_time(started_at, "WebJob history start")
-        terminal = status in {"Success", "Failed", "Aborted"}
-        if terminal:
-            end = parse_time(ended_at, "WebJob history end")
-            if end < start:
-                fail("WebJob history end precedes its start")
-            output_metadata = self._webjob_output_url_metadata(run.get("output_url"))
-        else:
-            if ended_at not in {None, ""}:
-                fail("nonterminal WebJob history unexpectedly has an end time")
-            output_metadata = None
-        return {
-            "historyId": history_id,
-            "webJobsRunId": run_id,
-            "triggerSha256": sha256_bytes(trigger.encode("utf-8")),
-            "status": status,
-            "startedAt": started_at,
-            "endedAt": ended_at if terminal else None,
-            "outputUrlMetadata": output_metadata,
-        }
+        projected: list[Mapping[str, Any]] = []
+        for run in runs:
+            run_id = run.get("web_job_id")
+            status = run.get("status")
+            trigger = run.get("trigger")
+            started_at = run.get("start_time")
+            ended_at = run.get("end_time")
+            if (
+                run.get("web_job_name") != job_name
+                or not isinstance(run_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id)
+                or status
+                not in {"Initializing", "Running", "Success", "Failed", "Aborted"}
+                or not isinstance(trigger, str)
+                or not trigger
+                or len(trigger.encode("utf-8")) > 1024
+                or not isinstance(started_at, str)
+            ):
+                fail("WebJob history run projection is not exact")
+            run_history_id = history_collection_id + "/" + run_id
+            if is_child and history_id.lower() != run_history_id.lower():
+                fail("WebJob history child ID does not match its run ID")
+            start = parse_time(started_at, "WebJob history start")
+            terminal = status in {"Success", "Failed", "Aborted"}
+            if terminal:
+                end = parse_time(ended_at, "WebJob history end")
+                if end < start:
+                    fail("WebJob history end precedes its start")
+                output_metadata = self._webjob_output_url_metadata(
+                    run.get("output_url")
+                )
+            else:
+                if ended_at not in {None, ""}:
+                    fail("nonterminal WebJob history unexpectedly has an end time")
+                output_metadata = None
+            projected.append(
+                {
+                    "historyId": run_history_id,
+                    "webJobsRunId": run_id,
+                    "triggerSha256": sha256_bytes(trigger.encode("utf-8")),
+                    "status": status,
+                    "startedAt": started_at,
+                    "endedAt": ended_at if terminal else None,
+                    "outputUrlMetadata": output_metadata,
+                }
+            )
+        return projected
 
     def _read_webjob_history(
         self,
@@ -14262,13 +14277,21 @@ class AzureCliBootstrapTransport:
             or len(values) > 1000
         ):
             fail("WebJob history is partial, paginated, or oversized")
-        projected = [
+        projected_groups = [
             self._project_webjob_history_item(
                 item,
                 site_resource_id=site_resource_id,
                 job_name=job_name,
             )
             for item in values
+        ]
+        source_ids = [item.get("id") for item in values]
+        if len(source_ids) != len(
+            {item.lower() for item in source_ids if isinstance(item, str)}
+        ):
+            fail("WebJob history contains duplicate source history IDs")
+        projected = [
+            item for group in projected_groups for item in group
         ]
         ids = [item["historyId"] for item in projected]
         run_ids = [item["webJobsRunId"] for item in projected]
