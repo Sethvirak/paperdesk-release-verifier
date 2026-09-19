@@ -95,6 +95,31 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                     job_name=JOB_NAME,
                 )
 
+    def test_invalid_entry_reports_only_nonsecret_shape(self):
+        for entry, expected in (
+            (
+                {"id": COLLECTION_ID, "properties": {"runs": None}},
+                "idClass=collection, runsClass=null, runsCount=n/a",
+            ),
+            (
+                {"id": SITE_ID + "/unexpected/secret-run-id", "properties": {"runs": []}},
+                "idClass=other-site-child, runsClass=list, runsCount=0",
+            ),
+            (
+                {"id": COLLECTION_ID + "/secret-run-id", "properties": {"runs": []}},
+                "idClass=child, runsClass=list, runsCount=0",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaises(bootstrap.BootstrapError) as raised:
+                    transport()._project_webjob_history_item(
+                        entry,
+                        site_resource_id=SITE_ID,
+                        job_name=JOB_NAME,
+                    )
+                self.assertIn(expected, str(raised.exception))
+                self.assertNotIn("secret-run-id", str(raised.exception))
+
     def test_history_read_accepts_documented_collection_shape_and_binds_digest(self):
         document = {
             "value": [

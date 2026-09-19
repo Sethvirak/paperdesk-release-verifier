@@ -14157,6 +14157,40 @@ class AzureCliBootstrapTransport:
             isinstance(history_id_lower, str)
             and history_id_lower.startswith(history_collection_id_lower + "/")
         )
+        # A provider response can fail this gate before the canary is
+        # triggered.  Report only structural categories so the next reviewed
+        # attempt identifies the incompatible field without recording run
+        # identifiers, URLs, trigger values, or the response body.
+        if is_collection:
+            id_class = "collection"
+        elif is_child:
+            id_class = "child"
+        elif history_id_lower == (
+            site_resource_id + f"/triggeredwebjobs/{job_name}"
+        ).lower():
+            id_class = "job"
+        elif isinstance(history_id_lower, str) and history_id_lower.startswith(
+            site_resource_id.lower() + "/"
+        ):
+            id_class = "other-site-child"
+        elif isinstance(history_id_lower, str) and history_id_lower.startswith(
+            "/subscriptions/"
+        ):
+            id_class = "other-arm-resource"
+        elif isinstance(history_id_lower, str):
+            id_class = "other-string"
+        else:
+            id_class = "missing-or-nonstring"
+        if not isinstance(properties, Mapping):
+            runs_class = "properties-missing-or-nonobject"
+        elif "runs" not in properties:
+            runs_class = "missing"
+        elif runs is None:
+            runs_class = "null"
+        elif isinstance(runs, list):
+            runs_class = "list"
+        else:
+            runs_class = "other"
         if (
             not isinstance(history_id, str)
             or not (is_collection or is_child)
@@ -14165,7 +14199,11 @@ class AzureCliBootstrapTransport:
             or (is_child and len(runs) != 1)
             or any(not isinstance(run, Mapping) for run in runs)
         ):
-            fail("WebJob history entry identity is not exact")
+            fail(
+                "WebJob history entry identity is not exact "
+                f"(idClass={id_class}, runsClass={runs_class}, "
+                f"runsCount={len(runs) if isinstance(runs, list) else 'n/a'})"
+            )
         projected: list[Mapping[str, Any]] = []
         for run in runs:
             run_id = run.get("web_job_id")
