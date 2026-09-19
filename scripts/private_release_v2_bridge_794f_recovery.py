@@ -229,7 +229,9 @@ class BoundSession:
         return self.inner.request(
             method, url, body=body,
             headers={"Content-Type": "application/json"} if method != "POST" else None,
-            deadline=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60),
+            deadline=dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                seconds=bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS + 30
+            ),
         )
 
 
