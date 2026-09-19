@@ -14959,7 +14959,7 @@ class AzureCliBootstrapTransport:
         retry_delays: tuple[float | None, ...] | None = None,
         failure_context: str | None = None,
     ) -> _RestResponse:
-        """Retry only exact read-only transport failures before mutation.
+        """Retry only exact read-only transport failures.
 
         Mutation requests continue to call the underlying session directly, so
         an ambiguous PUT/PATCH/DELETE is never replayed.  The sole allowed POST
@@ -18587,7 +18587,9 @@ class AzureCliBootstrapTransport:
             target_url = self._arm_url(account["resourceId"], "2025-06-01")
 
             def read_current_acl(label: str) -> dict[str, Any]:
-                current_response = self.session.request("GET", target_url)
+                current_response = self._read_request_with_transport_retry(
+                    "GET", target_url
+                )
                 current = self._json_response(current_response, {200}, label)
                 properties = current.get("properties")
                 network_acls = (
