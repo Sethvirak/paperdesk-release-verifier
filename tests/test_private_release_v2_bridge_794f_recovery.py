@@ -98,6 +98,17 @@ class RecoveryBoundaryTests(unittest.TestCase):
             session.request("PATCH", recovery.SITE, recovery.PUBLIC_BODY)
         self.assertEqual(len(inner.calls), 1)
 
+    def test_mutation_deadline_covers_credential_and_response_envelope(self):
+        inner = FakeSession()
+        session = recovery.BoundSession(inner, True)
+        before = dt.datetime.now(dt.timezone.utc)
+        session.request("POST", recovery.STOP, recovery.STOP_BODY)
+        deadline = inner.calls[0][2]["deadline"]
+        self.assertGreater(
+            (deadline - before).total_seconds(),
+            recovery.bootstrap.STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS,
+        )
+
     def test_stop_budget_is_bounded_and_unrelated_site_is_rejected(self):
         inner = FakeSession()
         session = recovery.BoundSession(inner, True)
