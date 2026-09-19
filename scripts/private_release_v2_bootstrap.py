@@ -14429,17 +14429,26 @@ class AzureCliBootstrapTransport:
         allow_transient_startup_error: bool = False,
         allow_transient_rate_limit: bool = False,
     ) -> Mapping[str, Any] | None:
-        response = self._read_request_with_transport_retry(
-            "GET",
-            self._arm_url(
-                site_resource_id,
-                "2025-05-01",
-                f"/triggeredwebjobs/{job_name}",
-            ),
-            deadline=deadline,
-            retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
-            failure_context="job-discovery",
-        )
+        try:
+            response = self._read_request_with_transport_retry(
+                "GET",
+                self._arm_url(
+                    site_resource_id,
+                    "2025-05-01",
+                    f"/triggeredwebjobs/{job_name}",
+                ),
+                deadline=deadline,
+                retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
+                failure_context="job-discovery",
+            )
+        except _RestTotalTimeout:
+            # A newly started bridge can leave the ARM WebJob proxy without a
+            # response for several full read envelopes.  Only the
+            # pre-trigger readiness loop may spend its remaining startup budget
+            # on another fresh GET; it never replays a WebJob trigger or a write.
+            if not allow_transient_startup_error or self.clock() >= deadline:
+                raise
+            return None
         if response.status == 429 and allow_transient_rate_limit:
             retry_after = self._header(response, "Retry-After")
             if not isinstance(retry_after, str) or re.fullmatch(
@@ -15019,7 +15028,13 @@ class AzureCliBootstrapTransport:
                 )
                 if not retryable_transport or delay is None:
                     if failure_context is not None:
-                        raise BootstrapError(
+                        error_type = (
+                            _RestTotalTimeout
+                            if failure_context == "job-discovery"
+                            and isinstance(error, _RestTotalTimeout)
+                            else BootstrapError
+                        )
+                        raise error_type(
                             f"{failure_context} read failed after "
                             f"{request_attempts} transport attempts: {error}"
                         ) from error
@@ -15028,7 +15043,13 @@ class AzureCliBootstrapTransport:
                     self.clock() + dt.timedelta(seconds=delay) >= request_deadline
                 ):
                     if failure_context is not None:
-                        raise BootstrapError(
+                        error_type = (
+                            _RestTotalTimeout
+                            if failure_context == "job-discovery"
+                            and isinstance(error, _RestTotalTimeout)
+                            else BootstrapError
+                        )
+                        raise error_type(
                             f"{failure_context} read retry stopped after "
                             f"{request_attempts} transport attempts because the "
                             "protected deadline would be crossed"
