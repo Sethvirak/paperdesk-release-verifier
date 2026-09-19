@@ -8016,6 +8016,108 @@ class BootstrapTests(unittest.TestCase):
             self.assertIsNotNone(method, name)
             self.assertIn(required, inspect.getsource(method))
 
+    def test_storage_acl_retries_only_transient_reads_around_one_patch(self):
+        projection = build_projection(self.plan, self.package)
+        authorization = build_authorization(
+            self.plan,
+            self.plan_sha,
+            self.package,
+            projection,
+            Path("C:/outside") / f"paperdesk-private-release-v2-bootstrap-{AUTH_ID}",
+        )
+        patch_response = bootstrap._RestResponse(
+            200, bootstrap.canonical_json_bytes({}), {}
+        )
+
+        for operation_id in (
+            "addOwnedUploaderIpv4Rule",
+            "removeOwnedUploaderIpv4Rule",
+        ):
+            with self.subTest(operation_id=operation_id):
+                operation = next(
+                    item for item in self.plan["mutations"]
+                    if item["id"] == operation_id
+                )
+                context = next(
+                    item["context"] for item in projection["operationAdmissions"]
+                    if item["operationId"] == operation_id
+                )
+                baseline = copy.deepcopy(
+                    context[
+                        "preNetworkAcls" if operation_id.startswith("add")
+                        else "restoreNetworkAcls"
+                    ]
+                )
+                added = copy.deepcopy(baseline)
+                added["ipRules"] = [
+                    {"value": "203.0.113.10", "action": "Allow"}
+                ]
+                before, after = (
+                    (baseline, added) if operation_id.startswith("add")
+                    else (added, baseline)
+                )
+
+                class Session:
+                    def __init__(self):
+                        self.methods = []
+
+                    def request(
+                        self, method, url, *, body=None, headers=None, deadline=None
+                    ):
+                        self.methods.append(method)
+                        if len(self.methods) in (1, 3):
+                            raise bootstrap._RestTransportAmbiguity(
+                                "Azure REST transport failed closed"
+                            )
+                        acl = before if len(self.methods) == 2 else after
+                        return bootstrap._RestResponse(
+                            200,
+                            bootstrap.canonical_json_bytes(
+                                {"properties": {"networkAcls": acl}}
+                            ),
+                            {},
+                        )
+
+                session = Session()
+                transport = bootstrap.AzureCliBootstrapTransport(
+                    authorization=authorization,
+                    plan=self.plan,
+                    package=self.package,
+                    preflight={"projection": projection},
+                    clock=lambda: NOW,
+                    sleep=lambda _delay: None,
+                    session=session,
+                )
+                state = {
+                    "proofs": {
+                        "addOwnedUploaderIpv4Rule": {
+                            "details": {
+                                "addedNetworkAclsSha256": bootstrap.sha256_bytes(
+                                    bootstrap.canonical_json_bytes(added)
+                                ),
+                            }
+                        }
+                    }
+                }
+                with mock.patch.object(
+                    transport, "_mutation_request", return_value=patch_response
+                ) as patch:
+                    result = transport._mutate(operation, state)
+                self.assertEqual(session.methods, ["GET"] * 4)
+                patch.assert_called_once()
+                self.assertEqual(
+                    json.loads(patch.call_args.kwargs["body"]),
+                    {"properties": {"networkAcls": {"ipRules": after["ipRules"]}}},
+                )
+                digest_key = (
+                    "addedNetworkAclsSha256" if operation_id.startswith("add")
+                    else "restoredNetworkAclsSha256"
+                )
+                self.assertEqual(
+                    result[digest_key],
+                    bootstrap.sha256_bytes(bootstrap.canonical_json_bytes(after)),
+                )
+
     def test_storage_acl_post_read_failure_records_owned_cleanup_obligation(self):
         with tempfile.TemporaryDirectory() as folder:
             projection = build_projection(self.plan, self.package)
@@ -8170,7 +8272,7 @@ class BootstrapTests(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            def request(self, method, url, *, body=None, headers=None):
+            def request(self, method, url, *, body=None, headers=None, deadline=None):
                 self.requests.append((method, url, body, dict(headers or {})))
                 return bootstrap._RestResponse(
                     200,
