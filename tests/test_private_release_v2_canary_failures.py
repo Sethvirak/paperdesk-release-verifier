@@ -282,6 +282,68 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(all(request[0] == "GET" for request in session.requests))
 
+    def test_webjob_discovery_uses_remaining_startup_budget_after_timeouts(self):
+        site = self.fixture.resources["bridgeSite"]
+        current = [NOW]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            current[0] += dt.timedelta(seconds=seconds)
+
+        transport, session, _journal = self.transport(
+            [
+                *[
+                    bootstrap._RestTotalTimeout(
+                        "Azure REST total response deadline expired"
+                    )
+                    for _ in range(4)
+                ],
+                self.webjob_metadata_response(),
+                bootstrap._RestResponse(404, b"", {"Content-Type": "application/json"}),
+            ],
+            CONFIGURE,
+            clock=lambda: current[0],
+            sleep=sleep,
+        )
+
+        def advance_request_clock():
+            if len(session.requests) <= 4:
+                current[0] += dt.timedelta(seconds=45)
+
+        session.after_request = advance_request_clock
+        proof = transport._wait_for_webjob_history_boundary(
+            site_resource_id=site["resourceId"],
+            job_name="paperdesk-accepted-release-registry",
+            deadline=NOW + dt.timedelta(seconds=710),
+        )
+
+        self.assertEqual(proof["boundaryState"], "pristine-history-absent")
+        self.assertEqual(len(session.requests), 6)
+        self.assertEqual(sleeps, [0.5, 1.0, 2.0, 1.25])
+        self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
+    def test_webjob_discovery_timeout_is_terminal_outside_startup(self):
+        site = self.fixture.resources["bridgeSite"]
+        transport, session, _journal = self.transport(
+            [bootstrap._RestTotalTimeout("Azure REST total response deadline expired")]
+            * 4,
+            CONFIGURE,
+        )
+
+        with self.assertRaisesRegex(
+            bootstrap._RestTotalTimeout,
+            "job-discovery read failed after 4 transport attempts",
+        ):
+            transport._read_triggered_webjob_metadata(
+                site_resource_id=site["resourceId"],
+                site_name=site["name"],
+                job_name="paperdesk-accepted-release-registry",
+                deadline=NOW + dt.timedelta(seconds=710),
+            )
+        self.assertEqual(len(session.requests), 4)
+        self.assertTrue(all(request[0] == "GET" for request in session.requests))
+
     def test_pristine_webjob_metadata_allows_adjacent_empty_history_404_boundary(self):
         site = self.fixture.resources["bridgeSite"]
         current = [NOW]
