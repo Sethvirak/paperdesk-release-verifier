@@ -8741,6 +8741,7 @@ class BootstrapTests(unittest.TestCase):
                 def __init__(
                     self,
                     terminal_status="Success",
+                    nonterminal_history_reads=0,
                     running_timeouts=0,
                     boundary_timeouts=0,
                     terminal_history_timeouts=0,
@@ -8768,6 +8769,7 @@ class BootstrapTests(unittest.TestCase):
                     self.public_network_access = "Disabled"
                     self.history_reads = 0
                     self.terminal_status = terminal_status
+                    self.nonterminal_history_reads = nonterminal_history_reads
                     self.running_timeouts = running_timeouts
                     self.boundary_timeouts = boundary_timeouts
                     self.terminal_history_timeouts = terminal_history_timeouts
@@ -8979,6 +8981,11 @@ class BootstrapTests(unittest.TestCase):
                             )
                         values = []
                         if self.history_reads > 1:
+                            run_status = (
+                                "Running"
+                                if self.history_reads <= 1 + self.nonterminal_history_reads
+                                else self.terminal_status
+                            )
                             values = [
                                 {
                                     "id": history_id,
@@ -8993,10 +9000,15 @@ class BootstrapTests(unittest.TestCase):
                                                     else None if self.history_trigger_mode == "missing"
                                                     else "External - unrelated-trigger"
                                                 ),
-                                                "status": self.terminal_status,
+                                                "status": run_status,
                                                 "start_time": stamp(self.run_started_at),
-                                                "end_time": stamp(
-                                                    self.run_started_at + dt.timedelta(seconds=2)
+                                                "end_time": (
+                                                    "0001-01-01T00:00:00"
+                                                    if run_status == "Running"
+                                                    else stamp(
+                                                        self.run_started_at
+                                                        + dt.timedelta(seconds=2)
+                                                    )
                                                 ),
                                                 "output_url": (
                                                     "https://paperdesk-release-registry-bridge-v2-"
@@ -9306,6 +9318,15 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(absent_location.stop_requests, 2)
             self.assertFalse(absent_location.scm_policy_enabled)
             self.assertEqual(absent_location.public_network_access, "Disabled")
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            pending_session = Session(nonterminal_history_reads=1)
+            pending_proof = build_transport(pending_session)._mutate(operation, state)
+            self.assertGreaterEqual(pending_session.history_reads, 4)
+            self.assertEqual(pending_proof["terminalHistory"]["status"], "Success")
+            self.assertEqual(pending_session.stop_requests, 2)
+            self.assertFalse(pending_session.scm_policy_enabled)
+            self.assertEqual(pending_session.public_network_access, "Disabled")
 
             current[0] = NOW + dt.timedelta(seconds=3)
             restarted_session = Session(restart_on_public_disable=True)
