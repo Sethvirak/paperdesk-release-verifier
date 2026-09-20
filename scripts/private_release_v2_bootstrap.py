@@ -14268,8 +14268,29 @@ class AzureCliBootstrapTransport:
                     run.get("output_url")
                 )
             else:
-                if ended_at not in {None, ""}:
-                    fail("nonterminal WebJob history unexpectedly has an end time")
+                # Kudu's TriggeredJobRun.EndTime is a nonnullable DateTime.
+                # Until ReportEndRun sets it, ARM can serialize its default
+                # (year 1) even while the status is Initializing or Running.
+                # Treat only that exact default as unset; a real end time on
+                # a nonterminal status remains a fail-closed shape conflict.
+                default_end_time = (
+                    isinstance(ended_at, str)
+                    and re.fullmatch(
+                        r"0001-01-01T00:00:00(?:\.0{1,7})?(?:Z|\+00:00)?",
+                        ended_at,
+                    )
+                    is not None
+                )
+                if ended_at is not None and ended_at != "" and not default_end_time:
+                    end_class = (
+                        "nondefault-string"
+                        if isinstance(ended_at, str)
+                        else "nonstring"
+                    )
+                    fail(
+                        "nonterminal WebJob history has a non-default end time "
+                        f"(status={status}, endClass={end_class})"
+                    )
                 output_metadata = None
             projected.append(
                 {

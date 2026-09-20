@@ -115,6 +115,60 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                     job_name=JOB_NAME,
                 )
 
+    def test_nonterminal_default_end_time_is_unset_without_proving_success(self):
+        for status in ("Initializing", "Running"):
+            for end_time in (
+                "0001-01-01T00:00:00",
+                "0001-01-01T00:00:00Z",
+                "0001-01-01T00:00:00.0000000+00:00",
+            ):
+                with self.subTest(status=status, end_time=end_time):
+                    item = run("run-1")
+                    item["status"] = status
+                    item["end_time"] = end_time
+                    projected = transport()._project_webjob_history_item(
+                        {"id": COLLECTION_ID + "/run-1", "properties": item},
+                        site_resource_id=SITE_ID,
+                        job_name=JOB_NAME,
+                    )
+                    self.assertEqual(projected[0]["status"], status)
+                    self.assertIsNone(projected[0]["endedAt"])
+                    self.assertIsNone(projected[0]["outputUrlMetadata"])
+
+    def test_nonterminal_real_or_malformed_end_time_fails_without_value_leak(self):
+        for end_time, expected_class in (
+            (stamp(NOW + dt.timedelta(seconds=1)), "nondefault-string"),
+            ("0001-01-01T00:00:01", "nondefault-string"),
+            ("secret-provider-value", "nondefault-string"),
+            (42, "nonstring"),
+            ({"secret-provider-key": "secret-provider-value"}, "nonstring"),
+        ):
+            with self.subTest(end_time=end_time):
+                item = run("run-1")
+                item["status"] = "Running"
+                item["end_time"] = end_time
+                with self.assertRaises(bootstrap.BootstrapError) as raised:
+                    transport()._project_webjob_history_item(
+                        {"id": COLLECTION_ID + "/run-1", "properties": item},
+                        site_resource_id=SITE_ID,
+                        job_name=JOB_NAME,
+                    )
+                diagnostic = str(raised.exception)
+                self.assertIn("status=Running", diagnostic)
+                self.assertIn("endClass=" + expected_class, diagnostic)
+                self.assertNotIn(str(end_time), diagnostic)
+                self.assertNotIn("secret-provider-value", diagnostic)
+
+    def test_terminal_success_rejects_default_end_time(self):
+        item = run("run-1")
+        item["end_time"] = "0001-01-01T00:00:00Z"
+        with self.assertRaises(bootstrap.BootstrapError):
+            transport()._project_webjob_history_item(
+                {"id": COLLECTION_ID + "/run-1", "properties": item},
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+            )
+
     def test_invalid_entry_reports_only_nonsecret_shape(self):
         for entry, expected in (
             (
