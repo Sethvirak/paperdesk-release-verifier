@@ -14416,6 +14416,11 @@ class AzureCliBootstrapTransport:
                 detail = self._json_response(
                     detail_response, {200}, "WebJob history detail"
                 )
+                if (
+                    not isinstance(detail.get("id"), str)
+                    or detail["id"].lower() != candidate[0].lower()
+                ):
+                    fail("WebJob history detail resource ID differs from list child")
                 group = self._project_webjob_history_item(
                     detail,
                     site_resource_id=site_resource_id,

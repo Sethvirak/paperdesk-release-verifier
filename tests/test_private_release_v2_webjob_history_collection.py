@@ -300,6 +300,27 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                 deadline=NOW + dt.timedelta(minutes=3),
             )
 
+        collection_detail = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": COLLECTION_ID,
+                "properties": {"runs": [run("run-1")]},
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            side_effect=[listing, collection_detail]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "resource ID differs from list child"
+        ):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+
         contradicting_detail = bootstrap._RestResponse(
             200,
             bootstrap.canonical_json_bytes({
