@@ -228,6 +228,168 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
             ["run-1", "run-2"],
         )
 
+    def test_incomplete_list_child_requires_exact_documented_detail(self):
+        listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [{
+                    "id": COLLECTION_ID + "/run-1",
+                    "properties": {"status": "Success"},
+                }],
+            }),
+            {"Content-Type": "application/json"},
+        )
+        detail = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": COLLECTION_ID + "/run-1",
+                "properties": {"runs": [run("run-1")]},
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            side_effect=[listing, detail]
+        )
+        observed = value._read_webjob_history(
+            site_resource_id=SITE_ID,
+            job_name=JOB_NAME,
+            deadline=NOW + dt.timedelta(minutes=3),
+        )
+        self.assertEqual(observed["entries"][0]["webJobsRunId"], "run-1")
+        self.assertEqual(
+            observed["detailResponseSha256s"],
+            [bootstrap._response_sha256(detail)],
+        )
+        detail_call = value._read_request_with_transport_retry.call_args_list[1]
+        self.assertEqual(detail_call.args[0], "GET")
+        self.assertEqual(
+            detail_call.args[1],
+            "https://management.azure.com" + COLLECTION_ID
+            + "/run-1?api-version=2025-05-01",
+        )
+        self.assertEqual(detail_call.kwargs["retry_delays"], (None,))
+
+    def test_history_detail_mismatch_and_invalid_child_path_fail_closed(self):
+        listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [{
+                    "id": COLLECTION_ID + "/run-1",
+                    "properties": {"status": "Success"},
+                }],
+            }),
+            {"Content-Type": "application/json"},
+        )
+        wrong_detail = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": COLLECTION_ID + "/run-2",
+                "properties": {"runs": [run("run-2")]},
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            side_effect=[listing, wrong_detail]
+        )
+        with self.assertRaises(bootstrap.BootstrapError):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+
+        collection_detail = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": COLLECTION_ID,
+                "properties": {"runs": [run("run-1")]},
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            side_effect=[listing, collection_detail]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "resource ID differs from list child"
+        ):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+
+        contradicting_detail = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "id": COLLECTION_ID + "/run-1",
+                "properties": {"runs": [run("run-1") | {"status": "Failed"}]},
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            side_effect=[listing, contradicting_detail]
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "contradicts its detail"
+        ):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+
+        malformed_listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [{
+                    "id": COLLECTION_ID + "/..",
+                    "properties": {"status": "Success"},
+                }],
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(
+            return_value=malformed_listing
+        )
+        with self.assertRaises(bootstrap.BootstrapError):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+        self.assertEqual(value._read_request_with_transport_retry.call_count, 1)
+
+    def test_history_detail_reads_are_bounded_before_any_detail_request(self):
+        listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [
+                    {
+                        "id": COLLECTION_ID + f"/run-{index}",
+                        "properties": {"status": "Success"},
+                    }
+                    for index in range(bootstrap.MAX_WEBJOB_HISTORY_DETAIL_READS + 1)
+                ],
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(return_value=listing)
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "too many detail reads"
+        ):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+        self.assertEqual(value._read_request_with_transport_retry.call_count, 1)
+
     def test_duplicate_source_resources_and_duplicate_runs_fail_closed(self):
         duplicate_source = {
             "value": [
