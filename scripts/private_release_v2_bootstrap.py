@@ -14157,6 +14157,17 @@ class AzureCliBootstrapTransport:
             isinstance(history_id_lower, str)
             and history_id_lower.startswith(history_collection_id_lower + "/")
         )
+        # ARM may return one history child with its run fields directly in
+        # properties instead of a one-element properties.runs array.  Keep
+        # the exact child-ID and run-field checks below for either shape.
+        if (
+            is_child
+            and isinstance(properties, Mapping)
+            and "runs" not in properties
+            and {"web_job_name", "web_job_id", "status", "trigger", "start_time"}
+            <= properties.keys()
+        ):
+            runs = [properties]
         # A provider response can fail this gate before the canary is
         # triggered.  Report only structural categories so the next reviewed
         # attempt identifies the incompatible field without recording run

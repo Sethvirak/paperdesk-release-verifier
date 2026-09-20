@@ -95,6 +95,26 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                     job_name=JOB_NAME,
                 )
 
+    def test_direct_child_run_properties_require_the_same_exact_identity(self):
+        projected = transport()._project_webjob_history_item(
+            {"id": COLLECTION_ID + "/run-1", "properties": run("run-1")},
+            site_resource_id=SITE_ID,
+            job_name=JOB_NAME,
+        )
+        self.assertEqual(projected[0]["historyId"], COLLECTION_ID + "/run-1")
+        self.assertEqual(projected[0]["status"], "Success")
+
+        for invalid in (
+            {"id": COLLECTION_ID + "/other-run", "properties": run("run-1")},
+            {"id": COLLECTION_ID + "/run-1", "properties": {"status": "Success"}},
+        ):
+            with self.assertRaises(bootstrap.BootstrapError):
+                transport()._project_webjob_history_item(
+                    invalid,
+                    site_resource_id=SITE_ID,
+                    job_name=JOB_NAME,
+                )
+
     def test_invalid_entry_reports_only_nonsecret_shape(self):
         for entry, expected in (
             (
@@ -152,6 +172,31 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
             bootstrap.sha256_bytes(
                 bootstrap.canonical_json_bytes(observed["entries"])
             ),
+        )
+
+    def test_history_read_accepts_exact_direct_child_shape(self):
+        document = {
+            "value": [
+                {"id": COLLECTION_ID + "/run-2", "properties": run("run-2", offset=3)},
+                {"id": COLLECTION_ID + "/run-1", "properties": run("run-1")},
+            ],
+            "nextLink": None,
+        }
+        response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes(document),
+            {"Content-Type": "application/json"},
+        )
+        value = transport()
+        value._read_request_with_transport_retry = mock.Mock(return_value=response)
+        observed = value._read_webjob_history(
+            site_resource_id=SITE_ID,
+            job_name=JOB_NAME,
+            deadline=NOW + dt.timedelta(seconds=30),
+        )
+        self.assertEqual(
+            [item["webJobsRunId"] for item in observed["entries"]],
+            ["run-1", "run-2"],
         )
 
     def test_duplicate_source_resources_and_duplicate_runs_fail_closed(self):
