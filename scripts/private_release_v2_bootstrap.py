@@ -1247,6 +1247,14 @@ class CleanupResolvedMutationError(BootstrapError):
         self.proof = dict(proof)
 
 
+class WebJobCanaryFailure(BootstrapError):
+    """Retain only the correlated failed run and bounded log-probe facts."""
+
+    def __init__(self, message: str, diagnostic: Mapping[str, Any]) -> None:
+        self.diagnostic = dict(diagnostic)
+        super().__init__(message)
+
+
 def fail(message: str) -> None:
     raise BootstrapError(message)
 
@@ -15017,7 +15025,37 @@ class AzureCliBootstrapTransport:
                 if start < trigger_requested_at - dt.timedelta(seconds=5):
                     fail("fresh WebJob run predates the authorized trigger")
                 if fresh["status"] in {"Failed", "Aborted"}:
-                    fail("fresh WebJob canary reached a terminal failure")
+                    run_id = fresh["webJobsRunId"]
+                    if (not isinstance(run_id, str)
+                            or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id) is None
+                            or run_id in {".", ".."}):
+                        fail("failed WebJob run ID is not exact")
+                    end = parse_time(fresh["endedAt"], "failed WebJob end")
+                    if end < start or end > after_response + dt.timedelta(seconds=5):
+                        fail("failed WebJob completion time is not exact")
+                    output = fresh["outputUrlMetadata"]
+                    if (not isinstance(output, Mapping)
+                            or set(output) != {"scheme", "host", "pathSha256", "queryPresent"}
+                            or output["scheme"] != "https"
+                            or output["host"] != site_resource_id.rsplit("/", 1)[-1].lower() + ".scm.azurewebsites.net"
+                            or not isinstance(output["pathSha256"], str)
+                            or SHA256.fullmatch(output["pathSha256"]) is None
+                            or output["queryPresent"] is not False):
+                        fail("failed WebJob output metadata is not exact")
+                    raise WebJobCanaryFailure(
+                        "fresh WebJob canary reached a terminal failure",
+                        {
+                            "stage": "bridge-webjob-terminal-history",
+                            "status": fresh["status"],
+                            "runId": run_id,
+                            "startedAt": fresh["startedAt"],
+                            "endedAt": fresh["endedAt"],
+                            "historyObservedAt": observed["observedAt"],
+                            "historyResponseSha256": observed["responseSha256"],
+                            "outputPathSha256": output["pathSha256"],
+                            "logProbe": None,
+                        },
+                    )
                 if fresh["status"] == "Success":
                     end = parse_time(fresh["endedAt"], "fresh WebJob end")
                     if end > after_response + dt.timedelta(seconds=5):
@@ -15035,6 +15073,143 @@ class AzureCliBootstrapTransport:
                 fail("WebJob canary polling would cross the authorization deadline")
             self.sleep(delay)
         fail("WebJob canary exceeded the source-bounded polling attempts")
+
+    @staticmethod
+    def _safe_webjob_failure_marker(body: bytes) -> str | None:
+        """Classify fixed source-owned errors without retaining provider log text."""
+        if len(body) > 64 * 1024:
+            return None
+        text = body.decode("utf-8", errors="replace")
+        for marker in (
+            "paperdesk-bridge-startup:site-name",
+            "paperdesk-bridge-startup:python-version",
+            "paperdesk-bridge-startup:entry-missing",
+        ):
+            if marker in text:
+                return marker
+        source_owned_labels = {
+            "entry-bootstrap-self-test",
+            "entry-bootstrap-self-test-json",
+            "entry-bootstrap-self-test-time",
+            "entry-bootstrap-self-test-privileged-state",
+            "entry-bootstrap-self-test-identity",
+            "entry-member-manifest",
+            "entry-member",
+            "entry-member-drift",
+            "identity-coordinate",
+            "identity-endpoint",
+            "identity-header",
+            "token-resource",
+            "token-response",
+            "token-audience",
+            "token-identity",
+            "token-time",
+            "fence-canary-input",
+            "fence-canary-expired",
+            "fence-canary-busy",
+            "fence-canary-acquire",
+            "fence-canary-idle-drift",
+            "fence-canary-renew",
+            "fence-canary-final-lease",
+            "fence-canary-final-readback",
+        }
+        for label in sorted(source_owned_labels):
+            if re.search(
+                r"(?:MailboxError|BootstrapError): " + re.escape(label) + r"(?:\s|$)",
+                text,
+            ):
+                return label
+        for name in ("ModuleNotFoundError", "ImportError", "SyntaxError"):
+            if re.search(r"(?m)^" + name + r":", text):
+                return "python-" + name.lower()
+        return None
+
+    def _probe_failed_webjob_log(
+        self, *, site_resource_id: str, job_name: str,
+        run_id: str, deadline: dt.datetime,
+    ) -> Mapping[str, Any]:
+        """One bounded read per exact log while the bridge is still exposed.
+
+        Only status, size, digest and allowlisted markers survive. Credentials
+        and raw Kudu output stay in memory and are never written to the ledger.
+        A probe failure cannot delay or replace the mandatory site/SCM cleanup.
+        """
+        unavailable: dict[str, Any] = {"state": "unavailable", "reason": "deadline"}
+        if (not isinstance(run_id, str)
+                or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id) is None
+                or run_id in {".", ".."}
+                or job_name != "paperdesk-accepted-release-registry"
+                or site_resource_id.lower()
+                != self.resources["bridgeSite"]["resourceId"].lower()):
+            return {"state": "unavailable", "reason": "target"}
+        if self.clock() + dt.timedelta(seconds=25) >= deadline:
+            return unavailable
+        session = self.session
+        cached = getattr(session, "_tokens", {}).get("https://management.azure.com/")
+        runner = getattr(session, "_exchange_runner", None)
+        if (not isinstance(cached, tuple) or len(cached) != 2
+                or not isinstance(cached[0], str) or not cached[0]
+                or type(cached[1]) is not int
+                or cached[1] <= int(self.clock().timestamp()) + 25
+                or not callable(runner)):
+            return {"state": "unavailable", "reason": "cached-arm-credential"}
+        credentials_url = self._arm_url(
+            site_resource_id, "2025-05-01", "/config/publishingcredentials/list"
+        )
+        request = urllib.request.Request(
+            credentials_url, data=b"",
+            headers={"Authorization": "Bearer " + cached[0], "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            response = runner(request, 6.0)
+        except Exception:
+            return {"state": "unavailable", "reason": "credential-transport"}
+        if not isinstance(response, _RestResponse) or response.status != 200 or len(response.body) > 8192:
+            return {"state": "unavailable", "reason": "credential-response"}
+        try:
+            properties = json.loads(response.body)["properties"]
+            username = properties["publishingUserName"]
+            password = properties["publishingPassword"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return {"state": "unavailable", "reason": "credential-shape"}
+        if (not isinstance(username, str) or not isinstance(password, str)
+                or not 1 <= len(username) <= 2048 or not 1 <= len(password) <= 2048
+                or any(char in username + password for char in "\r\n\0")):
+            return {"state": "unavailable", "reason": "credential-shape"}
+        basic = base64.b64encode((username + ":" + password).encode("utf-8")).decode("ascii")
+        host = site_resource_id.rsplit("/", 1)[-1].lower() + ".scm.azurewebsites.net"
+        root = ("https://" + host + "/api/vfs/data/jobs/triggered/"
+                + job_name + "/" + run_id + "/")
+        results: dict[str, Any] = {}
+        for kind in ("error", "output"):
+            if self.clock() + dt.timedelta(seconds=7) >= deadline:
+                results[kind] = {"state": "skipped-deadline"}
+                continue
+            log_request = urllib.request.Request(
+                root + kind + "_" + run_id + ".log",
+                headers={"Authorization": "Basic " + basic, "Accept-Encoding": "identity"},
+                method="GET",
+            )
+            try:
+                log_response = runner(log_request, 6.0)
+            except Exception:
+                results[kind] = {"state": "transport-error"}
+                continue
+            if not isinstance(log_response, _RestResponse):
+                results[kind] = {"state": "invalid-response"}
+                continue
+            if log_response.status != 200:
+                results[kind] = {"state": "http-error", "httpStatus": log_response.status}
+                continue
+            raw = log_response.body
+            results[kind] = {
+                "state": "read" if len(raw) <= 64 * 1024 else "oversized",
+                "bytes": len(raw),
+                "sha256": sha256_bytes(raw),
+                "markerHint": self._safe_webjob_failure_marker(raw),
+            }
+        return {"state": "probed", "error": results["error"], "output": results["output"]}
 
     def _read_final_webjob_history(
         self,
@@ -20289,6 +20464,31 @@ class AzureCliBootstrapTransport:
                     fail("WebJob terminal history does not match the authorized trigger")
             except BaseException as exc:
                 primary_error = exc
+                if isinstance(exc, WebJobCanaryFailure):
+                    location = trigger_correlation["location"]
+                    if (location is not None
+                            and exc.diagnostic["runId"] != location["runId"]):
+                        primary_error = BootstrapError(
+                            "failed WebJob terminal history does not match the "
+                            "authorized trigger location"
+                        )
+                        exc = primary_error
+                if isinstance(exc, WebJobCanaryFailure):
+                    try:
+                        exc.diagnostic["logProbe"] = dict(
+                            self._probe_failed_webjob_log(
+                                site_resource_id=site["resourceId"],
+                                job_name=job,
+                                run_id=exc.diagnostic["runId"],
+                                deadline=canary_control_deadline,
+                            )
+                        )
+                    except Exception:
+                        # The read is diagnostic only. Always continue into
+                        # the exact stop/SCM/public-network cleanup below.
+                        exc.diagnostic["logProbe"] = {
+                            "state": "unavailable", "reason": "probe-exception"
+                        }
             finally:
                 if start_attempted:
                     try:
@@ -20500,9 +20700,25 @@ class AzureCliBootstrapTransport:
                     or public_network_restore_error is not None
                     or final_stop_error is not None
                 ):
+                    if isinstance(primary_error, WebJobCanaryFailure):
+                        diagnostic = dict(primary_error.diagnostic)
+                        diagnostic["cleanupState"] = "failed"
+                        raise WebJobCanaryFailure(
+                            "bridge canary failed and exact finally cleanup also failed; "
+                            "the durable mutation journal requires operator recovery",
+                            diagnostic,
+                        ) from primary_error
                     raise BootstrapError(
                         "bridge canary failed and exact finally cleanup also failed; "
                         "the durable mutation journal requires operator recovery"
+                    ) from primary_error
+                if isinstance(primary_error, WebJobCanaryFailure):
+                    diagnostic = dict(primary_error.diagnostic)
+                    diagnostic["cleanupState"] = "proven"
+                    raise WebJobCanaryFailure(
+                        "bridge canary failed during terminal-history before terminal Success: "
+                        "fresh WebJob canary reached a terminal failure",
+                        diagnostic,
                     ) from primary_error
                 raise BootstrapError(
                     "bridge canary failed during "
@@ -23623,6 +23839,7 @@ class BootstrapExecutor:
                     ControllerReadinessError,
                     PackageReadinessError,
                     StorageOperationError,
+                    WebJobCanaryFailure,
                 ),
             ):
                 terminal["failureDiagnostic"] = dict(failure.diagnostic)

@@ -9,6 +9,10 @@ class Tests(unittest.TestCase):
    self.assertEqual(first.read_bytes(),second.read_bytes()); self.assertEqual(one["packageSha256"],hashlib.sha256(first.read_bytes()).hexdigest()); self.assertEqual(one,two)
    with zipfile.ZipFile(first) as archive:
     names=archive.namelist(); self.assertEqual(names,[build.JOB+item[1] for item in build.SOURCES]+[build.JOB+"private_release_bridge_members.json"])
+    runner=archive.read(build.JOB+"run.sh")
+    self.assertTrue(runner.startswith(b"#!/usr/bin/env bash\n"))
+    self.assertNotIn(b"\r",runner)
+    self.assertIn(b"paperdesk-bridge-startup:python-version",runner)
     self.assertTrue(all(name.startswith(build.JOB) for name in names)); self.assertEqual(len(names),len(set(names)))
     manifest=json.loads(archive.read(build.JOB+"private_release_bridge_members.json"))
     for name,digest in manifest["members"].items(): self.assertEqual(hashlib.sha256(archive.read(build.JOB+name)).hexdigest(),digest)

@@ -8614,6 +8614,46 @@ class BootstrapTests(unittest.TestCase):
                 with self.assertRaisesRegex(bootstrap.BootstrapError, "injected permanent failure"):
                     self.executor(validated, preflight, transport).run()
 
+    def test_failed_webjob_run_diagnostic_survives_cleanup_in_terminal_receipt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, validated, preflight, projection, receipt = self.fixture(folder)
+            transport = FakeTransport(projection)
+            original_apply = transport.apply_operation
+            diagnostic = {
+                "stage": "bridge-webjob-terminal-history",
+                "status": "Failed",
+                "runId": "failed-run",
+                "startedAt": "2026-09-20T07:48:40.000Z",
+                "endedAt": "2026-09-20T07:48:41.000Z",
+                "historyObservedAt": "2026-09-20T07:48:42.000Z",
+                "historyResponseSha256": "a" * 64,
+                "outputPathSha256": "b" * 64,
+                "logProbe": {
+                    "state": "probed",
+                    "error": {"state": "read", "bytes": 47, "sha256": "c" * 64,
+                              "markerHint": "entry-bootstrap-self-test-identity"},
+                    "output": {"state": "http-error", "httpStatus": 404},
+                },
+            }
+
+            def apply(operation, state):
+                if operation["id"] == "startBridgeForBoundedCanary":
+                    raise bootstrap.WebJobCanaryFailure(
+                        "failed run; raw secret must not enter the receipt",
+                        diagnostic,
+                    )
+                return original_apply(operation, state)
+
+            with mock.patch.object(transport, "apply_operation", side_effect=apply):
+                with self.assertRaises(bootstrap.WebJobCanaryFailure):
+                    self.executor(validated, preflight, transport).run()
+            terminal, raw = bootstrap.load_json(
+                receipt / "execution-terminal.json", require_canonical=True
+            )
+            self.assertEqual(terminal["failureType"], "WebJobCanaryFailure")
+            self.assertEqual(terminal["failureDiagnostic"], diagnostic)
+            self.assertNotIn(b"raw secret", raw)
+
     def test_authorization_specific_azure_claim_is_first_and_persistent(self):
         self.assertEqual(self.plan["mutations"][0]["id"], "claimAzureSingleUseAuthorization")
         claim = self.plan["resourceInventory"][0]
@@ -9806,9 +9846,10 @@ class BootstrapTests(unittest.TestCase):
             current[0] = NOW + dt.timedelta(seconds=3)
             failed_session = Session(terminal_status="Failed")
             with self.assertRaisesRegex(
-                bootstrap.BootstrapError, "before terminal Success"
-            ):
+                bootstrap.WebJobCanaryFailure, "before terminal Success"
+            ) as failed_run:
                 build_transport(failed_session)._mutate(operation, state)
+            self.assertEqual(failed_run.exception.diagnostic["cleanupState"], "proven")
             self.assertEqual(
                 sum(
                     url.split("?", 1)[0].endswith("/stop")
@@ -9818,6 +9859,18 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertFalse(failed_session.scm_policy_enabled)
             self.assertEqual(failed_session.public_network_access, "Disabled")
+
+            current[0] = NOW + dt.timedelta(seconds=3)
+            mismatched_failed_session = Session(
+                terminal_status="Failed", trigger_location_run_id="other-run"
+            )
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "failed WebJob terminal history does not match the authorized trigger location",
+            ):
+                build_transport(mismatched_failed_session)._mutate(operation, state)
+            self.assertFalse(mismatched_failed_session.scm_policy_enabled)
+            self.assertEqual(mismatched_failed_session.public_network_access, "Disabled")
 
             current[0] = NOW + dt.timedelta(seconds=3)
             unauthorized_session = Session(discovery_status=401)
