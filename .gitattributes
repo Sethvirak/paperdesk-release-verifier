@@ -2,6 +2,7 @@ webjobs/paperdesk-accepted-release-registry/run.sh text eol=lf
 webjobs/paperdesk-accepted-release-registry/settings.job text eol=lf
 webjobs/paperdesk-registry-cleanup-watcher/run.sh text eol=lf
 webjobs/paperdesk-registry-cleanup-watcher/settings.job text eol=lf
+webjobs/paperdesk-private-release-bridge/run.sh text eol=lf
 scripts/check_deadline.py text eol=lf
 scripts/watchdog_contract.py text eol=lf
 scripts/watchdog_evidence.py text eol=lf

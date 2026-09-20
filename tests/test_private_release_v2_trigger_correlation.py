@@ -1,7 +1,9 @@
 """Adversarial WebJob trigger-correlation and final-census regressions."""
 
+import base64
 import copy
 import datetime as dt
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,6 +23,9 @@ SITE_ID = (
     "sites/paperdesk-release-registry-bridge-v2-9c4e0d0d"
 )
 SITE_NAME = "paperdesk-release-registry-bridge-v2-9c4e0d0d"
+PROBE_SITE_ID = SITE_ID.replace(
+    "00000000-0000-0000-0000-000000000000", bootstrap.SUBSCRIPTION
+)
 JOB_NAME = "paperdesk-accepted-release-registry"
 AUTHORIZATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 REQUEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -319,6 +324,135 @@ class FreshHistoryPollingTests(unittest.TestCase):
             bootstrap.BootstrapError, "does not match the request trigger token"
         ):
             self.call([history_observation([wrong])], boundary_entries=[])
+
+    def test_exact_failed_history_retains_bounded_run_evidence(self):
+        for status in ("Failed", "Aborted"):
+            with self.subTest(status=status):
+                with self.assertRaises(bootstrap.WebJobCanaryFailure) as caught:
+                    self.call(
+                        [history_observation([history_entry("failed-run", status=status)])],
+                        boundary_entries=[],
+                    )
+                diagnostic = caught.exception.diagnostic
+                self.assertEqual(diagnostic["status"], status)
+                self.assertEqual(diagnostic["runId"], "failed-run")
+                self.assertEqual(diagnostic["historyResponseSha256"], "d" * 64)
+                self.assertEqual(diagnostic["outputPathSha256"], "c" * 64)
+                self.assertNotIn("trigger", json.dumps(diagnostic).lower())
+                self.assertNotIn("scm.azurewebsites.net", json.dumps(diagnostic))
+
+
+class FailedWebJobLogProbeTests(unittest.TestCase):
+    def transport(self, runner, *, site_id=PROBE_SITE_ID):
+        transport = bare_transport()
+        transport.resources = {
+            "bridgeSite": {"resourceId": PROBE_SITE_ID, "name": SITE_NAME}
+        }
+        transport.session = mock.Mock()
+        transport.session._tokens = {
+            "https://management.azure.com/": (
+                "ARM-TOKEN",
+                int((NOW + dt.timedelta(minutes=2)).timestamp()),
+            )
+        }
+        transport.session._exchange_runner = runner
+        return transport._probe_failed_webjob_log(
+            site_resource_id=site_id,
+            job_name=JOB_NAME,
+            run_id="failed-run",
+            deadline=NOW + dt.timedelta(minutes=1),
+        )
+
+    def test_reads_only_exact_run_files_once_and_retains_no_raw_log_or_credentials(self):
+        calls = []
+        secret = "private-diagnostic-secret"
+        error = (
+            "MailboxError: entry-bootstrap-self-test-identity\n" + secret
+        ).encode()
+
+        def runner(request, timeout):
+            calls.append((request.full_url, request.get_method(), timeout,
+                          request.get_header("Authorization")))
+            if len(calls) == 1:
+                return bootstrap._RestResponse(
+                    200,
+                    json.dumps({"properties": {
+                        "publishingUserName": "user",
+                        "publishingPassword": "password",
+                    }}).encode(),
+                    {},
+                )
+            if len(calls) == 2:
+                return bootstrap._RestResponse(200, error, {})
+            return bootstrap._RestResponse(404, b"missing", {})
+
+        diagnostic = self.transport(runner)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][1:], ("POST", 6.0, "Bearer ARM-TOKEN"))
+        self.assertEqual(calls[1][1:3], ("GET", 6.0))
+        self.assertEqual(calls[2][1:3], ("GET", 6.0))
+        self.assertEqual(
+            base64.b64decode(calls[1][3].removeprefix("Basic ")),
+            b"user:password",
+        )
+        self.assertTrue(calls[0][0].endswith(
+            PROBE_SITE_ID + "/config/publishingcredentials/list?api-version=2025-05-01"
+        ))
+        for kind, call in zip(("error", "output"), calls[1:]):
+            self.assertEqual(
+                call[0],
+                f"https://{SITE_NAME}.scm.azurewebsites.net/api/vfs/data/jobs/"
+                f"triggered/{JOB_NAME}/failed-run/{kind}_failed-run.log",
+            )
+        self.assertEqual(diagnostic["error"]["markerHint"],
+                         "entry-bootstrap-self-test-identity")
+        self.assertEqual(diagnostic["error"]["sha256"],
+                         bootstrap.sha256_bytes(error))
+        self.assertEqual(diagnostic["output"],
+                         {"state": "http-error", "httpStatus": 404})
+        self.assertNotIn(secret, json.dumps(diagnostic))
+        self.assertNotIn("password", json.dumps(diagnostic))
+        self.assertNotIn("ARM-TOKEN", json.dumps(diagnostic))
+
+    def test_wrong_site_or_transport_error_never_retries(self):
+        runner = mock.Mock(side_effect=RuntimeError("secret transport detail"))
+        wrong = self.transport(runner, site_id=PROBE_SITE_ID + "/other")
+        self.assertEqual(wrong, {"state": "unavailable", "reason": "target"})
+        runner.assert_not_called()
+
+        failed = self.transport(runner)
+        self.assertEqual(failed,
+                         {"state": "unavailable", "reason": "credential-transport"})
+        runner.assert_called_once()
+        self.assertNotIn("secret", json.dumps(failed))
+
+    def test_short_deadline_skips_all_credential_and_log_requests(self):
+        runner = mock.Mock()
+        transport = bare_transport()
+        transport.resources = {
+            "bridgeSite": {"resourceId": PROBE_SITE_ID, "name": SITE_NAME}
+        }
+        transport.session = mock.Mock()
+        transport.session._exchange_runner = runner
+        diagnostic = transport._probe_failed_webjob_log(
+            site_resource_id=PROBE_SITE_ID,
+            job_name=JOB_NAME,
+            run_id="failed-run",
+            deadline=NOW + dt.timedelta(seconds=24),
+        )
+        self.assertEqual(diagnostic,
+                         {"state": "unavailable", "reason": "deadline"})
+        runner.assert_not_called()
+
+    def test_marker_is_only_a_source_owned_hint(self):
+        classify = bootstrap.AzureCliBootstrapTransport._safe_webjob_failure_marker
+        self.assertEqual(classify(b"paperdesk-bridge-startup:python-version\n"),
+                         "paperdesk-bridge-startup:python-version")
+        self.assertEqual(classify(b"MailboxError: fence-canary-acquire\n"),
+                         "fence-canary-acquire")
+        self.assertIsNone(classify(b"secret token: abcdef\n"))
+        self.assertIsNone(classify(b"x" * (64 * 1024 + 1)))
 
 
 class TriggerCorrelationEvidenceBindingTests(unittest.TestCase):
