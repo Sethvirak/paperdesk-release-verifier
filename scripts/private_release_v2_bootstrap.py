@@ -17091,10 +17091,33 @@ class AzureCliBootstrapTransport:
                 )
             except _LateRestResponse as late_response:
                 response = late_response.response
+            except _RestTransportAmbiguity:
+                # This exact container listing is read-only. A lost response
+                # may be retried with a new request ID inside the existing
+                # propagation window without issuing a mutation.
+                completed = self.clock()
+                last_status, last_code = None, "unknown"
+                last_request_id = last_server_date = last_credential = None
+                attempt_records.append(_storage_attempt_record(
+                    attempt=attempts, started=before_request, completed=completed,
+                    client_request_id=client_request_id, status=None,
+                    error_code="unknown", request_id=None, server_date=None,
+                    outcome="transport-error",
+                ))
+                if attempts >= 64 or completed >= final_request_at:
+                    fail_readiness("controller lock proof transport failed closed", "transport-error")
+                delay = min(
+                    float(2 ** min(attempts - 1, 4)), 15.0,
+                    (final_request_at - completed).total_seconds(),
+                )
+                self.sleep(delay)
+                continue
             except Exception:
                 # No transport exception text or body enters diagnostics, and
-                # an ambiguous GET is not replayed by this readiness loop.
+                # unexpected request failures are not replayed.
                 completed = self.clock()
+                last_status, last_code = None, "unknown"
+                last_request_id = last_server_date = last_credential = None
                 attempt_records.append(_storage_attempt_record(
                     attempt=attempts, started=before_request, completed=completed,
                     client_request_id=client_request_id, status=None,

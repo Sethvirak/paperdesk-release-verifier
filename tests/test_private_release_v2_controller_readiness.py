@@ -241,6 +241,64 @@ class ControllerReadinessTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [])
         self.assertEqual(journal.records, [])
 
+    def test_known_read_only_transport_loss_continues_with_new_get(self):
+        def sequence(attempt):
+            if attempt <= 7:
+                return denied()
+            if attempt == 8:
+                raise bootstrap._RestTotalTimeout(SECRET)
+            return empty()
+
+        transport, session, journal, ids = self.make(sequence)
+        proof = transport._prove_controller_lock_container_empty(ids)[0]
+        self.assertEqual(proof["attempts"], 9)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8, 15, 15, 15, 15])
+        self.assertEqual(len(session.requests), 9)
+        client_ids = [request[2]["headers"]["x-ms-client-request-id"]
+                      for request in session.requests]
+        self.assertEqual(len(set(client_ids)), 9)
+        self.assertEqual(journal.records, [])
+
+    def test_transport_loss_does_not_hide_unexpected_exception_on_next_get(self):
+        def sequence(attempt):
+            if attempt == 1:
+                raise bootstrap._RestTransportAmbiguity(SECRET)
+            raise RuntimeError(SECRET)
+
+        transport, session, journal, ids = self.make(sequence)
+        with self.assertRaises(bootstrap.ControllerReadinessError) as error:
+            transport._prove_controller_lock_container_empty(ids)
+        self.assert_sanitized(error.exception)
+        self.assertEqual(error.exception.diagnostic["stopReason"], "transport-error")
+        self.assertEqual([item["outcome"] for item in error.exception.diagnostic["attemptRecords"]],
+                         ["transport-error", "transport-error"])
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(journal.records, [])
+
+    def test_lost_get_at_readiness_cutoff_does_not_start_another_request(self):
+        def timed_out(attempt):
+            if attempt == 1:
+                return denied(headers={"x-ms-request-id": REQUEST_ID, "Date": SERVER_DATE})
+            self.current = NOW + dt.timedelta(
+                seconds=bootstrap.MAX_STORAGE_DATA_PLANE_READINESS_SECONDS)
+            raise bootstrap._RestTotalTimeout(SECRET)
+
+        transport, session, journal, ids = self.make(timed_out)
+        with self.assertRaises(bootstrap.ControllerReadinessError) as error:
+            transport._prove_controller_lock_container_empty(ids)
+        self.assert_sanitized(error.exception)
+        self.assertEqual(error.exception.diagnostic["stopReason"], "transport-error")
+        self.assertIsNone(error.exception.diagnostic["status"])
+        self.assertEqual(error.exception.diagnostic["errorCode"], "unknown")
+        self.assertIsNone(error.exception.diagnostic["requestId"])
+        self.assertIsNone(error.exception.diagnostic["serverDate"])
+        self.assertIsNone(error.exception.diagnostic["credential"])
+        self.assertEqual([item["status"] for item in error.exception.diagnostic["attemptRecords"]],
+                         [403, None])
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(self.sleeps, [1])
+        self.assertEqual(journal.records, [])
+
     def test_zero_attempt_outside_authorization_window_has_no_response_metadata(self):
         for offset in (-1, bootstrap.MAX_AUTHORIZATION_SECONDS):
             with self.subTest(offset=offset):
@@ -356,7 +414,7 @@ class ControllerReadinessTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [1])
         self.assertEqual(journal.records, [])
 
-    def test_later_transport_failure_retains_last_response_headers_not_exception(self):
+    def test_later_transport_failure_clears_last_response_headers_and_credential(self):
         credential = {
             "source": "azure-cli-request",
             "tokenIssuedAtUnix": int(NOW.timestamp()) - 60,
@@ -364,7 +422,6 @@ class ControllerReadinessTests(unittest.TestCase):
             "tokenObservedAtUnix": int(NOW.timestamp()),
             "accountBindingVerified": True,
         }
-        expected_credential = dict(credential)
         credential_observations = []
 
         def diagnostic():
@@ -385,11 +442,12 @@ class ControllerReadinessTests(unittest.TestCase):
             transport._prove_controller_lock_container_empty(ids)
         self.assert_sanitized(error.exception)
         self.assertEqual(error.exception.diagnostic["stopReason"], "transport-error")
-        self.assertEqual(error.exception.diagnostic["status"], 403)
-        self.assertEqual(error.exception.diagnostic["errorCode"], "AuthorizationPermissionMismatch")
-        self.assertEqual(error.exception.diagnostic["requestId"], REQUEST_ID)
-        self.assertEqual(error.exception.diagnostic["serverDate"], SERVER_DATE)
-        self.assertEqual(error.exception.diagnostic["credential"], expected_credential)
+        self.assertIsNone(error.exception.diagnostic["status"])
+        self.assertEqual(error.exception.diagnostic["errorCode"], "unknown")
+        self.assertIsNone(error.exception.diagnostic["requestId"])
+        self.assertIsNone(error.exception.diagnostic["serverDate"])
+        self.assertIsNone(error.exception.diagnostic["credential"])
+        self.assertEqual(error.exception.diagnostic["attemptRecords"][0]["status"], 403)
         self.assertEqual(credential_observations, [1])
         self.assertEqual(len(session.requests), 2)
         self.assertEqual(self.sleeps, [1])
