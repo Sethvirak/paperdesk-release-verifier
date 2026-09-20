@@ -270,6 +270,91 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
         )
         self.assertEqual(detail_call.kwargs["retry_delays"], (None,))
 
+    def test_detail_only_flattened_identity_binds_exact_child_run(self):
+        alternate = {
+            key: value for key, value in run("run-1").items()
+            if key not in {"web_job_name", "web_job_id"}
+        }
+        alternate["job_name"] = JOB_NAME
+        listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [{
+                    "id": COLLECTION_ID + "/run-1",
+                    "properties": alternate,
+                }],
+            }),
+            {"Content-Type": "application/json"},
+        )
+
+        def read_with_detail(properties):
+            detail = bootstrap._RestResponse(
+                200,
+                bootstrap.canonical_json_bytes({
+                    "id": COLLECTION_ID + "/run-1",
+                    "properties": properties,
+                }),
+                {"Content-Type": "application/json"},
+            )
+            value = transport()
+            value._read_request_with_transport_retry = mock.Mock(
+                side_effect=[listing, detail]
+            )
+            return value, detail
+
+        value, detail = read_with_detail(alternate)
+        observed = value._read_webjob_history(
+            site_resource_id=SITE_ID,
+            job_name=JOB_NAME,
+            deadline=NOW + dt.timedelta(minutes=3),
+        )
+        self.assertEqual(observed["entries"][0]["webJobsRunId"], "run-1")
+        self.assertEqual(
+            observed["entries"][0]["historyId"], COLLECTION_ID + "/run-1"
+        )
+        self.assertEqual(
+            observed["detailResponseSha256s"],
+            [bootstrap._response_sha256(detail)],
+        )
+        self.assertEqual(value._read_request_with_transport_retry.call_count, 2)
+
+        for detail_properties in (
+            alternate | {"job_name": "another-job"},
+            alternate | {"web_job_id": "another-run"},
+            alternate | {"web_job_name": "another-job"},
+        ):
+            with self.subTest(detail_properties=detail_properties):
+                value, _ = read_with_detail(detail_properties)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    value._read_webjob_history(
+                        site_resource_id=SITE_ID,
+                        job_name=JOB_NAME,
+                        deadline=NOW + dt.timedelta(minutes=3),
+                    )
+
+        contradicting_listing = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({
+                "value": [{
+                    "id": COLLECTION_ID + "/run-1",
+                    "properties": alternate | {"status": "Failed"},
+                }],
+            }),
+            {"Content-Type": "application/json"},
+        )
+        value, detail = read_with_detail(alternate)
+        value._read_request_with_transport_retry.side_effect = [
+            contradicting_listing, detail,
+        ]
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "contradicts its detail"
+        ):
+            value._read_webjob_history(
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+                deadline=NOW + dt.timedelta(minutes=3),
+            )
+
     def test_history_detail_mismatch_and_invalid_child_path_fail_closed(self):
         listing = bootstrap._RestResponse(
             200,

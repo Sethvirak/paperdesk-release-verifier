@@ -14421,8 +14421,29 @@ class AzureCliBootstrapTransport:
                     or detail["id"].lower() != candidate[0].lower()
                 ):
                     fail("WebJob history detail resource ID differs from list child")
+                detail_properties = detail.get("properties")
+                projected_detail = detail
+                if (
+                    isinstance(detail_properties, Mapping)
+                    and "runs" not in detail_properties
+                    and "web_job_name" not in detail_properties
+                    and "web_job_id" not in detail_properties
+                    and detail_properties.get("job_name") == job_name
+                    and {"status", "trigger", "start_time"}
+                    <= detail_properties.keys()
+                ):
+                    # The by-ID response can flatten a run while omitting both
+                    # canonical identity fields.  Only this exact detail read
+                    # may bind its validated child-ID suffix as the run ID.
+                    # All remaining run fields still pass the usual projector.
+                    projected_detail = dict(detail)
+                    projected_detail["properties"] = {
+                        **detail_properties,
+                        "web_job_name": job_name,
+                        "web_job_id": candidate[1],
+                    }
                 group = self._project_webjob_history_item(
-                    detail,
+                    projected_detail,
                     site_resource_id=site_resource_id,
                     job_name=job_name,
                 )
@@ -14431,7 +14452,7 @@ class AzureCliBootstrapTransport:
                     or group[0]["historyId"].lower() != candidate[0].lower()
                 ):
                     fail("WebJob history detail does not match its list child")
-                detail_properties = detail.get("properties")
+                detail_properties = projected_detail.get("properties")
                 detail_runs = (
                     detail_properties.get("runs")
                     if isinstance(detail_properties, Mapping)
