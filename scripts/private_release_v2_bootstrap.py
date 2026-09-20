@@ -14202,6 +14202,25 @@ class AzureCliBootstrapTransport:
             runs_class = "list"
         else:
             runs_class = "other"
+        # A direct child without properties.runs has more than one provider
+        # shape in practice.  Report presence of fixed, documented run field
+        # names only.  Never log provider-supplied field names or values: the
+        # latter may contain run IDs, triggers, URLs, or credential material.
+        direct_field_presence = ""
+        if is_child and isinstance(properties, Mapping) and "runs" not in properties:
+            field_names = (
+                "web_job_name",
+                "job_name",
+                "web_job_id",
+                "status",
+                "trigger",
+                "start_time",
+                "end_time",
+                "output_url",
+            )
+            direct_field_presence = ", directFieldPresence=" + "".join(
+                "1" if field in properties else "0" for field in field_names
+            )
         if (
             not isinstance(history_id, str)
             or not (is_collection or is_child)
@@ -14213,7 +14232,8 @@ class AzureCliBootstrapTransport:
             fail(
                 "WebJob history entry identity is not exact "
                 f"(idClass={id_class}, runsClass={runs_class}, "
-                f"runsCount={len(runs) if isinstance(runs, list) else 'n/a'})"
+                f"runsCount={len(runs) if isinstance(runs, list) else 'n/a'}"
+                f"{direct_field_presence})"
             )
         projected: list[Mapping[str, Any]] = []
         for run in runs:
