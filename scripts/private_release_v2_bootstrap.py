@@ -90,6 +90,7 @@ MAX_CANARY_STARTUP_CONVERGENCE_SECONDS = 710
 MAX_CANARY_CONVERGENCE_SECONDS = 300
 MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS = 60
 MAX_CANARY_FINAL_HISTORY_SECONDS = 180
+MAX_WEBJOB_HISTORY_DETAIL_READS = 4
 WEBJOB_TRIGGER_USER_AGENT_PREFIX = "PaperDeskV2Bootstrap/"
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
 # A protected cleanup can reach lock restoration after its authorization has
@@ -14335,6 +14336,7 @@ class AzureCliBootstrapTransport:
                 "entries": empty,
                 "entriesSha256": sha256_bytes(canonical_json_bytes(empty)),
                 "responseSha256": _response_sha256(response),
+                "detailResponseSha256s": [],
                 "httpStatus": 404,
                 "boundaryState": "pristine-history-absent",
             }
@@ -14346,19 +14348,115 @@ class AzureCliBootstrapTransport:
             or len(values) > 1000
         ):
             fail("WebJob history is partial, paginated, or oversized")
-        projected_groups = [
-            self._project_webjob_history_item(
-                item,
-                site_resource_id=site_resource_id,
-                job_name=job_name,
-            )
-            for item in values
-        ]
         source_ids = [item.get("id") for item in values]
         if len(source_ids) != len(
             {item.lower() for item in source_ids if isinstance(item, str)}
         ):
             fail("WebJob history contains duplicate source history IDs")
+        history_collection_id = (
+            site_resource_id + f"/triggeredwebjobs/{job_name}/history"
+        )
+        detail_candidates: list[tuple[str, str]] = []
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            history_id = item.get("id")
+            properties = item.get("properties")
+            if (
+                isinstance(history_id, str)
+                and history_id.lower().startswith(history_collection_id.lower() + "/")
+                and isinstance(properties, Mapping)
+                and "runs" not in properties
+                and not {
+                    "web_job_name", "web_job_id", "status", "trigger", "start_time"
+                } <= properties.keys()
+            ):
+                run_id = history_id[len(history_collection_id) + 1 :]
+                if (
+                    re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", run_id) is None
+                    or run_id in {".", ".."}
+                ):
+                    fail("WebJob history child ID cannot bind a detail read")
+                detail_candidates.append((history_id, run_id))
+        if len(detail_candidates) > MAX_WEBJOB_HISTORY_DETAIL_READS:
+            fail("WebJob history needs too many detail reads")
+        detail_deadline = min(
+            deadline,
+            self.clock()
+            + dt.timedelta(seconds=2 * STORAGE_REQUEST_DEADLINE_RESERVE_SECONDS),
+        )
+        projected_groups: list[list[Mapping[str, Any]]] = []
+        detail_response_sha256s: list[str] = []
+        detail_index = 0
+        for item in values:
+            history_id = item.get("id") if isinstance(item, Mapping) else None
+            candidate = (
+                detail_candidates[detail_index]
+                if detail_index < len(detail_candidates)
+                else None
+            )
+            if candidate is not None and history_id == candidate[0]:
+                # Azure's list endpoint can return a child without the run
+                # fields documented for properties.runs.  Fetch that exact
+                # child through the separately documented by-ID endpoint.
+                # The detail must independently pass every existing run and
+                # child-ID check; a missing or drifted detail fails closed.
+                detail_url = self._arm_url(
+                    site_resource_id,
+                    "2025-05-01",
+                    f"/triggeredwebjobs/{job_name}/history/{candidate[1]}",
+                )
+                detail_response = self._read_request_with_transport_retry(
+                    "GET",
+                    detail_url,
+                    deadline=detail_deadline,
+                    retry_delays=(None,),
+                    failure_context="history-detail",
+                )
+                detail = self._json_response(
+                    detail_response, {200}, "WebJob history detail"
+                )
+                group = self._project_webjob_history_item(
+                    detail,
+                    site_resource_id=site_resource_id,
+                    job_name=job_name,
+                )
+                if (
+                    len(group) != 1
+                    or group[0]["historyId"].lower() != candidate[0].lower()
+                ):
+                    fail("WebJob history detail does not match its list child")
+                detail_properties = detail.get("properties")
+                detail_runs = (
+                    detail_properties.get("runs")
+                    if isinstance(detail_properties, Mapping)
+                    else None
+                )
+                detail_run = (
+                    detail_runs[0]
+                    if isinstance(detail_runs, list) and len(detail_runs) == 1
+                    else detail_properties
+                )
+                if any(
+                    key in item["properties"]
+                    and item["properties"][key] != detail_run.get(key)
+                    for key in (
+                        "web_job_name", "job_name", "web_job_id", "status",
+                        "trigger", "start_time", "end_time", "output_url",
+                    )
+                ):
+                    fail("WebJob history list child contradicts its detail")
+                projected_groups.append(group)
+                detail_response_sha256s.append(_response_sha256(detail_response))
+                detail_index += 1
+            else:
+                projected_groups.append(
+                    self._project_webjob_history_item(
+                        item,
+                        site_resource_id=site_resource_id,
+                        job_name=job_name,
+                    )
+                )
         projected = [
             item for group in projected_groups for item in group
         ]
@@ -14373,6 +14471,7 @@ class AzureCliBootstrapTransport:
             "entries": projected,
             "entriesSha256": sha256_bytes(canonical_json_bytes(projected)),
             "responseSha256": _response_sha256(response),
+            "detailResponseSha256s": detail_response_sha256s,
             "httpStatus": 200,
             "boundaryState": "history-present",
         }
