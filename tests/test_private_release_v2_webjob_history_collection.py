@@ -140,6 +140,35 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                 self.assertIn(expected, str(raised.exception))
                 self.assertNotIn("secret-run-id", str(raised.exception))
 
+    def test_incomplete_direct_child_reports_only_fixed_field_presence(self):
+        entry = {
+            "id": COLLECTION_ID + "/secret-run-id",
+            "properties": {
+                "job_name": JOB_NAME,
+                "web_job_id": "secret-run-id",
+                "status": "Success",
+                "trigger": "secret-trigger-value",
+                "start_time": stamp(NOW),
+                "secret-provider-key": "secret-provider-value",
+            },
+        }
+        with self.assertRaises(bootstrap.BootstrapError) as raised:
+            transport()._project_webjob_history_item(
+                entry,
+                site_resource_id=SITE_ID,
+                job_name=JOB_NAME,
+            )
+        diagnostic = str(raised.exception)
+        self.assertIn("idClass=child, runsClass=missing, runsCount=n/a", diagnostic)
+        self.assertIn("directFieldPresence=01111100", diagnostic)
+        for secret in (
+            "secret-run-id",
+            "secret-trigger-value",
+            "secret-provider-key",
+            "secret-provider-value",
+        ):
+            self.assertNotIn(secret, diagnostic)
+
     def test_history_read_accepts_documented_collection_shape_and_binds_digest(self):
         document = {
             "value": [
