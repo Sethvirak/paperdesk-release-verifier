@@ -336,25 +336,27 @@ exception text are never retained. These facts diagnose a failed attempt; they
 admit a retry only for the exact no-effect conditional-create denial above.
 
 The controller-container empty proof has the same ten-minute global readiness
-cap and 64-GET limit. The bootstrap authorization is capped at exactly 4,171
-seconds (69 minutes 31 seconds): account validation, fresh preflight, the durable
+cap and 64-GET limit. The bootstrap authorization is capped at exactly 5,549
+seconds (92 minutes 29 seconds): account validation, fresh preflight, the durable
 claim, and reviewed pre-controller operations have a hard 900-second budget; 630
 seconds then admit the exact controller role through seven bounded ARM calls;
 600 seconds remain available for data-plane propagation; and one 90-second
 envelope remains for the conditional canary create. Exact, durably journaled
 authorization-propagation 403s may retry within that same readiness boundary.
-Another exact 900 seconds stage the nominal finite-lease canary and every owned
-cleanup request, including one safe conditional-DELETE replay and a 30-second
-local margin. The final 1,051 seconds protect role cleanup, including a full
-120-second lock propagation
-boundary followed by one 90-second observation envelope. Natural finite expiry is accepted only as the
-exact Storage state `Expired` with `Unlocked` status and `Fixed` duration; it is
+Another 2,008 seconds reserve the finite-lease canary and every owned cleanup
+request, including one safe conditional-DELETE replay and a 30-second local
+margin. The next 1,051 seconds protect role cleanup, including a full
+120-second lock propagation boundary followed by one 90-second observation
+envelope. An additional 270 seconds reserve three adjacent WORM-policy reads
+before the package lock and accepted/result retention operations. Natural finite
+expiry is accepted only as the exact Storage state `Expired` with `Unlocked`
+status and `Fixed` duration; it is
 not misreported as `Available`. Backoff is capped at 15 seconds. Only the two
 recognized authorization-propagation 403s
 may wait; malformed errors, authentication failures, transport ambiguity, a
 different target, or a nonempty/paginated inventory stop immediately. Success
 still requires the exact source-bound empty-container and private-posture proof.
-The 4,171-second limit is the hard controller-safety window, not a promise that
+The 5,549-second limit is the outer one-shot window, not a promise that
 every later Azure propagation wait will also finish in the same attempt. The
 executor rechecks live authorization before each later mutation. Expiry stops
 before the next write and compensates every executor-owned temporary resource;
@@ -394,7 +396,7 @@ and assignment already validated through ARM, not a planned-role declaration
 or proof that the data plane has propagated that role. Missing observed
 evidence stays null. This instrumentation makes no extra credential or Azure
 requests, does not force token refresh, and never broadens permissions,
-changes the ten-minute/64-attempt limits or 4,171-second authorization lifetime,
+changes the ten-minute/64-attempt limits or 5,549-second authorization lifetime,
 or authorizes another execution. Historical failed
 receipts remain immutable; these facts are available only on a later freshly
 authorized attempt.
