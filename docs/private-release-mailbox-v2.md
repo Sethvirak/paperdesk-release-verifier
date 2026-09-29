@@ -105,13 +105,14 @@ in either file. The executor validates all local source, signature, exact-head
 review, package, plan, authorization, freshness and account boundaries before
 constructing its Azure CLI transport.
 
-The one-shot authorization has a maximum lifetime of 4,171 seconds (69 minutes
-31 seconds): 15 minutes for observation, confirmation and pre-controller setup,
-followed by a 3,271-second controller admission, readiness and cleanup reserve.
-The additional 271 seconds covers the second package assignment inside the one
-reviewed deletion-lock suspension and the one-second final-observation scheduler
-alignment allowance. A response envelope or alignment allowance never adds RBAC
-waiting beyond the applicable full data-plane readiness interval.
+The one-shot authorization has a maximum lifetime of 5,549 seconds (92 minutes
+29 seconds): 900 seconds for account validation, fresh preflight, the durable
+claim and pre-controller setup, followed by a 4,649-second reserve. That reserve
+comprises 630 seconds for controller-role admission, 600 seconds for data-plane
+readiness, a 90-second canary-create envelope, 2,008 seconds for the controller
+lease canary and owned cleanup, 1,051 seconds for protected-role cleanup, and
+270 seconds for three adjacent WORM-policy reads. These are safety allowances,
+not additional authorization after expiry or extra RBAC propagation time.
 The preflight must still be at most five minutes old when apply validates it.
 The executor rejects an already-exhausted setup window before adding the
 temporary uploader firewall rule, and checks it again before controller-role
@@ -431,7 +432,7 @@ Package-upload readiness alone permits an exact-target GET at up to 30 minutes,
 plus its 90-second request envelope, to accommodate the upper propagation
 allowance documented by [Azure Storage](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
 Its exponential backoff caps at 32 seconds and 64 GET attempts. The exact
-4,171-second (69-minute 31-second) authorization and protected cleanup deadline
+5,549-second (92-minute 29-second) authorization and protected cleanup deadline
 can shorten that window;
 the wait never borrows cleanup time. Only exact `BlobNotFound` admits one
 create-only PUT. Other readiness windows remain unchanged. A longer wait does
