@@ -19,24 +19,24 @@ MAX_REQUEST=32768; MAX_RESULT=65536; MAX_ZIP=1073741824; MAX_MEMBERS=25000
 MAX_ACTIVATION_DOCUMENT=32768
 KEY_RECOVERY_HORIZON_SECONDS=30*24*60*60
 BOOTSTRAP_BASELINE={
-    "sourceSha":"cef0242719d8f1ab19297c854f9d5e9c81dc3ead",
+    "sourceSha":"70f3ac3065e3dfbf2cc49f8dff60840711348335",
     "repositoryId":"1287744543","ownerId":"202535166",
-    "sourceRunId":"31665623339","sourceRunAttempt":"1","artifactId":"9168291596",
-    "artifactSha256":"e05a39a7e72521c67ed21b9b9e07d7f892c8979235ab1644c4b53304707a2623",
-    "artifactMember":"paperdesk-azure-runtime-cef0242719d8f1ab19297c854f9d5e9c81dc3ead.tar.gz",
-    "artifactMemberSha256":"f0094818699c6fda8184b6579cca814d5b56e27e0faef1927f0e7d7380599842",
+    "sourceRunId":"31845287909","sourceRunAttempt":"1","artifactId":"9236286421",
+    "artifactSha256":"64db9dd541a2068172e8460cb8e275e1ef46477979ce54707fab40b84eac852c",
+    "artifactMember":"paperdesk-azure-runtime-70f3ac3065e3dfbf2cc49f8dff60840711348335.tar.gz",
+    "artifactMemberSha256":"cc74ac1541f5acf9e830bbbef67916909440275068bb21b57cd1f737d692af88",
     "servedIndexSha256":"20db1a82cb4fc6367b30e0e467f178130e833b8d739ed541587cc52da4dca031",
     # Historical no-drift signal only. Candidate identity is proven by the
     # exact versioned run-from-package URL, MI binding, runtime marker, index,
     # and health; no OneDeploy operation participates in V2 activation.
     "oneDeployInvariant":{
         "historicalActiveDeploymentId":"54214e75-d66c-4a62-8d04-17d5b48b6b52",
-        "collectionSemanticProjectionSha256":"e51093a7b008224d50bb4d11b32aac0c59dc5a077f19cca559089106e37a92f3",
-        "propertyIdSetSha256":"3f405fccf4cdd62eb17a7176ed4c89a88d568e4af2d014cb5608a9232fc8e8e9",
+        "collectionSemanticProjectionSha256":"2b53bb7e0ef4910ca8e08fc38196d2a79d49eeafcedb148b6ddb2e3c933581c2",
+        "propertyIdSetSha256":"7a74a9fa5bfa23babeb837bd6fad179ddf7d92b938f67a29a044afc585a40604",
         "deploymentCount":10,
     },
     "readinessHttpStatus":503,"readinessCode":"attachment-malware-ingestion-not-ready",
-    "localEvidenceSha256":"76057b91193ca671dde356da25a1c1c8f8775c32c63f53a747312dec22f81d4c",
+    "localEvidenceSha256":"99bd17ab59fe9324372f167fe77dcc6f991ab1f4074a6c2fe940bfa212c669fb",
 }
 FIXED_COORDS={"subscriptionId":SUBSCRIPTION,"bridgeResourceGroup":"rg-master-data-structure-sea","bridgeApp":"paperdesk-release-registry-bridge-v2-9c4e0d0d","bridgeWebJob":"paperdesk-accepted-release-registry","productionResourceGroup":"rg-master-data-structure-sea","productionApp":"master-data-structure-sea-9c4e0d0d","registryAccount":"mdspdbak2608089c4e","registryContainer":"paperdesk-accepted-releases","resultContainer":"paperdesk-registry-webjob-results","packageAccount":"mdspdbak2608089c4e","packageContainer":"paperdesk-deployment-packages","controllerLockResourceGroup":"rg-paperdesk-rollback-sea-20260808","controllerLockContainer":"paperdesk-release-controller-lock","activationFenceContainer":"paperdesk-release-activation-control","activationFenceBlob":"v2/production-activation-fence.json","signingVault":"kv-mds-sea-9c4e0d0d","signingKeyName":"paperdesk-release-result-signing","managementApiVersion":"2025-04-01","webApiVersion":"2025-05-01","bootstrapBaseline":BOOTSTRAP_BASELINE}
 ACTIVATION_DOCUMENT_FIELDS={"schemaVersion","status","activation","fixed","limits","rule"}

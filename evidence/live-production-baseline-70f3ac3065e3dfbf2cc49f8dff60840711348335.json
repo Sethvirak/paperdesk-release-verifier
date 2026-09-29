@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "status": "source-observation-only",
+  "observedAt": "2026-09-29T02:54:37Z",
+  "source": {
+    "repository": "Sethvirak/MasterDataStructure",
+    "sha": "70f3ac3065e3dfbf2cc49f8dff60840711348335",
+    "runId": "31845287909",
+    "runAttempt": "1",
+    "runEvent": "push",
+    "runConclusion": "success",
+    "runUrl": "https://github.com/Sethvirak/MasterDataStructure/actions/runs/31845287909"
+  },
+  "verifiedArtifact": {
+    "id": "9236286421",
+    "name": "paperdesk-azure-runtime-verified-70f3ac3065e3dfbf2cc49f8dff60840711348335",
+    "outerSha256": "64db9dd541a2068172e8460cb8e275e1ef46477979ce54707fab40b84eac852c",
+    "outerBytes": 134879188,
+    "expiresAt": "2026-11-12T22:06:33Z",
+    "member": "paperdesk-azure-runtime-70f3ac3065e3dfbf2cc49f8dff60840711348335.tar.gz",
+    "memberSha256": "cc74ac1541f5acf9e830bbbef67916909440275068bb21b57cd1f737d692af88",
+    "archiveIndexSha256": "20db1a82cb4fc6367b30e0e467f178130e833b8d739ed541587cc52da4dca031",
+    "archiveReleaseMarkerSha256": "0f03cb0c24209895ddda3491a28c6775c7c7c4396d201f838291c6d44fa78928"
+  },
+  "verificationReceipt": {
+    "artifactId": "9236286735",
+    "bodySha256": "4163a889d86050e7945a1d86515f245177a0c9ce83d5cdca40a49ddc4428cd0c",
+    "candidateSha": "70f3ac3065e3dfbf2cc49f8dff60840711348335",
+    "archiveSha256": "cc74ac1541f5acf9e830bbbef67916909440275068bb21b57cd1f737d692af88",
+    "verifierWorkflowRef": "Sethvirak/paperdesk-release-verifier/.github/workflows/verify-candidate.yml@23fc16fca795e0c6786f35aae863167fe80aa3cd",
+    "historicalVerifierCommitVerified": false,
+    "historicalVerifierCommitReason": "unsigned"
+  },
+  "live": {
+    "app": "master-data-structure-sea-9c4e0d0d",
+    "kuduReleaseMarker": "70f3ac3065e3dfbf2cc49f8dff60840711348335",
+    "kuduReleaseMarkerSha256": "0f03cb0c24209895ddda3491a28c6775c7c7c4396d201f838291c6d44fa78928",
+    "servedIndexSha256": "20db1a82cb4fc6367b30e0e467f178130e833b8d739ed541587cc52da4dca031",
+    "runtimeReleaseApi": {
+      "status": 403,
+      "code": "api-route-unmapped"
+    },
+    "liveProbeStatus": 200,
+    "readyProbe": {
+      "status": 503,
+      "code": "attachment-malware-ingestion-not-ready"
+    },
+    "appHealthStatus": 200,
+    "securityInfoStatus": 200,
+    "oneDeployInvariant": {
+      "historicalActiveDeploymentId": "54214e75-d66c-4a62-8d04-17d5b48b6b52",
+      "collectionSemanticProjectionSha256": "2b53bb7e0ef4910ca8e08fc38196d2a79d49eeafcedb148b6ddb2e3c933581c2",
+      "propertyIdSetSha256": "7a74a9fa5bfa23babeb837bd6fad179ddf7d92b938f67a29a044afc585a40604",
+      "deploymentCount": 10
+    }
+  },
+  "limits": "Read-only source snapshot; it neither proves full deployed-tree byte parity nor accepts the degraded runtime for production. Bootstrap must recheck live state and obtain independent approval."
+}
