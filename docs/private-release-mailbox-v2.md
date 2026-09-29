@@ -377,6 +377,27 @@ invariant: historical deployment ID, canonical full-collection semantic digest,
 property-ID-set digest, and deployment count. OneDeploy is historical evidence;
 run-from-package and the exact versioned package are the activation mechanism.
 
+The source-only live-baseline snapshot in
+`evidence/live-production-baseline-70f3ac3065e3dfbf2cc49f8dff60840711348335.json`
+binds the currently deployed `70f3ac3065e3dfbf2cc49f8dff60840711348335`
+marker and served index to successful source run `31845287909`, its downloaded
+verified artifact, and the read-only Azure OneDeploy inventory. The public
+readiness probe still returns 503 with `attachment-malware-ingestion-not-ready`;
+this is a known degraded rollback baseline, not production acceptance. Its
+historical verification receipt cites unsigned external verifier commit
+`23fc16fca795e0c6786f35aae863167fe80aa3cd`; independent reviewers must
+assess that historical trust gap. The source snapshot does not establish full
+deployed-tree byte parity, replace live activation checks, or authorize bootstrap.
+The snapshot records one read-only Azure observation of the full OneDeploy
+collection and property-ID set. Its digests differ from the older signed
+authorization although the active deployment ID and count remain the same.
+The changed ID-set digest means at least one historical deployment ID changed;
+the older authorization did not retain its full ID list, so the exact turnover
+cannot be attributed from that record. These digests are a point-in-time
+boundary: independently re-read the full collection immediately before any
+bootstrap authorization or execution, and stop for review if it differs. Do not
+substitute the active deployment ID or count for the full invariant.
+
 ## Key and authorization proof
 
 Package-upload readiness alone permits an exact-target GET at up to 30 minutes,

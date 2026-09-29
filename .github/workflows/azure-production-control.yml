@@ -314,8 +314,8 @@ jobs:
               test -z "${VERIFIED_ARTIFACT_NAME}${VERIFICATION_RECEIPT_NAME}${VERIFICATION_RECEIPT_SHA256}${ACCEPTANCE_RUN_ID}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${EVIDENCE_RUN_ID}"
               ;;
             bootstrap-current-production)
-              test "${SOURCE_SHA}" = "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"
-              test "${SOURCE_RUN_ID}" = "31665623339"
+              test "${SOURCE_SHA}" = "70f3ac3065e3dfbf2cc49f8dff60840711348335"
+              test "${SOURCE_RUN_ID}" = "31845287909"
               test "${SOURCE_RUN_ATTEMPT}" = "1"
               test -z "${VERIFIED_ARTIFACT_NAME}${VERIFICATION_RECEIPT_NAME}${VERIFICATION_RECEIPT_SHA256}${ACCEPTANCE_RUN_ID}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${EVIDENCE_RUN_ID}"
               test "${GITHUB_WORKFLOW_REF}" = "${production_workflow_ref}"
@@ -1389,7 +1389,7 @@ jobs:
                     and (.consumedMarker == null or (.consumedMarker | descriptor))
                     and (if $operation == "registry-bridge-preflight" then
                            (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/manifest.json")
-                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"))
+                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "70f3ac3065e3dfbf2cc49f8dff60840711348335"))
                            and .pendingRelease == null and .consumedMarker == null
                          elif $operation == "bootstrap-current-production" then
                            .acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json")
@@ -1403,7 +1403,7 @@ jobs:
                            and (.consumedMarker.blob | test("^v2/pending/"+$sha+"/[^/]+/consumed\\.json$"))
                          elif $operation == "rollback-accepted-release" then
                            (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/manifest.json")
-                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "cef0242719d8f1ab19297c854f9d5e9c81dc3ead"))
+                            or (.acceptedBaseline.blob == ("v2/accepted/"+$sha+"/bootstrap-consumed/manifest.json") and $sha == "70f3ac3065e3dfbf2cc49f8dff60840711348335"))
                            and .pendingRelease == null and .consumedMarker == null
                          else false end)
                   ' "${descriptor_projection}" >/dev/null 2>&1; then

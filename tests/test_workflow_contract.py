@@ -14,6 +14,11 @@ BASELINE = ROOT / ".github" / "workflows" / "initialize-watchdog-rollback-baseli
 RECONCILIATION = ROOT / ".github" / "workflows" / "reconcile-watchdog-dispatch.yml"
 CONTRACT = ROOT / "contracts" / "private_release_mailbox_contract.json"
 PROVISIONING = ROOT / "evidence" / "private-release-provisioning-evidence.json"
+LIVE_BOOTSTRAP_EVIDENCE = (
+    ROOT
+    / "evidence"
+    / "live-production-baseline-70f3ac3065e3dfbf2cc49f8dff60840711348335.json"
+)
 MAILBOX = ROOT / "scripts" / "private_release_mailbox.py"
 CONTROLLER = ROOT / "scripts" / "private_release_external_controller.py"
 BRIDGE_RUNTIME = ROOT / "provider" / "private_release_bridge_runtime.py"
@@ -377,6 +382,45 @@ class WorkflowContractTests(unittest.TestCase):
         for phrase in contradictory:
             self.assertNotIn(phrase, readme)
             self.assertNotIn(phrase, operator)
+
+    def test_bootstrap_baseline_matches_observed_live_source_and_workflow(self):
+        from scripts import private_release_mailbox as mailbox
+
+        baseline = json.loads(CONTRACT.read_text(encoding="utf-8"))["fixed"]["bootstrapBaseline"]
+        evidence_bytes = LIVE_BOOTSTRAP_EVIDENCE.read_bytes()
+        evidence = json.loads(evidence_bytes)
+        self.assertEqual(
+            evidence_bytes,
+            (json.dumps(evidence, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+        self.assertEqual(hashlib.sha256(evidence_bytes).hexdigest(), baseline["localEvidenceSha256"])
+        self.assertEqual(mailbox.BOOTSTRAP_BASELINE, baseline)
+        self.assertEqual(evidence["status"], "source-observation-only")
+        self.assertEqual(evidence["source"]["sha"], baseline["sourceSha"])
+        self.assertEqual(evidence["source"]["runId"], baseline["sourceRunId"])
+        self.assertEqual(evidence["source"]["runAttempt"], baseline["sourceRunAttempt"])
+        self.assertEqual(evidence["source"]["runConclusion"], "success")
+        self.assertEqual(evidence["verifiedArtifact"]["id"], baseline["artifactId"])
+        self.assertEqual(evidence["verifiedArtifact"]["outerSha256"], baseline["artifactSha256"])
+        self.assertEqual(evidence["verifiedArtifact"]["member"], baseline["artifactMember"])
+        self.assertEqual(evidence["verifiedArtifact"]["memberSha256"], baseline["artifactMemberSha256"])
+        self.assertEqual(evidence["verificationReceipt"]["archiveSha256"], baseline["artifactMemberSha256"])
+        self.assertEqual(evidence["live"]["kuduReleaseMarker"], baseline["sourceSha"])
+        self.assertEqual(evidence["live"]["servedIndexSha256"], baseline["servedIndexSha256"])
+        self.assertEqual(evidence["verifiedArtifact"]["archiveIndexSha256"], baseline["servedIndexSha256"])
+        self.assertEqual(evidence["live"]["oneDeployInvariant"], baseline["oneDeployInvariant"])
+        self.assertEqual(evidence["live"]["readyProbe"], {
+            "status": baseline["readinessHttpStatus"],
+            "code": baseline["readinessCode"],
+        })
+        self.assertFalse(evidence["verificationReceipt"]["historicalVerifierCommitVerified"])
+
+        workflow = CONTROL.read_text(encoding="utf-8")
+        source_sha = baseline["sourceSha"]
+        source_run_id = baseline["sourceRunId"]
+        self.assertIn(f'test "${{SOURCE_SHA}}" = "{source_sha}"', workflow)
+        self.assertIn(f'test "${{SOURCE_RUN_ID}}" = "{source_run_id}"', workflow)
+        self.assertEqual(workflow.count(f'$sha == "{source_sha}"'), 2)
 
     def test_public_evidence_exception_is_narrow_and_secret_material_is_forbidden(self):
         security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")

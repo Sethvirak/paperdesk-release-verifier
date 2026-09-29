@@ -12,3 +12,4 @@ provider/startup.sh text eol=lf
 contracts/production_release_watchdog_contract.json text eol=lf
 contracts/registry_bridge_cleanup_contract.json text eol=lf
 contracts/watchdog_initial_baseline_bootstrap_contract.json text eol=lf
+evidence/live-production-baseline-70f3ac3065e3dfbf2cc49f8dff60840711348335.json text eol=lf
