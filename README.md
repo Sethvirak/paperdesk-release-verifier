@@ -11,6 +11,7 @@ artifact, customer record, persistent cloud credential, or production secret.
 | Candidate verifier | Independently pinned, read-only | May verify a hostile producer artifact without cloud identity |
 | Private release mailbox V2 | Source-dormant | Every activation field is null; every mutating operation stops before Azure login |
 | Watchdog V2 | Source-dormant | Baseline, reconciliation, and deadline workflows stop before OIDC/provider calls |
+| Provisional Defender canary proposal | Source-dormant | Offline evidence planner only; no deployment, candidate consumption, or accepted-release write |
 
 Merging dormant source is not deployment authorization. The sole pre-S2 Azure-mutation exception
 is the separately reviewed, one-shot local bootstrap
@@ -37,6 +38,11 @@ The reusable verifier:
 
 Actions and reusable workflows must always use full immutable commit SHAs. Never
 call a production control from a branch or tag.
+
+The [provisional Defender canary stage](docs/provisional-defender-canary-stage.md)
+is a separate, non-executable proposal for investigating a release that reports
+the exact malware-ingestion 503. The normal candidate and
+accepted-release paths still require their existing strict health proof.
 
 ## Private release mailbox V2
 

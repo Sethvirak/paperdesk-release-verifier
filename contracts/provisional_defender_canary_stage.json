@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "stageId": "paperdesk-provisional-defender-canary-v1",
+  "status": "source-dormant",
+  "sourceRepository": "Sethvirak/MasterDataStructure",
+  "verifierRepository": "Sethvirak/paperdesk-release-verifier",
+  "requiredSigningPrincipal": "paperdesk-release-signing-2026-08-30",
+  "requiredSigningKeyFingerprint": "SHA256:nOONZLlhHx9b03fmAPkCqfhYzp0CFZuHfLPc1T0rfA4",
+  "requiredRuntimeDatabaseRole": "paperdesk_app",
+  "readinessException": {
+    "httpStatus": 503,
+    "topLevelCode": "service-not-ready",
+    "attachmentMalwareCode": "attachment-malware-ingestion-not-ready",
+    "maximumEvidenceAgeSeconds": 600,
+    "maximumRollbackHours": 24
+  },
+  "allowedCandidates": [],
+  "activationAllowed": false,
+  "candidateConsumeAllowed": false,
+  "acceptedRegistryWriteAllowed": false
+}
