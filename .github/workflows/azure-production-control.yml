@@ -337,8 +337,11 @@ jobs:
               test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
               test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
               [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
-              [[ "${ACCEPTED_MANIFEST_BLOB}" =~ ^v2/accepted/[0-9a-f]{40}/[^/]+/manifest\.json$ ]]
-              [[ "${ACCEPTED_MANIFEST_VERSION_ID}" =~ ^[A-Za-z0-9._=:+/-]{1,256}$ ]]
+              if [ "${ACCEPTED_MANIFEST_BLOB}" != "v2/accepted/70f3ac3065e3dfbf2cc49f8dff60840711348335/bootstrap-consumed/manifest.json" ]; then
+                [[ "${ACCEPTED_MANIFEST_BLOB}" =~ ^v2/accepted/[0-9a-f]{40}/manifest\.json$ ]]
+              fi
+              [[ "${ACCEPTED_MANIFEST_VERSION_ID}" =~ ^[A-Za-z0-9._=:+/-]+$ ]]
+              test "${#ACCEPTED_MANIFEST_VERSION_ID}" -le 256
               [[ "${ACCEPTED_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]]
               [[ "${ACCEPTED_MANIFEST_SIZE}" =~ ^[1-9][0-9]*$ ]]
               [[ "${ACCEPTED_MANIFEST_ETAG}" =~ ^\"[^\"]+\"$ ]]
@@ -351,14 +354,22 @@ jobs:
               test "${VERIFIED_ARTIFACT_NAME}" = "paperdesk-azure-runtime-verified-${SOURCE_SHA}"
               test "${VERIFICATION_RECEIPT_NAME}" = "paperdesk-candidate-verification-receipt-${SOURCE_SHA}"
               [[ "${VERIFICATION_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
-              [[ "${ACCEPTANCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
-              [[ "${ACCEPTANCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
-              test "${ACCEPTANCE_RUN_ID}" != "${SOURCE_RUN_ID}"
-              test "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" = "paperdesk-production-acceptance-receipt-${SOURCE_SHA}"
-              [[ "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
-              [[ "${ACCEPTANCE_WORKFLOW_REF}" =~ ^Sethvirak/MasterDataStructure/.github/workflows/main_master-data-structure-sea-9c4e0d0d\.yml@${SOURCE_SHA}$ ]]
-              [[ "${ACCEPTED_MANIFEST_BLOB}" =~ ^v2/accepted/${SOURCE_SHA}/[^/]+/manifest\.json$ ]]
-              [[ "${ACCEPTED_MANIFEST_VERSION_ID}" =~ ^[A-Za-z0-9._=:+/-]{1,256}$ ]]
+              if [ "${ACCEPTED_MANIFEST_BLOB}" = "v2/accepted/70f3ac3065e3dfbf2cc49f8dff60840711348335/bootstrap-consumed/manifest.json" ]; then
+                test "${SOURCE_SHA}" = "70f3ac3065e3dfbf2cc49f8dff60840711348335"
+                test "${SOURCE_RUN_ID}" = "31845287909"
+                test "${SOURCE_RUN_ATTEMPT}" = "1"
+                test -z "${ACCEPTANCE_RUN_ID}${ACCEPTANCE_RUN_ATTEMPT}${ACCEPTANCE_WORKFLOW_REF}${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}"
+              else
+                test "${ACCEPTED_MANIFEST_BLOB}" = "v2/accepted/${SOURCE_SHA}/manifest.json"
+                [[ "${ACCEPTANCE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+                [[ "${ACCEPTANCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+                test "${ACCEPTANCE_RUN_ID}" != "${SOURCE_RUN_ID}"
+                test "${PRODUCTION_ACCEPTANCE_RECEIPT_NAME}" = "paperdesk-production-acceptance-receipt-${SOURCE_SHA}"
+                [[ "${PRODUCTION_ACCEPTANCE_RECEIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+                [[ "${ACCEPTANCE_WORKFLOW_REF}" =~ ^Sethvirak/MasterDataStructure/.github/workflows/main_master-data-structure-sea-9c4e0d0d\.yml@${SOURCE_SHA}$ ]]
+              fi
+              [[ "${ACCEPTED_MANIFEST_VERSION_ID}" =~ ^[A-Za-z0-9._=:+/-]+$ ]]
+              test "${#ACCEPTED_MANIFEST_VERSION_ID}" -le 256
               [[ "${ACCEPTED_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]]
               [[ "${ACCEPTED_MANIFEST_SIZE}" =~ ^[1-9][0-9]*$ ]]
               [[ "${ACCEPTED_MANIFEST_ETAG}" =~ ^\"[^\"]+\"$ ]]
@@ -1384,7 +1395,8 @@ jobs:
                       and (.versionId | type == "string" and test("^[A-Za-z0-9._=:+/-]{1,256}$"));
                     (keys == ["acceptedBaseline","consumedMarker","pendingRelease"])
                     and (.acceptedBaseline | descriptor)
-                    and (.acceptedBaseline.blob | test("^v2/accepted/[0-9a-f]{40}/(bootstrap-consumed/)?manifest\\.json$"))
+                    and ((.acceptedBaseline.blob | test("^v2/accepted/[0-9a-f]{40}/manifest\\.json$"))
+                         or .acceptedBaseline.blob == "v2/accepted/70f3ac3065e3dfbf2cc49f8dff60840711348335/bootstrap-consumed/manifest.json")
                     and (.pendingRelease == null or (.pendingRelease | descriptor))
                     and (.consumedMarker == null or (.consumedMarker | descriptor))
                     and (if $operation == "registry-bridge-preflight" then
