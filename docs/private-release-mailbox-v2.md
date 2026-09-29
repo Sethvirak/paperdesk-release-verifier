@@ -259,8 +259,18 @@ result containers must each be private and Locked for at least 91 days.
 
 Candidate and rollback package bytes are written create-only, read back through
 the separate reader identity and exact version ID, and promoted into the
-accepted namespace before its manifest. The accepted manifest is written last
-and is the sole completeness marker. Production activation uses the system
+accepted namespace before its manifest. For a newly persisted strict release,
+the private bridge validates every member of the bounded transfer archive and
+its source, deployment, and acceptance receipts before any accepted write. It
+then writes a compact canonical proof binding the production acceptance receipt
+digest, all three run pairs, pending and consumed descriptors, the accepted
+package descriptor, and the transfer digest. Strict manifest schema 3 binds
+the proof's exact versioned descriptor and is the final completeness marker.
+Historical strict schema 2 manifests remain readable for explicit existing
+release operations but cannot be replayed as new schema 3 persistence or
+admitted by the automatic current-baseline preflight. A strict current baseline
+requires a schema 3 manifest with validated accepted proof. Production
+activation uses the system
 identity with exact package-container read access and sets
 `WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID=SystemAssigned`; it never uses a
 SAS or a GitHub runner credential.
@@ -296,12 +306,29 @@ selects the verified main-push artifact and provenance; the candidate pair
 selects the successful deploy-candidate run and its exact deployment-coordinate
 receipt; the acceptance pair selects the fully accepted receipt; and the
 evidence pair selects post-deploy evidence. No pair may be reused. The durable
-v2 accepted manifest stores separate `source` and `deployment` objects and the
+transfer evidence contains separate `source` and `deployment` objects and the
 source-keyed legacy registry address remains
 `v1/releases/<sha>/<source-run-id>/<acceptance-run-id>/`. Private mailbox request
 schema version 2 adds `candidateRunId` and `candidateRunAttempt`, requires them
 only for `persist-accepted-release`, and requires exact nulls for every other
-operation. The public-control receipt schema version 6 mirrors that distinction.
+operation. The strict V2 accepted manifest uses explicit release coordinates
+and the exact accepted-proof descriptor. The public-control receipt schema
+version 6 mirrors the run-pair distinction. Watchdog baseline admission remains
+dormant; this proof alone does not authorize watchdog state promotion or rollback.
+
+The V2 bridge admits an Actions ZIP of at most 1 GiB. Its accepted transfer
+member is capped below that limit at 1 GiB minus 64 KiB to leave ZIP framing
+room; the legacy producer's 1,280 MiB transfer ceiling is not the V2 admission
+ceiling. A larger transfer fails closed at bridge intake or proof validation.
+The proof recomputes the verifier receipt's input manifest, runtime manifest,
+root and widget SBOM, provenance, and five-file release-material digests from
+the transfer members before any accepted-release write.
+It also requires exactly one complete gzip member and compares the entire
+uncompressed TAR stream with the producer's canonical PAX framing. This
+rejects trailing bytes, extra gzip members, hidden TAR records, and extra PAX
+metadata without assuming identical compression across Python/zlib versions.
+The complete gzip expansion is bounded before TAR parsing, and per-file PAX
+headers are capped before the TAR reader allocates their payloads.
 
 ## Production activation fence and proof
 

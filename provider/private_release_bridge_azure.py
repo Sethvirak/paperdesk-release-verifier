@@ -462,7 +462,8 @@ class GitHubArtifactReader:
         location=_header(first,"Location") or ""; parsed=urllib.parse.urlparse(location)
         if parsed.scheme!="https" or not parsed.hostname or not parsed.hostname.endswith(".blob.core.windows.net") or parsed.username or parsed.password: core.fail("artifact-location")
         second=self.http("GET",location,{"Accept":"application/octet-stream"},None)
-        if second.status!=200 or core.digest(second.body)!=request["artifactSha256"]: core.fail("artifact-digest")
+        if second.status!=200 or len(second.body)>core.MAX_ZIP: core.fail("artifact-size")
+        if core.digest(second.body)!=request["artifactSha256"]: core.fail("artifact-digest")
         try:
             with zipfile.ZipFile(io.BytesIO(second.body)) as archive:
                 infos=archive.infolist()

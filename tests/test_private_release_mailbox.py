@@ -3,11 +3,13 @@ import hashlib
 import io
 import json
 import tarfile
+import tempfile
 import unittest
 from pathlib import Path
 
 from scripts import private_release_mailbox as box
 from tests import private_release_v2_fixture as fixture
+from tests import test_accepted_release_registry as registry_fixture
 
 
 NOW = dt.datetime(2026, 8, 29, tzinfo=dt.timezone.utc)
@@ -50,6 +52,62 @@ def archive(index=b"<html>ok</html>"):
             info.size = len(body)
             target.addfile(info, io.BytesIO(body))
     return output.getvalue()
+
+
+def accepted_transfer(runtime=None):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = registry_fixture.RegistryFixture(root)
+        runtime_name = f"paperdesk-azure-runtime-{SHA}.tar.gz"
+        runtime = archive() if runtime is None else runtime
+        runtime_sha = hashlib.sha256(runtime).hexdigest()
+        (source.verified / runtime_name).write_bytes(runtime)
+        (source.verified / f"{runtime_name}.sha256").write_text(
+            f"{runtime_sha}  {runtime_name}\n", encoding="ascii")
+        materials = source.verified / "paperdesk-prebuild-release-materials"
+        stem = f"paperdesk-azure-runtime-{SHA}"
+        for suffix, relative in {
+            ".root-package.json": "package.json",
+            ".root-package-lock.json": "package-lock.json",
+            ".widget-package.json": "widget-showcase/package.json",
+            ".widget-package-lock.json": "widget-showcase/package-lock.json",
+            ".acceptance-contract.json": "architecture/production_acceptance_evidence_contract.json",
+        }.items():
+            (source.verified / (stem + suffix)).write_bytes((materials / relative).read_bytes())
+        verification = json.loads(source.verification.read_text(encoding="utf-8"))
+        verification["archiveSha256"] = runtime_sha
+        for field, suffix in {
+            "inputManifestSha256": ".package-input.json",
+            "runtimeManifestSha256": ".runtime-files.json",
+            "rootSbomSha256": ".cdx.json",
+            "widgetSbomSha256": ".widget.cdx.json",
+            "provenanceSha256": ".provenance.json",
+        }.items():
+            verification[field] = hashlib.sha256(
+                (source.verified / (stem + suffix)).read_bytes()
+            ).hexdigest()
+        material_records = [
+            {"path": path, "bytes": (materials / path).stat().st_size,
+             "sha256": hashlib.sha256((materials / path).read_bytes()).hexdigest()}
+            for path in sorted(registry_fixture.registry.RELEASE_MATERIAL_PATHS,
+                               key=lambda item: item.encode("utf-8"))
+        ]
+        verification["releaseMaterialsSha256"] = hashlib.sha256(
+            (json.dumps(material_records, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        ).hexdigest()
+        source.verification.write_text(json.dumps(verification), encoding="utf-8")
+        acceptance = json.loads(source.acceptance.read_text(encoding="utf-8"))
+        acceptance["candidateRuntimeSha256"] = runtime_sha
+        acceptance["evidenceContractSha256"] = hashlib.sha256(
+            (source.verified / (stem + ".acceptance-contract.json")).read_bytes()
+        ).hexdigest()
+        source.acceptance.write_text(json.dumps(acceptance), encoding="utf-8")
+        coordinate = json.loads(source.deployment_coordinate.read_text(encoding="utf-8"))
+        coordinate["candidateRuntimeSha256"] = runtime_sha
+        source.deployment_coordinate.write_text(json.dumps(coordinate), encoding="utf-8")
+        output = root / "accepted-release-request.tar.gz"
+        registry_fixture.registry.build_request(source.args(output))
+        return output.read_bytes()
 
 
 def activation_fence(release, pre="2" * 64, desired="3" * 64, source_sha=SHA):
@@ -180,13 +238,16 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(box.MailboxError, "request-unexpected-accepted-baseline"):
             box.validate_request(value, now=NOW)
 
-    def test_registry_preflight_resolves_strict_current_manifest_without_mutation(self):
+    def test_registry_preflight_rejects_proofless_historical_strict_current_manifest(self):
         registry, packages = Worm(), Worm()
         expected = seed_accepted(registry, packages)
         before = (registry.counter, packages.counter)
-        observed, document, _, _ = box.resolve_current_accepted(registry, SHA, packages)
+        observed, document, _, _ = box._load_accepted(registry, box._worm_descriptor(expected), packages)
         self.assertEqual(observed, expected)
         self.assertEqual(document["baselineMode"], "strict")
+        self.assertEqual(document["schemaVersion"], 2)
+        with self.assertRaisesRegex(box.MailboxError, "accepted-current-proof-required"):
+            box.resolve_current_accepted(registry, SHA, packages)
         self.assertEqual((registry.counter, packages.counter), before)
         self.assertEqual(box._worm_descriptor(observed)["blob"], f"v2/accepted/{SHA}/manifest.json")
 
@@ -385,20 +446,26 @@ class Tests(unittest.TestCase):
 
     def test_persisted_release_binds_source_candidate_acceptance_and_recovers_exactly(self):
         registry, packages = Worm(), Worm()
+        candidate_runtime = archive()
         baseline = seed_accepted(
             registry, packages, box.BOOTSTRAP_BASELINE["sourceSha"], mode="bootstrap"
         )
         candidate = request("prepare-candidate")
         candidate.update({"acceptedBaseline": box._worm_descriptor(baseline),
-            "acceptanceRunId": "4", "acceptanceRunAttempt": "2"})
+            "sourceRunId": registry_fixture.SOURCE_RUN,
+            "sourceRunAttempt": registry_fixture.SOURCE_ATTEMPT,
+            "acceptanceRunId": registry_fixture.DEPLOYMENT_RUN,
+            "acceptanceRunAttempt": registry_fixture.DEPLOYMENT_ATTEMPT,
+            "artifactMemberSha256": hashlib.sha256(candidate_runtime).hexdigest()})
         prepared = box.prepare_candidate(
-            registry, candidate, archive(), now=NOW, package_boundary=packages
+            registry, candidate, candidate_runtime, now=NOW, package_boundary=packages
         )
         pending_desc = prepared["records"]["pendingRelease"]
         pending = registry.read(pending_desc["blob"], pending_desc["versionId"])
         pending_document = json.loads(pending.body)
         self.assertEqual(pending_document["deploymentCoordinates"],
-            {"candidateRunId": "4", "candidateRunAttempt": "2"})
+            {"candidateRunId": registry_fixture.DEPLOYMENT_RUN,
+             "candidateRunAttempt": registry_fixture.DEPLOYMENT_ATTEMPT})
         consumed = registry.create(
             str(box.PurePosixPath(pending.blob).parent / "consumed.json"),
             box.canonical({"schemaVersion": 1, "lifecycle": "candidate-consumed",
@@ -408,10 +475,17 @@ class Tests(unittest.TestCase):
                 "activationProof": {}}),
             "*",
         )
-        transfer_tar = b"accepted release transfer"
+        transfer_tar = accepted_transfer(candidate_runtime)
         persist = request("persist-accepted-release")
         persist.update({"acceptedBaseline": None, "pendingRelease": pending_desc,
             "consumedMarker": box._worm_descriptor(consumed),
+            "sourceRunId": registry_fixture.SOURCE_RUN,
+            "sourceRunAttempt": registry_fixture.SOURCE_ATTEMPT,
+            "candidateRunId": registry_fixture.DEPLOYMENT_RUN,
+            "candidateRunAttempt": registry_fixture.DEPLOYMENT_ATTEMPT,
+            "acceptanceRunId": registry_fixture.ACCEPTANCE_RUN,
+            "acceptanceRunAttempt": registry_fixture.ACCEPTANCE_ATTEMPT,
+            "artifactMember": "paperdesk-accepted-release-request.tar.gz",
             "artifactMemberSha256": hashlib.sha256(transfer_tar).hexdigest()})
 
         mismatched_source = dict(persist)
@@ -439,17 +513,37 @@ class Tests(unittest.TestCase):
             )
         self.assertEqual((registry.counter, packages.counter), before)
 
+        invalid_tar = b"not a transfer archive"
+        invalid_request = dict(persist, artifactMemberSha256=hashlib.sha256(invalid_tar).hexdigest())
+        with self.assertRaisesRegex(box.MailboxError, "accepted-transfer-proof"):
+            box.persist_accepted_release(
+                registry, invalid_request, invalid_tar, now=NOW, package_boundary=packages
+            )
+        self.assertEqual((registry.counter, packages.counter), before)
+
         durable = box.persist_accepted_release(
             registry, persist, transfer_tar, now=NOW, package_boundary=packages
         )
         manifest_desc = durable["records"]["acceptedBaseline"]
         manifest = json.loads(registry.read(manifest_desc["blob"], manifest_desc["versionId"]).body)
         expected_coordinates = {field: persist[field] for field in box.RELEASE_COORDINATE_FIELDS}
-        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(manifest["schemaVersion"], 3)
         self.assertEqual(manifest["releaseCoordinates"], expected_coordinates)
         self.assertEqual(manifest["artifact"]["pendingRelease"], pending_desc)
         self.assertEqual(manifest["consumedMarker"], box._worm_descriptor(consumed))
-        self.assertIn("/4-2/5-1/", manifest["deploymentBundle"]["blob"])
+        self.assertIn(f"/{registry_fixture.DEPLOYMENT_RUN}-{registry_fixture.DEPLOYMENT_ATTEMPT}/{registry_fixture.ACCEPTANCE_RUN}-{registry_fixture.ACCEPTANCE_ATTEMPT}/", manifest["deploymentBundle"]["blob"])
+        proof_desc = manifest["acceptedProof"]
+        proof_doc = json.loads(registry.read(proof_desc["blob"], proof_desc["versionId"]).body)
+        with tarfile.open(fileobj=io.BytesIO(transfer_tar), mode="r:gz") as transfer:
+            receipt = transfer.extractfile(
+                f"payload/receipts/paperdesk-production-acceptance-receipt-{SHA}.json"
+            ).read()
+        self.assertEqual(proof_doc["productionAcceptanceReceiptSha256"], hashlib.sha256(receipt).hexdigest())
+        self.assertEqual(proof_doc["releaseCoordinates"], expected_coordinates)
+        resolved, resolved_doc, resolved_bundle, _ = box.resolve_current_accepted(registry, SHA, packages)
+        self.assertEqual(box._worm_descriptor(resolved), manifest_desc)
+        self.assertEqual(resolved_doc["schemaVersion"], 3)
+        self.assertEqual(box._worm_descriptor(resolved_bundle), manifest["deploymentBundle"])
 
         signed_records = dict(durable["records"])
         signed_records["cleanupObligation"] = descriptor(
@@ -466,12 +560,24 @@ class Tests(unittest.TestCase):
         tampered_result["metadata"]["releaseCoordinates"]["candidateRunAttempt"] = "3"
         with self.assertRaisesRegex(box.MailboxError, "result-release-coordinate-binding"):
             box.validate_result(tampered_result, persist)
+        misplaced_proof = json.loads(json.dumps(signed_result))
+        misplaced_proof["metadata"]["acceptedProof"]["blob"] = f"v2/accepted/{SHA}/other/accepted-proof.json"
+        with self.assertRaisesRegex(box.MailboxError, "result-accepted-proof-coordinate"):
+            box.validate_result(misplaced_proof, persist)
 
         before = (registry.counter, packages.counter)
         recovered = box.persist_accepted_release(
             registry, persist, transfer_tar, now=NOW, package_boundary=packages
         )
         self.assertEqual(recovered["records"]["acceptedBaseline"], manifest_desc)
+        self.assertEqual((registry.counter, packages.counter), before)
+
+        competing_acceptance = dict(persist, acceptanceRunId="99999")
+        with self.assertRaisesRegex(box.MailboxError, "accepted-recovery-coordinate-binding"):
+            box.persist_accepted_release(
+                registry, competing_acceptance, transfer_tar, now=NOW,
+                package_boundary=packages,
+            )
         self.assertEqual((registry.counter, packages.counter), before)
 
         tampered_attempt = dict(persist)
@@ -481,6 +587,23 @@ class Tests(unittest.TestCase):
                 registry, tampered_attempt, transfer_tar, now=NOW, package_boundary=packages
             )
         self.assertEqual((registry.counter, packages.counter), before)
+
+        rollback = request("prepare-rollback")
+        rollback.update({"artifactId": "", "artifactSha256": "", "artifactMember": "",
+            "artifactMemberSha256": "", "acceptedBaseline": manifest_desc,
+            "logicalOperationId": "7" * 64})
+        prepared_rollback = box.prepare_rollback(
+            registry, rollback, now=NOW, package_boundary=packages
+        )
+        self.assertEqual(prepared_rollback["records"]["acceptedBaseline"], manifest_desc)
+        self.assertEqual(prepared_rollback["records"]["deploymentBundle"], manifest["deploymentBundle"])
+
+        registry.data[proof_desc["blob"]] = box.WormRecord(
+            proof_desc["blob"], box.canonical({**proof_doc, "candidateRuntimeSha256": "0" * 64}),
+            proof_desc["etag"], proof_desc["versionId"],
+        )
+        with self.assertRaisesRegex(box.MailboxError, "accepted-proof-readback"):
+            box._load_accepted(registry, manifest_desc, packages)
 
     def test_persist_rejects_consumed_deployment_coordinate_tamper_before_write(self):
         registry, packages = Worm(), Worm()
