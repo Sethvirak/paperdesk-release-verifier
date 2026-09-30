@@ -1,7 +1,11 @@
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
+import textwrap
 import unittest
 
 
@@ -109,6 +113,19 @@ def workflow_step(source, name):
     if match is None:
         raise AssertionError(f"workflow step {name!r} was not found")
     return match.group(0)
+
+
+def operation_coordinate_guard(source, operation):
+    step = workflow_step(
+        source, "Validate immutable caller and operation coordinates before OIDC"
+    )
+    match = re.search(
+        rf"(?ms)^            {re.escape(operation)}\)\n(?P<body>.*?)^              ;;$",
+        step,
+    )
+    if match is None:
+        raise AssertionError(f"workflow operation {operation!r} guard was not found")
+    return "set -euo pipefail\n" + textwrap.dedent(match.group("body"))
 
 
 def function_source(source, name):
@@ -259,6 +276,86 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("registry-bridge-preflight", receipt)
         self.assertIn("bootstrap-consumed/manifest.json", receipt)
+        self.assertIn(
+            'or .acceptedBaseline.blob == "v2/accepted/70f3ac3065e3dfbf2cc49f8dff60840711348335/bootstrap-consumed/manifest.json"',
+            receipt,
+        )
+        self.assertNotIn('(bootstrap-consumed/)?manifest', receipt)
+
+    def test_candidate_and_rollback_accept_only_exact_bootstrap_or_strict_paths(self):
+        bash = shutil.which("bash")
+        if bash is None and os.name == "nt":
+            git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+            if git_bash.is_file():
+                bash = str(git_bash)
+        if bash is None:
+            self.skipTest("Bash is required to exercise the actual workflow guards")
+
+        workflow = self.workflow(CONTROL)
+        bootstrap_sha = "70f3ac3065e3dfbf2cc49f8dff60840711348335"
+        candidate_sha = "a" * 40
+        strict_sha = "b" * 40
+        bootstrap = f"v2/accepted/{bootstrap_sha}/bootstrap-consumed/manifest.json"
+        strict = f"v2/accepted/{strict_sha}/manifest.json"
+        workflow_ref = (
+            "Sethvirak/MasterDataStructure/.github/workflows/"
+            "main_master-data-structure-sea-9c4e0d0d.yml@refs/heads/main"
+        )
+
+        def check(operation, *, source_sha, accepted_blob, accepted_run="", **changes):
+            values = {
+                "GITHUB_WORKFLOW_REF": workflow_ref,
+                "production_workflow_ref": workflow_ref,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "SOURCE_SHA": source_sha,
+                "SOURCE_RUN_ID": "31845287909" if source_sha == bootstrap_sha else "12345",
+                "SOURCE_RUN_ATTEMPT": "1",
+                "VERIFIED_ARTIFACT_NAME": f"paperdesk-azure-runtime-verified-{source_sha}",
+                "VERIFICATION_RECEIPT_NAME": f"paperdesk-candidate-verification-receipt-{source_sha}",
+                "VERIFICATION_RECEIPT_SHA256": "0" * 64,
+                "LOGICAL_OPERATION_ID": "1" * 64,
+                "ACCEPTED_MANIFEST_BLOB": accepted_blob,
+                "ACCEPTED_MANIFEST_VERSION_ID": "20260929",
+                "ACCEPTED_MANIFEST_SHA256": "2" * 64,
+                "ACCEPTED_MANIFEST_SIZE": "123",
+                "ACCEPTED_MANIFEST_ETAG": '"etag"',
+                "ACCEPTANCE_RUN_ID": accepted_run,
+                "ACCEPTANCE_RUN_ATTEMPT": "1" if accepted_run else "",
+                "ACCEPTANCE_WORKFLOW_REF": (
+                    "Sethvirak/MasterDataStructure/.github/workflows/"
+                    f"main_master-data-structure-sea-9c4e0d0d.yml@{source_sha}"
+                ) if accepted_run else "",
+                "PRODUCTION_ACCEPTANCE_RECEIPT_NAME": (
+                    f"paperdesk-production-acceptance-receipt-{source_sha}"
+                ) if accepted_run else "",
+                "PRODUCTION_ACCEPTANCE_RECEIPT_SHA256": "3" * 64 if accepted_run else "",
+            }
+            values.update(changes)
+            result = subprocess.run(
+                [bash, "-c", operation_coordinate_guard(workflow, operation)],
+                env={**os.environ, **values},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+
+        self.assertTrue(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=bootstrap))
+        self.assertTrue(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=strict))
+        self.assertFalse(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=f"v2/accepted/{strict_sha}/bootstrap-consumed/manifest.json"))
+        self.assertFalse(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=f"v2/accepted/{strict_sha}/extra/manifest.json"))
+        self.assertFalse(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=bootstrap, ACCEPTED_MANIFEST_VERSION_ID=""))
+        self.assertFalse(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=bootstrap, ACCEPTED_MANIFEST_VERSION_ID="a" * 257))
+        self.assertFalse(check("deploy-candidate", source_sha=candidate_sha, accepted_blob=bootstrap, ACCEPTED_MANIFEST_SHA256="bad"))
+
+        self.assertTrue(check("rollback-accepted-release", source_sha=bootstrap_sha, accepted_blob=bootstrap))
+        self.assertFalse(check("rollback-accepted-release", source_sha=bootstrap_sha, accepted_blob=bootstrap, accepted_run="45678"))
+        self.assertFalse(check("rollback-accepted-release", source_sha=bootstrap_sha, accepted_blob=bootstrap, SOURCE_RUN_ID="12345"))
+        self.assertFalse(check("rollback-accepted-release", source_sha=strict_sha, accepted_blob=bootstrap))
+        self.assertTrue(check("rollback-accepted-release", source_sha=strict_sha, accepted_blob=strict, accepted_run="45678"))
+        self.assertFalse(check("rollback-accepted-release", source_sha=strict_sha, accepted_blob=strict))
+        self.assertFalse(check("rollback-accepted-release", source_sha=strict_sha, accepted_blob=strict, accepted_run="12345"))
+        self.assertFalse(check("rollback-accepted-release", source_sha=strict_sha, accepted_blob=f"v2/accepted/{strict_sha}/nested/manifest.json", accepted_run="45678"))
 
     def test_persistence_keeps_source_deployment_acceptance_and_evidence_runs_distinct(self):
         source = self.workflow(CONTROL)
