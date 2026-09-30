@@ -2,7 +2,7 @@
 import argparse, hashlib, json, stat, tempfile, zipfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]; TS=(1980,1,1,0,0,0); JOB="App_Data/jobs/triggered/paperdesk-accepted-release-registry/"
-SOURCES=(("scripts/private_release_mailbox.py","private_release_mailbox.py",0o644),("provider/private_release_bridge_runtime.py","private_release_bridge_runtime.py",0o644),("provider/private_release_bridge_azure.py","private_release_bridge_azure.py",0o644),("provider/private_release_bridge_entry.py","private_release_bridge_entry.py",0o644),("contracts/private_release_mailbox_contract.json","private_release_mailbox_contract.json",0o644),("webjobs/paperdesk-private-release-bridge/run.sh","run.sh",0o755),("webjobs/paperdesk-private-release-bridge/settings.job","settings.job",0o644))
+SOURCES=(("scripts/private_release_mailbox.py","private_release_mailbox.py",0o644),("scripts/private_release_v2_accepted_proof.py","private_release_v2_accepted_proof.py",0o644),("provider/private_release_bridge_runtime.py","private_release_bridge_runtime.py",0o644),("provider/private_release_bridge_azure.py","private_release_bridge_azure.py",0o644),("provider/private_release_bridge_entry.py","private_release_bridge_entry.py",0o644),("contracts/private_release_mailbox_contract.json","private_release_mailbox_contract.json",0o644),("webjobs/paperdesk-private-release-bridge/run.sh","run.sh",0o755),("webjobs/paperdesk-private-release-bridge/settings.job","settings.job",0o644))
 class PackageError(RuntimeError): pass
 def build(output):
     output=Path(output).resolve()

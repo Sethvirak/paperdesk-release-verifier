@@ -194,20 +194,39 @@ class Tests(unittest.TestCase):
             "v2/accepted/" + request["sourceSha"] + "/4-2/5-1/accepted-release-transfer.tar.gz",
             b"transfer", "*",
         )
+        coordinates = {"sourceRunId": "3", "sourceRunAttempt": "1",
+                       "candidateRunId": "4", "candidateRunAttempt": "2",
+                       "acceptanceRunId": "5", "acceptanceRunAttempt": "1"}
+        accepted_proof = registry.create(
+            "v2/accepted/" + request["sourceSha"] + "/4-2/5-1/accepted-proof.json",
+            box.canonical({
+                "schemaVersion": 1, "proofType": "paperdesk-v2-accepted-release-proof",
+                "sourceSha": request["sourceSha"], "releaseCoordinates": coordinates,
+                "productionAcceptanceReceiptSha256": "1" * 64,
+                "acceptedAt": "2026-08-29T00:00:00.000Z", "candidateRuntimeSha256": "4" * 64,
+                "pendingRelease": pending_desc, "consumedMarker": box._worm_descriptor(consumed),
+                "pendingBundle": box._worm_descriptor(pending_bundle),
+                "deploymentBundle": box._worm_descriptor(bundle),
+                "acceptedTransferSha256": box._worm_descriptor(transfer)["sha256"],
+                "transferRequestSha256": "3" * 64, "fileInventorySha256": "4" * 64,
+            }),
+            "*",
+        )
         manifest = registry.create(
             "v2/accepted/" + request["sourceSha"] + "/manifest.json",
             box.canonical({
-                "schemaVersion": 2, "lifecycle": "accepted", "baselineMode": "strict",
+                "schemaVersion": 3, "lifecycle": "accepted", "baselineMode": "strict",
                 "sourceSha": request["sourceSha"],
-                "releaseCoordinates": {"sourceRunId": "3", "sourceRunAttempt": "1",
-                    "candidateRunId": "4", "candidateRunAttempt": "2",
-                    "acceptanceRunId": "5", "acceptanceRunAttempt": "1"},
-                "artifact": {"id": "4", "outerSha256": "5" * 64, "member": "accepted.tar.gz",
-                    "memberSha256": "6" * 64, "pendingRelease": pending_desc,
+                "releaseCoordinates": coordinates,
+                "artifact": {"id": "4", "outerSha256": "5" * 64,
+                    "member": "paperdesk-accepted-release-request.tar.gz",
+                    "memberSha256": box._worm_descriptor(transfer)["sha256"],
+                    "pendingRelease": pending_desc,
                     "acceptedTransfer": box._worm_descriptor(transfer)}, "servedIndexSha256": "8" * 64,
                 "oneDeployInvariant": box.BOOTSTRAP_BASELINE["oneDeployInvariant"],
                 "healthPolicy": {"readyStatus": 200, "readyCode": "", "runtimeMarkerRequired": True},
                 "deploymentBundle": box._worm_descriptor(bundle), "consumedMarker": box._worm_descriptor(consumed),
+                "acceptedProof": box._worm_descriptor(accepted_proof),
             }),
             "*",
         )

@@ -86,6 +86,17 @@ class Tests(unittest.TestCase):
   req={"repositoryId":"1","artifactId":"2","artifactSha256":"0"*64,"artifactMember":"x.tar.gz","artifactMemberSha256":"1"*64}
   reader=azure.GitHubArtifactReader("x"*20,lambda *args:core.Response(302,"",b"",{"Location":"https://evil.example/x"}))
   with self.assertRaisesRegex(core.MailboxError,"artifact-location"): reader(req)
+ def test_artifact_reader_rejects_oversized_outer_zip_before_digest_or_parse(self):
+  class ReportedOversize(bytes):
+   def __len__(self):return core.MAX_ZIP+1
+  calls=[]
+  def http(method,url,headers,payload):
+   calls.append(1)
+   if len(calls)==1:return core.Response(302,url,b"",{"Location":"https://actionsresults.blob.core.windows.net/results/file?sig=x"})
+   return core.Response(200,url,ReportedOversize(b"small"),{})
+  req={"repositoryId":"1","artifactId":"2","artifactSha256":"0"*64,"artifactMember":"x.tar.gz","artifactMemberSha256":"1"*64}
+  with self.assertRaisesRegex(core.MailboxError,"artifact-size"):
+   azure.GitHubArtifactReader("x"*20,http)(req)
  def test_activation_fence_active_busy_expired_exact_rebind_and_stale_receipt(self):
   class Service:
    def __init__(self):

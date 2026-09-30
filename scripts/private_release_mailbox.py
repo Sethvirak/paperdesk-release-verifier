@@ -6,6 +6,11 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+if __package__ == "scripts":
+    from scripts import private_release_v2_accepted_proof as accepted_proof
+else:
+    import private_release_v2_accepted_proof as accepted_proof
+
 SHA40=re.compile(r"^[0-9a-f]{40}$"); SHA256=re.compile(r"^[0-9a-f]{64}$")
 POSITIVE=re.compile(r"^[1-9][0-9]*$"); NONCE=re.compile(r"^[0-9a-f]{32}$")
 UTC=re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
@@ -882,6 +887,10 @@ def validate_result(value,request):
     if request["operation"]=="persist-accepted-release":
         coordinates=validate_release_coordinates(metadata.get("releaseCoordinates"),"result-release-coordinates")
         if coordinates!={field:request[field] for field in RELEASE_COORDINATE_FIELDS}:fail("result-release-coordinate-binding")
+        proof_descriptor=validate_descriptor(metadata.get("acceptedProof"),"result-accepted-proof",prefix=f"v2/accepted/{request['sourceSha']}/",suffix="/accepted-proof.json")
+        proof_blob=(f"v2/accepted/{request['sourceSha']}/{coordinates['candidateRunId']}-{coordinates['candidateRunAttempt']}/"
+                    f"{coordinates['acceptanceRunId']}-{coordinates['acceptanceRunAttempt']}/accepted-proof.json")
+        if proof_descriptor["blob"]!=proof_blob:fail("result-accepted-proof-coordinate")
     if request["operation"]=="prepare-candidate":
         terminal=metadata.get("terminalState")
         if terminal not in {"pending","consumed"}:fail("result-candidate-terminal")
@@ -1219,9 +1228,10 @@ def _load_accepted(boundary,descriptor,package_boundary=None):
     manifest,doc=_read_json(boundary,descriptor,"accepted-manifest")
     base_fields={"schemaVersion","lifecycle","baselineMode","sourceSha","artifact","servedIndexSha256","oneDeployInvariant","healthPolicy","deploymentBundle","consumedMarker"}
     mode=doc.get("baselineMode") if isinstance(doc,dict) else None
-    expected=base_fields if mode=="bootstrap" else base_fields|{"releaseCoordinates"}
-    expected_schema=1 if mode=="bootstrap" else 2
-    if not isinstance(doc,dict) or set(doc)!=expected or doc.get("schemaVersion")!=expected_schema or doc.get("lifecycle")!="accepted" or mode not in {"bootstrap","strict"}: fail("accepted-manifest-shape")
+    version=doc.get("schemaVersion") if isinstance(doc,dict) else None
+    expected=(base_fields if mode=="bootstrap" else base_fields|{"releaseCoordinates"}|({"acceptedProof"} if version==3 else set()))
+    if (not isinstance(doc,dict) or set(doc)!=expected or (mode,version) not in {("bootstrap",1),("strict",2),("strict",3)}
+            or doc.get("lifecycle")!="accepted"): fail("accepted-manifest-shape")
     if (not SHA40.fullmatch(str(doc["sourceSha"])) or not SHA256.fullmatch(str(doc["servedIndexSha256"]))
             or doc.get("oneDeployInvariant")!=BOOTSTRAP_BASELINE["oneDeployInvariant"]): fail("accepted-manifest-identity")
     bundle=validate_descriptor(doc["deploymentBundle"],"accepted-bundle",prefix="v1/accepted/",suffix="/deployment.zip")
@@ -1244,9 +1254,20 @@ def _load_accepted(boundary,descriptor,package_boundary=None):
                 or not isinstance(artifact.get("member"),str) or PurePosixPath(artifact["member"]).name!=artifact["member"]
                 or not SHA256.fullmatch(str(artifact.get("memberSha256")))):fail("accepted-strict-binding")
         pending_desc=validate_descriptor(artifact.get("pendingRelease"),"accepted-pending",prefix=f"v2/pending/{doc['sourceSha']}/",suffix="/manifest.json")
-        validate_descriptor(artifact.get("acceptedTransfer"),"accepted-transfer",prefix=f"v2/accepted/{doc['sourceSha']}/",suffix="/accepted-release-transfer.tar.gz")
+        transfer_desc=validate_descriptor(artifact.get("acceptedTransfer"),"accepted-transfer",prefix=f"v2/accepted/{doc['sourceSha']}/",suffix="/accepted-release-transfer.tar.gz")
         pending,pending_doc=_read_json(boundary,pending_desc,"accepted-pending")
         _validate_strict_release_binding(boundary,source_sha=doc["sourceSha"],release_coordinates=doc["releaseCoordinates"],pending=pending,pending_doc=pending_doc,consumed=consumed_record,consumed_doc=consumed_doc)
+        if version==3:
+            coords=doc["releaseCoordinates"]
+            expected_prefix=(f"v2/accepted/{doc['sourceSha']}/{coords['candidateRunId']}-{coords['candidateRunAttempt']}/"
+                             f"{coords['acceptanceRunId']}-{coords['acceptanceRunAttempt']}")
+            proof_desc=validate_descriptor(doc["acceptedProof"],"accepted-proof",prefix=expected_prefix+"/",suffix="/accepted-proof.json")
+            if proof_desc["blob"]!=expected_prefix+"/accepted-proof.json" or transfer_desc["blob"]!=expected_prefix+"/accepted-release-transfer.tar.gz":fail("accepted-proof-coordinate")
+            _,proof_doc=_read_json(boundary,proof_desc,"accepted-proof")
+            try: accepted_proof.validate_proof(proof_doc,source_sha=doc["sourceSha"],coordinates=coords,pending_release=pending_desc,
+                consumed_marker=doc["consumedMarker"],accepted_bundle=doc["deploymentBundle"],transfer_sha256=transfer_desc["sha256"])
+            except accepted_proof.AcceptedProofError as error:raise MailboxError("accepted-proof-binding") from error
+            if proof_doc["pendingBundle"]!=pending_doc["deploymentBundle"]:fail("accepted-proof-pending-bundle")
     return manifest,doc,observed,consumed_record
 
 def resolve_current_accepted(boundary,source_sha,package_boundary):
@@ -1271,6 +1292,7 @@ def resolve_current_accepted(boundary,source_sha,package_boundary):
     expected_mode="strict" if strict is not None else "bootstrap"
     if (manifest!=record or doc.get("sourceSha")!=source_sha or doc.get("baselineMode")!=expected_mode
             or expected_mode=="bootstrap" and source_sha!=BOOTSTRAP_BASELINE["sourceSha"]):fail("accepted-current-binding")
+    if expected_mode=="strict" and doc.get("schemaVersion")!=3:fail("accepted-current-proof-required")
     return manifest,doc,bundle,consumed
 
 def validate_current_production_proof(proof,*,request,baseline):
@@ -1433,12 +1455,17 @@ def persist_accepted_release(boundary,request,transfer_tar,*,now,package_boundar
     existing=_read_current(boundary,canonical_blob)
     if existing is not None:
         _,existing_doc,_,_=_load_accepted(boundary,_worm_descriptor(existing),package_boundary)
+        if existing_doc["schemaVersion"]!=3:fail("accepted-recovery-unproven")
         artifact=existing_doc["artifact"]
         if (existing_doc.get("releaseCoordinates")!=release_coordinates
                 or artifact.get("pendingRelease")!=_worm_descriptor(pending)
                 or existing_doc.get("consumedMarker")!=_worm_descriptor(consumed)):fail("accepted-recovery-coordinate-binding")
     bundle_desc=validate_descriptor(pending_doc.get("deploymentBundle"),"accepted-pending-bundle")
     bundle=_read_exact(package_boundary,bundle_desc,"accepted-pending-bundle")
+    try: transfer_evidence=accepted_proof.validate_transfer(transfer_tar,request=request,pending_release=_worm_descriptor(pending),
+        consumed_marker=_worm_descriptor(consumed),pending_bundle=bundle_desc,
+        candidate_runtime_sha256=pending_doc["artifact"]["memberSha256"],now=now)
+    except accepted_proof.AcceptedProofError as error:raise MailboxError("accepted-transfer-proof") from error
     prefix=(f"v2/accepted/{request['sourceSha']}/"
             f"{request['candidateRunId']}-{request['candidateRunAttempt']}/"
             f"{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}")
@@ -1447,17 +1474,20 @@ def persist_accepted_release(boundary,request,transfer_tar,*,now,package_boundar
     # accept only v1/accepted/* package coordinates.
     accepted_bundle=_create_or_read_exact(package_boundary,
         f"v1/accepted/{request['sourceSha']}/{request['candidateRunId']}-{request['candidateRunAttempt']}/{request['acceptanceRunId']}-{request['acceptanceRunAttempt']}/deployment.zip",bundle.body)
+    try: proof=accepted_proof.seal_proof(transfer_evidence,_worm_descriptor(accepted_bundle))
+    except accepted_proof.AcceptedProofError as error:raise MailboxError("accepted-proof-seal") from error
+    proof_record=_create_or_read_exact(boundary,prefix+"/accepted-proof.json",canonical(proof))
     claim=_create_or_read_exact(boundary,prefix+f"/requests/{request_sha}/claim.json",raw)
     transfer=_create_or_read_exact(boundary,prefix+"/accepted-release-transfer.tar.gz",transfer_tar)
     result=_create_or_read_exact(boundary,prefix+f"/requests/{request_sha}/result.json",canonical({"schemaVersion":2,"operation":"persist-accepted-release","requestSha256":request_sha,"releaseCoordinates":release_coordinates,"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(consumed),"transferSha256":digest(transfer_tar)}))
-    manifest_body=canonical({"schemaVersion":2,"lifecycle":"accepted","baselineMode":"strict","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"artifact":{"id":request["artifactId"],"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"],"pendingRelease":_worm_descriptor(pending),"acceptedTransfer":_worm_descriptor(transfer)},"servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"],"healthPolicy":{"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True},"deploymentBundle":_worm_descriptor(accepted_bundle),"consumedMarker":_worm_descriptor(consumed)})
+    manifest_body=canonical({"schemaVersion":3,"lifecycle":"accepted","baselineMode":"strict","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"acceptedProof":_worm_descriptor(proof_record),"artifact":{"id":request["artifactId"],"outerSha256":request["artifactSha256"],"member":request["artifactMember"],"memberSha256":request["artifactMemberSha256"],"pendingRelease":_worm_descriptor(pending),"acceptedTransfer":_worm_descriptor(transfer)},"servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"],"healthPolicy":{"readyStatus":200,"readyCode":"","runtimeMarkerRequired":True},"deploymentBundle":_worm_descriptor(accepted_bundle),"consumedMarker":_worm_descriptor(consumed)})
     # The source-keyed canonical manifest is the final commit and the only
     # strict accepted-baseline coordinate exposed to later read-only preflight
     # calls.  A second acceptance attempt for the same source must be byte
     # identical or the create/read reconciliation fails closed.
     manifest=_create_or_read_exact(boundary,canonical_blob,manifest_body)
     records=_empty_records();records.update({"claim":_worm_descriptor(claim),"result":_worm_descriptor(result),"manifest":_worm_descriptor(manifest),"deploymentBundle":_worm_descriptor(accepted_bundle),"acceptedBaseline":_worm_descriptor(manifest),"pendingRelease":_worm_descriptor(pending),"consumedMarker":_worm_descriptor(consumed)})
-    return _durable(records,{"operation":"persist-accepted-release","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"baselineMode":"strict","servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"]})
+    return _durable(records,{"operation":"persist-accepted-release","sourceSha":request["sourceSha"],"releaseCoordinates":release_coordinates,"acceptedProof":_worm_descriptor(proof_record),"baselineMode":"strict","servedIndexSha256":pending_doc["servedIndexSha256"],"oneDeployInvariant":pending_doc["oneDeployInvariant"]})
 
 def prepare_rollback(boundary,request,*,now,package_boundary):
     request,raw,request_sha=validate_request(request,now=now)
