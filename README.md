@@ -11,6 +11,12 @@ artifact, customer record, persistent cloud credential, or production secret.
 | Candidate verifier | Independently pinned, read-only | May verify a hostile producer artifact without cloud identity |
 | Private release mailbox V2 | Source-dormant | Every activation field is null; every mutating operation stops before Azure login |
 | Watchdog V2 | Source-dormant | Baseline, reconciliation, and deadline workflows stop before OIDC/provider calls |
+| Private Defender marker reader | Offline candidate inspection only | Canonical PS256 checks confer no authorization; all admission flags stay false |
+
+The separate [private Defender marker byte contract](docs/provisional-defender-authorization-reader.md)
+reuses the mailbox cryptography for offline inspection. It has no issuer,
+provider reader, one-use claim or bridge/workflow/runtime entry. Its candidate
+allowlist remains empty and authorization admission is unavailable.
 
 Merging dormant source is not deployment authorization. Before S2, the only
 Azure mutation exceptions are the separately reviewed, one-shot local bootstrap
