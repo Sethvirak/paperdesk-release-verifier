@@ -7,9 +7,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts import private_release_mailbox as box
-from tests import private_release_v2_fixture as fixture
-from tests import test_accepted_release_registry as registry_fixture
+from tests.control_lifecycle_offline_boundary import external_access_blocked
+
+with external_access_blocked() as _import_attempts:
+    from scripts import private_release_mailbox as box
+    from tests import private_release_v2_fixture as fixture
+    from tests import test_accepted_release_registry as registry_fixture
+if _import_attempts:
+    raise AssertionError("mailbox test imports attempted external access")
 
 
 NOW = dt.datetime(2026, 8, 29, tzinfo=dt.timezone.utc)
@@ -224,6 +229,115 @@ def transient_control(operation, source_sha=SHA):
         "provisioningEvidenceSha256": "6" * 64, "bridgeRuntimeReceiptSha256": "7" * 64,
         "acquiredAt": "2026-08-29T00:00:00.000Z", "expiresAt": "2026-08-29T02:00:00.000Z",
     }
+
+
+class ClosedInitializationRejectionTests(unittest.TestCase):
+    """Synthetic rejection evidence only; no provider or acceptance authority."""
+
+    def test_untyped_v2_bootstrap_projection_cannot_claim_v1_watchdog_baseline(self):
+        with external_access_blocked() as attempts:
+            from scripts import watchdog_evidence
+            from tests.test_watchdog_evidence import initial_baseline
+
+            ordinary = initial_baseline()
+            self.assertEqual(watchdog_evidence.validate_initial_baseline(ordinary), ordinary)
+            projected = {
+                **ordinary,
+                "sourceSha": box.BOOTSTRAP_BASELINE["sourceSha"],
+                "acceptedReleasePrefix": (
+                    "v2/accepted/" + box.BOOTSTRAP_BASELINE["sourceSha"]
+                    + "/bootstrap-consumed/"
+                ),
+            }
+            before = json.loads(json.dumps(projected))
+            with self.assertRaisesRegex(
+                watchdog_evidence.EvidenceError,
+                "watchdog baseline accepted-release prefix is invalid",
+            ):
+                watchdog_evidence.validate_initial_baseline(projected)
+            self.assertEqual(projected, before)
+            self.assertEqual(attempts, [])
+
+    def test_unready_first_candidate_restores_exact_settings_without_consumption(self):
+        with external_access_blocked() as attempts:
+            registry, packages = Worm(), Worm()
+            baseline_record = seed_accepted(
+                registry, packages, box.BOOTSTRAP_BASELINE["sourceSha"], mode="bootstrap"
+            )
+            candidate = request("prepare-candidate")
+            candidate["acceptedBaseline"] = box._worm_descriptor(baseline_record)
+            prepared = box.prepare_candidate(
+                registry, candidate, archive(), now=NOW, package_boundary=packages
+            )
+            pending_desc = prepared["records"]["pendingRelease"]
+            pending = json.loads(registry.read(
+                pending_desc["blob"], pending_desc["versionId"]
+            ).body)
+            _, baseline, _, _ = box._load_accepted(
+                registry, candidate["acceptedBaseline"], packages
+            )
+            target = {
+                "sourceSha": SHA, "baselineMode": "strict",
+                "servedIndexSha256": pending["servedIndexSha256"],
+                "oneDeployInvariant": pending["oneDeployInvariant"],
+                "deploymentBundle": pending["deploymentBundle"],
+            }
+            # This property is synthetic state, not a real users-closed fence.
+            original = {"SYNTHETIC_USER_ADMISSION": "closed"}
+            state = [dict(original)]
+            desired = {
+                **original, "WEBSITE_RUN_FROM_PACKAGE": box.package_url(target["deploymentBundle"]),
+                "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID": "SystemAssigned",
+            }
+            fence = activation_fence(
+                pending_desc, box.digest(box.canonical(original)), box.digest(box.canonical(desired))
+            )
+            writes, restarts, probes, consumes, aborts = [], [], [], [], []
+            registry_before, packages_before = dict(registry.data), dict(packages.data)
+
+            def config_read():
+                return dict(state[0]), box.digest(box.canonical(state[0]))
+
+            def config_put(values, expected):
+                self.assertEqual(expected, box.digest(box.canonical(state[0])))
+                writes.append(dict(values))
+                state[0] = dict(values)
+                return box.digest(box.canonical(state[0]))
+
+            def probe(profile):
+                probes.append(profile["sourceSha"])
+                # Represents missing strict readiness; no malware/provider payload
+                # is inspected. The actual owner must not consume this result.
+                return {"sourceSha": profile["sourceSha"], "healthy": profile["sourceSha"] != SHA}
+
+            def consume(settlement):
+                consumes.append(settlement)
+                raise AssertionError("unready candidate must not reach consumption")
+
+            def abort(settlement):
+                aborts.append(settlement)
+                return {"status": "complete"}
+
+            result = box.activate_run_from_package(
+                source_sha=SHA, baseline=baseline, target=target, activation_fence=fence,
+                system_identity_principal=box.PRODUCTION_SYSTEM_PRINCIPAL_ID,
+                config_read=config_read, config_put=config_put,
+                restart=lambda: restarts.append(True), probe=probe, consume=consume, abort=abort,
+            )
+            self.assertEqual(result["status"], "aborted")
+            self.assertEqual(result["errorCode"], "activation-settlement")
+            self.assertEqual(writes, [desired, original])
+            self.assertEqual(len(restarts), 2)
+            self.assertEqual(probes, [baseline["sourceSha"], SHA, baseline["sourceSha"]])
+            self.assertEqual(consumes, [])
+            self.assertEqual(len(aborts), 1)
+            self.assertEqual(state[0], original)
+            self.assertEqual(registry.data, registry_before)
+            self.assertEqual(packages.data, packages_before)
+            self.assertEqual(pending["lifecycle"], "pending")
+            self.assertNotIn(str(box.PurePosixPath(pending_desc["blob"]).parent / "consumed.json"), registry.data)
+            self.assertNotIn(f"v2/accepted/{SHA}/manifest.json", registry.data)
+            self.assertEqual(attempts, [])
 
 
 class Tests(unittest.TestCase):
