@@ -191,7 +191,7 @@ The activation sequence is finite:
    still with null activation.
 2. Under a separate external single-use authorization, run only the exact local
    bootstrap plan and bind the sole temporary publisher FIC to S1-prime as its
-   final mutation. This bounded provisioning action is the sole pre-S2
+   final mutation. This bounded provisioning action is the bootstrap pre-S2
    Azure-mutation exception.
 3. Commit only the independently reviewable evidence and bootstrap receipts in
    **S2**; its tree must not silently change S1-prime control logic.
@@ -200,9 +200,10 @@ The activation sequence is finite:
 5. Only after independent review, main pins S2 and receives its exact caller
    integration.
 
-Apart from the exact one-shot bootstrap in step 2, no Azure mutation is
-authorized before S2 evidence acceptance and FIC repin. In particular, the
-bootstrap cannot run the reusable workflow, mailbox/release logic, production
+Apart from the exact one-shot bootstrap in step 2 and the bounded existing-key
+expiry maintenance in the authoritative operator contract, no Azure mutation is
+authorized before S2 evidence acceptance and FIC repin. Neither exception can
+run the reusable workflow, mailbox/release logic, production
 activation/deployment, accepted-release operations, or caller integration. Main
 pins S2 only after those gates. No impossible S3 self-reference is needed. Any
 later drift requires fresh evidence and a new reviewed pin.
