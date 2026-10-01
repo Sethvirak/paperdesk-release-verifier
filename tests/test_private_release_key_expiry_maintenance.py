@@ -1325,5 +1325,191 @@ class ExtendedCleanupFaultTests(OfflineCase):
         self.assertEqual(sum(call["method"] == "PUT" and call["url"] == lock_url for call in self.session.calls), 1)
 
 
+def large_role_inventory_bytes(target_size=1_251_119):
+    """978 synthetic metadata rows; no live Azure response or customer data."""
+    rows = [{"id": f"/subscriptions/{helper.SUB}/providers/Microsoft.Authorization/roleDefinitions/{index:032x}",
+             "properties": {"roleName": f"offline-role-{index}", "description": "",
+                            "type": "BuiltInRole", "permissions": [{"actions": ["Microsoft.Resources/subscriptions/read"],
+                            "notActions": [], "dataActions": [], "notDataActions": []}]}}
+            for index in range(978)]
+    document = {"value": rows}
+    remaining = target_size - len(helper.canonical(document))
+    if remaining < 0:
+        raise AssertionError("synthetic inventory target too small")
+    per_row, extra = divmod(remaining, len(rows))
+    for index, row in enumerate(rows):
+        row["properties"]["description"] = "x" * (per_row + (index < extra))
+    raw = helper.canonical(document)
+    if len(raw) != target_size:
+        raise AssertionError("synthetic inventory byte size differs")
+    return raw
+
+
+class InventoryResponseBoundTests(OfflineCase):
+    setup_maintenance = RequestGateTests.setup_maintenance
+
+    def test_complete_realistic_inventory_passes_read_and_object_same_exact_dispatch(self):
+        raw = large_role_inventory_bytes()
+        url = helper.ROLE_DEFINITIONS_INVENTORY_URL
+        self.assertEqual(url, self.plan["preflight"]["requiredCompleteInventoryUrls"][1])
+        maintenance = self.setup_maintenance(response=SimpleNamespace(status=200, body=raw, headers={}))
+        with mock.patch.object(helper, "strict_response_json", wraps=helper.strict_response_json) as parser:
+            self.assertEqual(maintenance.read("GET", url).body, raw)
+            self.assertEqual(len(helper.complete_inventory(maintenance.object(url))), 978)
+        self.assertEqual(parser.call_count, 3)
+        self.assertEqual({call.args[1] for call in parser.call_args_list}, {url})
+        self.assertEqual(len(self.session.calls), 2)
+        with self.assertRaises(helper.MaintenanceError):
+            helper.strict_json(raw)
+
+    def test_exact_two_mib_inventory_passes_and_one_more_byte_fails_both_reparses(self):
+        url = helper.ROLE_DEFINITIONS_INVENTORY_URL
+        raw = large_role_inventory_bytes(2 * 1024 * 1024)
+        self.assertEqual(len(helper.complete_inventory(helper.strict_response_json(raw, url))), 978)
+        oversized = raw + b" "
+        maintenance = self.setup_maintenance(response=SimpleNamespace(status=200, body=oversized, headers={}))
+        for operation in (lambda: maintenance.read("GET", url), lambda: maintenance.object(url)):
+            with self.assertRaises(helper.MaintenanceError):
+                operation()
+        self.assertEqual(len(self.session.calls), 2)
+        self.assertFalse((self.directory / "write-journal.jsonl").exists())
+
+    def test_one_mib_remains_default_for_other_allowed_inputs_and_key_data(self):
+        raw = b"{}" + b" " * (1024 * 1024 - 1)
+        self.assertEqual(len(raw), 1024 * 1024 + 1)
+        for url in self.plan["preflight"]["requiredCompleteInventoryUrls"] + [
+                self.plan["preflight"]["requiredArmKeyGetUrl"], self.plan["dataPlaneSequence"][0]["url"]]:
+            if url != helper.ROLE_DEFINITIONS_INVENTORY_URL:
+                with self.subTest(url=url), self.assertRaises(helper.MaintenanceError):
+                    helper.strict_response_json(raw, url)
+        with self.assertRaises(helper.MaintenanceError):
+            helper.strict_json(raw)
+        maintenance = self.setup_maintenance(response=SimpleNamespace(status=200, body=raw, headers={}))
+        self.clock.sleep(480)
+        key_url = self.plan["dataPlaneSequence"][0]["url"]
+        for operation in (lambda: maintenance.read("GET", key_url), lambda: maintenance.object(key_url)):
+            with self.assertRaises(helper.MaintenanceError):
+                operation()
+        self.assertEqual(maintenance.key_gets, 2)
+        self.assertFalse((self.directory / "write-journal.jsonl").exists())
+
+    def test_similar_foreign_path_and_query_urls_never_get_larger_limit_or_wire_access(self):
+        exact = helper.ROLE_DEFINITIONS_INVENTORY_URL
+        raw = large_role_inventory_bytes()
+        variants = [exact.replace("management.azure.com", "management.azure.com.foreign.invalid"),
+                    exact.replace("/roleDefinitions?", "/roleDefinitions/foreign?"),
+                    exact + "&extra=1", exact.replace("2022-04-01", "2022-04-02"),
+                    exact.replace("https://", "http://"), exact.replace("roleDefinitions", "RoleDefinitions")]
+        maintenance = self.setup_maintenance(response=SimpleNamespace(status=200, body=raw, headers={}))
+        for url in variants:
+            with self.subTest(url=url):
+                with self.assertRaises(helper.MaintenanceError):
+                    helper.strict_response_json(raw, url)
+                with self.assertRaises(helper.MaintenanceError):
+                    maintenance.read("GET", url)
+        self.assertEqual(self.session.calls, [])
+        self.assertEqual(maintenance.control_gets, 0)
+
+    def test_enlarged_inventory_still_rejects_duplicates_nonfinite_objects_and_partial_pages(self):
+        invalid = [b'{"value":[],"value":[]}', b'{"value":[],"metadata":NaN}',
+                   b'{"value":[],"metadata":Infinity}', b'[]', b'{"value":{}}',
+                   b'{"value":[],"nextLink":"https://foreign.invalid/next"}',
+                   b'{"value":[{"id":"SYNTHETIC"},{"id":"synthetic"}]}',
+                   b'{"value":[{"properties":{}}]}']
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(helper.MaintenanceError):
+                helper.strict_response_json(raw, helper.ROLE_DEFINITIONS_INVENTORY_URL)
+
+
+class PreflightArtifactBoundTests(OfflineCase):
+    acceptance_fixture = SourceAdmissionTests.acceptance_fixture
+    authorization_fixture = SourceAdmissionTests.authorization_fixture
+
+    def large_authorization_fixture(self):
+        auth, evidence, preflight_path = self.authorization_fixture()
+        model = FakeAzure(self.plan, SyntheticClock())
+        snapshot = model.initial_snapshot()
+        snapshot["roleDefinitions"] = helper.complete_inventory(
+            helper.strict_response_json(large_role_inventory_bytes(), helper.ROLE_DEFINITIONS_INVENTORY_URL))
+        document = {"schemaVersion": 1, "kind": "paperdesk-key-expiry-maintenance-preflight",
+                    "ceremonyId": helper.CEREMONY, "sourceSha": auth["verifierSourceSha"],
+                    "maintenancePlanSha256": auth["maintenancePlanSha256"],
+                    "observedAt": "2026-10-01T03:00:00Z", "completedAt": "2026-10-01T03:00:01Z",
+                    "snapshot": snapshot, "callerPermissions": model.permissions,
+                    "controlPlaneReadEvents": [{"synthetic": True, "ordinal": index} for index in range(9)],
+                    "keyVaultDataPlaneOperations": 0, "azureMutations": 0}
+        raw = helper.canonical(document)
+        self.assertGreater(len(raw), 1024 * 1024)
+        self.assertLess(len(raw), helper.PREFLIGHT_ARTIFACT_MAX_BYTES)
+        preflight_path.write_bytes(raw)
+        auth["freshPreflightSha256"] = helper.digest(raw)
+        return auth, evidence, preflight_path, document
+
+    def validate_fixture(self, auth, evidence, path):
+        return helper.validate_authorization(auth, PLAN_PATH.read_bytes(), HELPER_PATH.read_bytes(), BASE, evidence, path)
+
+    def test_realistic_complete_inventory_artifact_roundtrips_actual_authorization_and_snapshot_gate(self):
+        auth, evidence, path, document = self.large_authorization_fixture()
+        result = self.validate_fixture(auth, evidence, path)
+        self.assertEqual(result, document)
+        self.assertEqual(len(result["snapshot"]["roleDefinitions"]), 978)
+        _, locks = helper.load_primitives(BASE)
+        runner = helper.Maintenance(self.plan, auth, None, None, cleanup_module=locks)
+        runner.validate_preflight(result["snapshot"], helper.permission_page(result["callerPermissions"]))
+        with self.assertRaises(helper.MaintenanceError):
+            helper.strict_json(path.read_bytes())
+
+    def test_exact_four_mib_artifact_passes_and_one_more_byte_fails_actual_authorization(self):
+        auth, evidence, path, _ = self.large_authorization_fixture()
+        original = path.read_bytes()
+        boundary = original + b" " * (4 * 1024 * 1024 - len(original))
+        path.write_bytes(boundary)
+        auth["freshPreflightSha256"] = helper.digest(boundary)
+        self.validate_fixture(auth, evidence, path)
+        path.write_bytes(boundary + b" ")
+        auth["freshPreflightSha256"] = helper.digest(path.read_bytes())
+        with self.assertRaises(helper.MaintenanceError):
+            self.validate_fixture(auth, evidence, path)
+
+    def test_wrong_preflight_kind_ceremony_source_and_plan_still_reject_after_matching_raw_digest(self):
+        auth, evidence, path, document = self.large_authorization_fixture()
+        variants = [("kind", "foreign-preflight"), ("ceremonyId", "foreign-ceremony"),
+                    ("sourceSha", "3" * 40), ("maintenancePlanSha256", "3" * 64)]
+        for key, value in variants:
+            changed = copy.deepcopy(document)
+            changed[key] = value
+            raw = helper.canonical(changed)
+            path.write_bytes(raw)
+            auth["freshPreflightSha256"] = helper.digest(raw)
+            with self.subTest(key=key), self.assertRaises(helper.MaintenanceError):
+                self.validate_fixture(auth, evidence, path)
+
+    def test_artifact_duplicate_nonfinite_and_nonobject_json_reject_with_matching_digest(self):
+        auth, evidence, path, _ = self.large_authorization_fixture()
+        prefix = f'{{"kind":"paperdesk-key-expiry-maintenance-preflight","ceremonyId":"{helper.CEREMONY}"'.encode()
+        invalid = [prefix + b',"kind":"foreign"}', prefix + b',"metadata":NaN}',
+                   prefix + b',"metadata":Infinity}', b'[]']
+        for raw in invalid:
+            path.write_bytes(raw)
+            auth["freshPreflightSha256"] = helper.digest(raw)
+            with self.subTest(raw=raw), self.assertRaises(helper.MaintenanceError):
+                self.validate_fixture(auth, evidence, path)
+
+    def test_raw_digest_and_source_acceptance_mismatch_stop_before_large_artifact_parser(self):
+        auth, evidence, path, _ = self.large_authorization_fixture()
+        original_hash = auth["freshPreflightSha256"]
+        auth["freshPreflightSha256"] = "0" * 64
+        with mock.patch.object(helper, "strict_preflight_json", side_effect=AssertionError("unbound artifact parsed")) as parser:
+            with self.assertRaises(helper.MaintenanceError):
+                self.validate_fixture(auth, evidence, path)
+            parser.assert_not_called()
+        auth["freshPreflightSha256"] = original_hash
+        auth["sourceAcceptance"]["exactMergedMainCi"]["headSha"] = "3" * 40
+        with mock.patch.object(helper, "strict_preflight_json", side_effect=AssertionError("unreviewed source artifact parsed")) as parser:
+            with self.assertRaises(helper.MaintenanceError):
+                self.validate_fixture(auth, evidence, path)
+            parser.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
