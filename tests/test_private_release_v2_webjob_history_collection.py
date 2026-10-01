@@ -1,6 +1,7 @@
 """Live-shape regressions for the ARM triggered-WebJob history collection."""
 
 import datetime as dt
+import copy
 import unittest
 from unittest import mock
 
@@ -558,6 +559,210 @@ class WebJobHistoryCollectionTests(unittest.TestCase):
                     site_resource_id=SITE_ID,
                     job_name=JOB_NAME,
                     deadline=NOW + dt.timedelta(seconds=30),
+                )
+
+
+class SharedCanaryHistoryDetailBudgetTests(unittest.TestCase):
+    def budget(self):
+        return bootstrap._HistoryDetailBudget(
+            site_resource_id=SITE_ID, job_name=JOB_NAME,
+            error_type=bootstrap.BootstrapError,
+        )
+
+    def history_transport(self, documents, *, current=None):
+        current = current or [NOW]
+        value = transport()
+        value.clock = lambda: current[0]
+        value.sleep = lambda seconds: current.__setitem__(
+            0, current[0] + dt.timedelta(seconds=seconds)
+        )
+        value.resources = {"bridgeSite": {"name": SITE_NAME}}
+        value.authorization = {"validity": {"expiresAt": stamp(NOW + dt.timedelta(seconds=900))}}
+        value._read_triggered_webjob_metadata = mock.Mock(return_value={"latestRunPresent": True})
+        documents = iter(documents)
+        active = {}
+        reads = []
+
+        def request(method, url, **kwargs):
+            self.assertEqual(method, "GET")
+            reads.append((url, kwargs))
+            if url.split("?", 1)[0].endswith("/history"):
+                definitions, sparse = next(documents)
+                active.clear()
+                active.update({entry["web_job_id"]: entry for entry in definitions})
+                body = {"value": [
+                    {"id": COLLECTION_ID + "/" + entry["web_job_id"],
+                     "properties": {} if sparse else entry}
+                    for entry in definitions
+                ]}
+            else:
+                run_id = url.split("?", 1)[0].rsplit("/", 1)[-1]
+                body = {"id": COLLECTION_ID + "/" + run_id, "properties": active[run_id]}
+                self.assertEqual(kwargs["retry_delays"], (None,))
+            return bootstrap._RestResponse(200, bootstrap.canonical_json_bytes(body), {})
+
+        value._read_request_with_transport_retry = mock.Mock(side_effect=request)
+        return value, reads
+
+    def read(self, value, budget, stage="history-boundary"):
+        return value._read_webjob_history(
+            site_resource_id=SITE_ID, job_name=JOB_NAME,
+            deadline=NOW + dt.timedelta(seconds=300),
+            failure_context=stage, detail_budget=budget,
+        )
+
+    def test_growing_history_rereads_every_old_child_at_all_three_phases(self):
+        for old_count in (4, 5):
+            with self.subTest(old_count=old_count):
+                old = [run(f"old-{index}", offset=-20-index*2) for index in range(old_count)]
+                fresh = run("fresh", offset=-1)
+                expected = bootstrap.sha256_bytes(fresh["trigger"].encode())
+                value, reads = self.history_transport([
+                    (old, True), (old + [fresh], True), (old + [fresh], True),
+                ])
+                budget = self.budget()
+                boundary = value._wait_for_webjob_history_boundary(
+                    site_resource_id=SITE_ID, job_name=JOB_NAME,
+                    deadline=NOW + dt.timedelta(seconds=710), detail_budget=budget,
+                )
+                budget.seal_boundary(boundary)
+                canary = value._wait_for_fresh_webjob_success(
+                    site_resource_id=SITE_ID, job_name=JOB_NAME, boundary=boundary,
+                    trigger_requested_at=NOW, expected_trigger_sha256=expected,
+                    deadline=NOW + dt.timedelta(seconds=300), detail_budget=budget,
+                )
+                final = value._read_final_webjob_history(
+                    site_resource_id=SITE_ID, job_name=JOB_NAME, canary=canary,
+                    deadline=NOW + dt.timedelta(seconds=180), detail_budget=budget,
+                )
+                self.assertEqual(len(final["entries"]), old_count + 1)
+                self.assertEqual(len(reads), 3 + old_count + 2*(old_count + 1))
+                self.assertEqual(budget._remaining, 728 - old_count - 2*(old_count + 1))
+                for entry in old:
+                    self.assertEqual(sum(
+                        url.split("?", 1)[0].endswith("/" + entry["web_job_id"])
+                        for url, _ in reads
+                    ), 3)
+                before = len(reads)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    value._read_final_webjob_history(
+                        site_resource_id=SITE_ID, job_name=JOB_NAME, canary=canary,
+                        deadline=NOW + dt.timedelta(seconds=180), detail_budget=budget,
+                    )
+                self.assertEqual(len(reads), before)
+
+    def test_full_boundary_universe_reserves_headroom_even_when_list_is_complete(self):
+        old = [run(f"old-{index}", offset=-index*2-20) for index in range(364)]
+        value, reads = self.history_transport([(old, False)])
+        budget = self.budget()
+        boundary = self.read(value, budget)
+        self.assertEqual(len(reads), 1)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "pre-trigger census headroom"):
+            budget.seal_boundary(boundary)
+        self.assertEqual(budget._remaining, 728)
+
+    def test_oversized_census_is_rejected_before_any_detail_transport(self):
+        old = [run(f"old-{index}", offset=-index*2-20) for index in range(729)]
+        value, reads = self.history_transport([(old, True)])
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "shared detail read budget"):
+            self.read(value, self.budget())
+        self.assertEqual(len(reads), 1)
+
+    def test_terminal_polls_cannot_spend_the_final_reserved_census(self):
+        old = [run(f"old-{index}", offset=-20-index*2) for index in range(4)]
+        fresh = run("fresh", offset=-1)
+        value, reads = self.history_transport(
+            [(old, True)] + [(old + [fresh], True)] * 145
+        )
+        budget = self.budget()
+        boundary = self.read(value, budget)
+        budget.seal_boundary(boundary)
+        for _ in range(143):
+            self.read(value, budget, "terminal-history")
+        self.assertEqual(budget._remaining, 9)
+        before = len(reads)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "shared detail read budget"):
+            self.read(value, budget, "terminal-history")
+        self.assertEqual(len(reads), before + 1)
+        final = self.read(value, budget, "final-history-census")
+        self.assertEqual(len(final["entries"]), 5)
+        self.assertEqual(budget._remaining, 4)
+
+    def test_foreign_targets_wrong_phases_and_unsealed_poll_fail_before_collection(self):
+        for kwargs in (
+            {"site_resource_id": SITE_ID + "-other", "failure_context": "history-boundary"},
+            {"job_name": "other", "failure_context": "history-boundary"},
+            {"failure_context": "terminal-history"},
+            {"failure_context": "final-history-census"},
+            {"failure_context": None},
+        ):
+            value = transport()
+            value._read_request_with_transport_retry = mock.Mock()
+            args = {"site_resource_id": SITE_ID, "job_name": JOB_NAME,
+                    "failure_context": "history-boundary", **kwargs}
+            with self.subTest(kwargs=kwargs), self.assertRaises(bootstrap.BootstrapError):
+                value._read_webjob_history(
+                    **args, deadline=NOW + dt.timedelta(seconds=300), detail_budget=self.budget(),
+                )
+            value._read_request_with_transport_retry.assert_not_called()
+
+    def test_empty_pristine_and_throttled_boundary_do_not_consume_detail_credits(self):
+        budget = self.budget()
+        value = transport()
+        value.sleep = mock.Mock()
+        value._read_request_with_transport_retry = mock.Mock(side_effect=[
+            bootstrap._RestResponse(429, b"", {"Retry-After": "1"}),
+            bootstrap._RestResponse(404, b"", {}),
+        ])
+        args = {"site_resource_id": SITE_ID, "job_name": JOB_NAME,
+                "deadline": NOW + dt.timedelta(seconds=300),
+                "failure_context": "history-boundary", "detail_budget": budget,
+                "allow_pristine_absence": True, "allow_transient_rate_limit": True}
+        self.assertIsNone(value._read_webjob_history(**args))
+        boundary = value._read_webjob_history(**args)
+        budget.seal_boundary(boundary)
+        self.assertEqual(budget._remaining, 728)
+        self.assertEqual(budget._final_reserve, 1)
+        with self.assertRaises(bootstrap.BootstrapError):
+            budget.seal_boundary(boundary)
+        with self.assertRaises(bootstrap.BootstrapError):
+            value._read_webjob_history(**args)
+        self.assertEqual(value._read_request_with_transport_retry.call_count, 2)
+
+    def test_detail_timeout_and_malformed_response_never_refund_or_reset(self):
+        body = {"value": [{"id": COLLECTION_ID + "/one", "properties": {}}]}
+        for outcome in (
+            bootstrap._RestTotalTimeout("synthetic timeout"),
+            bootstrap._RestResponse(200, b"{}\n", {}),
+        ):
+            value = transport()
+            value._read_request_with_transport_retry = mock.Mock(side_effect=[
+                bootstrap._RestResponse(200, bootstrap.canonical_json_bytes(body), {}), outcome,
+            ])
+            budget = self.budget()
+            with self.subTest(outcome=type(outcome).__name__), self.assertRaises(bootstrap.BootstrapError):
+                self.read(value, budget)
+            self.assertEqual(budget._remaining, 727)
+            with self.assertRaises(bootstrap.BootstrapError):
+                self.read(value, budget)
+            self.assertEqual(value._read_request_with_transport_retry.call_count, 2)
+
+    def test_budget_does_not_relax_old_history_drift_or_ambiguous_fresh_runs(self):
+        old = [run(f"old-{index}", offset=-20-index*2) for index in range(5)]
+        fresh = run("fresh", offset=-1)
+        changed = copy.deepcopy(old)
+        changed[0]["trigger"] = "External - changed"
+        for terminal in (changed + [fresh], old + [fresh, run("extra", offset=-1)], old[1:] + [fresh]):
+            value, _ = self.history_transport([(old, True), (terminal, True)])
+            budget = self.budget()
+            boundary = self.read(value, budget)
+            budget.seal_boundary(boundary)
+            with self.subTest(terminal_count=len(terminal)), self.assertRaises(bootstrap.BootstrapError):
+                value._wait_for_fresh_webjob_success(
+                    site_resource_id=SITE_ID, job_name=JOB_NAME, boundary=boundary,
+                    trigger_requested_at=NOW,
+                    expected_trigger_sha256=bootstrap.sha256_bytes(fresh["trigger"].encode()),
+                    deadline=NOW + dt.timedelta(seconds=300), detail_budget=budget,
                 )
 
 

@@ -46,11 +46,13 @@ try:
     from scripts import private_release_v2_cleanup_locks as cleanup_locks
     from scripts import private_release_v2_webjob_evidence as webjob_evidence
     from scripts import private_release_v2_history_conflict_diagnostics as history_conflict
+    from scripts import private_release_v2_history_detail_budget as history_detail_budget
 except ModuleNotFoundError:  # direct ``python scripts/...`` execution
     import build_private_release_bridge_package as package_builder  # type: ignore
     import private_release_v2_cleanup_locks as cleanup_locks  # type: ignore
     import private_release_v2_webjob_evidence as webjob_evidence  # type: ignore
     import private_release_v2_history_conflict_diagnostics as history_conflict  # type: ignore
+    import private_release_v2_history_detail_budget as history_detail_budget  # type: ignore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +97,9 @@ MAX_CANARY_CONVERGENCE_SECONDS = 300
 MAX_CANARY_HISTORY_RETRY_AFTER_SECONDS = 60
 MAX_CANARY_FINAL_HISTORY_SECONDS = 180
 MAX_WEBJOB_HISTORY_DETAIL_READS = 4
+MAX_CANARY_WEBJOB_HISTORY_POLLS = history_detail_budget.MAX_TERMINAL_POLLS
+MAX_CANARY_WEBJOB_HISTORY_DETAIL_READS = history_detail_budget.MAX_DETAIL_READS
+_HistoryDetailBudget = history_detail_budget.CanaryWebJobHistoryDetailBudget
 WEBJOB_TRIGGER_USER_AGENT_PREFIX = "PaperDeskV2Bootstrap/"
 READ_ONLY_TRANSPORT_RETRY_DELAYS_SECONDS = (0.5, 1.0, None)
 # A protected cleanup can reach lock restoration after its authorization has
@@ -14521,7 +14526,15 @@ class AzureCliBootstrapTransport:
         failure_context: str | None = None,
         allow_pristine_absence: bool = False,
         allow_transient_rate_limit: bool = False,
+        detail_budget: _HistoryDetailBudget | None = None,
     ) -> Mapping[str, Any] | None:
+        if detail_budget is not None:
+            if type(detail_budget) is not _HistoryDetailBudget:
+                fail("WebJob history detail budget owner is not exact")
+            detail_budget.require_stage(
+                site_resource_id=site_resource_id, job_name=job_name,
+                stage=failure_context,
+            )
         url = self._arm_url(
             site_resource_id,
             "2025-05-01",
@@ -14605,8 +14618,14 @@ class AzureCliBootstrapTransport:
                 ):
                     fail("WebJob history child ID cannot bind a detail read")
                 detail_candidates.append((history_id, run_id))
-        if len(detail_candidates) > MAX_WEBJOB_HISTORY_DETAIL_READS:
-            fail("WebJob history needs too many detail reads")
+        if detail_budget is None:
+            if len(detail_candidates) > MAX_WEBJOB_HISTORY_DETAIL_READS:
+                fail("WebJob history needs too many detail reads")
+        else:
+            detail_budget.admit_census(
+                site_resource_id=site_resource_id, job_name=job_name,
+                stage=failure_context, detail_count=len(detail_candidates),
+            )
         detail_deadline = min(
             deadline,
             self.clock()
@@ -14633,6 +14652,8 @@ class AzureCliBootstrapTransport:
                     "2025-05-01",
                     f"/triggeredwebjobs/{job_name}/history/{candidate[1]}",
                 )
+                if detail_budget is not None:
+                    detail_budget.charge_detail()
                 detail_response = self._read_request_with_transport_retry(
                     "GET",
                     detail_url,
@@ -14724,6 +14745,8 @@ class AzureCliBootstrapTransport:
         if len(ids) != len(set(ids)) or len(run_ids) != len(set(run_ids)):
             fail("WebJob history contains duplicate history or run IDs")
         projected.sort(key=lambda item: item["historyId"])
+        if detail_budget is not None:
+            detail_budget.finish_census()
         observed_at = self.clock()
         return {
             "observedAt": self._timestamp(observed_at),
@@ -15100,6 +15123,7 @@ class AzureCliBootstrapTransport:
         site_resource_id: str,
         job_name: str,
         deadline: dt.datetime,
+        detail_budget: _HistoryDetailBudget | None = None,
     ) -> Mapping[str, Any]:
         attempts = 0
         while attempts < 180:
@@ -15138,6 +15162,7 @@ class AzureCliBootstrapTransport:
                 failure_context="history-boundary",
                 allow_pristine_absence=metadata["latestRunPresent"] is False,
                 allow_transient_rate_limit=True,
+                detail_budget=detail_budget,
             )
             if self.clock() >= deadline:
                 fail("WebJob history readiness response crossed the authorization deadline")
@@ -15170,6 +15195,7 @@ class AzureCliBootstrapTransport:
         trigger_requested_at: dt.datetime,
         expected_trigger_sha256: str,
         deadline: dt.datetime,
+        detail_budget: _HistoryDetailBudget | None = None,
     ) -> Mapping[str, Any]:
         before_entries = boundary.get("entries")
         if not isinstance(before_entries, list):
@@ -15181,6 +15207,8 @@ class AzureCliBootstrapTransport:
         }
         if len(before) != len(before_entries):
             fail("WebJob history boundary contains invalid or duplicate entries")
+        if detail_budget is not None:
+            detail_budget.require_boundary(boundary)
         expires = parse_time(
             self.authorization["validity"]["expiresAt"],
             "authorization expiresAt",
@@ -15192,7 +15220,7 @@ class AzureCliBootstrapTransport:
             deadline,
         )
         attempts = 0
-        while attempts < 180:
+        while attempts < MAX_CANARY_WEBJOB_HISTORY_POLLS:
             before_request = self.clock()
             if before_request >= deadline:
                 fail("WebJob canary did not converge before authorization expiry")
@@ -15204,6 +15232,7 @@ class AzureCliBootstrapTransport:
                 retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
                 failure_context="terminal-history",
                 allow_transient_rate_limit=True,
+                detail_budget=detail_budget,
             )
             after_response = self.clock()
             if after_response >= deadline:
@@ -15422,6 +15451,7 @@ class AzureCliBootstrapTransport:
         job_name: str,
         canary: Mapping[str, Any],
         deadline: dt.datetime,
+        detail_budget: _HistoryDetailBudget | None = None,
     ) -> Mapping[str, Any]:
         # Read only after the canary stop is proven, while SCM is still
         # available. An extra, removed, or changed run invalidates attribution.
@@ -15429,12 +15459,15 @@ class AzureCliBootstrapTransport:
         # cleanup beyond its small, separate deadline.
         if self.clock() >= deadline:
             fail("final WebJob history census deadline expired")
+        if detail_budget is not None:
+            detail_budget.require_boundary(canary["historyBoundary"])
         observed = self._read_webjob_history(
             site_resource_id=site_resource_id,
             job_name=job_name,
             deadline=deadline,
             retry_delays=CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
             failure_context="final-history-census",
+            detail_budget=detail_budget,
         )
         if self.clock() >= deadline:
             fail("final WebJob history census response crossed its deadline")
@@ -20511,6 +20544,10 @@ class AzureCliBootstrapTransport:
             pre_scm_restore_stopped: Mapping[str, Any] | None = None
             final_history: Mapping[str, Any] | None = None
             trigger_requested_at: dt.datetime | None = None
+            history_detail_budget = _HistoryDetailBudget(
+                site_resource_id=site["resourceId"], job_name=job,
+                error_type=BootstrapError,
+            )
             try:
                 primary_stage = "public-network-enable"
                 scm_pre_public_network = self._read_scm_basic_auth_policy(
@@ -20622,7 +20659,9 @@ class AzureCliBootstrapTransport:
                     site_resource_id=site["resourceId"],
                     job_name=job,
                     deadline=startup_deadline,
+                    detail_budget=history_detail_budget,
                 )
+                history_detail_budget.seal_boundary(boundary)
                 trigger_requested_at = self.clock()
                 require_live_canary()
                 primary_stage = "trigger"
@@ -20654,6 +20693,7 @@ class AzureCliBootstrapTransport:
                     trigger_requested_at=trigger_requested_at,
                     expected_trigger_sha256=trigger_correlation["expectedHistoryTriggerSha256"],
                     deadline=canary_control_deadline,
+                    detail_budget=history_detail_budget,
                 )
                 location = trigger_correlation["location"]
                 if location is not None and (
@@ -20726,6 +20766,7 @@ class AzureCliBootstrapTransport:
                             job_name=job,
                             canary=canary,
                             deadline=census_deadline,
+                            detail_budget=history_detail_budget,
                         )
                     except BaseException as exc:
                         primary_error = exc
