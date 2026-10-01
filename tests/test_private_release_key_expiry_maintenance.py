@@ -768,7 +768,8 @@ class SourceAdmissionTests(OfflineCase):
 
     def test_crlf_bom_and_content_drift_stop_before_import(self):
         relative_paths = ("contracts/private_release_bootstrap_plan.json", "scripts/private_release_v2_bootstrap.py",
-                          "scripts/private_release_v2_cleanup_locks.py")
+                          "scripts/private_release_v2_cleanup_locks.py",
+                          "scripts/private_release_v2_history_conflict_diagnostics.py")
         originals = {(BASE / relative).resolve(): self.committed_blob(relative) for relative in relative_paths}
         original_read, original_import = Path.read_bytes, __import__
         for relative in relative_paths:
@@ -793,7 +794,8 @@ class SourceAdmissionTests(OfflineCase):
                     raise AssertionError("unexpected local Git metadata request")
 
                 def no_primitive_import(name, *args, **kwargs):
-                    if name in ("private_release_v2_bootstrap", "private_release_v2_cleanup_locks"):
+                    if name in ("private_release_v2_bootstrap", "private_release_v2_cleanup_locks",
+                                "private_release_v2_history_conflict_diagnostics"):
                         attempted_imports.append(name)
                         raise AssertionError("drifted primitive import was reached")
                     return original_import(name, *args, **kwargs)
@@ -805,6 +807,121 @@ class SourceAdmissionTests(OfflineCase):
                         self.assertRaises(helper.MaintenanceError):
                     helper.load_primitives(BASE)
                 self.assertEqual(attempted_imports, [])
+
+    def test_reviewed_primitive_map_binds_exact_three_committed_lf_dependencies(self):
+        names = ("private_release_v2_bootstrap.py", "private_release_v2_cleanup_locks.py",
+                 "private_release_v2_history_conflict_diagnostics.py")
+        self.assertEqual(set(self.plan["source"]["pinnedPrimitiveHashes"]), set(names))
+        for name in names:
+            raw = self.committed_blob("scripts/" + name)
+            with self.subTest(primitive=name):
+                self.assertNotIn(b"\r", raw)
+                self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+                self.assertEqual(helper.digest(raw), self.plan["source"]["pinnedPrimitiveHashes"][name])
+                self.assertNotEqual(helper.digest(raw.replace(b"\n", b"\r\n")),
+                                    self.plan["source"]["pinnedPrimitiveHashes"][name])
+
+    def test_cached_diagnostic_module_outside_reviewed_checkout_is_rejected(self):
+        original_read, original_import = Path.read_bytes, __import__
+        paths = ("contracts/private_release_bootstrap_plan.json", "scripts/private_release_v2_bootstrap.py",
+                 "scripts/private_release_v2_cleanup_locks.py", "scripts/private_release_v2_history_conflict_diagnostics.py")
+        baseline = {(BASE / relative).resolve(): self.committed_blob(relative) for relative in paths}
+        fake_bootstrap = SimpleNamespace(__file__=str(BASE / "scripts/private_release_v2_bootstrap.py"),
+            history_conflict=SimpleNamespace(__file__=str(self.directory / "foreign_diagnostic.py")))
+        fake_locks = SimpleNamespace(__file__=str(BASE / "scripts/private_release_v2_cleanup_locks.py"))
+        def synthetic_read(path):
+            return baseline[path.resolve()] if path.resolve() in baseline else original_read(path)
+        def clean_git(arguments, **kwargs):
+            if "rev-parse" in arguments:
+                return SimpleNamespace(stdout="1" * 40)
+            if "diff" in arguments:
+                return SimpleNamespace(stdout="")
+            raise AssertionError("unexpected local Git metadata request")
+        def cached_import(name, *args, **kwargs):
+            if name == "private_release_v2_bootstrap":
+                return fake_bootstrap
+            if name == "private_release_v2_cleanup_locks":
+                return fake_locks
+            return original_import(name, *args, **kwargs)
+        with mock.patch.object(Path, "read_bytes", synthetic_read), \
+                mock.patch.object(helper.subprocess, "run", side_effect=clean_git), \
+                mock.patch("builtins.__import__", side_effect=cached_import), \
+                self.assertRaisesRegex(helper.MaintenanceError, "cached primitive module resolves outside"):
+            helper.load_primitives(BASE)
+
+    def test_missing_or_redirected_diagnostic_path_stops_before_bootstrap_import(self):
+        original_read, original_resolve, original_is_file, original_import = (
+            Path.read_bytes, Path.resolve, Path.is_file, __import__)
+        diagnostic_path = BASE / "scripts/private_release_v2_history_conflict_diagnostics.py"
+        source_plan = BASE / "contracts/private_release_bootstrap_plan.json"
+        plan_bytes = self.committed_blob("contracts/private_release_bootstrap_plan.json")
+        def clean_git(arguments, **kwargs):
+            if "rev-parse" in arguments:
+                return SimpleNamespace(stdout="1" * 40)
+            if "diff" in arguments:
+                return SimpleNamespace(stdout="")
+            raise AssertionError("unexpected local Git metadata request")
+        def synthetic_read(path):
+            return plan_bytes if path == source_plan else original_read(path)
+        def no_bootstrap_import(name, *args, **kwargs):
+            if name == "private_release_v2_bootstrap":
+                raise AssertionError("missing/redirected diagnostic reached bootstrap import")
+            return original_import(name, *args, **kwargs)
+        for state in ("missing", "redirected"):
+            def resolved(path, *args, **kwargs):
+                if path == diagnostic_path and state == "redirected":
+                    return self.directory / "foreign_diagnostic.py"
+                return original_resolve(path, *args, **kwargs)
+            def is_file(path):
+                return False if path == diagnostic_path and state == "missing" else original_is_file(path)
+            with self.subTest(state=state), \
+                    mock.patch.object(Path, "read_bytes", synthetic_read), \
+                    mock.patch.object(Path, "resolve", resolved), \
+                    mock.patch.object(Path, "is_file", is_file), \
+                    mock.patch.object(helper.subprocess, "run", side_effect=clean_git), \
+                    mock.patch("builtins.__import__", side_effect=no_bootstrap_import), \
+                    self.assertRaisesRegex(helper.MaintenanceError, "diagnostic dependency path.*before import"):
+                helper.load_primitives(BASE)
+
+    def test_foreign_cached_diagnostic_aliases_stop_before_bootstrap_import(self):
+        original_read, original_import = Path.read_bytes, __import__
+        paths = ("contracts/private_release_bootstrap_plan.json", "scripts/private_release_v2_bootstrap.py",
+                 "scripts/private_release_v2_cleanup_locks.py", "scripts/private_release_v2_history_conflict_diagnostics.py")
+        baseline = {(BASE / relative).resolve(): self.committed_blob(relative) for relative in paths}
+        def synthetic_read(path):
+            return baseline[path.resolve()] if path.resolve() in baseline else original_read(path)
+        def clean_git(arguments, **kwargs):
+            if "rev-parse" in arguments:
+                return SimpleNamespace(stdout="1" * 40)
+            if "diff" in arguments:
+                return SimpleNamespace(stdout="")
+            raise AssertionError("unexpected local Git metadata request")
+        def no_bootstrap_import(name, *args, **kwargs):
+            if name == "private_release_v2_bootstrap":
+                raise AssertionError("foreign cached diagnostic reached bootstrap import")
+            return original_import(name, *args, **kwargs)
+        for alias in ("scripts.private_release_v2_history_conflict_diagnostics",
+                      "private_release_v2_history_conflict_diagnostics"):
+            for foreign in (SimpleNamespace(__file__=str(self.directory / "foreign.py")), SimpleNamespace()):
+                with self.subTest(alias=alias, foreign=foreign), \
+                        mock.patch.object(Path, "read_bytes", synthetic_read), \
+                        mock.patch.object(helper.subprocess, "run", side_effect=clean_git), \
+                        mock.patch.dict(sys.modules, {alias: foreign}), \
+                        mock.patch("builtins.__import__", side_effect=no_bootstrap_import), \
+                        self.assertRaisesRegex(helper.MaintenanceError, "cached diagnostic.*before import"):
+                    helper.load_primitives(BASE)
+
+    def test_authorization_rejects_missing_or_wrong_diagnostic_dependency_pin(self):
+        auth, evidence, preflight = self.authorization_fixture()
+        for variant in ("missing", "wrong"):
+            changed = copy.deepcopy(auth)
+            if variant == "missing":
+                changed["primitiveHashes"].pop("private_release_v2_history_conflict_diagnostics.py")
+            else:
+                changed["primitiveHashes"]["private_release_v2_history_conflict_diagnostics.py"] = "0" * 64
+            with self.subTest(variant=variant), self.assertRaisesRegex(helper.MaintenanceError, "reviewed primitive bytes changed"):
+                helper.validate_authorization(changed, PLAN_PATH.read_bytes(), HELPER_PATH.read_bytes(),
+                                              BASE, evidence, preflight)
 
     def acceptance_fixture(self):
         # These strings are synthetic assertions, never provider review evidence.
@@ -830,7 +947,8 @@ class SourceAdmissionTests(OfflineCase):
                 "executorSha256": helper.digest(HELPER_PATH.read_bytes()),
                 "verifierSourceSha": "1" * 40,
                 "primitiveHashes": {name: helper.digest((BASE / "scripts" / name).read_bytes()) for name in
-                                    ("private_release_v2_bootstrap.py", "private_release_v2_cleanup_locks.py")},
+                                    ("private_release_v2_bootstrap.py", "private_release_v2_cleanup_locks.py",
+                                     "private_release_v2_history_conflict_diagnostics.py")},
                 "azure": {"subscriptionId": helper.SUB, "tenantId": helper.TENANT,
                           "accountObjectId": helper.OWNER, "accountType": "User"},
                 "validity": {"notBefore": "2026-10-01T03:00:00Z", "expiresAt": "2026-10-01T04:35:00Z"},
@@ -944,40 +1062,47 @@ class SourceAdmissionTests(OfflineCase):
                       "contracts/private_release_key_expiry_maintenance_plan.json")}
         baseline = {(BASE / relative).resolve(): self.committed_blob(relative) for relative in
                     ("contracts/private_release_bootstrap_plan.json", "scripts/private_release_v2_bootstrap.py",
-                     "scripts/private_release_v2_cleanup_locks.py")}
-        for primitive in ("private_release_v2_bootstrap.py", "private_release_v2_cleanup_locks.py"):
+                     "scripts/private_release_v2_cleanup_locks.py",
+                     "scripts/private_release_v2_history_conflict_diagnostics.py")}
+        for primitive in ("private_release_v2_bootstrap.py", "private_release_v2_cleanup_locks.py",
+                          "private_release_v2_history_conflict_diagnostics.py"):
+            variants = {"CRLF": baseline[(BASE / "scripts" / primitive).resolve()].replace(b"\n", b"\r\n"),
+                        "BOM": b"\xef\xbb\xbf" + baseline[(BASE / "scripts" / primitive).resolve()],
+                        "content": b"# hostile synthetic primitive bytes; never imported\n"}
             for require_merged in (False, True):
-                hostile_path = (BASE / "scripts" / primitive).resolve()
-                attempted_imports = []
+                for drift, altered in variants.items():
+                    hostile_path = (BASE / "scripts" / primitive).resolve()
+                    attempted_imports = []
 
-                def synthetic_read(path):
-                    resolved = path.resolve()
-                    if resolved == hostile_path:
-                        return b"# hostile synthetic primitive bytes; never imported\n"
-                    return baseline[resolved] if resolved in baseline else original_read(path)
+                    def synthetic_read(path):
+                        resolved = path.resolve()
+                        if resolved == hostile_path:
+                            return altered
+                        return baseline[resolved] if resolved in baseline else original_read(path)
 
-                def clean_git(arguments, **kwargs):
-                    if "rev-parse" in arguments:
-                        return SimpleNamespace(stdout="1" * 40)
-                    if "diff" in arguments:
-                        return SimpleNamespace(stdout="")
-                    if "show" in arguments:
-                        return SimpleNamespace(stdout=committed[arguments[-1].removeprefix("HEAD:")])
-                    raise AssertionError("unexpected local Git metadata request")
+                    def clean_git(arguments, **kwargs):
+                        if "rev-parse" in arguments:
+                            return SimpleNamespace(stdout="1" * 40)
+                        if "diff" in arguments:
+                            return SimpleNamespace(stdout="")
+                        if "show" in arguments:
+                            return SimpleNamespace(stdout=committed[arguments[-1].removeprefix("HEAD:")])
+                        raise AssertionError("unexpected local Git metadata request")
 
-                def no_primitive_import(name, *args, **kwargs):
-                    if name in ("private_release_v2_bootstrap", "private_release_v2_cleanup_locks"):
-                        attempted_imports.append(name)
-                        raise AssertionError("hostile primitive import was reached")
-                    return original_import(name, *args, **kwargs)
+                    def no_primitive_import(name, *args, **kwargs):
+                        if name in ("private_release_v2_bootstrap", "private_release_v2_cleanup_locks",
+                                    "private_release_v2_history_conflict_diagnostics"):
+                            attempted_imports.append(name)
+                            raise AssertionError("hostile primitive import was reached")
+                        return original_import(name, *args, **kwargs)
 
-                with self.subTest(primitive=primitive, require_merged=require_merged), \
-                        mock.patch.object(Path, "read_bytes", synthetic_read), \
-                        mock.patch.object(helper.subprocess, "run", side_effect=clean_git), \
-                        mock.patch("builtins.__import__", side_effect=no_primitive_import), \
-                        self.assertRaisesRegex(helper.MaintenanceError, "provider primitives differ.*before import"):
-                    helper.load_primitives(BASE, expected_head="1" * 40, require_merged=require_merged)
-                self.assertEqual(attempted_imports, [])
+                    with self.subTest(primitive=primitive, require_merged=require_merged, drift=drift), \
+                            mock.patch.object(Path, "read_bytes", synthetic_read), \
+                            mock.patch.object(helper.subprocess, "run", side_effect=clean_git), \
+                            mock.patch("builtins.__import__", side_effect=no_primitive_import), \
+                            self.assertRaisesRegex(helper.MaintenanceError, "provider primitives differ.*before import"):
+                        helper.load_primitives(BASE, expected_head="1" * 40, require_merged=require_merged)
+                    self.assertEqual(attempted_imports, [])
 
     def test_cli_observation_refuses_unmerged_source_before_journal_or_output_creation(self):
         output = self.directory / "forbidden-observation-output.json"

@@ -424,13 +424,14 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_private_release_v2_is_dormant_until_s2_evidence_and_fic_repin(self):
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
-        evidence = json.loads(PROVISIONING.read_text(encoding="utf-8"))
+        # This is the caller gate. Genuine S2 provisioning is already
+        # "activated" while this separate contract stays dormant; the terminal
+        # receipt and FIC validators admit that evidence, not this static guard.
         self.assertEqual(contract["status"], "source-dormant")
         self.assertTrue(contract["activation"])
         self.assertTrue(all(value is None for value in contract["activation"].values()))
         self.assertIsNone(contract["activation"]["mergedControlWorkflowSha"])
         self.assertIsNone(contract["activation"]["bridgePackageSourceSha"])
-        self.assertEqual(evidence["status"], "source-dormant")
 
         baseline = contract["fixed"]["bootstrapBaseline"]
         self.assertIn("oneDeployInvariant", baseline)
