@@ -108,6 +108,15 @@ checkout may be Git-clean but must fail this exact-byte admission. The original
 bootstrap plan retains historical CRLF approval hash `49f29773...`; its unchanged
 committed LF blob has the separately pinned `b6a834f1...` hash. These are distinct
 byte identities, and maintenance does not rewrite or renew bootstrap approval.
+The maintenance plan pins the exact committed LF bootstrap, cleanup-lock and
+history-conflict diagnostic modules before importing the transport; its
+externally approved authorization must bind that same complete dependency map.
+A refreshed source pin changes neither the historical ceremony nor its
+one-use claim. It cannot renew consumed approval or admit another operation.
+The loader rejects a missing or redirected diagnostic path and either cached
+diagnostic alias from another checkout before import, then verifies the module
+actually used by the bootstrap. `reviewedPrimitiveBaseSha` records the commit
+whose primitive bytes were pinned; it supplies no independent source acceptance.
 
 `sourceAcceptance` is an operator-retained observation record. Its
 `submittedByHuman` and CI conclusion values are strict shape checks, not

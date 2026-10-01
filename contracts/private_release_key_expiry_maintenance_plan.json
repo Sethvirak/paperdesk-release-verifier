@@ -11,10 +11,11 @@
     "bootstrapExecutionPermitted": false,
     "sourceOrPlanChangesPermitted": false,
     "preparationBaseSha": "88036176a2c22c3e24b2245207cff2ce28010f32",
-    "reviewedPrimitiveBaseSha": "88036176a2c22c3e24b2245207cff2ce28010f32",
+    "reviewedPrimitiveBaseSha": "152eda670df0ec095bafd492963bcc6e32f97bd6",
     "pinnedPrimitiveHashes": {
-      "private_release_v2_bootstrap.py": "d714a55517d7bfbbfc5e498a01df439a0f622f3402e9cf48964446e8adc87a4a",
-      "private_release_v2_cleanup_locks.py": "e27e8f2fce7ef0bfa6950bf810d8470b7ccc2c0578658d2a1f7e1e21040581a6"
+      "private_release_v2_bootstrap.py": "d2b612069a130548a4ef126b70213819c5d8caa9646ec1b01187de47e0a26161",
+      "private_release_v2_cleanup_locks.py": "e27e8f2fce7ef0bfa6950bf810d8470b7ccc2c0578658d2a1f7e1e21040581a6",
+      "private_release_v2_history_conflict_diagnostics.py": "c3162081433835644fd9ffa5c7757a23c6ae3f1561549aa171302b1600fb9699"
     },
     "finalExecutionHeadBoundExternallyByFreshAuthorization": true,
     "sourceExceptionRequiresBothNamedHumanReviewsAndExactPrAndMergedMainCi": true
