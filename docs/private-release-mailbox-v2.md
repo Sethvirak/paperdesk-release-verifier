@@ -8,10 +8,11 @@ and result signing off the GitHub-hosted runner. The committed source is still
 evidence is source-dormant, and the reusable workflow rejects that state before
 Azure login.
 
-No Azure mutation is authorized merely by merging this source. The sole pre-S2
-Azure-mutation exception is a separately reviewed, external single-use
-authorization for the exact local bootstrap plan from the superseding
-**S1-prime** source. That exception does not authorize the reusable workflow,
+No Azure mutation is authorized merely by merging this source. Before S2, the
+only exceptions are separately reviewed, external single-use authorization for
+the exact local bootstrap plan from superseding **S1-prime** source and the
+bounded existing-key expiry maintenance specified below. Each exception has
+separate source, evidence and human approval gates. Neither authorizes the reusable workflow,
 mailbox or release operations, production activation or deployment,
 accepted-release operations, or caller integration. Evidence commit, S2 review,
 federated-identity credential (FIC) repin, activated environment document, and
@@ -53,7 +54,7 @@ The finite trust sequence avoids an impossible self-referential third commit:
    reviewed V2 resources. The local provisioner creates the source-addressed,
    versioned bridge package, completes the bounded canaries and cleanup, and
    creates the sole temporary publisher FIC to S1-prime as its final Azure
-   mutation. This is the sole pre-S2 Azure-mutation exception; the reusable
+   mutation. This is the bootstrap pre-S2 Azure-mutation exception; the reusable
    workflow remains unable to operate.
 3. Commit the concrete, SHA-independent provisioning evidence and bootstrap
    receipt in **S2**. S2 must not silently change the reviewed resource policy or
@@ -64,7 +65,8 @@ The finite trust sequence avoids an impossible self-referential third commit:
    credentials fail closed.
 5. After the FIC repin and independent evidence review, the main repository pins
    S2 and adds the exact production, persistence, and cleanup callers. Apart
-   from the one-shot bootstrap in step 2, no Azure mutation is authorized until
+   from the one-shot bootstrap in step 2 and the bounded existing-key maintenance
+   below, no Azure mutation is authorized until
    S2 evidence is accepted, the FIC is repinned, the activated environment
    document is exact/non-null, and the caller is pinned. Mailbox/release,
    accepted-release, production activation/deployment, and reusable-workflow
@@ -73,6 +75,100 @@ The finite trust sequence avoids an impossible self-referential third commit:
 No S3 self-reference is required. Any resource drift after S2 requires new
 evidence and a new reviewed pin rather than editing a mutable environment value
 around the source checks.
+
+## Bounded existing-signing-key expiry maintenance
+
+The existing RSA3072 software key version can fall below bootstrap's unchanged
+authorization-expiry-plus-30-days minimum. Bootstrap's create/adopt operation
+does not renew it. The earlier bootstrap approval, failed consumed authorization,
+and a successful maintenance receipt cannot authorize another bootstrap or
+stand in for S2, recovery, provider scan evidence, activation or release GO.
+
+This source exception covers only
+`scripts/private_release_key_expiry_maintenance.py` and
+`contracts/private_release_key_expiry_maintenance_plan.json`. Default execution
+validates local bytes without credentials. The explicit preflight mode permits
+fixed control-plane GETs and the existing account-identity check, with no Key
+Vault data GET or Azure mutation. Mutating execution requires the final helper
+and plan to be committed byte-for-byte at both local HEAD and exact merged
+`origin/main`, fresh exact PR and merged-main CI, both named human source
+reviews, a complete preflight no older than 300 seconds, and a separate direct
+human single-use approval bound to source, helper, plan and source-acceptance
+hashes. The merged head is supplied externally; source never pins its own
+future commit SHA. Original mailbox activation values remain null.
+Preflight observation also requires the exact clean merged `origin/main` tree
+and committed helper/plan bytes before importing credential-capable transport.
+The current unmerged preparation branch cannot make a cloud preflight call.
+
+Use an LF-preserving clean checkout for this helper, plan and unchanged
+primitives, for example command-scoped `git -c core.autocrlf=false` at checkout;
+verify the actual files match their committed bytes before observation or
+execution. The loader does not normalize executable bytes. A Windows CRLF
+checkout may be Git-clean but must fail this exact-byte admission. The original
+bootstrap plan retains historical CRLF approval hash `49f29773...`; its unchanged
+committed LF blob has the separately pinned `b6a834f1...` hash. These are distinct
+byte identities, and maintenance does not rewrite or renew bootstrap approval.
+
+`sourceAcceptance` is an operator-retained observation record. Its
+`submittedByHuman` and CI conclusion values are strict shape checks, not
+independently verifiable GitHub provider attestations or cryptographic proof.
+Before requesting execution approval, the operator must freshly verify genuine
+reviews and exact-head CI against primary GitHub observations, retaining actual
+review IDs, run IDs, timestamps and response hashes in the external review
+package. Source authors cannot log into either reviewer account to produce the
+required decision. New heads need fresh reviews and CI.
+
+The exact plan authorizes at most one creation of a two-DataAction custom role
+and one assignment to the existing owner principal at the existing key-name
+scope. DataActions are public-key read and key-attribute update; Azure applies
+that assignment across the key's versions and permits general attributes, so
+the source restricts its single PATCH to the existing version's expiry only.
+No sign, export, decrypt, secret, key creation/rotation, network, access-policy,
+workflow, production configuration or data permission is included. Role
+availability is limited to the PaperDesk resource group. There is no automatic
+Azure expiry for the grant.
+
+The 95-minute authorization has a 15-minute key-work cutoff and 80-minute cleanup
+reserve. The source 90-second credential/response reserve is unchanged; the
+adapter accounts for 2 seconds of clock-boundary overhead and rejects reads
+arriving after the original guard's logical deadline. There are at most seven
+one-attempt mutations, two Key Vault GETs and one expiry PATCH, with no retry
+or fallback. A bounded propagation wait makes no readiness request; the first
+GET's 403, timeout or drift stops key work and enters owned cleanup. Public
+material, key version, tags and non-expiry fields must stay exact; only expiry
+and a non-regressing provider-updated timestamp may change. No undocumented
+conditional/ETag promise is assumed; coordinate a window without other writers.
+
+The vault's existing CanNotDelete lock stays during the grant and PATCH. Only
+the source-owned assignment cleanup suspends that one exact lock and restores
+its original properties in `finally` before removing the unused owned role.
+The only after-expiry write exception is that exact restoration, bounded by
+15 minutes; no role/key mutation is allowed afterward. Interruption, a changed
+resource, delayed visibility, journal failure or an ambiguous response can
+require separately approved manual cleanup/restoration and must preserve
+NO-GO. Even a later exact read cannot turn an ambiguous write into success.
+The original guard's deadlines remain controlling; not every propagation tail
+can converge within them.
+
+The 1250 total REST control-GET cap is partitioned into 1187 ordinary reads and 63
+reads reserved for that exact owned lock restoration. Reserve eligibility
+requires the source guard's active restoration callback, an existing owned
+assignment and durably recorded suspension intent. Ordinary lock observations
+and other URLs cannot borrow it. Exhausted ordinary reads stop further normal
+work while preserving that bounded restoration path. Focused synthetic tests
+measure a combined delayed path of 972 control GETs (956 ordinary, 16 restoration);
+provider propagation, actual process death and cached permission revocation
+remain external limits. ARM assignment/definition absence does not prove
+instant removal of cached data permissions. Two complete final inventories,
+separated by at least 120 seconds, are required for cleanup acceptance.
+
+The fixed software key/version introduces no new plan or paid resource. The
+three possible Key Vault operations are metered; current illustrative public
+pricing places them below one US cent, and actual billing may differ. Fresh
+approval must include those transactions, temporary access and lock/restoration
+risk. The US$1 operational stop is not an Azure-enforced cap. A maintenance
+receipt remains local evidence only; fresh bootstrap source observation and
+independent authorization are separate steps.
 
 ## One-shot bootstrap commands and local-only recovery
 
@@ -554,8 +650,9 @@ Activation is blocked until all of the following are independently proven:
   activation/deployment proofs.
 
 Until those gates pass, the null activation contract remains the controlling
-state. The only mutating mode allowed before S2 is the exact separately
-authorized one-shot bootstrap; every reusable-workflow, mailbox/release,
+state. The only mutating modes allowed before S2 are the exact separately
+authorized one-shot bootstrap and bounded existing-key expiry maintenance
+specified above; every reusable-workflow, mailbox/release,
 accepted-release, production activation/deployment, and caller-integration mode
 must stop before Azure login.
 

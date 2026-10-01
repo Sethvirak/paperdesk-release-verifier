@@ -448,14 +448,49 @@ class WorkflowContractTests(unittest.TestCase):
 
         readme = README.read_text(encoding="utf-8")
         operator = V2_DOC.read_text(encoding="utf-8")
-        for document, heading in (
-            (readme, "## Activation trust DAG"),
-            (operator, "## Trust DAG and activation sequence"),
+        for document, heading, exception_policy in (
+            (readme, "## Activation trust DAG", (
+                "Before S2, the only Azure mutation exceptions are the separately reviewed, "
+                "one-shot local bootstrap provisioning described below and the narrowly bounded "
+                "existing-signing-key expiry maintenance in the authoritative operator contract.",
+                "Each needs its own fresh external single-use approval and exact reviewed merged source.",
+                "Existing bootstrap approval cannot authorize maintenance.",
+                "Neither exception authorizes a reusable workflow, mailbox or release operation, "
+                "production activation or deployment, accepted-release operation, or caller integration.",
+                "Those remain blocked until the exact S2 evidence is accepted, the sole FIC is "
+                "explicitly repinned to S2, the activated environment document is exact, and every "
+                "main caller uses the exact reviewed S2 SHA.",
+                "Apart from the exact one-shot bootstrap in step 2 and the bounded existing-key "
+                "expiry maintenance in the authoritative operator contract, no Azure mutation is "
+                "authorized before S2 evidence acceptance and FIC repin.",
+            )),
+            (operator, "## Trust DAG and activation sequence", (
+                "Before S2, the only exceptions are separately reviewed, external single-use "
+                "authorization for the exact local bootstrap plan from superseding **S1-prime** "
+                "source and the bounded existing-key expiry maintenance specified below.",
+                "Each exception has separate source, evidence and human approval gates.",
+                "Mutating execution requires the final helper and plan to be committed byte-for-byte "
+                "at both local HEAD and exact merged `origin/main`, fresh exact PR and merged-main CI, "
+                "both named human source reviews, a complete preflight no older than 300 seconds, "
+                "and a separate direct human single-use approval bound to source, helper, plan and "
+                "source-acceptance hashes.",
+                "The earlier bootstrap approval, failed consumed authorization, and a successful "
+                "maintenance receipt cannot authorize another bootstrap or stand in for S2, recovery, "
+                "provider scan evidence, activation or release GO.",
+                "Neither authorizes the reusable workflow, mailbox or release operations, "
+                "production activation or deployment, accepted-release operations, or caller integration.",
+                "Apart from the one-shot bootstrap in step 2 and the bounded existing-key maintenance "
+                "below, no Azure mutation is authorized until S2 evidence is accepted, the FIC is "
+                "repinned, the activated environment document is exact/non-null, and the caller is pinned.",
+                "The only mutating modes allowed before S2 are the exact separately authorized "
+                "one-shot bootstrap and bounded existing-key expiry maintenance specified above; "
+                "every reusable-workflow, mailbox/release, accepted-release, production "
+                "activation/deployment, and caller-integration mode must stop before Azure login.",
+            )),
         ):
             for required in (
                 "S1-prime",
                 "S2",
-                "sole pre-S2 Azure-mutation exception",
                 "external single-use authorization",
                 "reusable workflow",
                 "mailbox",
@@ -471,6 +506,13 @@ class WorkflowContractTests(unittest.TestCase):
                 sequence.index("S2"),
             )
             self.assertLess(sequence.index("S2"), sequence.index("repin"))
+
+            # Allow line wrapping, while requiring both exact bounded exceptions
+            # and rejecting contradictory compatibility wording elsewhere.
+            normalized = " ".join(document.split())
+            self.assertNotIn("sole pre-S2 Azure-mutation exception", normalized)
+            for required in exception_policy:
+                self.assertIn(required, normalized)
 
         contradictory = (
             "No Azure mutation is authorized before S2 evidence acceptance",

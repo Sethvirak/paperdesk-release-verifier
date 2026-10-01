@@ -1,0 +1,562 @@
+{
+  "schemaVersion": 1,
+  "kind": "paperdesk-existing-key-expiry-maintenance-review-plan",
+  "status": "DORMANT_SOURCE_PROPOSAL_NO_CLOUD_AUTHORIZATION",
+  "ceremonyId": "28a41fb1-7080-44b6-85f5-bd41871b1f1e",
+  "source": {
+    "verifierMain": "426438a699306c639a580e268a7f9330b70c4ebf",
+    "unchangedBootstrapPlanSha256": "49F2977345BBBB25A26A42049AF0267603261C4F03909131CC30FFB1DBD8F760",
+    "unchangedBootstrapPlanGitBlobSha256": "b6a834f1bb00f10312d28a4b88cee7cc28fb9796a7f38384ca7245f0765bed76",
+    "consumedBootstrapAuthorization": "79b4cb83-29a4-4fba-9ef7-7fca1d19f930",
+    "bootstrapExecutionPermitted": false,
+    "sourceOrPlanChangesPermitted": false,
+    "preparationBaseSha": "88036176a2c22c3e24b2245207cff2ce28010f32",
+    "reviewedPrimitiveBaseSha": "88036176a2c22c3e24b2245207cff2ce28010f32",
+    "pinnedPrimitiveHashes": {
+      "private_release_v2_bootstrap.py": "d714a55517d7bfbbfc5e498a01df439a0f622f3402e9cf48964446e8adc87a4a",
+      "private_release_v2_cleanup_locks.py": "e27e8f2fce7ef0bfa6950bf810d8470b7ccc2c0578658d2a1f7e1e21040581a6"
+    },
+    "finalExecutionHeadBoundExternallyByFreshAuthorization": true,
+    "sourceExceptionRequiresBothNamedHumanReviewsAndExactPrAndMergedMainCi": true
+  },
+  "historicalPermissionObservation": {
+    "path": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-signing-key-renewal-caller-permissions-20261001.json",
+    "sha256": "4c3c18acf5cf6632f16dad65ba8d047e9858b7b2664d94fb2ac23f240210c1dc",
+    "observedAt": "2026-10-01T02:18:56.692369Z",
+    "completedAt": "2026-10-01T02:19:00.500214Z",
+    "pageComplete": true,
+    "listedKeyReadAllowed": false,
+    "listedKeyUpdateAllowed": false
+  },
+  "fixed": {
+    "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+    "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+    "ownerPrincipalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+    "ownerPrincipalType": "User",
+    "resourceGroupId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea",
+    "vaultResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d",
+    "keyResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing",
+    "keyVersionUri": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401",
+    "roleDefinitionId": "515f2f22-13a5-4405-891d-3a4426418d86",
+    "roleDefinitionResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/515f2f22-13a5-4405-891d-3a4426418d86",
+    "roleAssignableScope": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea",
+    "assignmentId": "99ef3a3e-c48b-410c-a42c-3d77f5fb99c0",
+    "assignmentResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing/providers/Microsoft.Authorization/roleAssignments/99ef3a3e-c48b-410c-a42c-3d77f5fb99c0",
+    "lockResourceId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete",
+    "ownershipMarker": "paperdesk-private-release-v2-temporary:maintenance-key-expiry-renewal:28a41fb1-7080-44b6-85f5-bd41871b1f1e"
+  },
+  "expiry": {
+    "historicalBefore": "2026-10-31T07:00:24Z",
+    "desired": "2027-01-01T00:00:00Z",
+    "desiredUnixSeconds": 1798761600
+  },
+  "bounds": {
+    "azureMutationAttemptsMaximum": 7,
+    "keyVaultDataPlaneGetAttemptsMaximum": 2,
+    "keyVaultDataPlanePatchAttemptsMaximum": 1,
+    "keyVaultMeteredOperationAttemptsMaximum": 3,
+    "automaticMutationRetries": 0,
+    "transportRetries": 0,
+    "controlPlaneGetAttemptsMaximum": 1250,
+    "preflightMaximumAgeSeconds": 300,
+    "ceremonyAuthorizationMaximumSeconds": 5700,
+    "grantSetupMaximumSeconds": 600,
+    "keyPatchAdmissionMaximumSecondsFromStart": 690,
+    "cleanupReservedSeconds": 4800,
+    "roleVisibilityMaximumSeconds": 600,
+    "roleDeletionAbsenceMaximumSeconds": 600,
+    "lockConvergenceMaximumSeconds": 120,
+    "lockFinalReadEnvelopeSeconds": 90,
+    "exactRestorationOnlyAfterAuthorizationExpiryMaximumSeconds": 900,
+    "finalReadOnlyObservationSeparationSeconds": 120,
+    "proposedOperationalStopUsd": 1,
+    "providerEnforcedDollarCap": false,
+    "grantCreationMutationLastAdmitSecondsFromStart": 208,
+    "allKeyWorkMustFinishSecondsFromStart": 900,
+    "restResponseAndTokenEnvelopeSeconds": 92,
+    "pollAlignmentSlackSeconds": 2,
+    "firstDataGetNoEarlierThanSecondsFromStart": 480,
+    "sourceCredentialAndResponseReserveSeconds": 90,
+    "transportAdmissionBoundaryAllowanceSeconds": 2,
+    "ordinaryControlPlaneGetAttemptsMaximum": 1187,
+    "exactOwnedLockRestorationGetAttemptsReservedMaximum": 63,
+    "restorationReserveRequiresDurableSuspensionIntentAndSourceGuardCallback": true
+  },
+  "preflight": {
+    "requiredAccountContext": {
+      "subscriptionId": "9c4e0d0d-602f-4cde-84bd-337250e5b64c",
+      "tenantId": "aba83bd8-3e5c-4a87-9eb1-7bca070685b2",
+      "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b"
+    },
+    "requiredControlPlaneAuthority": [
+      "Microsoft.Authorization/roleDefinitions/read",
+      "Microsoft.Authorization/roleDefinitions/write",
+      "Microsoft.Authorization/roleDefinitions/delete",
+      "Microsoft.Authorization/roleAssignments/read",
+      "Microsoft.Authorization/roleAssignments/write",
+      "Microsoft.Authorization/roleAssignments/delete",
+      "Microsoft.Authorization/locks/read",
+      "Microsoft.Authorization/locks/write",
+      "Microsoft.Authorization/locks/delete",
+      "Microsoft.KeyVault/vaults/read",
+      "Microsoft.KeyVault/vaults/keys/read"
+    ],
+    "requiredAbsentResourceGetUrls": [
+      "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/515f2f22-13a5-4405-891d-3a4426418d86?api-version=2022-04-01",
+      "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing/providers/Microsoft.Authorization/roleAssignments/99ef3a3e-c48b-410c-a42c-3d77f5fb99c0?api-version=2022-04-01"
+    ],
+    "requiredCompleteInventoryUrls": [
+      "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/locks?api-version=2016-09-01",
+      "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01",
+      "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01"
+    ],
+    "requiredExactLockGetUrl": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete?api-version=2016-09-01",
+    "requiredVaultGetUrl": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d?api-version=2025-05-01",
+    "requiredArmKeyGetUrl": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing?api-version=2023-07-01",
+    "freshCallerKeyPermissionsGetUrl": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing/providers/Microsoft.Authorization/permissions?api-version=2022-04-01",
+    "rejectPagination": true,
+    "onlyPermittedEffectiveAssignmentDeletionLock": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete",
+    "unexpectedInheritedLocks": "STOP_BEFORE_GRANT",
+    "initialRoleAndAssignmentPresence": "STOP_NO_ADOPT_NO_OVERWRITE",
+    "existingVaultRbacModelMustRemain": true,
+    "existingVaultNetworkProtectionAndAllOtherAssignmentsMustRemainUnchanged": true,
+    "minimumAuthorizationDurationSeconds": 5700,
+    "noConcurrentAuthorizedAdministratorMutationWindow": true,
+    "noDocumentedAtomicConditionalGuarantee": true,
+    "subscriptionLevelDefinitionDeleteMustHaveNoInheritedLock": true,
+    "preserveAllOtherRolesAndLocksByCanonicalProjections": true,
+    "armKeyUriWithVersionMustEqualExactApprovedVersion": true,
+    "exactExpectedVaultProperties": {
+      "enableRbacAuthorization": true,
+      "publicNetworkAccess": "Enabled",
+      "enableSoftDelete": true,
+      "enablePurgeProtection": true,
+      "networkAcls": {
+        "defaultAction": "Allow",
+        "bypass": "None"
+      }
+    },
+    "noPriorResidualTemporaryBootstrapOrMaintenanceRoles": true,
+    "preserveExistingBootstrapSourcePlanAndActivation": true
+  },
+  "createBodies": {
+    "roleDefinition": {
+      "properties": {
+        "roleName": "PaperDesk V2 temporary maintenance-key-expiry-renewal 28a41fb1-7080-44b6-85f5-bd41871b1f1e",
+        "description": "paperdesk-private-release-v2-temporary:maintenance-key-expiry-renewal:28a41fb1-7080-44b6-85f5-bd41871b1f1e",
+        "type": "CustomRole",
+        "permissions": [
+          {
+            "actions": [],
+            "notActions": [],
+            "dataActions": [
+              "Microsoft.KeyVault/vaults/keys/read",
+              "Microsoft.KeyVault/vaults/keys/update/action"
+            ],
+            "notDataActions": []
+          }
+        ],
+        "assignableScopes": [
+          "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea"
+        ]
+      }
+    },
+    "roleAssignment": {
+      "properties": {
+        "principalId": "b97bfa13-b375-4b27-93d7-141029dbc05b",
+        "principalType": "User",
+        "roleDefinitionId": "/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/515f2f22-13a5-4405-891d-3a4426418d86",
+        "description": "paperdesk-private-release-v2-temporary:maintenance-key-expiry-renewal:28a41fb1-7080-44b6-85f5-bd41871b1f1e"
+      }
+    },
+    "keyExpiryPatch": {
+      "attributes": {
+        "exp": 1798761600
+      }
+    },
+    "exactLockRestoration": {
+      "properties": {
+        "level": "CanNotDelete",
+        "notes": "PaperDesk production Key Vault deletion protection. Remove only for an approved delete, replacement, RBAC cleanup, or diagnostic cleanup."
+      }
+    }
+  },
+  "mutationAttemptOrder": [
+    {
+      "step": 1,
+      "id": "createOwnedTemporaryRoleDefinition",
+      "method": "PUT",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/515f2f22-13a5-4405-891d-3a4426418d86?api-version=2022-04-01",
+      "bodyReference": "createBodies.roleDefinition",
+      "requiredPreviousState": "404",
+      "successStatuses": [
+        201
+      ],
+      "maximumAttempts": 1
+    },
+    {
+      "step": 2,
+      "id": "createOwnedTemporaryKeyAssignment",
+      "method": "PUT",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing/providers/Microsoft.Authorization/roleAssignments/99ef3a3e-c48b-410c-a42c-3d77f5fb99c0?api-version=2022-04-01",
+      "bodyReference": "createBodies.roleAssignment",
+      "requiredPreviousState": "404",
+      "successStatuses": [
+        201
+      ],
+      "maximumAttempts": 1
+    },
+    {
+      "step": 3,
+      "id": "renewExactExistingKeyVersionExpiry",
+      "method": "PATCH",
+      "url": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401?api-version=2025-07-01",
+      "bodyReference": "createBodies.keyExpiryPatch",
+      "requiredPreviousState": "exact fresh public GET; source and permissions exact; request begins <=690s, all key work finishes <=900s; >=4800s cleanup reserve remains",
+      "successStatuses": [
+        200
+      ],
+      "maximumAttempts": 1,
+      "optionalIfKeyReadOrSetupFails": true
+    },
+    {
+      "step": 4,
+      "id": "suspendOneExactVaultDeletionLockForAssignmentCleanup",
+      "method": "DELETE",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete?api-version=2016-09-01",
+      "body": null,
+      "requiredPreviousState": "exact owned assignment still present; full effective locks exact; original lock exact; cleanup reserve intact",
+      "successStatuses": [
+        200,
+        202,
+        204
+      ],
+      "maximumAttempts": 1,
+      "skipIfAssignmentProvenAbsent": true
+    },
+    {
+      "step": 5,
+      "id": "deleteOwnedTemporaryKeyAssignment",
+      "method": "DELETE",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/keys/paperdesk-release-result-signing/providers/Microsoft.Authorization/roleAssignments/99ef3a3e-c48b-410c-a42c-3d77f5fb99c0?api-version=2022-04-01",
+      "body": null,
+      "requiredPreviousState": "lock absence proven; immediate exact owned assignment reread matches",
+      "successStatuses": [
+        200,
+        202,
+        204
+      ],
+      "maximumAttempts": 1,
+      "completionRequiresFresh404": true
+    },
+    {
+      "step": 6,
+      "id": "restoreOneExactVaultDeletionLockInFinally",
+      "method": "PUT",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/resourceGroups/rg-master-data-structure-sea/providers/Microsoft.KeyVault/vaults/kv-mds-sea-9c4e0d0d/providers/Microsoft.Authorization/locks/paperdesk-protect-keyvault-delete?api-version=2016-09-01",
+      "bodyReference": "createBodies.exactLockRestoration",
+      "requiredPreviousState": "exact lock absent; no third state; execute in finally around lock suspension",
+      "successStatuses": [
+        200,
+        201
+      ],
+      "maximumAttempts": 1,
+      "skipIfExactLockAlreadyRestored": true,
+      "exactRestorationOnlyAfterExpiry": true
+    },
+    {
+      "step": 7,
+      "id": "deleteUnusedOwnedTemporaryRoleDefinition",
+      "method": "DELETE",
+      "url": "https://management.azure.com/subscriptions/9c4e0d0d-602f-4cde-84bd-337250e5b64c/providers/Microsoft.Authorization/roleDefinitions/515f2f22-13a5-4405-891d-3a4426418d86?api-version=2022-04-01",
+      "body": null,
+      "requiredPreviousState": "assignment absence proven; lock restored; exact owned definition; complete referencing assignment inventory empty",
+      "successStatuses": [
+        200,
+        204
+      ],
+      "maximumAttempts": 1
+    }
+  ],
+  "dataPlaneSequence": [
+    {
+      "id": "publicKeyBefore",
+      "method": "GET",
+      "url": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401?api-version=2025-07-01",
+      "maximumAttempts": 1,
+      "requiredStatus": 200
+    },
+    {
+      "id": "keyExpiryOnlyUpdate",
+      "mutationStep": 3
+    },
+    {
+      "id": "publicKeyAfterOrAmbiguityReconciliation",
+      "method": "GET",
+      "url": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401?api-version=2025-07-01",
+      "maximumAttempts": 1,
+      "requiredStatus": 200
+    }
+  ],
+  "journaling": {
+    "localClaimCreateOnly": true,
+    "localClaimPath": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-28a41fb1-7080-44b6-85f5-bd41871b1f1e-claimed.json",
+    "authorizationPath": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-28a41fb1-7080-44b6-85f5-bd41871b1f1e-authorization.json",
+    "journalPath": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-28a41fb1-7080-44b6-85f5-bd41871b1f1e-write-journal.jsonl",
+    "finalReceiptPath": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-28a41fb1-7080-44b6-85f5-bd41871b1f1e-final-receipt.json",
+    "authorizationMustBindMaintenancePlanSha256": true,
+    "authorizationMustBindFreshPreflightSha256": true,
+    "userApprovalEvidenceRequired": true,
+    "everyMutationRequiresFsyncedIntentBeforeCall": true,
+    "everyResultRequiresFsync": true,
+    "includeStepAttemptedEvenWhenResponseAmbiguous": true,
+    "ownershipBindsCeremonyAndExactCreatedResourceProjection": true,
+    "claimAndHistoricalEvidencePreserved": true,
+    "noTokensSecretsPrivateKeyOrRawExceptionsRetained": true,
+    "userApprovalMustBindFinalSourceAcceptanceAndPlanAndExecutorHashes": true
+  },
+  "completion": {
+    "roleDefinitionMustBe404": true,
+    "assignmentMustBe404": true,
+    "roleDefinitionReferencesMustBeEmptyInCompleteInventory": true,
+    "ownershipMarkersMustBeAbsentInCompleteRoleAndAssignmentInventories": true,
+    "exactVaultLockMustMatchOriginalProperties": true,
+    "allOtherLocksAssignmentsVaultAndKeyNonExpiryFieldsMustBePreserved": true,
+    "finalSnapshotsSeparatedByAtLeast120Seconds": true,
+    "renewalAndCleanupVerdictsSeparate": true,
+    "cacheRevocationMustNotBeClaimedFromArmAbsenceAlone": true,
+    "noBootstrapS2OrReleaseGoClaim": true,
+    "existingBootstrapResidualMarkerGuardsMustRecognizeAnyLeak": true,
+    "originalBootstrapControlActivationMustRemainDormant": true
+  },
+  "failureRules": {
+    "anyGrantOrKeyFailure": "STOP_ADDITIONAL_GRANT_OR_KEY_WRITES_AND_ENTER_OWNED_CLEANUP",
+    "anyUnownedOrThirdState": "DO_NOT_DELETE_OR_OVERWRITE_THIRD_STATE; RESTORE_ONLY_EXACT_MISSING_OWNED_LOCK_IF_ADMITTED; NO_GO",
+    "ambiguousWrite": "NO_RETRY; BOUNDED_READ_ONLY_RECONCILIATION; OWNED_CLEANUP_ONLY; PRESERVE_FAILURE",
+    "authorizationExpiry": "NO_FURTHER_ROLE_OR_KEY_MUTATION; EXACT_ORIGINAL_LOCK_RESTORATION_ONLY_WITHIN_900_SECONDS_RESERVE; NO_GO",
+    "processDeathOrJournalFailure": "TEMPORARY_ACCESS_OR_MISSING_PROTECTION_MAY_REQUIRE_SEPARATELY_BOUND_MANUAL_RECOVERY; NO_GO",
+    "ordinaryControlGetBudgetExhausted": "NO_ADDITIONAL_ORDINARY_READS_OR_WRITES; ONLY_EXACT_SOURCE_GUARD_OWNED_LOCK_RESTORATION_USING_RESERVED_READS; NO_GO_AND_MANUAL_CLEANUP_IF_GRANT_REMAINS"
+  },
+  "permissionLimitations": [
+    "ordinary RBAC assignment has no automatic expiry",
+    "key-name assignment covers the key's versions; permission is not version-scoped",
+    "keys/update/action permits key attribute updates generally; permission cannot constrain only exp",
+    "request/executor constrains a single exact-version exp-only PATCH",
+    "ARM locks protect control-plane deletions, not data-plane key attributes",
+    "RBAC deletion and Key Vault authorization caching may converge asynchronously"
+  ],
+  "forbidden": [
+    "new paid infrastructure",
+    "key create/import/rotate/export/backup/sign/decrypt",
+    "secret or private-key reads",
+    "broad CryptoOfficer/CryptoUser/Administrator role",
+    "subscription or resource-group role assignment",
+    "any second grant or key write",
+    "any other lock suspension",
+    "vault firewall/network/RBAC-model/access-policy modification",
+    "source/bootstrap-plan change",
+    "bootstrap replay or retry",
+    "production app or data mutation",
+    "deployment or provisional/canary activation",
+    "scan-cap/GitHub-budget increase"
+  ],
+  "executionPreparation": {
+    "separateMaintenanceHarnessRequired": true,
+    "reuseAllowed": [
+      "AzureCliRestSession with unchanged90s reserve,92s standalone adapter envelope,strict original guard logical deadlines,and no retries",
+      "canonical_json_bytes and pure role/key/lock projection validators",
+      "CleanupLockGuard with callbacks bound only to this separately approved maintenance plan"
+    ],
+    "reuseForbidden": [
+      "AzureCliBootstrapTransport for this different plan",
+      "changing original bootstrap plan or admitted operations",
+      "monkey-patching residual guards or lock maps",
+      "manufacturing S2 or successful bootstrap receipts",
+      "_read_signing_public_jwk_when_ready (up to64KeyVaultGETs)",
+      "original post-expiry temporary-role-definition delete exemption",
+      "unsupported If-Match or If-None-Match CAS claims"
+    ],
+    "executionStatus": "SOURCE_PROPOSAL_PREPARED_NOT_PUBLISHED_OR_CLOUD_EXECUTED",
+    "offlineCasesRequired": [
+      "grant creation failure",
+      "ambiguous create response and delayed visibility",
+      "changed/unowned role or assignment",
+      "Key Vault GET 403",
+      "PATCH ambiguity and key non-expiry mismatch",
+      "partial or paginated inventories",
+      "lock delete ambiguity",
+      "assignment delete ambiguity",
+      "exact restoration on failure or authorization expiry",
+      "journal failure and process-death manual recovery boundary",
+      "each phase cutoff including full90s request admission",
+      "assignment DELETE202 is only admitted response; completion still requires fresh404",
+      "residual marker prefixes recognized by verifier",
+      "key identity/modulus/attributes/tags/private-member checks",
+      "both final complete snapshots with >=120s separation",
+      "unchangedRestSession integration with advancing clock/fakeCLIandexchange",
+      "original guard logical readdeadline late result remainsfailure",
+      "exact ordinalKeyVaultGET600/780scutoffs",
+      "1250total1187ordinary63restoration partition; noordinaryborrowing",
+      "combineddelayedpathGETcardinality; exhaustionstillrestoresoneexactlock",
+      "finalmergedHEAD/origin-main/committedhelperandplan/sourceacceptanceproofs",
+      "humanapprovalbindssourceAcceptance/plan/helper/finalsourceSHA"
+    ],
+    "remainingCodeGap": "Execution requires this exception's final merged source, both genuine named exact-head reviews, exact PR and merged-main CI, fresh source/preflight/hash-bound direct human approval, and cleanup/lock risk acceptance. Current branch and preserved off-repo426draft cannot execute."
+  },
+  "costEvidence": {
+    "path": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-public-retail-cost-20261001.json",
+    "sha256": "7e00efe44bf3733e834e9b3f9c0eea8566859a93f0d1f30e5f976c52f22e2112",
+    "softwareRsa3072RetailUsdPer10000Operations": 0.15,
+    "maximumMeteredOperations": 3,
+    "illustrativeUsd": 0.000045,
+    "actualBillingMayDiffer": true,
+    "primaryPricingPage": "https://azure.microsoft.com/en-us/pricing/details/key-vault/"
+  },
+  "supersedesLocalDraftSha256": "D5A8DB5E49011D8EB11CB76F72250B8E78544E31850095408AFB9A7BE22A0308",
+  "keyValidation": {
+    "requiredArmProperties": {
+      "kty": "RSA",
+      "keySize": 3072,
+      "keyOps": [
+        "sign",
+        "verify"
+      ],
+      "keyUriWithVersion": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401",
+      "enabled": true,
+      "exportable": false,
+      "releasePolicy": null
+    },
+    "requiredPublicKey": {
+      "kid": "https://kv-mds-sea-9c4e0d0d.vault.azure.net/keys/paperdesk-release-result-signing/60c5e54e98e64ef0b909cb8105ca2401",
+      "kty": "RSA",
+      "e": "AQAB",
+      "key_ops": [
+        "sign",
+        "verify"
+      ],
+      "modulusDecodedLengthBytes": 384,
+      "modulusBitLength": 3072,
+      "modulusUnpaddedCanonicalBase64url": true,
+      "privateMembersForbidden": [
+        "d",
+        "p",
+        "q",
+        "dp",
+        "dq",
+        "qi",
+        "k"
+      ]
+    },
+    "requiredAttributes": {
+      "enabled": true,
+      "exportable": false,
+      "recoverableDays": 90,
+      "nonemptyRecoveryLevel": true,
+      "integerFields": [
+        "exp",
+        "created",
+        "updated",
+        "recoverableDays"
+      ],
+      "nbf": "null or integer <=created"
+    },
+    "beforeExpiryUnixSeconds": 1793430024,
+    "afterExpiryUnixSeconds": 1798761600,
+    "afterUpdated": "integer >=before.updated and >=created; may equal before.updated due provider clock granularity",
+    "exactBeforeAfterComparisons": [
+      "kid",
+      "kty",
+      "n",
+      "e",
+      "key_ops",
+      "all key members",
+      "attributes except exp and updated",
+      "tags and their absence/presence",
+      "all other returned non-private fields"
+    ],
+    "releasePolicyMustBeAbsentOrNull": true,
+    "privateReturnedMembersCauseRejectWithoutPersistence": true,
+    "duplicateJsonMembersCauseReject": true,
+    "rawPrivateFieldsOrResponsesMustNotBePersisted": true,
+    "purposeBuiltStandaloneValidatorRequired": true,
+    "forbidFabricatingBootstrapPriorState": true,
+    "immutablePublicMaterialRequiresFreshBeforeAndAfter": true,
+    "firstGetFailure": "NO_PATCH; ENTER_OWNED_CLEANUP",
+    "secondGetPurposeOnly": "exact post-PATCH validation or one ambiguous-PATCH reconciliation; no third GET or readiness polling"
+  },
+  "deadlineSchedule": {
+    "policy": "Source90s credential+response reserve stays unchanged. Standalone callbacks reserve92s including2s boundary overhead. Original guard logical read deadlines remain strict;2s transport allowance cannot turn a late read into success. Convergence is not promised.",
+    "grantCreates": {
+      "latestRequestStartOffsetSeconds": 208,
+      "latestResponseCompletionOffsetSeconds": 300,
+      "eachMutationMaximumAttempts": 1
+    },
+    "normalSetup": {
+      "absoluteDeadlineOffsetSeconds": 600,
+      "noNewGrantWritesAfterOffsetSeconds": 208
+    },
+    "key": {
+      "firstGetLatestStartOffsetSeconds": 600,
+      "patchLatestStartOffsetSeconds": 690,
+      "afterGetLatestStartOffsetSeconds": 780,
+      "finishAbsoluteDeadlineOffsetSeconds": 900,
+      "oneGetOnePatchOneGetMaximumRequestSeconds": 276,
+      "documentedReadOnlyPropagationWait": "After exact assignment ARM visibility, wait without provider readiness reads until ceremonyT+480s; first data GET still must begin byT+600s. This does not prove access; first403/timeouts entercleanup, no retry."
+    },
+    "cleanupAssignmentGuard": {
+      "fixedReadAndMutationEnvelopeCount": 9,
+      "fixedEnvelopesSeconds": 828,
+      "lockAbsenceWindowSeconds": 214,
+      "assignmentAbsenceWindowSeconds": 694,
+      "lockRestorationWindowSeconds": 122,
+      "maximumSeconds": 1858,
+      "explanation": "Nine conservative92s fixed envelopes; source lockabsence120+2alignment+90final with2s adapter tail; source assignmentabsence600+2+90 with2s adapter tail; lockrestoration120+2tail. Original logical guard read deadlines remain strict and late responses fail."
+    },
+    "roleDefinitionCleanup": {
+      "exactDefinitionReadSeconds": 92,
+      "completeReferenceInventorySeconds": 92,
+      "deleteEnvelopeSeconds": 92,
+      "absenceWindowSeconds": 694,
+      "maximumSeconds": 970
+    },
+    "finalProof": {
+      "snapshotGets": [
+        "roleDefinition404",
+        "assignment404",
+        "completeRoleDefinitions",
+        "completeAssignments",
+        "completeSubscriptionLocks",
+        "exactVaultLock",
+        "vaultProperties",
+        "armKeyProperties"
+      ],
+      "getEnvelopeSeconds": 92,
+      "snapshots": 2,
+      "separationAfterFirstCompletionSeconds": 120,
+      "maximumSeconds": 1592
+    },
+    "normalCleanupMaximumSeconds": 4420,
+    "normalCleanupAdmissionOffsetSeconds": 900,
+    "normalCompleteLatestOffsetSeconds": 5320,
+    "ambiguousGrantSettlement": {
+      "maximumSeconds": 694,
+      "mustFinishByOffsetSeconds": 994,
+      "stopAllFurtherGrantOrKeyWrites": true,
+      "sharedFromOriginalWireAttempt": true,
+      "convergenceAbsoluteBoundary": "original grant intent+92sresponse+600sconvergence; final observation+2salignment+92sadaptor. Setup visibility failure does not reset this window."
+    },
+    "ambiguousAssignmentPathCompleteLatestOffsetSeconds": 5414,
+    "authorizationEndOffsetSeconds": 5700,
+    "smallestWorstCaseRemainingMarginSeconds": 286,
+    "absoluteDeadlineRule": "Each callback clamps its phase/authorization deadline; every mutation needs a full92s adapter envelope. Its attempted-before-wire fsynced intent cannot consume the2s session admission allowance; later sourceclockcheck still requires90s. No deferred role DELETE after expiry. Explicit keyGET ordinal starts <=600/780s.",
+    "restorationOnlyExceptionalDeadline": "If lock suspension intent was durable and exact lock absent, exact original-lock PUT only may be admitted until authExpiry+900s; no other writes. Ambiguous result remains failure even if exact readback proves restoration.",
+    "unsupportedExecutorGap": "No claimed cloud compatibility or execution: the prepared separate helper and meaningful synthetic tests still require independent audit, stable hash bindings and fresh direct human approval."
+  },
+  "historicalNetworkObservation": {
+    "path": "C:/Users/HP PC/.codex/outputs/01a0c486-d7ec-7742-b701-121466d11565/PaperDesk-key-renewal-vault-network-20261001.json",
+    "sha256": "41c21fb14a921f8ed1794fd41b49f038b3519ac69c0cea682d5e89a2d9acbaa1",
+    "observedAt": "2026-10-01T02:33:04.37516Z",
+    "completedAt": "2026-10-01T02:33:09.615972Z",
+    "keyVaultDataPlaneOperations": 0
+  }
+}
