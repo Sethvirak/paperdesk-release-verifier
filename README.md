@@ -519,6 +519,13 @@ census observation, not a claim that an out-of-band administrator cannot invoke
 Kudu afterward. The trigger is never retried, and the existing control deadline
 and one-use authorization remain unchanged.
 
+History detail-response digests remain reader diagnostics. The canonical canary
+receipt removes only `detailResponseSha256s` from its boundary and final census;
+all run projections, census digests and unknown-field rejection stay intact.
+The connected offline qualification exercises actual settings/canary owners and
+their emitted journal through receipt builders with synthetic outer resources.
+It supplies no provider observation, source acceptance or release permission.
+
 The canary owns one shared allowance of 728 single-attempt history detail reads:
 the previous four-read ceiling multiplied by one boundary, at most 180 terminal
 polls and one final census. This is a fixed resource count policy, not a measured
