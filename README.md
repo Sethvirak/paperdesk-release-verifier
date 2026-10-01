@@ -12,10 +12,12 @@ artifact, customer record, persistent cloud credential, or production secret.
 | Private release mailbox V2 | Source-dormant | Every activation field is null; every mutating operation stops before Azure login |
 | Watchdog V2 | Source-dormant | Baseline, reconciliation, and deadline workflows stop before OIDC/provider calls |
 
-Merging dormant source is not deployment authorization. The sole pre-S2 Azure-mutation exception
-is the separately reviewed, one-shot local bootstrap
-provisioning described below, executed from the exact merged **S1-prime** source
-under an external single-use authorization. It does not authorize a reusable
+Merging dormant source is not deployment authorization. Before S2, the only
+Azure mutation exceptions are the separately reviewed, one-shot local bootstrap
+provisioning described below and the narrowly bounded existing-signing-key
+expiry maintenance in the authoritative operator contract. Each needs its own
+fresh external single-use approval and exact reviewed merged source. Existing
+bootstrap approval cannot authorize maintenance. Neither exception authorizes a reusable
 workflow, mailbox or release operation, production activation or deployment,
 accepted-release operation, or caller integration. Those remain blocked until
 the exact S2 evidence is accepted, the sole FIC is explicitly repinned to S2,
