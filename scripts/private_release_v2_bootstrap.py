@@ -28,6 +28,8 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -178,9 +180,73 @@ MAX_AUTHORIZATION_SECONDS = (
     CONTROLLER_CANARY_PRE_CONTROLLER_WORK_ALLOWANCE_SECONDS
     + CONTROLLER_CANARY_POST_ADMISSION_REQUIRED_SECONDS
 )
+REST_TRANSPORT_DIAGNOSTIC_STAGES = frozenset({
+    "unknown", "request-envelope", "request-construction", "exchange-open",
+    "response-status", "response-body", "response-headers", "response-close",
+    "response-validation", "response-encoding", "exchange-launch",
+    "exchange-wait", "exchange-output", "exchange-decode",
+})
+REST_TRANSPORT_DIAGNOSTIC_CATEGORIES = frozenset({
+    "unknown", "tls-verification", "tls", "name-resolution", "socket-timeout",
+    "connection-reset", "connection-refused", "connection-aborted", "os-error",
+    "url-error", "invalid-value", "total-timeout", "subprocess-error",
+    "child-exit", "empty-output", "output-limit", "invalid-utf8",
+    "invalid-json", "invalid-envelope", "invalid-base64",
+})
+
+
+def _safe_rest_transport_diagnostic(value: Any) -> dict[str, str] | None:
+    """Accept two fixed enums only; diagnostic text never changes admission."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"stage", "category"}
+        or type(value.get("stage")) is not str
+        or value["stage"] not in REST_TRANSPORT_DIAGNOSTIC_STAGES
+        or type(value.get("category")) is not str
+        or value["category"] not in REST_TRANSPORT_DIAGNOSTIC_CATEGORIES
+    ):
+        return None
+    return {"stage": value["stage"], "category": value["category"]}
+
+
+def _rest_transport_error_category(error: BaseException) -> str:
+    """Classify exception types without reading their text, URL, or arguments."""
+
+    reason = (
+        error.reason
+        if isinstance(error, urllib.error.URLError)
+        and isinstance(error.reason, BaseException)
+        else error
+    )
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls-verification"
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, socket.gaierror):
+        return "name-resolution"
+    if isinstance(reason, TimeoutError):
+        return "socket-timeout"
+    if isinstance(reason, ConnectionResetError):
+        return "connection-reset"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection-refused"
+    if isinstance(reason, ConnectionAbortedError):
+        return "connection-aborted"
+    if isinstance(error, urllib.error.URLError):
+        return "url-error"
+    if isinstance(reason, OSError):
+        return "os-error"
+    if isinstance(reason, (ValueError, TypeError)):
+        return "invalid-value"
+    return "unknown"
+
+
 _AZURE_REST_EXCHANGE_CHILD = r"""
 import base64
 import json
+import socket
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -198,6 +264,36 @@ def emit(value):
                    sort_keys=True, separators=(",", ":")).encode("utf-8")
     )
 
+def error_category(error):
+    reason = (
+        error.reason
+        if isinstance(error, urllib.error.URLError)
+        and isinstance(error.reason, BaseException)
+        else error
+    )
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls-verification"
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, socket.gaierror):
+        return "name-resolution"
+    if isinstance(reason, TimeoutError):
+        return "socket-timeout"
+    if isinstance(reason, ConnectionResetError):
+        return "connection-reset"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection-refused"
+    if isinstance(reason, ConnectionAbortedError):
+        return "connection-aborted"
+    if isinstance(error, urllib.error.URLError):
+        return "url-error"
+    if isinstance(reason, OSError):
+        return "os-error"
+    if isinstance(reason, (ValueError, TypeError)):
+        return "invalid-value"
+    return "unknown"
+
+stage = "request-envelope"
 try:
     payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     if set(payload) != {"method", "url", "body", "headers", "socketTimeout"}:
@@ -211,6 +307,7 @@ try:
         for item in headers
     ):
         raise ValueError("invalid request headers")
+    stage = "request-construction"
     request = urllib.request.Request(
         payload["url"], data=body, headers=dict(headers), method=payload["method"]
     )
@@ -220,27 +317,37 @@ try:
     response = None
     try:
         try:
+            stage = "exchange-open"
             response = opener.open(request, timeout=float(payload["socketTimeout"]))
         except urllib.error.HTTPError as error:
             response = error
+        stage = "response-status"
         status = int(response.status if hasattr(response, "status") else response.code)
+        stage = "response-body"
         response_body = response.read(MAX_BODY + 1)
+        stage = "response-headers"
         response_headers = [
             [str(key), str(value)] for key, value in response.headers.items()
         ]
     finally:
         if response is not None:
+            prior_stage = stage
+            stage = "response-close"
             response.close()
+            stage = prior_stage
+    stage = "response-validation"
     if sum(len(key) + len(value) for key, value in response_headers) > MAX_HEADERS:
         raise ValueError("response headers are oversized")
+    stage = "response-encoding"
     emit({
         "kind": "response",
         "status": status,
         "body": base64.b64encode(response_body).decode("ascii"),
         "headers": response_headers,
     })
-except Exception:
-    emit({"kind": "transport-error"})
+except Exception as error:
+    emit({"kind": "transport-error", "stage": stage,
+          "category": error_category(error)})
 """
 BRIDGE_SETTINGS_OWNER_OPERATION_ID = (
     "configureBridgeExactVersionedPackageAndCriticalSettings"
@@ -11967,6 +12074,14 @@ class _LateRestResponse(BootstrapError):
 class _RestTransportAmbiguity(BootstrapError):
     """One request may have reached Azure but has no complete response."""
 
+    def __init__(
+        self, message: str, *, stage: str = "unknown", category: str = "unknown"
+    ) -> None:
+        super().__init__(message)
+        self.transport_diagnostic = _safe_rest_transport_diagnostic({
+            "stage": stage, "category": category,
+        }) or {"stage": "unknown", "category": "unknown"}
+
 
 class _RestTotalTimeout(_RestTransportAmbiguity):
     """The killable one-request exchange exceeded its total wall-clock budget."""
@@ -11975,9 +12090,36 @@ class _RestTotalTimeout(_RestTransportAmbiguity):
 class _MutationOwnershipAmbiguity(BootstrapError):
     """A durable mutation intent has an applied or possibly-applied outcome."""
 
-    def __init__(self, message: str, response: _RestResponse | None = None) -> None:
+    def __init__(
+        self, message: str, response: _RestResponse | None = None, *,
+        transport_diagnostic: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.response = response
+        self.transport_diagnostic = _safe_rest_transport_diagnostic(
+            transport_diagnostic
+        )
+
+
+def _transport_failure_diagnostic(error: BaseException | None) -> dict[str, str] | None:
+    """Retain fixed transport enums through owned-error wrappers, without text."""
+
+    seen: set[int] = set()
+    for _ in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        if isinstance(error, (
+            _RestTransportAmbiguity, _MutationOwnershipAmbiguity, StorageOperationError,
+        )):
+            diagnostic = _safe_rest_transport_diagnostic(
+                getattr(error, "transport_diagnostic", None)
+            )
+            if diagnostic is not None:
+                return diagnostic
+        # Only an explicit cause is trusted; an unrelated handled context is not.
+        error = error.__cause__
+    return None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -12025,7 +12167,10 @@ class AzureCliRestSession:
         """Run exactly one killable urllib exchange under a monotonic total cap."""
 
         if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise _RestTotalTimeout("Azure REST total response deadline expired")
+            raise _RestTotalTimeout(
+                "Azure REST total response deadline expired",
+                stage="exchange-launch", category="total-timeout",
+            )
         monotonic_deadline = time.monotonic() + float(timeout)
         payload = {
             "method": request.get_method(),
@@ -12041,7 +12186,10 @@ class AzureCliRestSession:
         encoded = canonical_json_bytes(payload)
         remaining = monotonic_deadline - time.monotonic()
         if remaining <= 0:
-            raise _RestTotalTimeout("Azure REST total response deadline expired")
+            raise _RestTotalTimeout(
+                "Azure REST total response deadline expired",
+                stage="exchange-launch", category="total-timeout",
+            )
         try:
             completed = subprocess.run(
                 [sys.executable, "-I", "-c", _AZURE_REST_EXCHANGE_CHILD],
@@ -12055,11 +12203,14 @@ class AzureCliRestSession:
             # subprocess.run kills and waits for this sole child before raising;
             # no stale request process can later race exact compensation.
             raise _RestTotalTimeout(
-                "Azure REST total response deadline expired"
+                "Azure REST total response deadline expired",
+                stage="exchange-wait", category="total-timeout",
             ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise _RestTransportAmbiguity(
-                "Azure REST transport failed closed"
+                "Azure REST transport failed closed",
+                stage="exchange-launch",
+                category="os-error" if isinstance(exc, OSError) else "subprocess-error",
             ) from exc
         if (
             completed.returncode != 0
@@ -12067,7 +12218,15 @@ class AzureCliRestSession:
             or len(completed.stdout) > 32 * 1024 * 1024
             or len(completed.stderr) > 1024 * 1024
         ):
-            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+            category = (
+                "child-exit" if completed.returncode != 0
+                else "empty-output" if not completed.stdout
+                else "output-limit"
+            )
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed",
+                stage="exchange-output", category=category,
+            )
         try:
             document = json.loads(
                 completed.stdout.decode("utf-8"),
@@ -12078,17 +12237,33 @@ class AzureCliRestSession:
             )
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise _RestTransportAmbiguity(
-                "Azure REST transport failed closed"
+                "Azure REST transport failed closed", stage="exchange-decode",
+                category="invalid-utf8" if isinstance(exc, UnicodeDecodeError) else "invalid-json",
             ) from exc
         if document == {"kind": "transport-error"}:
             raise _RestTransportAmbiguity("Azure REST transport failed closed")
+        if (
+            isinstance(document, Mapping)
+            and set(document) == {"kind", "stage", "category"}
+            and document["kind"] == "transport-error"
+        ):
+            diagnostic = _safe_rest_transport_diagnostic({
+                "stage": document["stage"], "category": document["category"],
+            })
+            if diagnostic is not None:
+                raise _RestTransportAmbiguity(
+                    "Azure REST transport failed closed", **diagnostic
+                )
         if not isinstance(document, Mapping) or set(document) != {
             "kind",
             "status",
             "body",
             "headers",
         }:
-            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed",
+                stage="exchange-decode", category="invalid-envelope",
+            )
         status = document["status"]
         body_value = document["body"]
         header_items = document["headers"]
@@ -12107,12 +12282,16 @@ class AzureCliRestSession:
             or sum(len(item[0]) + len(item[1]) for item in header_items)
             > MAX_AZURE_REST_RESPONSE_HEADERS_BYTES
         ):
-            raise _RestTransportAmbiguity("Azure REST transport failed closed")
+            raise _RestTransportAmbiguity(
+                "Azure REST transport failed closed",
+                stage="exchange-decode", category="invalid-envelope",
+            )
         try:
             response_body = base64.b64decode(body_value, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise _RestTransportAmbiguity(
-                "Azure REST transport failed closed"
+                "Azure REST transport failed closed",
+                stage="exchange-decode", category="invalid-base64",
             ) from exc
         return _RestResponse(
             status=status,
@@ -12352,7 +12531,8 @@ class AzureCliRestSession:
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise _RestTransportAmbiguity(
-                "Azure REST transport failed closed"
+                "Azure REST transport failed closed", stage="exchange-open",
+                category=_rest_transport_error_category(exc),
             ) from exc
         if not isinstance(response, _RestResponse):
             fail("Azure REST exchange runner returned an invalid response")
@@ -13618,7 +13798,7 @@ class AzureCliBootstrapTransport:
             fail(f"mutation request returned unexpected HTTP status {response.status}")
         except _RestTransportAmbiguity as transport_error:
             if is_storage and client_request_id is not None:
-                raise self._storage_operation_failure(
+                storage_error = self._storage_operation_failure(
                     operation_id=self._active_operation_id,
                     method=method,
                     started=request_started,
@@ -13628,9 +13808,14 @@ class AzureCliBootstrapTransport:
                     stop_reason="deadline"
                     if isinstance(transport_error, _RestTotalTimeout)
                     else "transport-error",
-                ) from None
+                )
+                storage_error.transport_diagnostic = _transport_failure_diagnostic(
+                    transport_error
+                )
+                raise storage_error from None
             raise _MutationOwnershipAmbiguity(
-                "mutation transport outcome is ambiguous"
+                "mutation transport outcome is ambiguous",
+                transport_diagnostic=_transport_failure_diagnostic(transport_error),
             ) from transport_error
         except Exception:
             if is_storage and client_request_id is not None:
@@ -23802,13 +23987,15 @@ class BootstrapExecutor:
                         fail("temporary compensation did not prove exact owned removal")
                     cleanup_proofs.append(dict(cleanup))
                 except BaseException as cleanup_error:
-                    cleanup_proofs.append(
-                        {
-                            "operationId": operation["id"],
-                            "status": "cleanup-failed",
-                            "errorType": type(cleanup_error).__name__,
-                        }
-                    )
+                    cleanup_failure: dict[str, Any] = {
+                        "operationId": operation["id"],
+                        "status": "cleanup-failed",
+                        "errorType": type(cleanup_error).__name__,
+                    }
+                    transport_diagnostic = _transport_failure_diagnostic(cleanup_error)
+                    if transport_diagnostic is not None:
+                        cleanup_failure["transportFailureDiagnostic"] = transport_diagnostic
+                    cleanup_proofs.append(cleanup_failure)
             raise
         finally:
             terminal = {
@@ -23843,6 +24030,9 @@ class BootstrapExecutor:
                 ),
             ):
                 terminal["failureDiagnostic"] = dict(failure.diagnostic)
+            transport_diagnostic = _transport_failure_diagnostic(failure)
+            if terminal_status != "complete" and transport_diagnostic is not None:
+                terminal["transportFailureDiagnostic"] = transport_diagnostic
             # The authorization-specific directory and single-use-state.json
             # are the durable consumed boundary.  Terminal evidence is useful,
             # but a pre-existing file or disk failure must never mask the
