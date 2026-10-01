@@ -11,6 +11,15 @@ from typing import Any, Callable, Mapping
 import urllib.parse
 
 
+def receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Omit only reader-internal detail diagnostics from canonical receipts.
+
+    Unknown fields remain present so the exact receipt validator rejects them.
+    The caller's read result and its diagnostic digests are never modified.
+    """
+    return {key: item for key, item in value.items() if key != "detailResponseSha256s"}
+
+
 def validate_canary_projection(
     body: Any, *, resources: Mapping[str, Any], prior: Mapping[str, Any],
     authorization: Mapping[str, Any], control_timing: Mapping[str, Any],

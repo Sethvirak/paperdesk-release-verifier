@@ -27,7 +27,7 @@ from typing import Any
 SOURCE_SHA = "426438a699306c639a580e268a7f9330b70c4ebf"
 BOOTSTRAP_PLAN_SHA = "49f2977345bbbb25a26a42049af0267603261c4f03909131cc30ffb1dbd8f760"
 BOOTSTRAP_PLAN_GIT_BLOB_SHA = "b6a834f1bb00f10312d28a4b88cee7cc28fb9796a7f38384ca7245f0765bed76"
-REVIEWED_PLAN_CANONICAL_SHA = "3c9bc25d690e0e055f4b9518cab34f97224c6109d2e8bd7bc9298e9e798a7fc1"
+REVIEWED_PLAN_CANONICAL_SHA = "fe736e49dc9a47b2f42353380e2754f532ab5d7cad11c0f81aa28498e44289dc"
 # Exact committed LF primitives, including both bootstrap history dependencies.
 # Source revisions never renew a consumed ceremony or supply external approval.
 PRIMITIVE_NAMES = ("private_release_v2_bootstrap.py",

@@ -21023,7 +21023,7 @@ class AzureCliBootstrapTransport:
                 "triggerStatus": trigger_status,
                 "triggerCorrelation": dict(trigger_correlation),
                 "preScmRestoreStopped": dict(pre_scm_restore_stopped),
-                "finalHistoryCensus": dict(final_history),
+                "finalHistoryCensus": webjob_evidence.receipt(final_history),
                 "scmBasicAuthInitial": dict(scm_initial),
                 "scmBasicAuthPrePublicNetwork": dict(scm_pre_public_network),
                 "scmBasicAuthEnabled": dict(scm_enabled),
@@ -21045,7 +21045,7 @@ class AzureCliBootstrapTransport:
                 ),
                 "postRestoreStopMutationIssued": post_restore_stop_mutation_issued,
                 "triggerRequestedAt": self._timestamp(trigger_requested_at),
-                "historyBoundary": canary["historyBoundary"],
+                "historyBoundary": webjob_evidence.receipt(canary["historyBoundary"]),
                 "terminalHistory": canary["terminalHistory"],
                 "terminalHistoryObservedAt": canary[
                     "terminalHistoryObservedAt"
