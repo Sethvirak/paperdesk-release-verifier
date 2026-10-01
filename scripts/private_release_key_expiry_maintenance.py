@@ -50,6 +50,9 @@ UTC = dt.timezone.utc
 REQUEST_ENVELOPE_SECONDS = 92
 SOURCE_RESERVE_SECONDS = 90
 BOUNDARY_ALLOWANCE_SECONDS = 2
+ROLE_DEFINITIONS_INVENTORY_URL = ARM + f"/subscriptions/{SUB}/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01"
+ROLE_DEFINITIONS_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
+PREFLIGHT_ARTIFACT_MAX_BYTES = 4 * 1024 * 1024
 # The narrowly documented source exception is dormant until this helper is
 # merged, independently reviewed, exact-head CI passes, and external single-use
 # approval binds that final merged head. No source SHA is self-referential.
@@ -73,6 +76,35 @@ def digest(raw: bytes) -> str:
 
 
 def strict_json(raw: bytes | str | dict) -> dict:
+    if isinstance(raw, bytes) and len(raw) > 1024 * 1024:
+        fail("JSON response exceeds bounded size")
+    return _json_object(raw)
+
+
+def strict_response_json(raw: bytes, url: str) -> dict:
+    # Only this source-pinned, complete role inventory has a larger wire bound.
+    # No caller can provide a maximum or transfer it to another endpoint.
+    if url != ROLE_DEFINITIONS_INVENTORY_URL:
+        return strict_json(raw)
+    if not isinstance(raw, bytes) or len(raw) > ROLE_DEFINITIONS_RESPONSE_MAX_BYTES:
+        fail("exact role inventory response exceeds bounded size or is not bytes")
+    result = _json_object(raw)
+    complete_inventory(result)
+    return result
+
+
+def strict_preflight_json(raw: bytes) -> dict:
+    # The canonical artifact aggregates the bounded inventory and other evidence.
+    # Its exact raw digest is checked before this parser is called by authorization.
+    if not isinstance(raw, bytes) or len(raw) > PREFLIGHT_ARTIFACT_MAX_BYTES:
+        fail("preflight artifact exceeds bounded size or is not bytes")
+    result = _json_object(raw)
+    if result.get("kind") != "paperdesk-key-expiry-maintenance-preflight" or result.get("ceremonyId") != CEREMONY:
+        fail("preflight boundary changed")
+    return result
+
+
+def _json_object(raw: bytes | str | dict) -> dict:
     if isinstance(raw, dict):
         return copy.deepcopy(raw)
 
@@ -87,8 +119,6 @@ def strict_json(raw: bytes | str | dict) -> dict:
     def invalid_constant(_):
         fail("nonfinite JSON constant")
 
-    if isinstance(raw, bytes) and len(raw) > 1024 * 1024:
-        fail("JSON response exceeds bounded size")
     try:
         result = json.loads(raw, object_pairs_hook=unique, parse_constant=invalid_constant)
     except (ValueError, TypeError, UnicodeError):
@@ -440,7 +470,7 @@ class Maintenance:
         if self.now() > logical:
             fail("read completed after original logical deadline")
         if response.status == 200:
-            parsed = strict_json(response.body)
+            parsed = strict_response_json(response.body, url)
             if data:
                 _reject_private(parsed)
             # Source CleanupLockGuard uses json.loads; parsing here rejects duplicates first.
@@ -525,7 +555,7 @@ class Maintenance:
         response = self.read("GET", url)
         if response.status != status:
             fail("read returned unexpected status")
-        return strict_json(response.body) if status == 200 else None
+        return strict_response_json(response.body, url) if status == 200 else None
 
     def effective_locks(self, rows, scope):
         return [r for r in rows if scope.lower().startswith(r["id"].lower().rsplit("/providers/microsoft.authorization/locks/", 1)[0] + "/")]
@@ -909,7 +939,7 @@ def validate_authorization(auth, plan_raw, helper_raw, verifier, evidence_path, 
     preflight_raw = Path(preflight_path).read_bytes()
     if digest(preflight_raw) != auth["freshPreflightSha256"]:
         fail("fresh preflight digest mismatch")
-    preflight = strict_json(preflight_raw)
+    preflight = strict_preflight_json(preflight_raw)
     if preflight.get("kind") != "paperdesk-key-expiry-maintenance-preflight" or preflight.get("ceremonyId") != CEREMONY:
         fail("preflight boundary changed")
     if preflight.get("sourceSha") != auth["verifierSourceSha"] or preflight.get("maintenancePlanSha256") != auth["maintenancePlanSha256"]:
