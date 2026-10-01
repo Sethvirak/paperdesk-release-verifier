@@ -1,14 +1,18 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import private_release_v2_bootstrap as bootstrap
 from scripts import private_release_v2_bootstrap_receipts as receipts
+from scripts import private_release_mailbox as mailbox
 from scripts.private_release_v2_terminal_s2 import build_terminal_s2_documents
 from tests.test_private_release_v2_bootstrap import (
     build_complete_terminal_receipt_input_fixture,
 )
+from tests import test_workflow_contract as workflow_contract
 
 
 AUTHORIZATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -59,6 +63,53 @@ class TerminalS2BuilderTests(unittest.TestCase):
     def test_exact_claim_and_terminal_times_are_derived_when_omitted(self):
         built = self.build(started_at=None, completed_at=None)
         self.assertEqual(built, self.fixture["s2Documents"])
+
+    def test_generated_s2_provisioning_leaves_caller_dormant_and_unauthorized(self):
+        built = self.build()
+        path = receipts.S2_EVIDENCE_COMPONENT_PATHS["provisioningEvidence"]
+        provisioning = json.loads(built[path])
+        self.assertEqual(provisioning["status"], "activated")
+        contract = json.loads(workflow_contract.CONTRACT.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as folder:
+            evidence_path = Path(folder) / "provisioning.json"
+            evidence_path.write_bytes(built[path])
+            with mock.patch.object(workflow_contract, "PROVISIONING", evidence_path):
+                guard = workflow_contract.WorkflowContractTests()
+                guard.test_private_release_v2_is_dormant_until_s2_evidence_and_fic_repin()
+        with self.assertRaisesRegex(mailbox.MailboxError, "activation-document"):
+            mailbox.load_activation_document(
+                contract, runtime_workflow_sha="a" * 40,
+                observed_bridge_package_sha256="b" * 64,
+                provisioning_evidence=provisioning,
+            )
+
+    def test_s2_provisioning_cannot_make_partial_caller_activation_pass(self):
+        built = self.build()
+        path = receipts.S2_EVIDENCE_COMPONENT_PATHS["provisioningEvidence"]
+        provisioning = json.loads(built[path])
+        original = json.loads(workflow_contract.CONTRACT.read_text(encoding="utf-8"))
+        for mutation in ("status", "nonnull-coordinate"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder:
+                contract = copy.deepcopy(original)
+                if mutation == "status":
+                    contract["status"] = "activated"
+                else:
+                    contract["activation"]["mergedControlWorkflowSha"] = "a" * 40
+                contract_path = Path(folder) / "contract.json"
+                evidence_path = Path(folder) / "provisioning.json"
+                contract_path.write_text(json.dumps(contract), encoding="utf-8")
+                evidence_path.write_bytes(built[path])
+                with mock.patch.object(workflow_contract, "CONTRACT", contract_path), mock.patch.object(
+                    workflow_contract, "PROVISIONING", evidence_path
+                ), self.assertRaises(AssertionError):
+                    guard = workflow_contract.WorkflowContractTests()
+                    guard.test_private_release_v2_is_dormant_until_s2_evidence_and_fic_repin()
+                with self.assertRaises(mailbox.MailboxError):
+                    mailbox.load_activation_document(
+                        contract, runtime_workflow_sha="a" * 40,
+                        observed_bridge_package_sha256="b" * 64,
+                        provisioning_evidence=provisioning,
+                    )
 
     def test_caller_cannot_replace_a_source_owned_component_fact(self):
         components = copy.deepcopy(self.fixture["components"])

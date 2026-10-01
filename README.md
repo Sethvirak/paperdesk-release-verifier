@@ -206,6 +206,14 @@ The activation sequence is finite:
 5. Only after independent review, main pins S2 and receives its exact caller
    integration.
 
+At S2, the validated provider provisioning inventory has status `activated`;
+the separate caller contract still has status `source-dormant` and all-null
+activation coordinates. The workflow contract test checks that caller boundary
+without requiring the provider inventory to remain a placeholder. It does not
+admit S2 evidence: the original authorization, exact terminal receipts, six-file
+S2 diff, sole S1-prime parent, independent reviews and FIC repin remain required
+by their existing validators before caller activation.
+
 Apart from the exact one-shot bootstrap in step 2 and the bounded existing-key
 expiry maintenance in the authoritative operator contract, no Azure mutation is
 authorized before S2 evidence acceptance and FIC repin. Neither exception can
@@ -409,6 +417,26 @@ changes the ten-minute/64-attempt limits or 5,549-second authorization lifetime,
 or authorizes another execution. Historical failed
 receipts remain immutable; these facts are available only on a later freshly
 authorized attempt.
+
+A rejected WebJob history list/detail pair retains a separate local diagnostic
+through `scripts/private_release_v2_history_conflict_diagnostics.py`. Its fixed
+field order is `web_job_name`, `job_name`, `web_job_id`, `status`, `trigger`,
+`start_time`, `end_time`, and `output_url`; the corresponding eight-bit vector
+records the unchanged list-present/detail-get inequality. Value classes are
+fixed JSON shapes, with only allowlisted nonterminal/success/failure status
+classes. The record binds the actual list and detail responses using the
+existing canonical-JSON response SHA-256 function, plus hashes of the validated
+child/run identity and fixed read stage. It retains no provider values, extra
+property names, trigger text, URLs, settings, tokens or raw identifiers.
+
+This pure local module is outside the explicit bridge package source list.
+Its diagnostic follows only a bounded explicit exception-cause chain into the
+consumed failed terminal receipt, including the canary's existing cleanup
+wrapper. A list/detail transition still fails immediately; no extra request,
+poll, trigger, retry, lifetime or permission is introduced. A conflict is not a
+validated terminal WebJob failure or success and cannot produce S2 evidence.
+Receipt-write failure preserves the original rejection; hard process death
+cannot guarantee a terminal receipt. Historical failures remain unchanged.
 
 The plan also binds exactly three existing `CanNotDelete` locks and the eight
 role-assignment removals they protect. A fresh complete subscription lock

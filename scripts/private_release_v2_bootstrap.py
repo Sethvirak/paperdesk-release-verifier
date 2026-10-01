@@ -45,10 +45,12 @@ try:
     from scripts import build_private_release_bridge_package as package_builder
     from scripts import private_release_v2_cleanup_locks as cleanup_locks
     from scripts import private_release_v2_webjob_evidence as webjob_evidence
+    from scripts import private_release_v2_history_conflict_diagnostics as history_conflict
 except ModuleNotFoundError:  # direct ``python scripts/...`` execution
     import build_private_release_bridge_package as package_builder  # type: ignore
     import private_release_v2_cleanup_locks as cleanup_locks  # type: ignore
     import private_release_v2_webjob_evidence as webjob_evidence  # type: ignore
+    import private_release_v2_history_conflict_diagnostics as history_conflict  # type: ignore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1360,6 +1362,17 @@ class WebJobCanaryFailure(BootstrapError):
     def __init__(self, message: str, diagnostic: Mapping[str, Any]) -> None:
         self.diagnostic = dict(diagnostic)
         super().__init__(message)
+
+
+class WebJobHistoryConflictError(BootstrapError):
+    """A rejected list/detail pair; never a validated WebJob terminal outcome."""
+
+    def __init__(self, diagnostic: Mapping[str, Any]) -> None:
+        try:
+            self.diagnostic = history_conflict.validate(diagnostic)
+        except (ValueError, TypeError) as exc:
+            raise BootstrapError("WebJob history conflict diagnostic is invalid") from exc
+        super().__init__("WebJob history list child contradicts its detail")
 
 
 def fail(message: str) -> None:
@@ -14685,7 +14698,13 @@ class AzureCliBootstrapTransport:
                         "trigger", "start_time", "end_time", "output_url",
                     )
                 ):
-                    fail("WebJob history list child contradicts its detail")
+                    raise WebJobHistoryConflictError(history_conflict.build(
+                        list_properties=item["properties"], detail_run=detail_run,
+                        list_response_sha256=_response_sha256(response),
+                        detail_response_sha256=_response_sha256(detail_response),
+                        history_id=group[0]["historyId"], run_id=group[0]["webJobsRunId"],
+                        read_stage=failure_context,
+                    ))
                 projected_groups.append(group)
                 detail_response_sha256s.append(_response_sha256(detail_response))
                 detail_index += 1
@@ -24030,6 +24049,11 @@ class BootstrapExecutor:
                 ),
             ):
                 terminal["failureDiagnostic"] = dict(failure.diagnostic)
+            history_diagnostic = history_conflict.from_failure(
+                failure, WebJobHistoryConflictError
+            )
+            if history_diagnostic is not None and "failureDiagnostic" not in terminal:
+                terminal["failureDiagnostic"] = history_diagnostic
             transport_diagnostic = _transport_failure_diagnostic(failure)
             if terminal_status != "complete" and transport_diagnostic is not None:
                 terminal["transportFailureDiagnostic"] = transport_diagnostic
