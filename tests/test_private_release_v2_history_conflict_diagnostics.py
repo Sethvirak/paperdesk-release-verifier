@@ -357,7 +357,7 @@ class HistoryConflictCanaryAndReceiptTests(unittest.TestCase):
               mock.patch.object(transport, "_wait_for_site_state", side_effect=site_state),
               mock.patch.object(transport, "_read_scm_basic_auth_policy", side_effect=scm),
               mock.patch.object(transport, "_read_site_public_network_access", side_effect=network),
-              mock.patch.object(transport, "_wait_for_webjob_history_boundary", return_value={}),
+              mock.patch.object(transport, "_wait_for_webjob_history_boundary", return_value={"entries": []}),
               mock.patch.object(transport, "_wait_for_fresh_webjob_success", side_effect=fresh_history),
               mock.patch.object(transport, "_read_request_with_transport_retry", side_effect=responses) as reads,
               mock.patch.object(transport, "_probe_failed_webjob_log") as log_probe,

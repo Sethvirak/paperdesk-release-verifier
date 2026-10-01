@@ -2,9 +2,11 @@
 
 import copy
 import datetime as dt
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import private_release_v2_bootstrap as bootstrap
 from tests.test_private_release_v2_bootstrap import (
@@ -220,6 +222,201 @@ class ControllerCanaryFailureTests(unittest.TestCase):
         transport.bind_journal(journal or MemoryJournal())
         transport._active_operation_id = CONFIGURE
         return transport, session
+
+    def history_run(self, run_id):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        return {
+            "web_job_name": job, "web_job_id": run_id,
+            "trigger": "External - synthetic old", "status": "Success",
+            "start_time": stamp(NOW - dt.timedelta(seconds=20)),
+            "end_time": stamp(NOW - dt.timedelta(seconds=19)),
+            "output_url": f"https://{site['name']}.scm.azurewebsites.net/vfs/{run_id}/output.txt",
+        }
+
+    def test_shared_history_budget_keeps_original_detail_deadline_and_request_reserve(self):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        collection = site["resourceId"] + f"/triggeredwebjobs/{job}/history"
+        entries = [self.history_run(f"old-{index}") for index in range(5)]
+        response = bootstrap._RestResponse(200, bootstrap.canonical_json_bytes({"value": [
+            {"id": collection + "/" + entry["web_job_id"], "properties": {}}
+            for entry in entries
+        ]}), {})
+        current = [NOW]
+
+        def detail(entry):
+            def read():
+                current[0] += dt.timedelta(seconds=25)
+                return bootstrap._RestResponse(200, bootstrap.canonical_json_bytes({
+                    "id": collection + "/" + entry["web_job_id"], "properties": entry,
+                }), {})
+            return read
+
+        transport, session, _journal = self.transport(
+            [response] + [detail(entry) for entry in entries],
+            "startBridgeForBoundedCanary", clock=lambda: current[0],
+        )
+        budget = bootstrap._HistoryDetailBudget(
+            site_resource_id=site["resourceId"], job_name=job,
+            error_type=bootstrap.BootstrapError,
+        )
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "protected cleanup reserve"):
+            transport._read_webjob_history(
+                site_resource_id=site["resourceId"], job_name=job,
+                deadline=NOW + dt.timedelta(seconds=300),
+                failure_context="history-boundary", detail_budget=budget,
+            )
+        self.assertEqual(len(session.requests), 5)  # Collection plus four details; fifth never reaches HTTP.
+        self.assertEqual(current[0], NOW + dt.timedelta(seconds=100))
+        self.assertEqual(budget._remaining, 723)  # The fifth envelope attempt is charged, never refunded.
+
+    def test_unavailable_full_history_headroom_prevents_trigger_and_restores_owned_access(self):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        collection = site["resourceId"] + f"/triggeredwebjobs/{job}/history"
+        entries = [self.history_run(f"old-{index}") for index in range(364)]
+        response = bootstrap._RestResponse(200, bootstrap.canonical_json_bytes({"value": [
+            {"id": collection + "/" + entry["web_job_id"], "properties": entry}
+            for entry in entries
+        ]}), {})
+        transport, session, journal = self.transport([response], "startBridgeForBoundedCanary")
+        posture = {"state": "Stopped", "publicNetworkAccess": "Disabled", "allow": False}
+        mutations = []
+
+        def mutate(method, url, *, body=None, cleanup=False, **_kwargs):
+            path = url.split("?", 1)[0]
+            mutations.append((method, path, cleanup))
+            if method == "PATCH":
+                posture["publicNetworkAccess"] = json.loads(body)["properties"]["publicNetworkAccess"]
+            elif method == "PUT":
+                posture["allow"] = json.loads(body)["properties"]["allow"]
+            elif path.endswith("/start"):
+                posture["state"] = "Running"
+            elif path.endswith("/stop"):
+                posture["state"] = "Stopped"
+            return bootstrap._RestResponse(200, b"", {})
+
+        def state_read(*, expected_state, **_kwargs):
+            self.assertEqual(posture["state"], expected_state)
+            return {"state": posture["state"], "observedAt": stamp(NOW)}
+
+        def network(*, expected_access, expected_state, **_kwargs):
+            if expected_access is not None:
+                self.assertEqual(posture["publicNetworkAccess"], expected_access)
+            if expected_state is not None:
+                self.assertEqual(posture["state"], expected_state)
+            return {"publicNetworkAccess": posture["publicNetworkAccess"], "state": posture["state"]}
+
+        def scm(*, expected_allow, **_kwargs):
+            if expected_allow is not None:
+                self.assertEqual(posture["allow"], expected_allow)
+            return {"allow": posture["allow"]}
+
+        state = {"proofs": {CONFIGURE: {"details": {
+            "bootstrapSelfTestIssuedAt": stamp(NOW),
+            "bootstrapSelfTestExpiresAt": stamp(NOW + dt.timedelta(seconds=900)),
+        }}}}
+        operation = next(item for item in self.plan["mutations"] if item["id"] == "startBridgeForBoundedCanary")
+        with (
+            mock.patch.object(transport, "_mutation_request", side_effect=mutate),
+            mock.patch.object(transport, "_wait_for_site_state", side_effect=state_read),
+            mock.patch.object(transport, "_read_site_public_network_access", side_effect=network),
+            mock.patch.object(transport, "_read_scm_basic_auth_policy", side_effect=scm),
+            mock.patch.object(transport, "_read_triggered_webjob_metadata", return_value={"latestRunPresent": True}),
+            self.assertRaisesRegex(bootstrap.BootstrapError, "pre-trigger census headroom"),
+        ):
+            transport._mutate(operation, state)
+        self.assertEqual(len(session.requests), 1)  # Complete list; no sparse detail reads.
+        self.assertFalse(any(path.endswith("/run") for _, path, _ in mutations))
+        self.assertEqual(sum(path.endswith("/start") for _, path, _ in mutations), 1)
+        self.assertTrue(any(path.endswith("/stop") and cleanup for _, path, cleanup in mutations))
+        self.assertEqual(posture, {"state": "Stopped", "publicNetworkAccess": "Disabled", "allow": False})
+        self.assertEqual(journal.unresolved_public_network_incidents, [])
+
+    def test_malformed_final_history_is_read_once_and_restores_owned_access(self):
+        site = self.fixture.resources["bridgeSite"]
+        job = "paperdesk-accepted-release-registry"
+        response = bootstrap._RestResponse(
+            200,
+            bootstrap.canonical_json_bytes({"value": {"not": "a collection"}}),
+            {"Content-Type": "application/json"},
+        )
+        transport, session, journal = self.transport(
+            [response], "startBridgeForBoundedCanary"
+        )
+        posture = {"state": "Stopped", "publicNetworkAccess": "Disabled", "allow": False}
+        mutations = []
+        history_read_postures = []
+        session.after_request = lambda: history_read_postures.append(dict(posture))
+
+        def mutate(method, url, *, body=None, cleanup=False, **_kwargs):
+            path = url.split("?", 1)[0]
+            mutations.append((method, path, cleanup))
+            if method == "PATCH":
+                posture["publicNetworkAccess"] = json.loads(body)["properties"]["publicNetworkAccess"]
+            elif method == "PUT":
+                posture["allow"] = json.loads(body)["properties"]["allow"]
+            elif path.endswith("/start"):
+                posture["state"] = "Running"
+            elif path.endswith("/stop"):
+                posture["state"] = "Stopped"
+            return bootstrap._RestResponse(200, b"", {})
+
+        def state_read(*, expected_state, **_kwargs):
+            self.assertEqual(posture["state"], expected_state)
+            return {"state": posture["state"], "observedAt": stamp(NOW)}
+
+        def network(*, expected_access, expected_state, **_kwargs):
+            if expected_access is not None:
+                self.assertEqual(posture["publicNetworkAccess"], expected_access)
+            if expected_state is not None:
+                self.assertEqual(posture["state"], expected_state)
+            return {"publicNetworkAccess": posture["publicNetworkAccess"], "state": posture["state"]}
+
+        def scm(*, expected_allow, **_kwargs):
+            if expected_allow is not None:
+                self.assertEqual(posture["allow"], expected_allow)
+            return {"allow": posture["allow"]}
+
+        boundary = {"entries": []}
+        state = {"proofs": {CONFIGURE: {"details": {
+            "bootstrapSelfTestIssuedAt": stamp(NOW),
+            "bootstrapSelfTestExpiresAt": stamp(NOW + dt.timedelta(seconds=900)),
+        }}}}
+        operation = next(item for item in self.plan["mutations"] if item["id"] == "startBridgeForBoundedCanary")
+        with (
+            mock.patch.object(transport, "_mutation_request", side_effect=mutate),
+            mock.patch.object(transport, "_wait_for_site_state", side_effect=state_read),
+            mock.patch.object(transport, "_read_site_public_network_access", side_effect=network),
+            mock.patch.object(transport, "_read_scm_basic_auth_policy", side_effect=scm),
+            mock.patch.object(transport, "_wait_for_webjob_history_boundary", return_value=boundary),
+            mock.patch.object(transport, "_wait_for_fresh_webjob_success", return_value={
+                "historyBoundary": boundary, "terminalHistory": {},
+            }),
+            self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "failed during final-history-census.*WebJob history is partial, paginated, or oversized",
+            ),
+        ):
+            transport._mutate(operation, state)
+
+        self.assertEqual(len(session.requests), 1)
+        self.assertEqual(session.requests[0][0], "GET")
+        self.assertEqual(
+            session.requests[0][1],
+            transport._arm_url(site["resourceId"], "2025-05-01", f"/triggeredwebjobs/{job}/history"),
+        )
+        self.assertEqual(history_read_postures, [{
+            "state": "Stopped", "publicNetworkAccess": "Enabled", "allow": True,
+        }])
+        self.assertEqual(sum(path.endswith("/run") for _, path, _ in mutations), 1)
+        self.assertEqual(sum(path.endswith("/start") for _, path, _ in mutations), 1)
+        self.assertEqual(sum(path.endswith("/stop") and cleanup for _, path, cleanup in mutations), 1)
+        self.assertEqual(sum(method == "PUT" and cleanup for method, _, cleanup in mutations), 1)
+        self.assertEqual(sum(method == "PATCH" and cleanup for method, _, cleanup in mutations), 1)
+        self.assertEqual(posture, {"state": "Stopped", "publicNetworkAccess": "Disabled", "allow": False})
+        self.assertEqual(journal.unresolved_public_network_incidents, [])
 
     def test_bridge_site_state_retries_read_only_total_timeout(self):
         site = self.fixture.resources["bridgeSite"]

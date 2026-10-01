@@ -519,6 +519,25 @@ census observation, not a claim that an out-of-band administrator cannot invoke
 Kudu afterward. The trigger is never retried, and the existing control deadline
 and one-use authorization remain unchanged.
 
+The canary owns one shared allowance of 728 single-attempt history detail reads:
+the previous four-read ceiling multiplied by one boundary, at most 180 terminal
+polls and one final census. This is a fixed resource count policy, not a measured
+provider-load, latency or cost equivalence. Every census remains unfiltered and
+every sparse old child is read again. Before the trigger, the complete boundary
+universe plus one possible new run must fit both a terminal and a final census;
+terminal polls cannot spend the protected final allowance. Credits are charged
+before transport and never reset or refunded. Ordinary history callers retain
+the four-detail ceiling. The existing 180-second detail/final windows, 300-second
+terminal window, 90-second request reserve and immutable authorization still
+stop slow or oversized censuses. This source change needs fresh exact-source
+review and fresh metered-attempt consent; it does not renew any consumed attempt.
+The separate maintenance loader pins four exact LF dependencies, including this
+pure budget module, and rejects foreign cached modules or redirected paths
+before importing bootstrap. Its preparation-base reference does not assert that
+the new bytes existed in that ancestor; the final head is externally reviewed
+and bound by any fresh authorization. Historical ceremony/source identifiers,
+approved scope, validity and mutation bounds remain unchanged.
+
 The canary's maximum 15-minute lifetime starts just before the final settings
 precondition read, rather than at preflight preparation. Its expiry
 is still clipped to the unchanged outer bootstrap authorization. Retained

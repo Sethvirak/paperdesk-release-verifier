@@ -27,12 +27,13 @@ from typing import Any
 SOURCE_SHA = "426438a699306c639a580e268a7f9330b70c4ebf"
 BOOTSTRAP_PLAN_SHA = "49f2977345bbbb25a26a42049af0267603261c4f03909131cc30ffb1dbd8f760"
 BOOTSTRAP_PLAN_GIT_BLOB_SHA = "b6a834f1bb00f10312d28a4b88cee7cc28fb9796a7f38384ca7245f0765bed76"
-REVIEWED_PLAN_CANONICAL_SHA = "37fbffcffa0f18c919728d3b050bc10411eb0a82ef347d4e8491662ef85ccfdd"
-# Exact committed LF primitives, including the bootstrap's diagnostic import.
+REVIEWED_PLAN_CANONICAL_SHA = "3c9bc25d690e0e055f4b9518cab34f97224c6109d2e8bd7bc9298e9e798a7fc1"
+# Exact committed LF primitives, including both bootstrap history dependencies.
 # Source revisions never renew a consumed ceremony or supply external approval.
 PRIMITIVE_NAMES = ("private_release_v2_bootstrap.py",
                    "private_release_v2_cleanup_locks.py",
-                   "private_release_v2_history_conflict_diagnostics.py")
+                   "private_release_v2_history_conflict_diagnostics.py",
+                   "private_release_v2_history_detail_budget.py")
 SUB = "9c4e0d0d-602f-4cde-84bd-337250e5b64c"
 TENANT = "aba83bd8-3e5c-4a87-9eb1-7bca070685b2"
 OWNER = "b97bfa13-b375-4b27-93d7-141029dbc05b"
@@ -892,17 +893,27 @@ def load_primitives(verifier, expected_head=None, require_merged=False):
     maintenance_plan = strict_json((verifier / "contracts/private_release_key_expiry_maintenance_plan.json").read_bytes())
     validate_plan(maintenance_plan)
     diagnostic_path = verifier / "scripts/private_release_v2_history_conflict_diagnostics.py"
-    if diagnostic_path.resolve() != diagnostic_path or not diagnostic_path.is_file():
-        fail("diagnostic dependency path differs from reviewed checkout before import")
+    budget_path = verifier / "scripts/private_release_v2_history_detail_budget.py"
+    dependencies = ((diagnostic_path, "diagnostic"), (budget_path, "history detail budget"))
+    for dependency_path, label in dependencies:
+        if dependency_path.resolve() != dependency_path or not dependency_path.is_file():
+            fail(label + " dependency path differs from reviewed checkout before import")
+        for node in (dependency_path, *dependency_path.parents):
+            try:
+                metadata = node.lstat()
+            except FileNotFoundError:
+                fail(label + " dependency path is absent before import")
+            if node.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+                fail(label + " dependency path is a link or reparse point before import")
     primitive_hashes = {name: digest((verifier / "scripts" / name).read_bytes()) for name in PRIMITIVE_NAMES}
     if primitive_hashes != maintenance_plan["source"]["pinnedPrimitiveHashes"]:
         fail("provider primitives differ from the reviewed maintenance plan before import")
-    for alias in ("scripts.private_release_v2_history_conflict_diagnostics",
-                  "private_release_v2_history_conflict_diagnostics"):
-        cached = sys.modules.get(alias)
-        if cached is not None and (not isinstance(getattr(cached, "__file__", None), str) or
-                                   Path(cached.__file__).resolve() != diagnostic_path):
-            fail("cached diagnostic module resolves outside reviewed checkout before import")
+    for dependency_path, label in dependencies:
+        for alias in ("scripts." + dependency_path.stem, dependency_path.stem):
+            cached = sys.modules.get(alias)
+            if cached is not None and (not isinstance(getattr(cached, "__file__", None), str) or
+                                       Path(cached.__file__).resolve() != dependency_path):
+                fail("cached " + label + " module resolves outside reviewed checkout before import")
     # Bootstrap imports both top-level sibling modules and the scripts package.
     # Resolve both from the exact verified checkout, independently of caller CWD.
     sys.path[0:0] = [str(verifier), str(verifier / "scripts")]
@@ -910,7 +921,8 @@ def load_primitives(verifier, expected_head=None, require_merged=False):
     import private_release_v2_cleanup_locks as locks
     if (Path(bootstrap.__file__).resolve() != verifier / "scripts/private_release_v2_bootstrap.py" or
         Path(locks.__file__).resolve() != verifier / "scripts/private_release_v2_cleanup_locks.py" or
-        Path(bootstrap.history_conflict.__file__).resolve() != verifier / "scripts/private_release_v2_history_conflict_diagnostics.py"):
+        Path(bootstrap.history_conflict.__file__).resolve() != diagnostic_path or
+        Path(bootstrap.history_detail_budget.__file__).resolve() != budget_path):
         fail("cached primitive module resolves outside reviewed checkout")
     return bootstrap, locks
 

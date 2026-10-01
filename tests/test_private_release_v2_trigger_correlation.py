@@ -215,6 +215,7 @@ class FinalHistoryCensusTests(unittest.TestCase):
             deadline=NOW + dt.timedelta(seconds=60),
             retry_delays=bootstrap.CANARY_READ_TRANSPORT_RETRY_DELAYS_SECONDS,
             failure_context="final-history-census",
+            detail_budget=None,
         )
 
     def test_added_removed_or_changed_history_fails_closed(self):
