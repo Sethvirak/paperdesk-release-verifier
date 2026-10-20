@@ -358,7 +358,9 @@ class ProductionActivation:
         opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),_NoRedirect())
         try:
             with opener.open(request,timeout=30) as response:return response.status,response.read(maximum+1)
-        except urllib.error.HTTPError as error:return error.code,error.read(maximum+1)
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code,error.read(maximum+1)
         except Exception:return 0,b""
     @staticmethod
     def _probe_item(status,body):
