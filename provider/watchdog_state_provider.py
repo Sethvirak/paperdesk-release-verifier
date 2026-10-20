@@ -1609,6 +1609,68 @@ class WatchdogProvider:
             created=created,
         )
 
+    def inspect_users_closed_baseline_readback(
+        self,
+        baseline_projection: Mapping[str, Any],
+        recovery_projection: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Inspect one backend receipt against complete declared B1/B2 inputs.
+
+        This read-only Stage B seam is not wired to WSGI, CLI, initialization,
+        state transitions or dispatch. Backend bytes are not proof of genuine
+        review, protected custody, closed ingress or recovery completeness.
+        Ordinary exact-90-day WORM/state/deadline contracts remain unchanged.
+        """
+        from scripts import watchdog_users_closed_baseline_candidate as candidate
+
+        try:
+            baseline_raw = candidate._canonical(baseline_projection)
+            recovery_raw = candidate._canonical(recovery_projection)
+            if any(not 2 <= len(raw) <= candidate.MAX_CANDIDATE_BYTES
+                   for raw in (baseline_raw, recovery_raw)):
+                raise candidate.CandidateError("projection byte length is invalid")
+            baseline_snapshot = json.loads(baseline_raw)
+            recovery_snapshot = json.loads(recovery_raw)
+            declared = candidate.validate_users_closed_baseline_projection(baseline_snapshot)
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            fail("users-closed readback declarations are invalid", 400, "users-closed-projection-invalid")
+        recovery_sha256 = _sha256(recovery_raw)
+        record = self._get_worm(baseline_snapshot["baselineReceipt"]["blob"])
+        try:
+            changed = (candidate._canonical(baseline_projection) != baseline_raw
+                       or candidate._canonical(recovery_projection) != recovery_raw)
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            changed = True
+        if changed:
+            fail("users-closed declarations changed during readback", 409, "users-closed-projection-drift")
+        if record is None:
+            fail("users-closed baseline receipt is absent", 409, "users-closed-baseline-missing")
+        try:
+            inspected = candidate.validate_users_closed_recovery_projection(
+                recovery_snapshot, baseline_snapshot, record,
+            )
+        except candidate.CandidateError:
+            fail("users-closed baseline readback differs", 409, "users-closed-baseline-conflict")
+        if (
+            inspected["baselineProjectionSha256"] != declared["projectionSha256"]
+            or inspected["recoveryProjectionSha256"] != recovery_sha256
+        ):
+            fail("users-closed declarations changed during readback", 409, "users-closed-projection-drift")
+        if any(inspected.get(name) is not False for name in (
+            "healthy", "accepted", "userAdmissionAllowed", "scanWindowAllowed",
+            "authorizationAvailable", "providerStateInitializationAllowed", "liveActivationAllowed",
+        )):
+            fail("users-closed inspection cannot grant authority", 503, "users-closed-inspection-authority")
+        return {
+            **inspected,
+            "status": "users-closed-baseline-readback-inspected",
+            "receiptScope": "provider-backend-readback-only",
+            "providerRecordReadback": True,
+            "providerEvidenceAuthenticated": False,
+            "protectedCustodyVerified": False,
+            "recoveryCompletenessProved": False,
+        }
+
     def state_snapshot(self) -> StateSnapshot:
         record = self.storage.get_blob(STATE_CONTAINER, STATE_BLOB, MAX_BODY)
         if record is None:
