@@ -897,17 +897,20 @@ class WorkflowContractTests(unittest.TestCase):
                 "scripts/watchdog_evidence.py",
                 "scripts/watchdog_contract.py",
                 "provider/watchdog_state_provider.py",
+                "scripts/watchdog_users_closed_baseline_candidate.py",
                 "provider/accepted_release_manifest.py",
                 "contracts/production_release_watchdog_contract.json",
             },
             BASELINE: {
                 "scripts/watchdog_evidence.py",
                 "provider/watchdog_state_provider.py",
+                "scripts/watchdog_users_closed_baseline_candidate.py",
                 "contracts/production_release_watchdog_contract.json",
             },
             RECONCILIATION: {
                 "scripts/watchdog_evidence.py",
                 "provider/watchdog_state_provider.py",
+                "scripts/watchdog_users_closed_baseline_candidate.py",
             },
         }
         for workflow_path, required in expected_paths.items():

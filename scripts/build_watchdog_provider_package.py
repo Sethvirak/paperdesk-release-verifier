@@ -25,6 +25,7 @@ SOURCES = (
     (ROOT / "scripts" / "check_deadline.py", "scripts/check_deadline.py", 0o644, 256 * 1024),
     (ROOT / "scripts" / "watchdog_contract.py", "scripts/watchdog_contract.py", 0o644, 128 * 1024),
     (ROOT / "scripts" / "watchdog_evidence.py", "scripts/watchdog_evidence.py", 0o644, 512 * 1024),
+    (ROOT / "scripts" / "watchdog_users_closed_baseline_candidate.py", "scripts/watchdog_users_closed_baseline_candidate.py", 0o644, 65536),
     (ROOT / "contracts" / "production_release_watchdog_contract.json", "contracts/production_release_watchdog_contract.json", 0o644, 65536),
     (ROOT / "provider" / "requirements.lock", "requirements.txt", 0o644, 16384),
     (ROOT / "provider" / "startup.sh", "startup.sh", 0o755, 4096),

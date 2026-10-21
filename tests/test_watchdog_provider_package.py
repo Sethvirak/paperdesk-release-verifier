@@ -1,8 +1,12 @@
 import hashlib
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +57,87 @@ class WatchdogProviderPackageTests(unittest.TestCase):
                 self.assertEqual(archive.read("contracts/production_release_watchdog_contract.json"), (
                     ROOT / "contracts" / "production_release_watchdog_contract.json"
                 ).read_bytes())
+
+    def test_lazy_baseline_grammar_is_packaged_with_exact_bounded_bytes(self):
+        member = "scripts/watchdog_users_closed_baseline_candidate.py"
+        registrations = [entry for entry in package.SOURCES if entry[1] == member]
+        self.assertEqual(len(registrations), 1)
+        source, _, mode, maximum = registrations[0]
+        self.assertEqual(source, ROOT / member)
+        self.assertEqual((mode, maximum), (0o644, 65536))
+        expected = package.source_bytes(source, maximum)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "provider.zip"
+            manifest = package.build(output)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(archive.read(member), expected)
+            record = next(item for item in manifest["files"] if item["path"] == member)
+            self.assertEqual(record["size"], len(expected))
+            self.assertEqual(record["sha256"], hashlib.sha256(expected).hexdigest())
+            oversize = Path(temporary) / "oversize-grammar.py"
+            oversize.write_bytes(b"x" * (maximum + 1))
+            sources = tuple((oversize if path == source else path, name, source_mode, bound)
+                            for path, name, source_mode, bound in package.SOURCES)
+            refused = Path(temporary) / "oversize-refused.zip"
+            with mock.patch.object(package, "SOURCES", sources):
+                with self.assertRaisesRegex(package.PackageError, "exceeds its bound"):
+                    package.build(refused)
+            self.assertFalse(refused.exists())
+
+    def test_packaged_provider_lazy_import_has_no_checkout_fallback_or_external_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "provider.zip"
+            extracted = Path(temporary) / "isolated-package"
+            package.build(output)
+            with zipfile.ZipFile(output) as archive:
+                archive.extractall(extracted)
+            code = textwrap.dedent("""
+                from contextlib import ExitStack
+                import os
+                from pathlib import Path
+                import socket
+                import subprocess
+                import sys
+                import urllib.request
+                from unittest import mock
+
+                root = Path(sys.argv[1]).resolve()
+                sys.path.insert(0, str(root))
+                attempts = []
+                def blocked(*args, **kwargs):
+                    attempts.append("external-access")
+                    raise AssertionError("packaged readback import crossed an external boundary")
+                with ExitStack() as guards:
+                    for owner, name in (
+                        (socket.socket, "connect"), (socket.socket, "connect_ex"),
+                        (socket, "create_connection"), (urllib.request, "urlopen"),
+                        (urllib.request.OpenerDirector, "open"),
+                        (subprocess, "Popen"), (os, "system"),
+                    ):
+                        guards.enter_context(mock.patch.object(owner, name, new=blocked))
+                    from provider import watchdog_state_provider as provider
+                    assert Path(provider.__file__).resolve() == root / "provider/watchdog_state_provider.py"
+                    try:
+                        provider.WatchdogProvider.inspect_users_closed_baseline_readback(object(), {}, {})
+                    except provider.ProviderError as error:
+                        assert (error.status, error.code) == (400, "users-closed-projection-invalid")
+                    else:
+                        raise AssertionError("invalid declarations must not reach backend readback")
+                    grammar = sys.modules["scripts.watchdog_users_closed_baseline_candidate"]
+                    assert Path(grammar.__file__).resolve() == root / "scripts/watchdog_users_closed_baseline_candidate.py"
+                assert attempts == []
+                print("packaged-lazy-grammar-import-closure-ok")
+            """)
+            environment = {name: os.environ[name] for name in ("SystemRoot", "TEMP", "TMP")
+                           if name in os.environ}
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", code, str(extracted)],
+                cwd=extracted, env=environment, capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "packaged-lazy-grammar-import-closure-ok")
+            self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":
