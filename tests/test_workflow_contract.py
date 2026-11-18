@@ -691,6 +691,22 @@ class WorkflowContractTests(unittest.TestCase):
         for field in (".workflow_id", ".name", ".path", ".head_sha", ".head_branch", ".event"):
             self.assertIn(field, revalidate)
 
+    def test_production_control_targets_current_paperdesk_folio_app(self):
+        source = self.workflow(CONTROL)
+        for marker in (
+            'production_workflow_name="Build and deploy Node.js app to Azure Web App: paperdesk-folio-pilot-sea-202611"',
+            'test "${EXPECTED_APP_NAME}" = "paperdesk-folio-pilot-sea-202611"',
+            'test "${EXPECTED_RESOURCE_GROUP}" = "rg-paperdesk-folio-pilot-sea-202611"',
+            'test "${EXPECTED_LIVE_URL}" = "https://app.master-data-structure.com"',
+        ):
+            self.assertIn(marker, source)
+        for retired in (
+            'test "${EXPECTED_APP_NAME}" = "master-data-structure-sea-9c4e0d0d"',
+            'test "${EXPECTED_RESOURCE_GROUP}" = "rg-master-data-structure-sea"',
+            'test "${EXPECTED_LIVE_URL}" = "https://master-data-structure-sea-9c4e0d0d.azurewebsites.net"',
+        ):
+            self.assertNotIn(retired, source)
+
     def test_runner_has_no_direct_storage_onedeploy_or_production_setting_mutation(self):
         source = self.workflow(CONTROL)
         for forbidden in (
